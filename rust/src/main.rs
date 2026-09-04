@@ -309,7 +309,7 @@ fn encode(opt: writer::Options, tmpdir: &std::path::Path, a: Option<aln::Aln>) {
     let mut slab = vec![0u8; SLAB];
     let mut have = 0usize;
     let nthr = rayon::current_num_threads().min(32);
-    let mut stdin = std::io::stdin().lock();
+    let mut stdin = karyozip::unzip(std::io::stdin());   // plain or .gz
     let mut eof = false;
     let _p = prof::span(0);
     loop {

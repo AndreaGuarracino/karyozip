@@ -39,8 +39,7 @@ impl Aln {
 
     /// The reference track: one contig's rows together, sorted, gapless.
     pub fn load_ref(&mut self, path: &str) {
-        let data = std::fs::read(path)
-            .unwrap_or_else(|_| crate::bail("cannot open the reference track"));
+        let data = crate::slurp(path, "cannot open the reference track");
         let mut rh = FNV0;
         let (mut badln, mut cur) = (0u64, usize::MAX);
         for raw in data.split(|&c| c == b'\n') {
@@ -78,7 +77,7 @@ impl Aln {
 
     /// The PAF, read for its cg:Z: CIGARs. Everything else is dead weight.
     pub fn load_paf(&mut self, path: &str) {
-        let data = std::fs::read(path).unwrap_or_else(|_| crate::bail("cannot open the PAF"));
+        let data = crate::slurp(path, "cannot open the PAF");
         let (mut nblk, mut badpaf, mut nocg, mut noref) = (0usize, 0u64, 0u64, 0u64);
         for raw in data.split(|&c| c == b'\n') {
             let mut line = raw;
@@ -285,8 +284,7 @@ impl Aln {
 
     /// One name a line, in the order the annotator produced them.
     pub fn load_ordinals(&mut self, path: &str) {
-        let data = std::fs::read(path)
-            .unwrap_or_else(|_| crate::bail("cannot open the file given to --names"));
+        let data = crate::slurp(path, "cannot open the file given to --names");
         let mut h = FNV0;
         for line in data.split(|&c| c == b'\n') {
             let mut l = line;

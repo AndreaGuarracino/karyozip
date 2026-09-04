@@ -25,7 +25,7 @@ all: build/karyozip build/libkaryozip.a build/libtest
 
 build/karyozip: $(SRC)
 	mkdir -p build
-	$(CC) $(CFLAGS) $(ZSTD_CFLAGS) -o $@ $(SRC) $(LDFLAGS) $(ZSTD_LIBS) -lm -lpthread
+	$(CC) $(CFLAGS) $(ZSTD_CFLAGS) -o $@ $(SRC) $(LDFLAGS) $(ZSTD_LIBS) -lm -lpthread -lz
 
 # the same sources, minus main: an annotator can write .kst without a BED
 build/libkaryozip.a: $(SRC) karyozip.h
@@ -34,7 +34,7 @@ build/libkaryozip.a: $(SRC) karyozip.h
 	$(AR) rcs $@ build/lib/*.o
 
 build/libtest: build/libkaryozip.a tests/libtest.c
-	$(CC) $(CFLAGS) $(ZSTD_CFLAGS) -o $@ tests/libtest.c build/libkaryozip.a $(LDFLAGS) $(ZSTD_LIBS) -lm -lpthread
+	$(CC) $(CFLAGS) $(ZSTD_CFLAGS) -o $@ tests/libtest.c build/libkaryozip.a $(LDFLAGS) $(ZSTD_LIBS) -lm -lpthread -lz
 
 test: build/karyozip build/libtest
 	KT=$(CURDIR)/build/karyozip tests/run.sh

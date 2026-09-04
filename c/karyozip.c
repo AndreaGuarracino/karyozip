@@ -6,6 +6,7 @@
 #include <string.h>
 #include <limits.h>
 #include <stdint.h>
+#include <zlib.h>
 #include <time.h>
 #include <zstd.h>
 #include "karyozip.h"
@@ -119,6 +120,23 @@ static uint64_t bedcoord(const char *p, const char *end, const char *what) {
     uint64_t v = bedcoord_e(p, end, what, &err);
     if (err) die(err);
     return v;
+}
+
+/* Every text input goes through zlib, which reads a plain file transparently
+   and a .gz on the fly. fopencookie wraps it in a FILE*, so getline, fgets
+   and fread below are unchanged. A path of NULL means stdin. */
+static ssize_t zread_(void *c, char *b, size_t n) {
+    int g = gzread((gzFile)c, b, (unsigned)n);
+    return g < 0 ? -1 : g;
+}
+static int zclose_(void *c) { return gzclose((gzFile)c) == Z_OK ? 0 : -1; }
+static FILE *zfopen(const char *path) {
+    gzFile g = path ? gzopen(path, "rb") : gzdopen(dup(0), "rb");
+    if (!g) return NULL;
+    cookie_io_functions_t io = { zread_, NULL, NULL, zclose_ };
+    FILE *f = fopencookie(g, "r", io);
+    if (!f) gzclose(g);
+    return f;
 }
 
 static uint64_t fnvbuf(uint64_t h, const void *p, size_t n) {
@@ -822,7 +840,7 @@ static qseg *qseg_get(const char *nm, int make) {
 }
 
 static void loadref(const char *path) {
-    FILE *f = fopen(path, "r");
+    FILE *f = zfopen(path);
     if (!f) die("cannot open the reference track");
     char *ln = NULL; size_t cap = 0; ssize_t n;
     rcon *cur = NULL; uint64_t badln = 0;
@@ -882,7 +900,7 @@ static void seghash(void) {
 }
 
 static void loadpaf(const char *path) {
-    FILE *f = fopen(path, "r");
+    FILE *f = zfopen(path);
     if (!f) die("cannot open the PAF");
     char *ln = NULL; size_t cap = 0; ssize_t n;
     size_t nblk = 0; uint64_t badpaf = 0, nocg = 0, noref = 0;
@@ -1136,7 +1154,7 @@ static void loadaln(const char *path) {
 }
 
 static void loadordinals(const char *path) {
-    FILE *f = fopen(path, "r");
+    FILE *f = zfopen(path);
     if (!f) die("cannot open the file given to --names");
     char *ln = NULL; size_t cap = 0; ssize_t n; size_t c = 0;
     while ((n = getline(&ln, &cap, f)) > 0) {
@@ -1347,7 +1365,7 @@ static uint32_t tup_get(const uint32_t *v, size_t n) {
 
 static uint64_t FEATHASH;
 static void loadfeatures(const char *path) {
-    FILE *f = fopen(path, "r");
+    FILE *f = zfopen(path);
     if (!f) die("cannot open the features table");
     char *ln = NULL; size_t cap = 0; ssize_t n;
     uint32_t maxid = 0; FEATHASH = FNV0;
@@ -1663,12 +1681,14 @@ static void encode(void) {
     prow **pr = xcalloc((size_t)T, sizeof *pr);
     size_t *prn = xcalloc((size_t)T, sizeof *prn), *prc = xcalloc((size_t)T, sizeof *prc);
     size_t have = 0; int eof = 0;
+    FILE *IN = zfopen(NULL);            /* plain or .gz, decided by the bytes */
+    if (!IN) die("read error on stdin");
     double _tp = nowsec();
     while (!eof || have) {
         if (!eof) {
-            size_t got = fread(slab + have, 1, SLAB - have, stdin);
+            size_t got = fread(slab + have, 1, SLAB - have, IN);
             have += got;
-            if (got == 0) { if (ferror(stdin)) die("read error on stdin"); eof = 1; }
+            if (got == 0) { if (ferror(IN)) die("read error on stdin"); eof = 1; }
         }
         char *end = slab + have;
         char *last = have ? memrchr(slab, '\n', have) : NULL;
@@ -2739,17 +2759,16 @@ static uint64_t stathash(const struct stat *st) {
 }
 static char *readnamefile(uint64_t nreads) {
     char *names;
-        FILE *nf = fopen(NAMEFILE, "rb");
+        FILE *nf = zfopen(NAMEFILE);
         if (!nf) die("cannot open the file given to --names");
-        struct stat st0; if (fstat(fileno(nf), &st0)) die("cannot stat the file given to --names");
+        /* stat the path: a cookie stream has no descriptor of its own */
+        struct stat st0; if (stat(NAMEFILE, &st0)) die("cannot stat the file given to --names");
         size_t cap = 1 << 20, w = 0;
         names = xmalloc(cap);
         char *ln = NULL; size_t lcap = 0; uint64_t got = 0; int fq = 2, lineno = 0;
 
         char *hd[3] = { NULL, NULL, NULL }; size_t hc[3] = { 0, 0, 0 }; int nhd = 0;
         while (nhd < 3 && getline(&hd[nhd], &hc[nhd], nf) > 0) nhd++;
-        if (nhd && (unsigned char)hd[0][0] == 0x1f && hc[0] > 1 && (unsigned char)hd[0][1] == 0x8b)
-            die("the file given to --names is gzipped; decompress it first");
         if (nhd >= 2) {
             if (hd[0][0] == '@' && nhd >= 3 && hd[2][0] == '+') fq = 1;
             else if (hd[0][0] == '>' && hd[1][0] != '>') fq = 0;
@@ -2769,7 +2788,7 @@ static char *readnamefile(uint64_t nreads) {
         }
         if (ferror(nf)) die("read error on the file given to --names");
         for (int h = 0; h < 3; h++) free(hd[h]);   /* unused when the file is shorter */
-        {   struct stat st1; if (fstat(fileno(nf), &st1)) die("cannot stat the file given to --names");
+        {   struct stat st1; if (stat(NAMEFILE, &st1)) die("cannot stat the file given to --names");
             NAMESRC_H = stathash(&st0);
             if (S_ISREG(st0.st_mode) && stathash(&st1) != NAMESRC_H)
                 die("the file given to --names changed while it was read");
@@ -3278,7 +3297,7 @@ static int nodeid(const char *nm, size_t n) {
 }
 
 static void loadhier(const char *path, const char *fs) {
-    FILE *f = fopen(path, "r");
+    FILE *f = zfopen(path);
     if (!f) die("cannot open the hierarchy file");
     char *line = NULL; size_t cap = 0; ssize_t len;
     while ((len = getline(&line, &cap, f)) > 0) {
@@ -3709,7 +3728,7 @@ static void encode_db(int nfiles, char **files) {
     brd *b = xcalloc((size_t)nfiles, sizeof *b);
     for (int i = 0; i < nfiles; i++) {
         b[i].set = i;
-        b[i].f = strcmp(files[i], "-") ? fopen(files[i], "r") : stdin;
+        b[i].f = zfopen(strcmp(files[i], "-") ? files[i] : NULL);
         if (!b[i].f) { fprintf(stderr, "cannot open %s: %s\n", files[i], strerror(errno));
                        die("cannot open an input BED"); }
         bnext(&b[i]);

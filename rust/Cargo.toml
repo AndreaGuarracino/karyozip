@@ -20,6 +20,10 @@ clap     = { version = "4.6.6", features = ["derive"] }
 # The parser is half of encode, and this is the SIMD byte search the C gets
 # from glibc's memchr for free.
 memchr   = "2.8.3"
+# The real tracks are .bed.gz, so every reader inflates on the fly. zlib-rs
+# is the Rust rewrite of zlib: no system library, and far faster at inflate
+# than the miniz_oxide default.
+flate2   = { version = "1.1.10", default-features = false, features = ["zlib-rs"] }
 rayon    = "1.12.0"
 
 [build-dependencies]

@@ -205,6 +205,30 @@ for bad_in in 'r1\t0\t10' 'r1\t5\t10\tA' 'r1\t0\t0\tA' '\t0\t10\tA' 'r1\tx\t10\t
 done
 echo "refusals: same message from both"
 
+# 11b. gzipped input, which is how the real tracks are stored. zlib and
+# zlib-rs must inflate to the same bytes, so the track must be identical to
+# the one built from the plain file.
+gok=0; gbad=0
+for f in "$D"/s.bed "$D"/ls.bed "$D"/db.rall.bed "$D"/ord.bed; do
+  gzip -c "$f" > "$W/in.gz"
+  "$C" encode < "$f" > "$W/c.plain" 2>/dev/null
+  for b in "$C" "$R"; do
+    "$b" encode < "$W/in.gz" > "$W/g.kst" 2>/dev/null
+    if cmp -s "$W/c.plain" "$W/g.kst"; then gok=$((gok+1))
+    else gbad=$((gbad+1)); echo "  gz differs: $(basename "$f") $b"; fi
+  done
+done
+gzip -c "$D/ref.bed" > "$W/ref.gz"; gzip -c "$D/p.paf" > "$W/paf.gz"
+gzip -c "$D/s.bed" > "$W/s.gz"
+"$C" encode --aln "$D/p.paf" --ref "$D/ref.bed" < "$D/s.bed" > "$W/a.plain" 2>/dev/null
+for b in "$C" "$R"; do
+  "$b" encode --aln "$W/paf.gz" --ref "$W/ref.gz" < "$W/s.gz" > "$W/a.gz.kst" 2>/dev/null
+  if cmp -s "$W/a.plain" "$W/a.gz.kst"; then gok=$((gok+1))
+  else gbad=$((gbad+1)); echo "  gz --aln differs: $b"; fi
+done
+[ $gbad = 0 ] && echo "gzip input: $gok forms match the plain track" \
+  || { echo "gzip input: $gbad DIFFER"; fail=1; }
+
 # 12. the command line itself: the same words and the same exit code for
 # every malformed form, including --help and --version.
 cok=0; cbad=0

@@ -16,8 +16,7 @@ pub struct Feats {
 
 impl Feats {
     pub fn load(path: &str) -> Feats {
-        let data = std::fs::read(path)
-            .unwrap_or_else(|_| crate::bail("cannot open the features table"));
+        let data = crate::slurp(path, "cannot open the features table");
         let mut f = Feats { sets: Vec::new(), id2lab: HashMap::new(),
                             tup: HashMap::new(), hash: FNV0 };
         let mut first = true;
@@ -80,13 +79,14 @@ impl Brd {
         let data = if path == "-" {
             use std::io::Read;
             let mut v = Vec::new();
-            std::io::stdin().read_to_end(&mut v).unwrap_or_else(|_| crate::bail("cannot open an input BED"));
+            crate::unzip(std::io::stdin()).read_to_end(&mut v)
+                .unwrap_or_else(|_| crate::bail("cannot open an input BED"));
             v
         } else {
-            std::fs::read(path).unwrap_or_else(|_| {
-                eprintln!("cannot open {path}");
-                crate::bail("cannot open an input BED")
-            })
+            {
+                if std::fs::metadata(path).is_err() { eprintln!("cannot open {path}"); }
+                crate::slurp(path, "cannot open an input BED")
+            }
         };
         if !data.is_empty() && data.last() != Some(&b'\n') {
             crate::bail("input does not end with a newline");

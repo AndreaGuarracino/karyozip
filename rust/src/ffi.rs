@@ -99,7 +99,7 @@ pub fn zstd_frame_size(src: &[u8]) -> Option<usize> {
 pub fn zstd_decompress(src: &[u8], raw: usize) -> Option<Vec<u8>> {
     // SAFETY: out is sized to the caller's expected length.
     unsafe {
-        let mut out = vec![0u8; raw];
+        let mut out = vec![0u8; crate::ckalloc(raw)];
         let n = zstd_sys::ZSTD_decompress(out.as_mut_ptr() as *mut c_void, raw,
                                           src.as_ptr() as *const c_void, src.len());
         if zstd_sys::ZSTD_isError(n) != 0 || n != raw { return None; }
@@ -161,6 +161,7 @@ pub fn paycomp(src: &[u8], codec: i32) -> Option<Vec<u8>> {
 
 /// The matching decompressor. `raw` is the decoded length the file claims.
 pub fn paydecomp(src: &[u8], codec: i32, raw: usize) -> Option<Vec<u8>> {
+    crate::ckalloc(raw);
     if codec & CODEC_BZIP3 != 0 {
         // SAFETY: out is the claimed decoded length; got is checked against it.
         unsafe {

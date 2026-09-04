@@ -23,10 +23,7 @@ impl Hier {
 
     /// feature_set, child, parent; one feature set at a time.
     pub fn load(path: &str, fs: &[u8]) -> Hier {
-        let data = match std::fs::read(path) {
-            Ok(d) => d,
-            Err(_) => crate::bail("cannot open the hierarchy file"),
-        };
+        let data = crate::slurp(path, "cannot open the hierarchy file");
         let mut h = Hier { node: Vec::new(), par: Vec::new(), anc: Vec::new(),
                            lca: Vec::new(), root: -1 };
         for raw in data.split(|&c| c == b'\n') {

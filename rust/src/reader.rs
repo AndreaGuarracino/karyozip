@@ -23,17 +23,14 @@ const IDXMAGIC: u64 = 0x3130_5844_4954_534b;   // "KSTIDX01"
 const ICHUNK: u64 = 65536;
 
 fn ordinals(n: u64) -> Vec<u8> {
-    let mut v = Vec::with_capacity(n as usize * 8);
+    let mut v = Vec::with_capacity(crate::ckalloc(n as usize * 8));
     for i in 0..n { crate::kst::putu64(&mut v, i); v.push(b'\n'); }
     v
 }
 
 /// --names FILE: a FASTA, a FASTQ, or one name per line. Rank N is record N.
 fn read_name_file(path: &str, nreads: u64) -> Vec<u8> {
-    let data = rd(std::fs::read(path), "cannot open the file given to --names");
-    if data.len() > 1 && data[0] == 0x1f && data[1] == 0x8b {
-        crate::bail("the file given to --names is gzipped; decompress it first");
-    }
+    let data = crate::slurp(path, "cannot open the file given to --names");
     // getline gives no line after a final newline, and the split does, which
     // made an @-line index land on the empty tail.
     let mut lines: Vec<&[u8]> = data.split(|&c| c == b'\n').collect();
@@ -191,7 +188,7 @@ impl Reader {
         rd(f.seek(SeekFrom::Start(8 + 128)), "seek");
 
         let lzl = h[6] as usize;
-        let mut lzraw = vec![0u8; lzl];
+        let mut lzraw = vec![0u8; crate::ckalloc(lzl)];
         if lzl > 0 { rd(f.read_exact(&mut lzraw), "short labels"); }
         let mut lab: Vec<Vec<u8>> = Vec::new();
         if lzl > 0 {
@@ -220,13 +217,13 @@ impl Reader {
         }
         let nzl = nml as usize;
         let nz_off = 8 + 128 + lzl as u64;
-        let mut nz = vec![0u8; nzl];
+        let mut nz = vec![0u8; crate::ckalloc(nzl)];
         if nzl > 0 { rd(f.read_exact(&mut nz), "short names"); }
-        let mut iz = vec![0u8; h[2] as usize];
+        let mut iz = vec![0u8; crate::ckalloc(h[2] as usize)];
         rd(f.read_exact(&mut iz), "short index");
-        let mut sz = vec![0u8; h[3] as usize];
+        let mut sz = vec![0u8; crate::ckalloc(h[3] as usize)];
         rd(f.read_exact(&mut sz), "short sizes");
-        let mut itz = vec![0u8; h[11] as usize];
+        let mut itz = vec![0u8; crate::ckalloc(h[11] as usize)];
         rd(f.read_exact(&mut itz), "short index table");
 
         // A sidecar holds the names --names drop:FILE wrote.
@@ -243,7 +240,7 @@ impl Reader {
                 }
             }
         }
-        let mut pz = vec![0u8; if was_perm { h[14] as usize } else { 0 }];
+        let mut pz = vec![0u8; crate::ckalloc(if was_perm { h[14] as usize } else { 0 })];
         if !pz.is_empty() { rd(f.read_exact(&mut pz), "short input-order names"); }
 
         // The metadata hash covers the header with h[15] zeroed, then every
@@ -298,6 +295,9 @@ impl Reader {
             if e2 != 0 && (c2 == 0 || d2 == 0) {
                 crate::bail("corrupt index: a block with rows but an empty stream");
             }
+            if c2 > h[4] * 16 + 64 || d2 > h[4] * 16 + 64 {
+                crate::bail("corrupt index: a block claims an impossible decoded size");
+            }
             b.push(Blk { off: acc, size: a + b2, l: a, raw: c2, lraw: d2, rows: e2, hash: g2 });
             acc += a + b2;
         }
@@ -316,21 +316,39 @@ impl Reader {
         // The index: chunk table, then the concatenated chunk frames.
         let tbuf = zdec(&itz, "index table");
         let mut coff = vec![0u64];
+        let mut cpend = vec![];
         let (mut q, mut acc2) = (0usize, 0u64);
         for _ in 0..h[10] {
             let (cl, n1) = vget(&tbuf, q);
-            let (_sp, n2) = vget(&tbuf, n1);
+            let (sp, n2) = vget(&tbuf, n1);
             q = n2;
             acc2 += cl;
             coff.push(acc2);
+            cpend.push(sp);
         }
+        cpend.push(h[4]);
         if acc2 != h[2] { crate::bail("index chunk table does not match the index"); }
         if h[10] != h[0].div_ceil(ICHUNK) {
             crate::bail("corrupt file: index chunks do not match the sequence count");
         }
+        // Each chunk must hold exactly its share of the sequences and add up
+        // to the run count its table entry promised.
         let mut ibx = Vec::new();
         for c in 0..h[10] as usize {
-            ibx.extend_from_slice(&zdec(&iz[coff[c] as usize..coff[c + 1] as usize], "index chunk"));
+            let d = zdec(&iz[coff[c] as usize..coff[c + 1] as usize], "index chunk");
+            let want = if (c as u64) + 1 < h[10] { ICHUNK } else { h[0] - c as u64 * ICHUNK };
+            let (mut i, mut sum, mut k) = (0usize, 0u64, 0u64);
+            while k < want && i < d.len() {
+                let (v, n) = vget(&d, i);
+                if v > u32::MAX as u64 { crate::bail("corrupt index: a run count past 32 bits"); }
+                sum += v;
+                i = n;
+                k += 1;
+            }
+            if k != want || i != d.len() || cpend[c] + sum != cpend[c + 1] {
+                crate::bail("corrupt index: an index chunk does not match its table entry");
+            }
+            ibx.extend_from_slice(&d);
         }
 
         // A permutation track with no stored blob keeps its names outside,
@@ -494,7 +512,7 @@ impl Reader {
     fn load_raw(&mut self, b: usize) -> (Vec<u8>, usize, u64) {
         if b >= self.b.len() { crate::bail("corrupt index: a block number is past the end"); }
         let m = &self.b[b];
-        let mut cb = vec![0u8; m.size as usize];
+        let mut cb = vec![0u8; crate::ckalloc(m.size as usize)];
         rd(self.f.seek(SeekFrom::Start(self.data0 + m.off)), "seek");
         rd(self.f.read_exact(&mut cb), "file is truncated: a block is missing or short");
         if kst::fnv(FNV0, &cb) != m.hash {
@@ -528,7 +546,7 @@ fn zdec(src: &[u8], what: &str) -> Vec<u8> {
 
 fn int_names_d(b: &[u8], cnt: u64) -> Vec<u8> {
     let v = zdec(b, "int names");
-    let mut o = Vec::with_capacity(cnt as usize * 8);
+    let mut o = Vec::with_capacity(crate::ckalloc(cnt as usize * 8));
     let (mut q, mut cur) = (0usize, 0u64);
     for _ in 0..cnt {
         let (u, n) = vget(&v, q);
@@ -760,7 +778,7 @@ impl Reader {
             .map(|i| (kst::fnv(FNV0, &self.names[i]), i as u32)).collect();
         pair.sort_unstable();
         let dup = pair.windows(2).filter(|w| w[0].0 == w[1].0).count() as u64;
-        let mut t = Vec::with_capacity(n * 20 + 32);
+        let mut t = Vec::with_capacity(crate::ckalloc(n * 20 + 32));
         for (k, _) in &pair { t.extend_from_slice(&k.to_le_bytes()); }
         for (_, o) in &pair {
             t.extend_from_slice(&(h64b(&self.names[*o as usize])

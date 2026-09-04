@@ -1,4 +1,4 @@
-//! The only unsafe in the crate, besides the reader's mmap. Every raw
+//! The only unsafe in the crate. Every raw
 //! pointer and every length check lives here; callers see slices and
 //! `Option<Vec<u8>>`.
 //!

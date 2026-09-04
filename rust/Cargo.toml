@@ -18,7 +18,6 @@ clap     = { version = "4.6.6", features = ["derive"] }
 # from glibc's memchr for free.
 memchr   = "2.8.3"
 rayon    = "1.12.0"
-memmap2  = "0.9.11"
 
 [build-dependencies]
 cc = "1.4.5"

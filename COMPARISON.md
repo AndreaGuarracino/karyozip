@@ -28,7 +28,7 @@ cli: 69 forms give the same words and code
 |------------------------|------:|------:|
 | lines, excluding vendored C | 4,218 | 3,993 |
 | files                  |     2 |    10 |
-| `unsafe` blocks        |     — |    15 |
+| `unsafe` blocks        |     — |    13 |
 | stripped binary        | 358 KB | 2,491 KB |
 
 The Rust is 5% shorter. Some of that is real, the parallel arrays and the
@@ -44,7 +44,7 @@ of `c/karyozip.c` at build time, so `--help` is the same bytes from both by
 construction. The htscodecs and bzip3 version strings come the same way,
 from `c/htscodecs/version.h` and `c/Makefile`.
 
-All 15 `unsafe` blocks are in `src/ffi.rs`, the one module that calls the
+All 13 `unsafe` blocks are in `src/ffi.rs`, the one module that calls the
 vendored C codecs. Nothing else in the crate is unsafe.
 
 ## Speed

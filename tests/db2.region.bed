@@ -1,0 +1,7 @@
+chrA	0	150	arm
+chrLONGNAME_XYZ	0	100	parm
+chrLONGNAME_XYZ	100	150	arm
+c	0	50	parm
+c	50	150	arm
+chrMEDIUM	0	100	parm
+chrMEDIUM	100	150	arm

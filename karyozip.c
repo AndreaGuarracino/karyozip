@@ -239,10 +239,12 @@ static int intern(const char *s, size_t n) {
     return lastid = nlabtab++;
 }
 
+/* ZSTD_compress builds a level-17 match table per call, about 46 MB. Do NOT
+   hold one context across calls: measured, that costs 42 MB more, because a
+   freed table can be reused by the tokeniser and a live one cannot. */
 static size_t zcl(buf *in, uint8_t **out, int level) {
     size_t bound = ZSTD_compressBound(in->n);
     *out = xmalloc(bound);
-    if (!*out) die("oom");
     size_t got = ZSTD_compress(*out, bound, in->d, in->n, level);
     if (ZSTD_isError(got)) die(ZSTD_getErrorName(got));
     return got;

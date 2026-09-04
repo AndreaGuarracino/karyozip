@@ -30,6 +30,7 @@ pub struct Reader {
     pub nreads: u64,
     pub rows: u64,
     lab: Vec<Vec<u8>>,
+    block: u64,
     b: Vec<Blk>,
     data0: u64,
     idcodec: i32,
@@ -39,6 +40,8 @@ pub struct Reader {
     tailskip: u64,
     pub names: Vec<Vec<u8>>,
     ibx: Vec<u8>,
+    hasidx: bool,
+    mhash: u64,
 }
 
 fn rd<T>(r: Result<T, std::io::Error>, what: &str) -> T {
@@ -70,6 +73,7 @@ impl Reader {
         }
         let h1_raw = h[1];
         let mut fsz = rd(f.seek(SeekFrom::End(0)), "seek");
+        let mut hasidx = false;
         // An index trailer sits past the data: take it off, so every size
         // check below still bounds the data alone.
         if fsz >= 32 + 8 + 128 {
@@ -79,7 +83,7 @@ impl Reader {
             let w: Vec<u64> = (0..4)
                 .map(|i| u64::from_le_bytes(t[i * 8..i * 8 + 8].try_into().unwrap())).collect();
             if w[3] == IDXMAGIC && w[0] == h[0] && w[0] <= (fsz - 32) / 20
-                && fsz - 32 - w[0] * 20 >= 8 + 128 { fsz -= 32 + w[0] * 20; }
+                && fsz - 32 - w[0] * 20 >= 8 + 128 { fsz -= 32 + w[0] * 20; hasidx = true; }
         }
         let nml = h[1] & !FLAGS;
         if nml > fsz || h[2] > fsz || h[3] > fsz || h[6] > fsz || h[11] > fsz
@@ -224,46 +228,26 @@ impl Reader {
 
         let data0 = 8 + 128 + lzl as u64 + nml + h[2] + h[3] + h[11];
         Reader {
-            f, nreads: h[0], rows: h[4], lab, b, data0,
+            f, nreads: h[0], rows: h[4], lab, block: blk, b, data0,
             idcodec: h[9] as u32 as i32, lencodec: h[5] as u32 as i32,
             taildec, tailpred: h[12], tailskip: h[13] & 0xff, names, ibx,
+            hasidx, mhash: h[15],
         }
     }
 
-    /// The runs of every sequence, in order. One forward pass: a cursor per
-    /// frame, advanced row by row, so a block is walked once however many
-    /// sequences it holds. Restarting at the block head per sequence is what
-    /// made the C's smooth 9x slower before it was fixed.
+    /// Every sequence, in order. One forward pass over the blocks.
     pub fn decode(&mut self, out: &mut impl std::io::Write) {
-        let mut emitted = 0u64;
         let mut buf: Vec<u8> = Vec::with_capacity(1 << 22);
-        let mut blk = usize::MAX;
-        let (mut data, mut lp, mut ip, mut left) = (Vec::new(), 0usize, 0usize, 0u64);
-        let mut ipos = 0usize;
+        let mut c = Cursor { blk: usize::MAX, data: Vec::new(), lp: 0, ip: 0, left: 0 };
+        let (mut ipos, mut emitted) = (0usize, 0u64);
+        let tskip = self.tailskip;
         for i in 0..self.nreads {
             let (nruns, next) = vget(&self.ibx, ipos);
             ipos = next;
             let name = std::mem::take(&mut self.names[i as usize]);
             let mut st = 0u64;
             for k in 0..nruns {
-                if left == 0 {
-                    blk = if blk == usize::MAX { 0 } else { blk + 1 };
-                    let (d, split, rows) = self.load(blk);
-                    data = d; lp = 0; ip = split; left = rows;
-                }
-                let last = k + 1 == nruns && i >= self.tailskip;
-                let (v, l2) = vget(&data, lp);
-                lp = l2;
-                let len = if last && self.taildec {
-                    let t = self.tailpred.wrapping_add(unzz(v));
-                    if t <= st { crate::bail("corrupt track: sequence total is not past its last run"); }
-                    t - st
-                } else {
-                    if v == 0 { crate::bail("corrupt track: a zero length outside a sentinel block"); }
-                    v
-                };
-                let (f, i2) = vget(&data, ip);
-                ip = i2;
+                let (len, f) = self.step(&mut c, st, k + 1 == nruns && i >= tskip);
                 let en = st + len;
                 buf.extend_from_slice(&name);
                 buf.push(b'\t');
@@ -271,11 +255,7 @@ impl Reader {
                 buf.push(b'\t');
                 buf.extend_from_slice(en.to_string().as_bytes());
                 buf.push(b'\t');
-                match self.lab.get(f as usize) {
-                    Some(l) => buf.extend_from_slice(l),
-                    None if self.lab.is_empty() => buf.extend_from_slice(f.to_string().as_bytes()),
-                    None => crate::bail("corrupt block: a label id past the table"),
-                }
+                self.label(f, &mut buf);
                 buf.push(b'\n');
                 if buf.len() > (1 << 22) - 4096 {
                     rd(out.write_all(&buf), "write failed");
@@ -283,7 +263,6 @@ impl Reader {
                 }
                 st = en;
                 emitted += 1;
-                left -= 1;
             }
             self.names[i as usize] = name;
         }
@@ -386,3 +365,182 @@ pub fn vget(b: &[u8], mut i: usize) -> (u64, usize) {
 }
 
 fn unzz(v: u64) -> u64 { ((v >> 1) as i64 ^ -((v & 1) as i64)) as u64 }
+
+/* ------------------------------------------------ one sequence at a time */
+
+/// A position in the row stream: the block, its bytes, a cursor per frame,
+/// and how many of its rows are left.
+struct Cursor { blk: usize, data: Vec<u8>, lp: usize, ip: usize, left: u64 }
+
+impl Reader {
+    /// (block, offset in it, run count) for sequence `ri`.
+    fn locate(&self, ri: u64) -> (usize, u64, u64) {
+        let (mut q, mut cpend) = (0usize, 0u64);
+        let mut nruns = 0u64;
+        for _ in 0..=ri {
+            let (n, next) = vget(&self.ibx, q);
+            q = next;
+            if cpend / self.block > u32::MAX as u64 {
+                crate::bail("corrupt index: a block number past 32 bits");
+            }
+            nruns = n;
+            cpend += n;
+        }
+        let start = cpend - nruns;
+        (( start / self.block) as usize, start % self.block, nruns)
+    }
+
+    fn at(&mut self, blk: usize, off: u64) -> Cursor {
+        let (data, split, rows) = self.load(blk);
+        let mut c = Cursor { blk, data, lp: 0, ip: split, left: rows };
+        for _ in 0..off { c.lp = skip(&c.data, c.lp); c.ip = skip(&c.data, c.ip); }
+        c.left -= off;
+        c
+    }
+
+    /// Next row: (length, label id). Steps to the next block when this one ends.
+    fn step(&mut self, c: &mut Cursor, st: u64, last: bool) -> (u64, u64) {
+        if c.left == 0 {
+            let b = if c.blk == usize::MAX { 0 } else { c.blk + 1 };
+            let (data, split, rows) = self.load(b);
+            *c = Cursor { blk: b, data, lp: 0, ip: split, left: rows };
+        }
+        let (v, l2) = vget(&c.data, c.lp);
+        c.lp = l2;
+        let len = if last && self.taildec {
+            let t = self.tailpred.wrapping_add(unzz(v));
+            if t <= st { crate::bail("corrupt track: sequence total is not past its last run"); }
+            t - st
+        } else {
+            if v == 0 { crate::bail("corrupt track: a zero length outside a sentinel block"); }
+            v
+        };
+        let (f, i2) = vget(&c.data, c.ip);
+        c.ip = i2;
+        c.left -= 1;
+        (len, f)
+    }
+
+    fn label(&self, f: u64, out: &mut Vec<u8>) {
+        match self.lab.get(f as usize) {
+            Some(l) => out.extend_from_slice(l),
+            None if self.lab.is_empty() => out.extend_from_slice(f.to_string().as_bytes()),
+            None => crate::bail("corrupt block: a label id past the table"),
+        }
+    }
+
+    fn find(&self, seq: &[u8]) -> i64 {
+        self.names.iter().position(|n| n == seq).map_or(-1, |i| i as i64)
+    }
+
+    /// region F SEQ | SEQ POS | SEQ START END [HALO].
+    pub fn region(&mut self, seq: &[u8], lo: u64, hi: u64, halo: u64,
+                  out: &mut impl std::io::Write) {
+        let ri = self.find(seq);
+        if ri < 0 { crate::bail("sequence not found"); }
+        let ri = ri as u64;
+        let (blk, off, nruns) = self.locate(ri);
+        let tskip = self.tailskip;
+        let last_of = |k: u64| k + 1 == nruns && ri >= tskip;
+
+        // With a halo the runs to print are found first, then reprinted with
+        // the neighbours the halo asks for.
+        let (mut kfirst, mut klast, mut lo, mut hi) = (0u64, nruns, lo, hi);
+        if halo > 0 && (lo > 0 || hi > 0) {
+            let mut c = self.at(blk, off);
+            let (mut s2, mut first, mut last) = (0u64, nruns, 0u64);
+            for k in 0..nruns {
+                if hi > 0 && s2 >= hi { break; }
+                let (len, _) = self.step(&mut c, s2, last_of(k));
+                let e2 = s2 + len;
+                if e2 > lo && (hi == 0 || s2 < hi) {
+                    if k < first { first = k; }
+                    last = k;
+                }
+                s2 = e2;
+            }
+            if first > last { return; }
+            kfirst = first.saturating_sub(halo);
+            klast = if nruns - last - 1 <= halo { nruns } else { last + halo + 1 };
+            lo = 0; hi = 0;
+        }
+
+        let mut c = self.at(blk, off);
+        let mut buf = Vec::with_capacity(1 << 20);
+        let mut st = 0u64;
+        for k in 0..klast {
+            let (len, f) = self.step(&mut c, st, last_of(k));
+            let en = st + len;
+            if k >= kfirst && en > lo && (hi == 0 || st < hi) {
+                buf.extend_from_slice(seq);
+                buf.push(b'\t');
+                buf.extend_from_slice(st.to_string().as_bytes());
+                buf.push(b'\t');
+                buf.extend_from_slice(en.to_string().as_bytes());
+                buf.push(b'\t');
+                self.label(f, &mut buf);
+                buf.push(b'\n');
+                if buf.len() > (1 << 20) - 4096 {
+                    rd(out.write_all(&buf), "write failed");
+                    buf.clear();
+                }
+            }
+            st = en;
+            if hi > 0 && st >= hi { break; }
+        }
+        rd(out.write_all(&buf), "write failed");
+    }
+}
+
+fn skip(b: &[u8], mut i: usize) -> usize {
+    while i < b.len() && b[i] >= 0x80 { i += 1; }
+    i + 1
+}
+
+/* ------------------------------------------------------------ the index */
+
+/// "KSTIDX01" reversed into the trailer's last word.
+const H64B_K: u64 = 0x9e37_79b9_7f4a_7c15;
+
+fn h64b(s: &[u8]) -> u64 {
+    let mut h = H64B_K;
+    for &c in s {
+        h ^= c as u64;
+        h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
+        h ^= h >> 32;
+    }
+    h
+}
+
+impl Reader {
+    /// Appends a name index to the track, magic last so a torn write is
+    /// simply not seen. One file, not two.
+    pub fn build_index(&mut self, path: &str) {
+        if self.hasidx { eprintln!("karyozip: {path} already carries an index"); return; }
+        if self.nreads > u32::MAX as u64 {
+            crate::bail("more than 2^32 sequences: the index stores the ordinal in 32 bits");
+        }
+        let n = self.nreads as usize;
+        let mut pair: Vec<(u64, u32)> = (0..n)
+            .map(|i| (kst::fnv(FNV0, &self.names[i]), i as u32)).collect();
+        pair.sort_unstable();
+        let dup = pair.windows(2).filter(|w| w[0].0 == w[1].0).count() as u64;
+        let mut t = Vec::with_capacity(n * 20 + 32);
+        for (k, _) in &pair { t.extend_from_slice(&k.to_le_bytes()); }
+        for (_, o) in &pair {
+            t.extend_from_slice(&(h64b(&self.names[*o as usize])
+                                  ^ (*o as u64).wrapping_mul(H64B_K)).to_le_bytes());
+        }
+        for (_, o) in &pair { t.extend_from_slice(&o.to_le_bytes()); }
+        for v in [self.nreads, dup, self.mhash, IDXMAGIC] {
+            t.extend_from_slice(&v.to_le_bytes());
+        }
+        use std::io::Write;
+        let mut f = rd(std::fs::OpenOptions::new().append(true).open(path),
+                       "cannot append the index to the track");
+        rd(f.write_all(&t), "index write failed");
+        rd(f.flush(), "index write failed");
+        eprintln!("index: {} sequences, {} B appended, {dup} hash collisions",
+                  self.nreads, 32 + n * 20);
+    }
+}

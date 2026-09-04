@@ -61,6 +61,34 @@ fn main() {
     }
     match cmd.as_deref() {
         Some("encode") => encode(opt, std::path::Path::new(&tmpdir)),
+        Some("index") => {
+            let f = args.iter().skip(1).find(|a| !a.starts_with('-') && *a != "index")
+                        .unwrap_or_else(|| die("index needs a track"));
+            reader::Reader::open(f).build_index(f);
+        }
+        Some("region") => {
+            let pos: Vec<&String> = args.iter().skip(1)
+                .filter(|a| !a.starts_with('-') && *a != "region").collect();
+            if pos.len() < 2 { die("bad command or missing arguments"); }
+            let n = |s: &str, w: &str| -> u64 {
+                s.parse().unwrap_or_else(|_| die(w)) };
+            let (lo, hi, halo) = match pos.len() {
+                2 => (0, 0, 0),
+                3 => { let p = n(pos[2], "region: start is not a number"); (p, p + 1, 0) }
+                4 | 5 => {
+                    let a = n(pos[2], "region: start is not a number");
+                    let b = n(pos[3], "region: end is not a number");
+                    if a >= b { die("region: give START END with END past START"); }
+                    (a, b, if pos.len() == 5 { n(pos[4], "region: halo is not a number") } else { 0 })
+                }
+                _ => die("bad command or missing arguments"),
+            };
+            let mut r = reader::Reader::open(pos[0]);
+            let stdout = std::io::stdout();
+            let mut o = BufWriter::new(stdout.lock());
+            r.region(pos[1].as_bytes(), lo, hi, halo, &mut o);
+            o.flush().unwrap_or_else(|e| die(&e.to_string()));
+        }
         Some("decode") => {
             let f = args.iter().skip(1).find(|a| !a.starts_with('-') && *a != "decode")
                         .unwrap_or_else(|| die("decode needs a track"));

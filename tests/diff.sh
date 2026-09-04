@@ -53,7 +53,36 @@ for f in "$D"/ls.bed "$D"/db.rall.bed; do
 done
 echo "cross-decode: the C reads the Rust's files"
 
-# 5. the same refusals, with the same words.
+# 5. region: the same rows for every shape of query.
+rok=0; rbad=0
+for f in ls.bed s.bed db.rall.bed ord.bed; do
+  for bl in "" "--block 4"; do
+    "$C" $bl encode < "$D/$f" > "$W/t.kst" 2>/dev/null
+    for seq in $(awk -F'\t' '{print $1}' "$D/$f" | uniq | head -3); do
+      for q in "$seq" "$seq 50" "$seq 0 100" "$seq 0 100 2" "$seq 999999"; do
+        "$C" region "$W/t.kst" $q > "$W/c.out" 2>/dev/null; c1=$?
+        "$R" region "$W/t.kst" $q > "$W/r.out" 2>/dev/null; c2=$?
+        if cmp -s "$W/c.out" "$W/r.out" && [ $c1 = $c2 ]; then rok=$((rok+1))
+        else rbad=$((rbad+1)); echo "  region differs: $f [$bl] [$q]"; fi
+      done
+    done
+  done
+done
+[ $rbad = 0 ] && echo "region: $rok queries identical" \
+  || { echo "region: $rbad of $((rok+rbad)) DIFFER"; fail=1; }
+
+# 6. index: the same trailer, and each reads the other's.
+"$C" encode < "$D/db.rall.bed" > "$W/ci.kst" 2>/dev/null
+cp "$W/ci.kst" "$W/ri.kst"
+"$C" index "$W/ci.kst" >/dev/null 2>&1
+"$R" index "$W/ri.kst" >/dev/null 2>&1
+if cmp -s "$W/ci.kst" "$W/ri.kst"; then echo "index: byte-identical trailer"
+else echo "index: TRAILERS DIFFER"; fail=1; fi
+"$C" region "$W/ri.kst" seq0005 > "$W/a" 2>/dev/null
+"$R" region "$W/ci.kst" seq0005 > "$W/b" 2>/dev/null
+cmp -s "$W/a" "$W/b" || { echo "index: cross-read DIFFERS"; fail=1; }
+
+# 7. the same refusals, with the same words.
 for bad_in in 'r1\t0\t10' 'r1\t5\t10\tA' 'r1\t0\t0\tA' '\t0\t10\tA' 'r1\tx\t10\tA'; do
   cm=$(printf "$bad_in\n" | "$C" encode 2>&1 >/dev/null | tail -1)
   rm2=$(printf "$bad_in\n" | "$R" encode 2>&1 >/dev/null | tail -1)

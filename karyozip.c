@@ -20,7 +20,7 @@
 #endif
 
 static uint64_t BLOCK = 262144;
-static int BLOCKSET = 0, ONEBLOCK = 0;   /* --block and --one-block are exclusive */
+static int BLOCKSET = 0;                 /* --block was given */
 /* 0 means use every core; --threads overrides */
 static int NTHREADS = 0;
 static int LEVEL = 17;
@@ -110,9 +110,9 @@ static long int_arg(const char *p, long lo, long hi, const char *what) {   /* a 
 }
 
 static uint64_t mem_arg(const char *p) {   /* bytes, with a K, M, G or T suffix */
-    if (!p || !*p) die("--sort-mem must be positive");
+    if (!p || !*p) die("--sort=MEM must be positive");
     char *e = NULL; double val = strtod(p, &e);
-    if (!(val > 0) || val != val || val > 1e18 || e == p) die("--sort-mem must be positive");
+    if (!(val > 0) || val != val || val > 1e18 || e == p) die("--sort=MEM must be positive");
     uint64_t mul = 1;
     if (*e) {
         switch (*e) {
@@ -120,13 +120,13 @@ static uint64_t mem_arg(const char *p) {   /* bytes, with a K, M, G or T suffix 
         case 'm': case 'M': mul = 1ULL << 20; break;
         case 'g': case 'G': mul = 1ULL << 30; break;
         case 't': case 'T': mul = 1ULL << 40; break;
-        default: die("--sort-mem: use a plain number of bytes or a K, M, G or T suffix");
+        default: die("--sort=MEM: use a plain number of bytes or a K, M, G or T suffix");
         }
-        if (e[1]) die("--sort-mem: nothing may follow the unit");
+        if (e[1]) die("--sort=MEM: nothing may follow the unit");
     }
-    if (val > (double)UINT64_MAX / (double)mul) die("--sort-mem is larger than the address space");
+    if (val > (double)UINT64_MAX / (double)mul) die("--sort=MEM is larger than the address space");
     uint64_t m = (uint64_t)(val * (double)mul);
-    if (m < (1u << 20)) die("--sort-mem must be at least 1M");
+    if (m < (1u << 20)) die("--sort=MEM must be at least 1M");
     return m;
 }
 static uint64_t num_arg(const char *p, uint64_t max, const char *what) {
@@ -265,7 +265,6 @@ static int SLOW = 0;                  /* --slow: every codec over every block */
 static int FASTMODE = 1;              /* the default: quick-decoding codecs */
 static int SORT = 0;                  /* --sort: order records by label tuple */
 static uint64_t SORTBP;               /* end of the run --sort last took */
-static const char *SORTTMP = NULL;
 static uint64_t SORTMEM = 0;
 static const char *DBFEATS = NULL;    /* --db features.tsv */
 static int DBIDS = 0;
@@ -1397,12 +1396,13 @@ static void spillwrite(void) {
         cspill = cspill ? cspill * 2 : 16;
         SPILL = xrealloc(SPILL, cspill * sizeof *SPILL);
     }
-    char *tp; if (asprintf(&tp, "%s/karyozip.sort.XXXXXX", SORTTMP) < 0) die("oom");
+    const char *sd = TMPD; if (!sd || !*sd) sd = getenv("TMPDIR"); if (!sd || !*sd) sd = "/tmp";
+    char *tp; if (asprintf(&tp, "%s/karyozip.sort.XXXXXX", sd) < 0) die("oom");
     int fd = mkstemp(tp);
-    if (fd < 0) die("cannot create a sort temp file: check --sort-tmp-dir");
+    if (fd < 0) die("cannot create a sort temp file: check --tmp-dir");
     unlink(tp); free(tp);
     FILE *f = fdopen(fd, "w+b");
-    if (!f) die("cannot create a sort temp file: check --sort-tmp-dir");
+    if (!f) die("cannot create a sort temp file: check --tmp-dir");
     SPILL[nspill++] = f;
     for (size_t i = 0; i < rrecn; i++) {
         const char *nm = rbuf + rrec[i].nam;
@@ -1411,9 +1411,9 @@ static void spillwrite(void) {
             fwrite(&rrec[i].idx, 4, 1, f) != 1 ||
             fwrite(nm, 1, nl, f) != nl ||
             fwrite(rrun + rrec[i].off, sizeof(srun), nr, f) != nr)
-            die("sort spill write failed: is --sort-tmp-dir full?");
+            die("sort spill write failed: is --tmp-dir full?");
     }
-    if (fflush(f)) die("sort spill write failed: is --sort-tmp-dir full?");
+    if (fflush(f)) die("sort spill write failed: is --tmp-dir full?");
     fprintf(stderr, "spill %zu: %zu records\n", nspill - 1, rrecn);
     rrecn = 0; rrunn = 0; rbufn = 0;
 }
@@ -1512,7 +1512,7 @@ static void sortpush(const char *nm, size_t nlen, uint64_t st, uint64_t len,
         NATN++; rrecn++;
     }
     uint64_t held = rbufn + rrunn * sizeof(srun) + rrecn * sizeof(srec);
-    if (SORTTMP && SORTMEM && held > SORTMEM && st == 0) {
+    if (SORTMEM && held > SORTMEM && st == 0) {
 
         srec last = rrec[rrecn - 1];
         char nmb[512];
@@ -1635,7 +1635,7 @@ static void encode(void) {
     }
     for (int t = 0; t < T; t++) free(pr[t]);
     free(pr); free(prn); free(prc); free(slab);
-    if (SORTTMP) {
+    if (SORTMEM) {
         if (rrecn) spillwrite();
         if (nspill) spillmerge(w);
     } else if (SORT && rrecn) sortflush(w);
@@ -3583,7 +3583,7 @@ static void encode_db(int nfiles, char **files) {
         fprintf(stderr, "aln: %llu of %llu rows matched the reference (%.1f%%)%s",
                 (unsigned long long)ALNHIT, (unsigned long long)rows,
                 rows ? 100.0 * (double)ALNHIT / (double)rows : 0.0, "\n");
-    if (SORTTMP) {
+    if (SORTMEM) {
         if (rrecn) spillwrite();
         if (nspill) spillmerge(w);
     } else if (SORT && rrecn) sortflush(w);
@@ -3750,26 +3750,30 @@ int main(int argc, char **argv) {
     atexit(profdump);
     atexit(emitflush);
     static const char *const USAGE = "usage:\n"
-            "  karyozip encode [--block N | --one-block] [--level N] [--slow: smaller, slower]\n"
+            "  karyozip encode [--block N|all] [--level N] [--slow: smaller, slower]\n"
             "                  [--names keep|drop|drop:FILE]\n"
-            "                  [--sort [--sort-tmp-dir DIR] [--sort-mem SIZE]]\n"
+            "                  [--sort | --sort=MEM]\n"
             "                  [--db features.tsv] [--aln P.paf --ref R [--aln-names F]]\n"
             "  karyozip decode F | --db features.tsv --out DIR F | --aln P.paf --ref R F\n"
             "                  --names F reads the names, from drop:FILE or a FASTA, FASTQ or list\n"
             "                  --names ordinal accepts a track whose names were dropped\n"
             "                  --raw shows what is stored, reversing no transform\n"
             "  karyozip aln-pack P.paf REF.bed OUT   only what --aln reads\n"
-            "  karyozip query  F SEQ [POS]           the whole sequence, or the run at POS\n"
-            "  karyozip region F SEQ [START END [HALO]]\n"
-            "  karyozip dump   F                     decode, keeping every stored form\n"
+            "  karyozip region F SEQ                 the whole sequence\n"
+            "  karyozip region F SEQ POS             the run covering POS\n"
+            "  karyozip region F SEQ START END [HALO]\n"
             "  karyozip smooth F HIER FS [SEQ [START END]]\n"
             "  karyozip index  F                     writes F.idx beside the track\n"
-            "  any command: --threads N  --profile  --tmp-dir DIR\n"
-            "  encode:      --names keep|drop|drop:FILE  --tail 0|1  --tok-chunk N\n"
-            "               --id-codec N  --len-codec N\n"
+            "  any command: --threads N, -t N  --profile  --tmp-dir DIR  --help, -h\n"
+            "  encode:      --block N|all  --level N  --slow  --sort[=MEM]\n"
+            "               --names keep|drop|drop:FILE  --db F  --aln P --ref R\n"
+            "               --tail 0|1  --tok-chunk N  --id-codec N  --len-codec N\n"
+            "  decode:      --raw  --out DIR  --db F  --aln P --ref R\n"
             "  readers:     --names FILE|ordinal\n"
-            "  with --aln:  --aln-names FILE, when the track names rows by ordinal\n"
-            "  smooth:      --max-gap N  --halo N  --v1";
+            "  with --aln:  --aln-names FILE, on encode and decode, when the track\n"
+            "               names rows by ordinal\n"
+            "  smooth:      --max-gap N  --halo N  --v1\n"
+            "  TMPDIR is read when --tmp-dir is not given; no other variable is.";
     for (int i = 1; i < argc; i++)
         if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) { puts(USAGE); return 0; }
     if (argc < 2) die(USAGE);
@@ -3777,8 +3781,8 @@ int main(int argc, char **argv) {
         {"--threads",1},{"-t",1},{"--profile",0},{"--tmp-dir",1},{"--names",1},
         {"--tok-chunk",1},{"--tail",1},{"--id-codec",1},{"--len-codec",1},
         {"--max-gap",1},{"--halo",1},{"--v1",0},{"--aln-names",1},{"--sort",0},
-        {"--sort-tmp-dir",1},{"--sort-mem",1},{"--slow",0},
-        {"--block",1},{"--one-block",0},{"--level",1},{"--db",1},{"--aln",1},
+        {"--slow",0},
+        {"--block",1},{"--level",1},{"--db",1},{"--aln",1},
         {"--ref",1},{"--out",1},{"--raw",0},
     };
     const char *cmd = "";   /* the first word that is not a flag or its value */
@@ -3786,16 +3790,16 @@ int main(int argc, char **argv) {
         const char *a = argv[i];
         if (a[0] != '-' || !a[1]) { cmd = a; break; }
         int nv = -1;
-        for (size_t k = 0; k < sizeof FLAGS / sizeof *FLAGS; k++)
+        if (!strncmp(a, "--sort=", 7)) nv = 0;        /* the value is in the flag */
+        else for (size_t k = 0; k < sizeof FLAGS / sizeof *FLAGS; k++)
             if (!strcmp(a, FLAGS[k].f)) { nv = FLAGS[k].nv; break; }
         if (nv < 0) { fprintf(stderr, "karyozip: unknown flag %s\n", a); exit(1); }
         i += nv;
     }
     int enc = !strcmp(cmd, "encode");
     int sm = !strcmp(cmd, "smooth");
-    int dec = !strcmp(cmd, "decode") || !strcmp(cmd, "dump");
-    int rd = sm || dec || !strcmp(cmd, "query") || !strcmp(cmd, "region")
-             || !strcmp(cmd, "index");
+    int dec = !strcmp(cmd, "decode");
+    int rd = sm || dec || !strcmp(cmd, "region") || !strcmp(cmd, "index");
     for (int i = 1; i < argc; i++) {
         int take = 0, ok = 1; const char *a = argv[i], *v = i + 1 < argc ? argv[i + 1] : NULL;
         for (size_t k = 0; k < sizeof FLAGS / sizeof *FLAGS; k++)   /* a value is required */
@@ -3814,7 +3818,7 @@ int main(int argc, char **argv) {
                 if (enc) die("encode takes --names keep, drop or drop:FILE");
                 ok = rd; ORDNAMES = 1; }
             else if (enc) die("encode takes --names keep, drop or drop:FILE; a name file is --aln-names");
-            else NAMESARG = v;   /* the blob drop:FILE wrote, or a FASTA, FASTQ or list */
+            else { ok = rd; NAMESARG = v; }   /* the blob drop:FILE wrote, or a FASTA, FASTQ or list */
             take = 2; }
         else if (!strcmp(a, "--tok-chunk")) { ok = enc;
             TOKCHUNK = (uint32_t)int_arg(v, 1, 0x7fffffff, "--tok-chunk needs a number");
@@ -3831,17 +3835,13 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--aln-names")) {   /* the alignment's own table: ordinal N is line N+1 */
             ok = enc || dec; ALNNAMES = v; take = 2; }
         else if (!strcmp(a, "--sort")) { ok = enc; SORT = 1; take = 1; }
-        else if (!strcmp(a, "--sort-tmp-dir")) { ok = enc; SORTTMP = v; take = 2; }
-        else if (!strcmp(a, "--sort-mem")) { ok = enc; SORTMEM = mem_arg(v); take = 2; }
+        else if (!strncmp(a, "--sort=", 7)) { ok = enc; SORT = 1; SORTMEM = mem_arg(a + 7); take = 1; }
         else if (!strcmp(a, "--slow")) { ok = enc; SLOW = 1; FASTMODE = 0; take = 1; }
         else if (!strcmp(a, "--block")) { ok = enc;
-            if (ONEBLOCK) die("--block and --one-block are exclusive");
-            BLOCK = (uint64_t)int_arg(v, 1, 0x7fffffffffffffffL,
-                                      "--block must be a number of runs, 1 or more");
+            BLOCK = !strcmp(v, "all") ? UINT64_MAX      /* one block, no random access */
+                  : (uint64_t)int_arg(v, 1, 0x7fffffffffffffffL,
+                                      "--block is a number of runs, 1 or more, or \"all\"");
             BLOCKSET = 1; take = 2; }
-        else if (!strcmp(a, "--one-block")) { ok = enc;
-            if (BLOCKSET) die("--block and --one-block are exclusive");
-            BLOCK = UINT64_MAX; ONEBLOCK = 1; take = 1; }
         else if (!strcmp(a, "--level")) { ok = enc;
             LEVEL = (int)int_arg(v, 1, 22, "--level is a zstd level, 1 to 22"); LEVELSET = 1; take = 2; }
         else if (!strcmp(a, "--db")) { ok = enc || dec; DBFEATS = v; take = 2; }
@@ -3895,13 +3895,6 @@ int main(int argc, char **argv) {
             die("--aln with --sort and --names drop cannot be decoded: sorting "
                 "reorders the records, so the ordinal name map is invalid");
         if (ALNNAMES && !ALNPAF) die("--aln-names does nothing without --aln");
-        if (SORTMEM && !SORTTMP) die("--sort-mem does nothing without --sort-tmp-dir");
-        if (SORTTMP && !SORTMEM) die("--sort-tmp-dir needs --sort-mem to bound memory");
-
-        if (SORTTMP && !SORT)
-            die("--sort-tmp-dir bounds the memory --sort uses and does nothing "
-                "on its own: add --sort");
-        if (SORT && !SORTTMP && SORTMEM) die("--sort-mem needs --sort-tmp-dir");
 
         PERMON = SORT && !NAMES_OUT;
         if (ALNPAF) { if (ALNNAMES) loadordinals(ALNNAMES);
@@ -3913,7 +3906,7 @@ int main(int argc, char **argv) {
         } else encode();
     }
 
-    else if ((!strcmp(argv[1], "decode") || !strcmp(argv[1], "dump")) && argc > 2) {
+    else if (!strcmp(argv[1], "decode") && argc > 2) {
         const char *f = NULL;
         for (int i = 2; i < argc; i++) {
             if (argv[i][0] == '-') die("unknown decode flag");
@@ -3930,16 +3923,13 @@ int main(int argc, char **argv) {
         else dump(f);
     }
 
-    else if (!strcmp(argv[1], "query") && argc > 3) {
-        if (argc > 4) {                 /* one position: the run covering it */
-            uint64_t pos = num_arg(argv[4], UINT64_MAX - 1, "query: the position is not a number");
-            region(argv[2], argv[3], pos, pos + 1, 0);
-        } else region(argv[2], argv[3], 0, 0, 0);      /* the whole sequence */
-    }
+    /* one reader: SEQ alone is the whole sequence, SEQ POS the run covering
+       POS, SEQ START END the overlap, plus an optional halo. */
     else if (!strcmp(argv[1], "region") && argc > 3) {
-        uint64_t rlo = argc > 4 ? num_arg(argv[4], UINT64_MAX, "region: start is not a number") : 0;
+        uint64_t rlo = argc > 4 ? num_arg(argv[4], UINT64_MAX - 1, "region: start is not a number") : 0;
         uint64_t rhi = argc > 5 ? num_arg(argv[5], UINT64_MAX, "region: end is not a number") : 0;
-        if (argc == 5 || (argc > 5 && rlo >= rhi)) die("region: give START END with END past START");
+        if (argc == 5) rhi = rlo + 1;                  /* one position */
+        if (argc > 5 && rlo >= rhi) die("region: give START END with END past START");
         region(argv[2], argv[3], rlo, rhi, argc > 6 ? num_arg(argv[6], UINT64_MAX, "region: halo is not a number") : 0);
     }
     else if (!strcmp(argv[1], "index") && argc > 2) buildindex(argv[2]);

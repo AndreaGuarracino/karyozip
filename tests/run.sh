@@ -25,7 +25,7 @@ cmp -s "$W/rt" "$D/s.bed" && echo "aln restore: byte-identical" || { echo "aln r
 $KT encode < "$D/s.bed" > "$W/p.kt" 2>/dev/null
 $KT decode "$W/p.kt" 2>/dev/null | cmp -s - "$D/s.bed" && echo "plain: byte-identical" || { echo "plain: WRONG"; fail=1; }
 
-for f in --sort "--sort --names drop" --one-block "--block 4"; do
+for f in --sort "--sort --names drop" "--block all" "--block 4"; do
   ofl=""
   $KT encode $f < "$D/s.bed" > "$W/f.kt" 2>/dev/null || { echo "$f: ENCODE FAILED"; fail=1; continue; }
   case "$f" in
@@ -51,11 +51,11 @@ $KT decode --db "$D/db.features.tsv" --out "$W/o" "$W/f.kt" 2>/dev/null
 n=0; for f in $sets; do cmp -s "$W/o/$f.bed" "$D/db.$f.bed" && n=$((n+1)); done
 [ "$n" = 6 ] && echo "db: 6/6 identical" || { echo "db: only $n/6 identical"; fail=1; }
 
-# --sort-tmp-dir must give byte-identical output to the in-memory sort: that is
+# give byte-identical output to the in-memory sort: that is
 # the whole point of an external sort.
 $KT encode --sort --names drop < "$D/s.bed" > "$W/mem.kt" 2>/dev/null
 mkdir -p "$W/tmp"
-$KT encode --sort --sort-tmp-dir "$W/tmp" --sort-mem 1M --names drop < "$D/s.bed" > "$W/ext.kt" 2>/dev/null
+$KT encode --tmp-dir "$W/tmp" --sort=1M --names drop < "$D/s.bed" > "$W/ext.kt" 2>/dev/null
 cmp -s "$W/mem.kt" "$W/ext.kt" && echo "external sort: identical to in-memory" \
  || { echo "external sort: DIFFERS from in-memory"; fail=1; }
 [ -z "$(ls -A "$W/tmp")" ] && echo "external sort: temp files cleaned up" \
@@ -87,8 +87,8 @@ must_fail "decode --db track without --db" $KT decode "$W/f.kt"
 must_fail "encode --ref without --aln" $KT encode --ref "$D/ref.bed"
 must_fail "--aln-names without --aln" $KT encode --aln-names "$D/ord.names.txt" < "$D/s.bed"
 must_fail "a name file given to encode as --names" $KT encode --names "$D/ord.names.txt" < "$D/s.bed"
-must_fail "encode --sort-mem without a temp dir" $KT encode --sort --sort-mem 1M
-must_fail "encode --sort-tmp-dir without --sort-mem" $KT encode --sort --sort-tmp-dir "$W"
+must_fail "--sort= with no size" $KT encode --sort=
+must_fail "the retired --sort-tmp-dir" $KT encode --sort-tmp-dir "$W"
 
 # the sidecar --names drop:writes must be the one --names reads
 $KT encode --names drop:"$W/side.bin" < "$D/s.bed" > "$W/sc.kt" 2>/dev/null
@@ -182,7 +182,7 @@ cmp -s "$W/tail.bed" "$W/tail.out" \
 [ "$b" -lt "$a" ] && echo "constant-length reads: $a -> $b bytes" \
  || { echo "constant-length reads: no gain, $a -> $b"; fail=1; }
 # random access must still land on the right rows
-$KT query "$W/tail.kt" r2000 2>/dev/null > "$W/tq.out"
+$KT region "$W/tail.kt" r2000 2>/dev/null > "$W/tq.out"
 grep "^r2000	" "$W/tail.bed" > "$W/tq.exp"
 cmp -s "$W/tq.out" "$W/tq.exp" && echo "constant-length reads: query exact" \
  || { echo "constant-length reads: query WRONG"; fail=1; }
@@ -234,7 +234,7 @@ printf 'a\t0\t10\tA\nb\t0\t10\tB\na\t10\t20\tC\n' > "$W/il.bed"
 $KT encode --block 4 < "$W/il.bed" > /dev/null 2>&1 \
   && { echo "interleaved records, plain: ACCEPTED"; fail=1; } \
  || echo "interleaved records, plain: refused, as it should"
-$KT encode --block 4 --sort --sort-tmp-dir "$W" --sort-mem 1G < "$W/il.bed" > /dev/null 2>&1 \
+$KT encode --block 4 --tmp-dir "$W" --sort=1G < "$W/il.bed" > /dev/null 2>&1 \
   && { echo "interleaved records, --sort: ACCEPTED"; fail=1; } \
  || echo "interleaved records, --sort: refused, as it should"
 
@@ -243,7 +243,7 @@ $KT encode --block 4 --sort --sort-tmp-dir "$W" --sort-mem 1G < "$W/il.bed" > /d
 printf 'a\t0\t10\tA\na\t20\t30\tB\n' > "$W/gap.bed"
 printf 'a\t0\t10\tA\na\t9\t20\tB\n'  > "$W/ovl.bed"
 for f in gap ovl; do
-  for m in "" "--sort --sort-tmp-dir $W --sort-mem 1G"; do
+  for m in "" "--tmp-dir $W --sort=1G"; do
     t=plain; [ -n "$m" ] && t=--sort
     $KT encode --block 4 $m < "$W/$f.bed" > /dev/null 2>&1 \
       && { echo "$f, $t: ACCEPTED"; fail=1; } \
@@ -376,9 +376,9 @@ $KT region "$W/halo4.kt" s 45 46 3 2>/dev/null | cmp -s - <($KT region "$W/halo1
 awk 'BEGIN{for(i=0;i<20;i++)printf "r%d\t0\t%d\tL%d\n",i,50+i,i%5}' > "$W/idx.bed"
 $KT encode < "$W/idx.bed" > "$W/idx.kt" 2>/dev/null; $KT index "$W/idx.kt" >/dev/null 2>&1
 $KT encode --sort --names keep < "$W/idx.bed" > "$W/idx.kt" 2>/dev/null
-$KT query "$W/idx.kt" r7 2>/dev/null | cmp -s - <(grep -P '^r7\t' "$W/idx.bed") \
+$KT region "$W/idx.kt" r7 2>/dev/null | cmp -s - <(grep -P '^r7\t' "$W/idx.bed") \
   && echo "stale idx: ignored" || { echo "stale idx: WRONG ROWS"; fail=1; }
-$KT index "$W/idx.kt" >/dev/null 2>&1; $KT query "$W/idx.kt" r7 2>/dev/null | cmp -s - <(grep -P '^r7\t' "$W/idx.bed") \
+$KT index "$W/idx.kt" >/dev/null 2>&1; $KT region "$W/idx.kt" r7 2>/dev/null | cmp -s - <(grep -P '^r7\t' "$W/idx.bed") \
   && echo "fresh idx: correct" || { echo "fresh idx: WRONG ROWS"; fail=1; }
 T1=$(cut -f1 "$D/ref.bed" | head -1)
 printf 'a\t0\t5\t=\na\t5\t10\tZ\n' > "$W/eq.bed"
@@ -392,13 +392,13 @@ $KT decode "$W/t63.kt" 2>/dev/null | cmp -s - "$W/t63.bed" && echo "total past 2
 printf 'feature_set\tchild\tparent\nacrocentric\tacro\tx\nacrocentric\tx\tacro\n' > "$W/cyc.tsv"
 rc=0; timeout 10 $KT smooth "$W/p.kt" "$W/cyc.tsv" acrocentric >/dev/null 2>&1 || rc=$?
 [ $rc = 1 ] && echo "cyclic hierarchy: refused" || { echo "cyclic hierarchy: rc=$rc"; fail=1; }
-for c in "decode $W/p.kt" "region $W/p.kt q1" "smooth $W/sm.kt $W/sm.tsv acrocentric" "dump $W/p.kt"; do
+for c in "decode $W/p.kt" "region $W/p.kt q1" "smooth $W/sm.kt $W/sm.tsv acrocentric" "decode --raw $W/p.kt"; do
   $KT $c > /dev/full 2>/dev/null && { echo "$c to /dev/full: EXIT 0"; fail=1; } || echo "${c%% *} to /dev/full: exit 1"
 done
 printf 'a\t0\t10\tA\0B\nc\t0\t10\tB\n' > "$W/nul.bed"
 must_fail "NUL inside a row" $KT encode < "$W/nul.bed"
 mkdir -p "$W/sptmp"; { awk 'BEGIN{for(i=0;i<80000;i++)printf "s%d\t0\t10\tA\n",i}'; printf 'zz\t5\t10\tL0\n'; } > "$W/splate.bed"
-$KT encode --sort --sort-tmp-dir "$W/sptmp" --sort-mem 1M < "$W/splate.bed" > /dev/null 2> "$W/sp.err" && { echo "late overlap: ACCEPTED"; fail=1; }
+$KT encode --tmp-dir "$W/sptmp" --sort=1M < "$W/splate.bed" > /dev/null 2> "$W/sp.err" && { echo "late overlap: ACCEPTED"; fail=1; }
 grep -qi spill "$W/sp.err" || { echo "late overlap: NEVER SPILLED"; fail=1; }
 [ "$(ls "$W/sptmp" | wc -l)" = 0 ] && echo "spill files after a failure: none" || { echo "spill files after a failure: $(ls "$W/sptmp" | wc -l) LEFT"; fail=1; }
 sed '2s/acro/ACRO/' "$D/db.features.tsv" > "$W/other.tsv"
@@ -506,7 +506,7 @@ $KT --names "$W/gt.names" decode "$W/gt.kt" 2>/dev/null | cmp -s - "$W/gt.bed" \
 L="$W"; for i in 1 2 3 4 5; do L="$L/$(printf 'd%.0s' $(seq 1 120))"; done; mkdir -p "$L"
 echo keep > "${L:0:511}" 2>/dev/null || true
 awk 'BEGIN{for(i=0;i<80000;i++)printf "s%d\t0\t10\tA\n",i}' > "$W/long.bed"
-$KT encode --sort --names drop --sort-tmp-dir "$L" --sort-mem 1M < "$W/long.bed" > "$W/long.kt" 2>/dev/null \
+$KT encode --tmp-dir "$L" --sort=1M --names drop < "$W/long.bed" > "$W/long.kt" 2>/dev/null \
   && $KT decode --names ordinal "$W/long.kt" 2>/dev/null | cut -f2,3,4 | cmp -s - <(cut -f2,3,4 "$W/long.bed") \
   && [ "$(cat "${L:0:511}" 2>/dev/null)" = keep ] \
   && echo "long sort temp dir: round-trip, bystander intact" || { echo "long sort temp dir: WRONG"; fail=1; }
@@ -527,7 +527,7 @@ must_fail "a repeat behind a hash collision, sorted" $KT encode --sort < "$W/col
 printf 'FQ6SH1h576F\t0\t10\tL\nOyHUvXChfZK\t0\t10\tL\n' > "$W/coll2.bed"
 $KT encode < "$W/coll2.bed" > "$W/coll2.kt" 2>/dev/null; $KT decode "$W/coll2.kt" 2>/dev/null | cmp -s - "$W/coll2.bed" \
   && echo "two names with one hash: accepted" || { echo "two names with one hash: WRONG"; fail=1; }
-mkdir -p "$W/spfull"; (trap "" XFSZ; ulimit -f 32; $KT encode --sort --sort-tmp-dir "$W/spfull" --sort-mem 1M < "$W/long.bed" > /dev/null 2>&1) || true
+mkdir -p "$W/spfull"; (trap "" XFSZ; ulimit -f 32; $KT encode --tmp-dir "$W/spfull" --sort=1M < "$W/long.bed" > /dev/null 2>&1) || true
   [ "$(ls "$W/spfull" | wc -l)" = 0 ] && echo "spill on a full disk: removed" || { echo "spill on a full disk: LEFT"; fail=1; }
 printf 'r1\r\nr2\r\n' > "$W/crlf.txt"; printf 'r1\t0\t10\tA\nr2\t0\t10\tB\n' > "$W/n2.bed"
 $KT encode --names drop < "$W/n2.bed" > "$W/n2.kt" 2>/dev/null
@@ -538,7 +538,7 @@ $KT encode --names drop < "$W/gt1.bed" > "$W/gt1.kt" 2>/dev/null
 $KT --names "$W/gt1.txt" decode "$W/gt1.kt" 2>/dev/null | cmp -s - "$W/gt1.bed" \
   && echo "one-line name list starting with >: restored" || { echo "one-line name list starting with >: WRONG"; fail=1; }
 printf 'r1\n' > "$W/dupn.txt"; printf 'r1\nr1\n' > "$W/dupn2.txt"
-must_fail "a name file with a repeat, on query" $KT --names "$W/dupn2.txt" query "$W/n2.kt" r1
+must_fail "a name file with a repeat, on query" $KT --names "$W/dupn2.txt" region "$W/n2.kt" r1
 printf 'featureID acrocentric chromosome\n1\tA\tX\n' > "$W/notab.tsv"; printf 's\t0\t10\t1\n' > "$W/ids1.bed"
 must_fail "features.tsv whose first line has no tab" $KT encode --db "$W/notab.tsv" "$W/ids1.bed"
 
@@ -546,21 +546,21 @@ must_fail "features.tsv whose first line has no tab" $KT encode --db "$W/notab.t
 # stored one, and one built under a name file answered under another.
 printf 'aaa\t0\t10\tA\nYo5P2GphlrB\t0\t10\tB\nYo5P2GphlrB\t10\t30\tC\nzzz\t0\t10\tD\n' > "$W/hc.bed"
 $KT encode < "$W/hc.bed" > "$W/hc.kt" 2>/dev/null; $KT index "$W/hc.kt" >/dev/null 2>&1
-must_fail "indexed query of a colliding absent name" $KT query "$W/hc.kt" TQyOn5lCDT5
-$KT query "$W/hc.kt" Yo5P2GphlrB 2>/dev/null | cmp -s - <(grep -P '^Yo5P2GphlrB\t' "$W/hc.bed") \
+must_fail "indexed query of a colliding absent name" $KT region "$W/hc.kt" TQyOn5lCDT5
+$KT region "$W/hc.kt" Yo5P2GphlrB 2>/dev/null | cmp -s - <(grep -P '^Yo5P2GphlrB\t' "$W/hc.bed") \
   && echo "indexed query of the stored name: correct" || { echo "indexed query of the stored name: WRONG"; fail=1; }
 printf 'r0\t0\t10\tA\nr1\t0\t10\tB\nr2\t0\t10\tC\nr3\t0\t10\tD\n' > "$W/nx.bed"
 $KT encode --names drop < "$W/nx.bed" > "$W/nx.kt" 2>/dev/null
 printf 'r0\nr1\nr2\nr3\n' > "$W/A.txt"; printf 'r3\nr2\nr1\nr0\n' > "$W/B.txt"
 $KT --names "$W/A.txt" index "$W/nx.kt" >/dev/null 2>&1
-[ "$($KT --names "$W/B.txt" query "$W/nx.kt" r0 2>/dev/null | cut -f4)" = D ] \
+[ "$($KT --names "$W/B.txt" region "$W/nx.kt" r0 2>/dev/null | cut -f4)" = D ] \
   && echo "index under another name file: ignored" || { echo "index under another name file: WRONG"; fail=1; }
 
 # Round 16: a name file rewritten in place, an index entry with its ordinal
 # edited, a 5 MB label through smooth, query and decode, and --names ordinal
 # on query.
 cp "$W/B.txt" "$W/A.txt"
-[ "$($KT --names "$W/A.txt" query "$W/nx.kt" r0 2>/dev/null | cut -f4)" = D ] \
+[ "$($KT --names "$W/A.txt" region "$W/nx.kt" r0 2>/dev/null | cut -f4)" = D ] \
   && echo "index after the name file changed: ignored" || { echo "index after the name file changed: WRONG"; fail=1; }
 python3 - "$W" <<'PY'
 import struct, sys
@@ -568,16 +568,16 @@ W = sys.argv[1]; d = bytearray(open(W + "/hc.kt.idx", "rb").read()); n = struct.
 o = 32 + 16 * n; ords = list(struct.unpack_from("<%dI" % n, d, o)); ords[0], ords[-1] = ords[-1], ords[0]
 struct.pack_into("<%dI" % n, d, o, *ords); open(W + "/hc.kt.idx", "wb").write(d)
 PY
-$KT query "$W/hc.kt" aaa 2>/dev/null | cmp -s - <(grep -P '^aaa\t' "$W/hc.bed") \
+$KT region "$W/hc.kt" aaa 2>/dev/null | cmp -s - <(grep -P '^aaa\t' "$W/hc.bed") \
   && echo "index with edited ordinals: not trusted" || { echo "index with edited ordinals: WRONG"; fail=1; }
 python3 -c "open('$W/five.bed', 'w').write('s\t0\t10\t%s\n' % ('z' * (5 << 20)))"
 $KT encode < "$W/five.bed" > "$W/five.kt" 2>/dev/null
 printf 'feature_set\tchild\tparent\nfs\t%s\tcategorized\n' "$(head -c $((5 << 20)) /dev/zero | tr '\0' z)" > "$W/five.tsv"
 $KT smooth "$W/five.kt" "$W/five.tsv" fs 2>/dev/null | cmp -s - "$W/five.bed" && $KT decode "$W/five.kt" 2>/dev/null | cmp -s - "$W/five.bed" \
-  && $KT query "$W/five.kt" s 2>/dev/null | cmp -s - "$W/five.bed" \
+  && $KT region "$W/five.kt" s 2>/dev/null | cmp -s - "$W/five.bed" \
   && echo "5 MB label: smooth, decode, query" || { echo "5 MB label: WRONG"; fail=1; }
 $KT encode --names drop < "$D/s.bed" > "$W/nn.kt" 2>/dev/null
-$KT query --names ordinal "$W/nn.kt" 0 2>/dev/null | cut -f2,3,4 | cmp -s - <(grep -P '^q1\t' "$D/s.bed" | cut -f2,3,4) \
+$KT region --names ordinal "$W/nn.kt" 0 2>/dev/null | cut -f2,3,4 | cmp -s - <(grep -P '^q1\t' "$D/s.bed" | cut -f2,3,4) \
   && echo "query --names ordinal: correct" || { echo "query --names ordinal: WRONG"; fail=1; }
 
 # Round 17: a 5 MB label with a long name overflowed decode's buffer, and a
@@ -610,8 +610,8 @@ cat "$D/s.bed" | $KT encode > "$W/pipe.kt" 2>/dev/null
 cmp -s "$W/file.kt" "$W/pipe.kt" && cmp -s "$W/file.kt" "$W/slow.kt" \
   && echo "encode from a pipe and a slow producer: byte-identical" || { echo "encode from a pipe: WRONG"; fail=1; }
 awk 'BEGIN{srand(3);for(i=0;i<20000;i++){p=0;for(j=0;j<5;j++){c=p+int(rand()*300)+1;printf "read%d\t%d\t%d\tL%d\n",i,p,c,int(rand()*6);p=c}}}' > "$W/pbig.bed"
-cat "$W/pbig.bed" | $KT encode --sort --sort-tmp-dir "$W" --sort-mem 1M > "$W/pipesort.kt" 2>/dev/null
-$KT encode --sort --sort-tmp-dir "$W" --sort-mem 1M < "$W/pbig.bed" > "$W/filesort.kt" 2>/dev/null
+cat "$W/pbig.bed" | $KT encode --tmp-dir "$W" --sort=1M > "$W/pipesort.kt" 2>/dev/null
+$KT encode --tmp-dir "$W" --sort=1M < "$W/pbig.bed" > "$W/filesort.kt" 2>/dev/null
 cmp -s "$W/pipesort.kt" "$W/filesort.kt" && echo "sorted encode from a pipe: byte-identical" || { echo "sorted encode from a pipe: WRONG"; fail=1; }
 $KT decode --raw "$W/f.kt" 2>/dev/null | $KT encode --db "$D/db.features.tsv" - > "$W/pipedb.kt" 2>/dev/null
 $KT decode --raw "$W/f.kt" 2>/dev/null > "$W/merged.bed"; $KT encode --db "$D/db.features.tsv" "$W/merged.bed" > "$W/filedb.kt" 2>/dev/null
@@ -717,8 +717,8 @@ must_fail "region with END before START" $KT region "$W/p.kt" q1 150 20
 must_fail "--threads 100000" $KT -t 100000 encode < "$D/s.bed"
 rc=0; (ulimit -f 1; $KT encode < "$W/pbig.bed" > "$W/lim.kt" 2> "$W/lim.err") || rc=$?
 [ $rc = 1 ] && echo "file-size limit: exit 1, not a signal" || { echo "file-size limit: rc=$rc"; fail=1; }
-$KT --len-codec 0 --id-codec 0 encode --level 1 --one-block < "$W/pbig.bed" > "$W/l5.kt" 2>/dev/null
-$KT --len-codec 0 --id-codec 0 encode --level 1 --one-block --slow < "$W/pbig.bed" > "$W/l5s.kt" 2>/dev/null
+$KT --len-codec 0 --id-codec 0 encode --level 1 --block all < "$W/pbig.bed" > "$W/l5.kt" 2>/dev/null
+$KT --len-codec 0 --id-codec 0 encode --level 1 --block all --slow < "$W/pbig.bed" > "$W/l5s.kt" 2>/dev/null
 [ "$(stat -c%s "$W/l5.kt")" = "$(stat -c%s "$W/l5s.kt")" ] && echo "--slow keeps --level: same size" || { echo "--slow keeps --level: WRONG"; fail=1; }
 must_fail "--tmp-dir that does not exist" $KT --tmp-dir /nonexistent/dir encode < "$D/s.bed"
 $KT --tmp-dir "$W" encode < "$D/s.bed" 2>/dev/null | cmp -s - "$W/p.kt" && echo "--tmp-dir honoured: same bytes" || { echo "--tmp-dir honoured: WRONG"; fail=1; }
@@ -731,26 +731,26 @@ must_fail "--id-codec with arith X_EXT" $KT --id-codec 0x10004 encode < "$D/s.be
 must_fail "--level abc" $KT encode --level abc < "$D/s.bed"
 must_fail "--block 4abc" $KT encode --block 4abc < "$D/s.bed"
 must_fail "-t 4x" $KT -t 4x encode < "$D/s.bed"
-must_fail "--sort-mem nan" $KT encode --sort --sort-tmp-dir "$W" --sort-mem nan < "$D/s.bed"
+must_fail "--sort=nan" $KT encode --tmp-dir "$W" --sort=nan < "$D/s.bed"
 
 # Round 26: an index built while its name file was replaced answered from the
 # new file; a failed decode --db destroyed the previous output; a signal left
-# spill files; --sort-mem took junk after the unit.
+# spill files; junk after the unit.
 cp "$W/A.txt" "$W/A2.txt"; $KT --names "$W/A2.txt" index "$W/nx.kt" >/dev/null 2>&1; cp "$W/B.txt" "$W/A2.tmp"; mv -f "$W/A2.tmp" "$W/A2.txt"
-[ "$($KT --names "$W/A2.txt" query "$W/nx.kt" r0 2>/dev/null | cut -f4)" = D ] \
+[ "$($KT --names "$W/A2.txt" region "$W/nx.kt" r0 2>/dev/null | cut -f4)" = D ] \
   && echo "index built before a name file swap: ignored" || { echo "index built before a name file swap: WRONG"; fail=1; }
 mkdir -p "$W/good"; $KT decode --db "$D/db.features.tsv" --out "$W/good" "$W/f.kt" >/dev/null 2>&1; m1=$(cat "$W/good"/*.bed | md5sum)
 cp "$W/f.kt" "$W/fbad.kt"; sz=$(stat -c%s "$W/fbad.kt"); printf '\xff' | dd of="$W/fbad.kt" bs=1 seek=$((sz-100)) conv=notrunc status=none
 $KT decode --db "$D/db.features.tsv" --out "$W/good" "$W/fbad.kt" >/dev/null 2>&1 && { echo "decode of a damaged db track: EXIT 0"; fail=1; }
 [ "$(cat "$W/good"/*.bed | md5sum)" = "$m1" ] && [ -z "$(ls "$W/good" | grep tmp)" ] \
   && echo "failed decode --db: previous output intact, no temporaries" || { echo "failed decode --db: OUTPUT DAMAGED"; fail=1; }
-mkdir -p "$W/sigspill"; ( (awk '{print; if (NR % 2000 == 0) system("sleep 0.05")}' "$W/long.bed"; sleep 3) | $KT encode --sort --sort-tmp-dir "$W/sigspill" --sort-mem 1M > /dev/null 2>&1 & p=$!; sleep 1.5; kill -INT $p 2>/dev/null; wait $p ) 2>/dev/null || true
+mkdir -p "$W/sigspill"; ( (awk '{print; if (NR % 2000 == 0) system("sleep 0.05")}' "$W/long.bed"; sleep 3) | $KT encode --tmp-dir "$W/sigspill" --sort=1M > /dev/null 2>&1 & p=$!; sleep 1.5; kill -INT $p 2>/dev/null; wait $p ) 2>/dev/null || true
 [ "$(ls "$W/sigspill" | wc -l)" = 0 ] && echo "SIGINT during a spilling sort: no files left" || { echo "SIGINT during a spilling sort: FILES LEFT"; fail=1; }
-must_fail "--sort-mem 1M2" $KT encode --sort --sort-tmp-dir "$W" --sort-mem 1M2 < "$D/s.bed"
+must_fail "--sort=1M2" $KT encode --tmp-dir "$W" --sort=1M2 < "$D/s.bed"
 
 # Round 27: a name file on a pipe lost its first lines to a failed rewind; a
 # failed rename left the db output half-updated; a signal left db temporaries;
-# --sort-mem overflowed its cast.
+# its cast.
 printf 'r0\nr1\nr2\nr3\n' > "$W/pn.txt"
 $KT decode --names ordinal "$W/nx.kt" 2>/dev/null | cut -f2,3,4 > "$W/pn.want"
 $KT --names <(cat "$W/pn.txt") decode "$W/nx.kt" 2>/dev/null | cmp -s - "$W/nx.bed" \
@@ -765,13 +765,13 @@ must_fail "decode --db over a directory in --out" $KT decode --db "$D/db.feature
   && echo "refused db decode: all old files kept, no leftovers" || { echo "refused db decode: HALF UPDATED"; fail=1; }
 mkdir -p "$W/dbsig"; ( $KT decode --db "$D/db.features.tsv" --out "$W/dbsig" "$W/f.kt" >/dev/null 2>&1 & p=$!; sleep 0.02; kill -INT $p 2>/dev/null; wait $p ) 2>/dev/null || true
 [ -z "$(ls "$W/dbsig" | grep tmp)" ] && echo "SIGINT during decode --db: no temporaries left" || { echo "SIGINT during decode --db: TEMPORARIES LEFT"; fail=1; }
-must_fail "--sort-mem 1e18T" $KT encode --sort --sort-tmp-dir "$W" --sort-mem 1e18T < "$D/s.bed"
+must_fail "--sort=1e18T" $KT encode --tmp-dir "$W" --sort=1e18T < "$D/s.bed"
 
 # The README says these pairs are exclusive and these ranges are the limits.
 must_fail "--names drop with --names keep" $KT encode --names drop --names keep < "$D/s.bed"
 must_fail "--names keep with --names drop" $KT encode --names keep --names drop < "$D/s.bed"
-must_fail "--block with --one-block" $KT encode --block 4 --one-block < "$D/s.bed"
-must_fail "--one-block with --block" $KT encode --one-block --block 4 < "$D/s.bed"
+must_fail "the retired --one-block" $KT encode --one-block < "$D/s.bed"
+must_fail "--block junk" $KT encode --block xyz < "$D/s.bed"
 must_fail "--threads 1025" $KT -t 1025 encode < "$D/s.bed"
 must_fail "--level 23" $KT encode --level 23 < "$D/s.bed"
 must_fail "--level -1" $KT encode --level -1 < "$D/s.bed"
@@ -814,12 +814,12 @@ $KT decode "$W/v99.kst" 2>&1 | grep -q "KST version 00099" \
 must_fail "unknown flag" $KT --bogus encode
 $KT --help > "$W/help.txt" 2>/dev/null && [ -s "$W/help.txt" ] \
   && echo "--help: on stdout, exit 0" || { echo "--help: WRONG"; fail=1; }
-must_fail "query --db" $KT query "$W/side1.kt" --db x
+must_fail "query --db" $KT region "$W/side1.kt" --db x
 must_fail "encode --out" $KT encode --out "$W" < "$D/s.bed"
 must_fail "encode --names ordinal" $KT encode --names ordinal < "$D/s.bed"
 must_fail "decode --tail" $KT decode --tail 1 "$W/side1.kt"
 must_fail "decode two tracks" $KT decode "$W/side1.kt" "$W/side2.kt"
-must_fail "--sort-mem with no value" $KT encode --sort-mem
+must_fail "the retired --sort-mem" $KT encode --sort-mem 1M
 
 # htscodecs wrote "compiled without libbz2" for 32 candidates that were never
 # meant to reach arith: nothing from htscodecs may reach stderr.

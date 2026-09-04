@@ -1,8 +1,8 @@
 # karyozip
 
-Reads and writes the **KaryoScope Track (KST)** binary format: lossless, compact storage and O(1) random access for k-mer annotation tracks. Files are `.kst`, the index beside one is `.kst.idx`.
+Reads and writes the **KaryoScope Track (KST)** binary format: lossless, compact storage and O(1) random access for k-mer annotation tracks. Files are `.kst`; `karyozip index F` writes `F.idx`, so `sample.kst.idx`.
 
-Compresses a BED-like track (`seq  start  end  label`, sorted, gapless, one block of rows per sequence) and gives it back byte-identical. Build with `make`. No environment variables: every knob is a flag, and every flag is read before the command runs, so it works on either side of the command name. `karyozip --help` prints the usage.
+Compresses a BED-like track (`seq  start  end  label`, sorted, gapless, one block of rows per sequence) and gives it back byte-identical. Build with `make`. Every knob is a flag, and every flag is read before the command runs, so it works on either side of the command name. `karyozip --help` prints the usage. The only environment variable read is `TMPDIR`, and only when `--tmp-dir` is not given; nothing else changes what karyozip does.
 
 Two compression modes: none (quick-decoding codecs) and `--slow` (smaller, slower both ways). Names live in one of two places: in the track, or outside it, in which case decode needs `--names FILE`.
 
@@ -15,15 +15,14 @@ karyozip encode [flags] < in.bed > out.kst        # or: producer | karyozip enco
 | flag | effect |
 |---|---|
 | `--block N` | rows per block, default 262144. Small blocks, fast queries. |
-| `--one-block` | one block, no random access, smallest file. |
+| `--block all` | one block, no random access, smallest file. |
 | `--level N` | zstd level, 1 to 22, default 17. |
 | `--slow` | every codec over every block: smaller file, slower encode and decode. |
 | `--names keep` | store names even when they are 0,1,2,... |
 | `--names drop` | store no names. Decode needs `--names FILE`, a FASTA, FASTQ or one name per line. |
 | `--names drop:F` | store no names, write them to `F`. Decode needs `--names F` itself, nothing else. |
 | `--sort` | order records by label tuple, then lengths, then input rank. |
-| `--sort-tmp-dir DIR` | spill to `DIR` instead of holding every record. |
-| `--sort-mem SIZE` | bytes held before a spill, `1M` and up. Needs `--sort-tmp-dir`. |
+| `--sort=MEM` | the same, spilling past `MEM` bytes instead of holding every record. `1M` and up; spills under `--tmp-dir`. |
 | `--db features.tsv` | inputs are one BED per feature set, or one merged featureID track. |
 | `--aln P.paf --ref R` | labels and lengths the reference already gives are not stored. |
 | `--aln-names F` | for `--aln` on a track that names rows by ordinal: ordinal N is line N+1 of `F`. |
@@ -46,15 +45,14 @@ karyozip decode --raw out.kst                            # what is stored, no tr
 ## read
 
 ```
-karyozip dump   F                        like decode, every stored form kept
-karyozip query  F SEQ                    the whole sequence
-karyozip query  F SEQ POS                the run covering POS
+karyozip region F SEQ                    the whole sequence
+karyozip region F SEQ POS                the run covering POS
 karyozip region F SEQ START END          rows overlapping the range
 karyozip region F SEQ START END HALO      plus HALO runs on each side
 karyozip smooth F HIER FS                promote noisy runs, whole track
 karyozip smooth F HIER FS SEQ            one sequence
 karyozip smooth F HIER FS SEQ START END  one range
-karyozip index  F                        writes F.kst.idx, faster lookups
+karyozip index  F                        writes F.idx, faster lookups
 karyozip aln-pack P.paf REF.bed OUT      packs a PAF to only what --aln reads
 ```
 
@@ -72,7 +70,7 @@ karyozip aln-pack P.paf REF.bed OUT      packs a PAF to only what --aln reads
 
 ## combinations
 
-Encode flags combine freely except: `--names keep` with `--names drop`, `--block` with `--one-block`, `--sort-mem` without `--sort-tmp-dir`, `--aln` with `--names drop` and no name file.
+Encode flags combine freely except: `--names keep` with `--names drop`, and `--aln` with `--names drop` and no name file.
 Decode must be given the same `--db` table, the same PAF and reference, and the same name source as encode; a mismatch is refused, never guessed.
 `--sort` reorders records, so a decode of a sorted track returns the same rows in the sorted order, never the input order. Compare such a decode against a sorted copy of the input.
 A flag used on the wrong command is refused: `encode --names ordinal` and `decode --tail 1` both fail with a message.

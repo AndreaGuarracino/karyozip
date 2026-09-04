@@ -135,21 +135,29 @@ static long int_arg(const char *p, long lo, long hi, const char *what) {   /* a 
 
 static uint64_t mem_arg(const char *p) {   /* bytes, with a K, M, G or T suffix */
     if (!p || !*p) die("--sort=MEM must be positive");
-    char *e = NULL; double val = strtod(p, &e);
-    if (!(val > 0) || val != val || val > 1e18 || e == p) die("--sort=MEM must be positive");
+    /* Digits only, like every other number on the command line. This used
+       strtod, which quietly took " 1M", "+1M", "1e9" and "1.5M", though the
+       README says a sign and an exponent are refused. */
+    uint64_t val = 0; const char *q = p;
+    for (; *q >= '0' && *q <= '9'; q++) {
+        if (val > (UINT64_MAX - (uint64_t)(*q - '0')) / 10)
+            die("--sort=MEM is larger than the address space");
+        val = val * 10 + (uint64_t)(*q - '0');
+    }
+    if (q == p || !val) die("--sort=MEM must be positive");
     uint64_t mul = 1;
-    if (*e) {
-        switch (*e) {
+    if (*q) {
+        switch (*q) {
         case 'k': case 'K': mul = 1ULL << 10; break;
         case 'm': case 'M': mul = 1ULL << 20; break;
         case 'g': case 'G': mul = 1ULL << 30; break;
         case 't': case 'T': mul = 1ULL << 40; break;
         default: die("--sort=MEM: use a plain number of bytes or a K, M, G or T suffix");
         }
-        if (e[1]) die("--sort=MEM: nothing may follow the unit");
+        if (q[1]) die("--sort=MEM: nothing may follow the unit");
     }
-    if (val > (double)UINT64_MAX / (double)mul) die("--sort=MEM is larger than the address space");
-    uint64_t m = (uint64_t)(val * (double)mul);
+    if (val > UINT64_MAX / mul) die("--sort=MEM is larger than the address space");
+    uint64_t m = val * mul;
     if (m < (1u << 20)) die("--sort=MEM must be at least 1M");
     return m;
 }

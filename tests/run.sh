@@ -747,6 +747,12 @@ must_fail "--level abc" $KT encode --level abc < "$D/s.bed"
 must_fail "--block 4abc" $KT encode --block 4abc < "$D/s.bed"
 must_fail "-t 4x" $KT -t 4x encode < "$D/s.bed"
 must_fail "--sort=nan" $KT encode --tmp-dir "$W" --sort=nan < "$D/s.bed"
+# Round 32: mem_arg used strtod, so a sign, an exponent, a fraction and a
+# leading space all got through, though the README says a number on the
+# command line refuses +1 and 1e2. Digits and an optional unit now.
+for v in "1e9" "+1M" "1.5M" " 1M" "0" "-1M" "1Z" "99999999999999999999T"; do
+  must_fail "--sort=$v" $KT encode --sort="$v" < "$D/s.bed"
+done
 
 # Round 26: an index built while its name file was replaced answered from the
 # new file; a failed decode --db destroyed the previous output; a signal left
@@ -875,6 +881,49 @@ if [ -x "$LT" ]; then
 else
   echo "library API: skipped, build/libtest not built"
 fi
+
+# Round 32, the phase 2 and 3 surfaces. The label cache is keyed on four
+# bytes, so labels sharing length and their first, middle and last byte
+# collide; the parse threads decide "same name as the row before", so names
+# that are prefixes of each other and sequences split across chunk
+# boundaries are the cases that would break it.
+printf 'r1\t0\t10\tabcXYZ\nr1\t10\t20\tabqXYZ\nr1\t20\t30\tabcXYZ\n' > "$W/coll.bed"
+$KT encode < "$W/coll.bed" > "$W/coll.kt" 2>/dev/null
+$KT decode "$W/coll.kt" 2>/dev/null | cmp -s - "$W/coll.bed" \
+  && echo "label cache: colliding keys round-trip" \
+  || { echo "label cache: COLLIDING KEYS WRONG"; fail=1; }
+python3 -c "
+p=0
+f=open('$W/many.bed','w')
+for i in range(60000):
+    f.write('r1\t%d\t%d\ta%04dz\n' % (p, p+10, i % 20000)); p += 10
+"
+$KT encode < "$W/many.bed" > "$W/many.kt" 2>/dev/null
+$KT decode "$W/many.kt" 2>/dev/null | cmp -s - "$W/many.bed" \
+  && echo "label cache: 20000 labels round-trip" \
+  || { echo "label cache: 20000 labels WRONG"; fail=1; }
+printf 'r1\t0\t10\tA\nr11\t0\t10\tB\nr111\t0\t10\tC\n' > "$W/pre.bed"
+$KT encode < "$W/pre.bed" > "$W/pre.kt" 2>/dev/null
+$KT decode "$W/pre.kt" 2>/dev/null | cmp -s - "$W/pre.bed" \
+  && echo "prefix sequence names: round-trip" \
+  || { echo "prefix sequence names: WRONG"; fail=1; }
+python3 -c "
+f=open('$W/chunk.bed','w')
+for s in range(200000): f.write('seq%06d\t0\t10\tA\n' % s)
+"
+$KT -t 8 encode < "$W/chunk.bed" > "$W/chunk.kt" 2>/dev/null
+$KT decode "$W/chunk.kt" 2>/dev/null | cmp -s - "$W/chunk.bed" \
+  && echo "200000 one-row sequences at 8 threads: round-trip" \
+  || { echo "200000 one-row sequences: WRONG"; fail=1; }
+# The staging file is new: a full temp filesystem must be fatal, not silent.
+mkdir -p "$W/tinytmp"
+awk 'BEGIN{p=0; for(k=0;k<400000;k++){printf "r1\t%d\t%d\tchr%d\n", p, p+20, k%22; p+=20}}' > "$W/stage.bed"
+# 256 KB: the staging payload for this input is about 780 KB
+( ulimit -f 512; trap "" XFSZ; $KT --tmp-dir "$W/tinytmp" encode < "$W/stage.bed" >/dev/null 2>&1 ) \
+  && { echo "a full staging filesystem: ACCEPTED"; fail=1; } \
+  || echo "a full staging filesystem: refused"
+[ -z "$(ls -A "$W/tinytmp" 2>/dev/null)" ] && echo "a full staging filesystem: no temp files left" \
+  || { echo "a full staging filesystem: TEMP FILES LEFT"; fail=1; }
 
 # The stored bytes are a function of the codec versions, and zstd does not
 # promise identical output across its own releases. Pin them here: a bump

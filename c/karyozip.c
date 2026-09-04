@@ -1586,6 +1586,15 @@ static void spillmerge(ktw *w) {
     free(rd); free(SPILL); SPILL = NULL; nspill = 0;
 }
 
+/* Both encode paths end the same way: spill what is held, merge, free. */
+static void sortfinish(ktw *w) {
+    if (SORTMEM) {
+        if (rrecn) spillwrite();
+        if (nspill) spillmerge(w);
+    } else if (SORT && rrecn) sortflush(w);
+    if (SORT) { free(rbuf); free(rrun); free(rrec); }
+}
+
 static void sortpush(const char *nm, size_t nlen, uint64_t st, uint64_t len,
                      const char *lab, size_t llen) {
 
@@ -1753,11 +1762,7 @@ static void encode(void) {
     }
     for (int t = 0; t < T; t++) free(pr[t]);
     free(pr); free(prn); free(prc); free(slab);
-    if (SORTMEM) {
-        if (rrecn) spillwrite();
-        if (nspill) spillmerge(w);
-    } else if (SORT && rrecn) sortflush(w);
-    if (SORT) { free(rbuf); free(rrun); free(rrec); }
+    sortfinish(w);
     PH_ADD(0, _tp);
     ktw_tail(w);
     ktw_pushread(w);
@@ -3792,11 +3797,7 @@ static void encode_db(int nfiles, char **files) {
         fprintf(stderr, "aln: %llu of %llu rows matched the reference (%.1f%%)%s",
                 (unsigned long long)ALNHIT, (unsigned long long)rows,
                 rows ? 100.0 * (double)ALNHIT / (double)rows : 0.0, "\n");
-    if (SORTMEM) {
-        if (rrecn) spillwrite();
-        if (nspill) spillmerge(w);
-    } else if (SORT && rrecn) sortflush(w);
-    if (SORT) { free(rbuf); free(rrun); free(rrec); }
+    sortfinish(w);
     ktw_tail(w);
     ktw_pushread(w);
     ktw_flush(w);

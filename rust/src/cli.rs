@@ -10,8 +10,8 @@ pub const USAGE: &str = include_str!(concat!(env!("OUT_DIR"), "/usage.txt"));
 /// What --version prints: the tool, the format, and the linked codecs.
 fn version_text() -> &'static str {
     format!("{}, format KST00001\n  zstd       {}\n  libbz3     {}\n  htscodecs  {}",
-            env!("CARGO_PKG_VERSION"), crate::ffi::zstd_version(),
-            crate::ffi::bzip3_version(), crate::ffi::HTSCODECS_VERSION).leak()
+            env!("CARGO_PKG_VERSION"), karyozip::ffi::zstd_version(),
+            karyozip::ffi::bzip3_version(), karyozip::ffi::HTSCODECS_VERSION).leak()
 }
 
 #[derive(Parser)]
@@ -128,7 +128,7 @@ impl Cli {
             // The C echoes the spelling that was used, and -t is the one short.
             let arg = if arg == "--threads" && std::env::args().any(|a| a == "-t")
                 { "-t" } else { arg };
-            crate::bail(&match e.kind() {
+            karyozip::bail(&match e.kind() {
                 ErrorKind::UnknownArgument => format!("unknown flag {arg}"),
                 ErrorKind::InvalidValue if !arg.is_empty() => format!("{arg} needs a value"),
                 _ => "bad command or missing arguments".to_string(),

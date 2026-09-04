@@ -1,23 +1,10 @@
-mod aln;
 mod cli;
-mod db;
-mod ffi;
-mod kst;
-mod prof;
-mod reader;
-mod smooth;
-mod writer;
+
+use karyozip::{aln, bail as die, bedcoord_r, db, ffi, kst, prof, reader, smooth, writer};
 
 use cli::{Cli, Cmd};
 use std::io::{BufWriter, Read, Write};
 
-fn die(msg: &str) -> ! {
-    eprintln!("karyozip: {msg}");
-    db::drop_tmp();
-    prof::dump();
-    std::process::exit(1);
-}
-pub fn bail(msg: &str) -> ! { die(msg) }
 
 /// The C's wording for a number that is not one.
 fn num(v: &Option<String>, lo: u64, hi: u64, what: &'static str) -> Option<u64> {
@@ -348,7 +335,7 @@ fn encode(opt: writer::Options, tmpdir: &std::path::Path, a: Option<aln::Aln>) {
         drop(_s);
         let _s = prof::span(6);
         for r in rows.iter().flatten() {
-            w.row(&slab[r.nm.0 as usize..r.nm.1 as usize], r.en - r.st,
+            w.push(&slab[r.nm.0 as usize..r.nm.1 as usize], r.en - r.st,
                   &slab[r.lab.0 as usize..r.lab.1 as usize], r.st)
                 .unwrap_or_else(|m| die(&m));
         }
@@ -359,16 +346,7 @@ fn encode(opt: writer::Options, tmpdir: &std::path::Path, a: Option<aln::Aln>) {
     }
 
     drop(_p);
-    let stdout = std::io::stdout();
-    let mut out = BufWriter::new(stdout.lock());
-    let hits = w.aln_hit();
-    let st = w.close(&mut out).unwrap_or_else(|m| die(&m));
-    out.flush().unwrap_or_else(|e| die(&e.to_string()));
-    if aln_on {
-        eprintln!("aln: {hits} of {} rows matched the reference ({:.1}%)",
-                  st.rows, if st.rows > 0 { 100.0 * hits as f64 / st.rows as f64 } else { 0.0 });
-    }
-    report(&st);
+    finish(w, aln_on);
 }
 
 fn report(st: &writer::Stats) {
@@ -426,28 +404,6 @@ fn parse_chunk(s: &[u8], from: usize, to: usize) -> Result<Vec<Row>, &'static st
         p = nl + 1;
     }
     Ok(out)
-}
-
-fn bedcoord_r(b: &[u8], what: &'static str) -> Result<u64, &'static str> {
-    let mut v: u64 = 0;
-    for &c in b {
-        if !c.is_ascii_digit() { return Err(what); }
-        if v > (u64::MAX - (c - b'0') as u64) / 10 {
-            return Err("a coordinate does not fit in 64 bits");
-        }
-        v = v * 10 + (c - b'0') as u64;
-    }
-    Ok(v)
-}
-
-pub fn bedcoord(b: &[u8], what: &str) -> u64 {
-    let mut v: u64 = 0;
-    for &c in b {
-        if !c.is_ascii_digit() { die(what); }
-        if v > (u64::MAX - (c - b'0') as u64) / 10 { die("a coordinate does not fit in 64 bits"); }
-        v = v * 10 + (c - b'0') as u64;
-    }
-    v
 }
 
 fn probe(path: &str) {

@@ -350,7 +350,7 @@ impl Writer {
             let mut pos = 0u64;
             for &(len, id) in &r.runs {
                 let l = self.labtab[id as usize].clone();
-                self.row_inner(name, len as u64, &l, pos, false)?;
+                self.row_inner(name, len as u64, &l, pos)?;
                 pos += len as u64;
             }
             out += 1;
@@ -376,7 +376,7 @@ impl Writer {
             let mut pos = 0u64;
             for &(len, id) in &r.runs {
                 let l = self.labtab[id as usize].clone();
-                self.row_inner(name, len as u64, &l, pos, false)?;
+                self.row_inner(name, len as u64, &l, pos)?;
                 pos += len as u64;
             }
         }
@@ -384,21 +384,35 @@ impl Writer {
         Ok(())
     }
 
+    /// The CLI gets these for free: its parser split on tabs and newlines,
+    /// so a name or label can never hold one, and a zero-length run cannot
+    /// reach the writer. A library caller can produce all of them, and a
+    /// newline in a label makes a track that does not decode, because the
+    /// label table is newline separated. Refusing here keeps encode
+    /// lossless.
     pub fn row(&mut self, name: &[u8], run_len: u64, label: &[u8], start: u64)
         -> Result<(), String> {
-        self.row_hint(name, run_len, label, start, false)
+        let bad = name.iter().find(|&&c| matches!(c, 0 | b'\n' | b'\t'))
+            .or_else(|| label.iter().find(|&&c| matches!(c, 0 | b'\n')));
+        match bad {
+            Some(0) => return Err("a NUL byte inside a row".into()),
+            Some(b'\n') => return Err("a newline inside a name or label".into()),
+            Some(_) => return Err("a tab inside a sequence name".into()),
+            None => {}
+        }
+        self.push(name, run_len, label, start)
     }
 
-    /// `same` is the caller's promise that `name` repeats the row before it,
-    /// which saves a compare on the one serial phase of encode.
-    pub fn row_hint(&mut self, name: &[u8], run_len: u64, label: &[u8], start: u64,
-                    same: bool) -> Result<(), String> {
+    /// The same row without those checks, for callers whose parser already
+    /// split on tabs and newlines. This is the CLI's path, as it is the C's.
+    pub fn push(&mut self, name: &[u8], run_len: u64, label: &[u8], start: u64)
+        -> Result<(), String> {
         if self.opt.sort { return self.sortpush(name, run_len, label, start); }
-        self.row_inner(name, run_len, label, start, same)
+        self.row_inner(name, run_len, label, start)
     }
 
-    fn row_inner(&mut self, name: &[u8], run_len: u64, label: &[u8], start: u64,
-                 same: bool) -> Result<(), String> {
+    fn row_inner(&mut self, name: &[u8], run_len: u64, label: &[u8], start: u64)
+        -> Result<(), String> {
         if name.is_empty() { return Err("empty sequence name".into()); }
         if run_len == 0 {
             return Err("end equals start: a run must cover at least one base".into());
@@ -406,7 +420,7 @@ impl Writer {
         if start > u64::MAX - run_len {
             return Err("a coordinate does not fit in 64 bits".into());
         }
-        if !same && name != self.cur.as_slice() {
+        if name != self.cur.as_slice() {
             if start != 0 { return Err("a sequence does not start at 0".into()); }
             if name.len() >= 512 { return Err("name too long".into()); }
             self.tail();

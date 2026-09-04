@@ -187,7 +187,7 @@ pub fn encode(files: &[String], feats: &Feats, w: &mut crate::writer::Writer) {
         lastend = hi;
         let mut lab = Vec::with_capacity(12);
         kst::putu64(&mut lab, id as u64);
-        w.row(&b[0].seq, hi - lo, &lab, lo)
+        w.push(&b[0].seq, hi - lo, &lab, lo)
             .unwrap_or_else(|m| crate::bail(&m));
         rows += 1;
         for x in b.iter_mut() {

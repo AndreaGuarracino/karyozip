@@ -226,16 +226,33 @@ static int labhash_init = 0;
 static size_t *labnlen;
 static int lastid = -1;
 
+/* A track has a handful of distinct labels, 31 on a real chromosome track,
+   but it cycles through them: measured on 4M real rows, the label equals the
+   previous one 0.1% of the time, so the old single-slot cache never hit and
+   every row paid a full FNV over the label plus a probe. This is a small
+   direct-mapped cache on a four-byte key, checked with one memcmp. It changes
+   no id: the table below still assigns them in first-seen order. */
+#define LCACHE 512
+static int lcache[LCACHE];
+static int lcache_init = 0;
 static int intern(const char *s, size_t n) {
     if (lastid >= 0 && labnlen[lastid] == n && !memcmp(labtab[lastid], s, n))
         return lastid;
+    if (!lcache_init) { for (int i = 0; i < LCACHE; i++) lcache[i] = -1; lcache_init = 1; }
+    uint32_t ck = (uint32_t)n * 2654435761u;
+    ck ^= (uint32_t)(uint8_t)s[0] << 7;
+    ck ^= (uint32_t)(uint8_t)s[n - 1] << 15;
+    ck ^= (uint32_t)(uint8_t)s[n >> 1] << 23;
+    ck = (ck ^ (ck >> 13)) & (LCACHE - 1);
+    int cid = lcache[ck];
+    if (cid >= 0 && labnlen[cid] == n && !memcmp(labtab[cid], s, n)) return lastid = cid;
     if (!labhash_init) { memset(labhash, 0xff, sizeof labhash); labhash_init = 1; }
     uint64_t k = fnvbuf(FNV0, s, n) & (LABHASH - 1);
     uint64_t probes = 0;
     while (labhash[k] >= 0) {
         if (++probes >= LABHASH) die("more than LABHASH distinct labels");
         int id = labhash[k];
-        if (labnlen[id] == n && !memcmp(labtab[id], s, n)) return lastid = id;
+        if (labnlen[id] == n && !memcmp(labtab[id], s, n)) { lcache[ck] = id; return lastid = id; }
         k = (k + 1) & (LABHASH - 1);
     }
     if (nlabtab == labcap) {
@@ -246,6 +263,7 @@ static int intern(const char *s, size_t n) {
     labtab[nlabtab] = strndup(s, n);
     labnlen[nlabtab] = n;
     labhash[k] = nlabtab;
+    lcache[ck] = nlabtab;
     return lastid = nlabtab++;
 }
 
@@ -708,9 +726,13 @@ static uint64_t refend_at(const char *nm, uint64_t pos);
 static __thread int LASTREV;   /* strand of the last refend answer */
 static const char *ALNNAME = NULL;    /* --sort writes ranks; the PAF wants names */
 
+/* same: the caller already knows this row's name equals the previous row's,
+   which the parse threads work out in parallel. It saves one memcmp per row,
+   and the name changes only once per sequence. */
 static void ktw_row(ktw *w, const char *name, size_t nlen,
-                    uint64_t run_len, const char *label, size_t llen, uint64_t start) {
-    if (nlen != w->curlen || memcmp(name, w->cur, nlen) != 0) {
+                    uint64_t run_len, const char *label, size_t llen, uint64_t start,
+                    int same) {
+    if (!same && (nlen != w->curlen || memcmp(name, w->cur, nlen) != 0)) {
         if (start != 0) die("a sequence does not start at 0");
         ktw_tail(w);            /* the held row was this sequence's last */
         ktw_pushread(w);
@@ -1447,7 +1469,7 @@ static void sortflush(ktw *w) {
         for (uint32_t k = 0; k < rrec[i].nrun; k++) {
             const srun *u = rrun + rrec[i].off + k;
             const char *lb = labtab[u->lab];
-            ktw_row(w, nm, nl2, u->len, lb, strlen(lb), pos);
+            ktw_row(w, nm, nl2, u->len, lb, strlen(lb), pos, 0);
             pos += u->len;
         }
     }
@@ -1537,7 +1559,7 @@ static void spillmerge(ktw *w) {
         uint64_t pos = 0;
         for (uint32_t k = 0; k < r->nrun; k++) {
             const char *lb = labtab[r->rs[k].lab];
-            ktw_row(w, nmp, nl, r->rs[k].len, lb, strlen(lb), pos);
+            ktw_row(w, nmp, nl, r->rs[k].len, lb, strlen(lb), pos, 0);
             pos += r->rs[k].len;
         }
         out++;
@@ -1611,7 +1633,7 @@ static void encode(void) {
     ktw *w = ktw_open();
 
     typedef struct { const char *nm; uint32_t nlen, llen; const char *lab;
-                     uint64_t st, len; } prow;
+                     uint64_t st, len; int same; } prow;   /* same: name equals the row before */
     const size_t SLAB = 1 << 24;
     char *slab = xmalloc(SLAB + 1);
     int T = nthreads();
@@ -1676,6 +1698,8 @@ static void encode(void) {
                     pr[t] = realloc(pr[t], prc[t] * sizeof **pr);
                     if (!pr[t]) { e = "oom"; break; }
                 }
+                pr[t][n].same = n && pr[t][n - 1].nlen == (uint32_t)(t1 - line)
+                                && !memcmp(pr[t][n - 1].nm, line, (size_t)(t1 - line));
                 pr[t][n].nm = line; pr[t][n].nlen = (uint32_t)(t1 - line);
                 pr[t][n].lab = t3 + 1; pr[t][n].llen = (uint32_t)(len - (t3 + 1 - line));
                 pr[t][n].st = st; pr[t][n].len = en - st;
@@ -1702,7 +1726,7 @@ static void encode(void) {
                     }
                 }
                 if (SORT) sortpush(q->nm, q->nlen, q->st, q->len, lab, llen);
-                else ktw_row(w, q->nm, q->nlen, q->len, lab, llen, q->st);
+                else ktw_row(w, q->nm, q->nlen, q->len, lab, llen, q->st, q->same);
             }
         PH_ADD(6, _tser);                       /* serial: append the rows */
         have -= span2;
@@ -3676,7 +3700,7 @@ static void encode_db(int nfiles, char **files) {
             }
         }
         if (SORT) sortpush(b[0].seq, seqlen, lo, hi - lo, lab, llen);
-        else ktw_row(w, b[0].seq, seqlen, hi - lo, lab, llen, lo);
+        else ktw_row(w, b[0].seq, seqlen, hi - lo, lab, llen, lo, 0);
         rows++;
         for (int i = 0; i < nfiles; i++) {
             b[i].st = hi;                            /* consume up to the cut */

@@ -1,7 +1,5 @@
-mod codec;
 mod ffi;
-mod names;
-mod varint;
+mod kst;
 mod writer;
 
 use std::io::{BufWriter, Read, Write};
@@ -162,21 +160,21 @@ fn probe(path: &str) {
     let mut out = std::io::stdout().lock();
     for lvl in [1, 3, 17, 19, 22] {
         let z = ffi::zstd(&src, lvl);
-        writeln!(out, "zstd:{lvl}\t{}\t{:016x}", z.len(), varint::fnv(varint::FNV0, &z)).unwrap();
+        writeln!(out, "zstd:{lvl}\t{}\t{:016x}", z.len(), kst::fnv(kst::FNV0, &z)).unwrap();
     }
-    for c in codec::CAND_FAST {
+    for c in writer::CAND_FAST {
         match ffi::paycomp(&src, c) {
             Some(v) => {
                 let ok = ffi::paydecomp(&v, c, src.len()).as_deref() == Some(&src[..]);
                 writeln!(out, "codec:0x{c:x}\t{}\t{:016x}\troundtrip={}",
-                         v.len(), varint::fnv(varint::FNV0, &v), ok).unwrap();
+                         v.len(), kst::fnv(kst::FNV0, &v), ok).unwrap();
             }
             None => writeln!(out, "codec:0x{c:x}\trefused").unwrap(),
         }
     }
     match ffi::tok_encode(&src) {
         Some(v) => writeln!(out, "tok\t{}\t{:016x}\troundtrip={}", v.len(),
-                            varint::fnv(varint::FNV0, &v),
+                            kst::fnv(kst::FNV0, &v),
                             ffi::tok_decode(&v).as_deref() == Some(&src[..])).unwrap(),
         None => writeln!(out, "tok\trefused").unwrap(),
     }

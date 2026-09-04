@@ -3,12 +3,11 @@
 //! Every layout decision here is c/karyozip.c's, because the two must produce
 //! the same bytes.
 
-use crate::codec;
 use crate::ffi;
-use crate::names;
-use crate::varint::{self, FNV0};
+use crate::kst::{self, FNV0};
 use rayon::prelude::*;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::io::{Seek, SeekFrom, Write};
 
 pub const MAGIC: &[u8; 8] = b"KST00001";
@@ -116,22 +115,22 @@ impl Writer {
                     .sum();
                 self.tailon = Some(dev * 12 <= self.tailpred * TAILSKIP as u64);
             }
-            varint::put(&mut self.lens, self.plen);
+            kst::put(&mut self.lens, self.plen);
             self.phas = false;
             return;
         }
         if self.tailon != Some(true) {
-            varint::put(&mut self.lens, self.plen);
+            kst::put(&mut self.lens, self.plen);
             self.phas = false;
             return;
         }
-        varint::put(&mut self.lens, varint::zz(self.curbp as i64 - self.tailpred as i64));
+        kst::put(&mut self.lens, kst::zz(self.curbp as i64 - self.tailpred as i64));
         self.phas = false;
     }
 
     fn pushread(&mut self) {
         if self.cur.is_empty() { return; }
-        varint::put(&mut self.ibx, self.currun);
+        kst::put(&mut self.ibx, self.currun);
         if self.ordok {
             let want = self.nidx.to_string();
             if self.cur == want.as_bytes() {
@@ -191,14 +190,14 @@ impl Writer {
         }
         let id = self.intern(label) as u64;
         if self.phas {
-            varint::put(&mut self.lens, self.plen);
+            kst::put(&mut self.lens, self.plen);
             self.phas = false;
         }
         if self.pend >= self.opt.block { self.flush().map_err(io)?; }
         if self.pend == 0 { self.blkbp0 = self.curbp; }
         self.plen = run_len;
         self.phas = true;
-        varint::put(&mut self.ids, id);
+        kst::put(&mut self.ids, id);
         self.pend += 1;
         self.currun += 1;
         self.rows += 1;
@@ -227,7 +226,7 @@ impl Writer {
             .collect::<std::io::Result<_>>().map_err(io)?;
         let sref: Vec<(&[u8], &[u8])> = sampled.iter()
             .map(|(l, i)| (l.as_slice(), i.as_slice())).collect();
-        let p = codec::pick(&sref, seekable, level, self.opt.id_codec, self.opt.len_codec);
+        let p = pick(&sref, seekable, level, self.opt.id_codec, self.opt.len_codec);
 
         // Compress apart, write in order, a batch at a time. Holding every
         // compressed block would cost the whole file in memory; the C stages
@@ -241,8 +240,8 @@ impl Writer {
                 .par_iter()
                 .map(|&i| {
                     let (lens, ids) = self.read_block(i).expect("staged block");
-                    let a = codec::comp_lens(&lens, p.len, level).expect("lens frame");
-                    let b = codec::comp_ids(&ids, p.id, level).expect("ids frame");
+                    let a = comp_lens(&lens, p.len, level).expect("lens frame");
+                    let b = comp_ids(&ids, p.id, level).expect("ids frame");
                     (a, b, lens.len(), ids.len(), self.bm[i].rows, self.bm[i].bp)
                 })
                 .collect();
@@ -251,13 +250,13 @@ impl Writer {
                 body.write_all(b).map_err(io)?;
                 byt_lens += a.len() as u64;
                 byt_labs += b.len() as u64;
-                varint::put(&mut sizes, a.len() as u64);
-                varint::put(&mut sizes, b.len() as u64);
-                varint::put(&mut sizes, *ni as u64);
-                varint::put(&mut sizes, *nl as u64);
-                varint::put(&mut sizes, *rows);
-                varint::put(&mut sizes, *bp);
-                varint::put(&mut sizes, varint::fnv(varint::fnv(FNV0, a), b));
+                kst::put(&mut sizes, a.len() as u64);
+                kst::put(&mut sizes, b.len() as u64);
+                kst::put(&mut sizes, *ni as u64);
+                kst::put(&mut sizes, *nl as u64);
+                kst::put(&mut sizes, *rows);
+                kst::put(&mut sizes, *bp);
+                kst::put(&mut sizes, kst::fnv(kst::fnv(FNV0, a), b));
             }
         }
 
@@ -266,7 +265,7 @@ impl Writer {
 
         let mut ordinal = self.ordok && self.nidx > 0;
         if self.opt.keep_names { ordinal = false; }
-        if self.nidx > 1 { names::check_unique(&self.names)?; }
+        if self.nidx > 1 { check_unique(&self.names)?; }
         if !ordinal && self.ordok && self.names.is_empty() && self.nidx > 0 {
             for i in 0..self.nidx {
                 self.names.extend_from_slice(i.to_string().as_bytes());
@@ -278,7 +277,7 @@ impl Writer {
         let (nz, tokused, intused) = if ordinal {
             (Vec::new(), false, false)
         } else {
-            let b = names::best(&self.names, self.nidx, level);
+            let b = best_names(&self.names, self.nidx, level);
             (b.bytes, b.kind == 2, b.kind == 1)
         };
 
@@ -297,8 +296,8 @@ impl Writer {
                 if seen % ICHUNK == 0 || q >= self.ibx.len() {
                     let cz = ffi::zstd(&self.ibx[cstart..q], meta);
                     ichunks.extend_from_slice(&cz);
-                    varint::put(&mut itab, cz.len() as u64);
-                    varint::put(&mut itab, spend);
+                    kst::put(&mut itab, cz.len() as u64);
+                    kst::put(&mut itab, spend);
                     nichunk += 1;
                     cstart = q;
                     spend = cpend;
@@ -330,12 +329,12 @@ impl Writer {
         h[14] = 0;
         let mut hb = Vec::with_capacity(128);
         for v in h { hb.extend_from_slice(&v.to_le_bytes()); }
-        let mut mh = varint::fnv(FNV0, &hb);
-        mh = varint::fnv(mh, &lz);
-        mh = varint::fnv(mh, &nz);
-        mh = varint::fnv(mh, &ichunks);
-        mh = varint::fnv(mh, &sz);
-        mh = varint::fnv(mh, &itz);
+        let mut mh = kst::fnv(FNV0, &hb);
+        mh = kst::fnv(mh, &lz);
+        mh = kst::fnv(mh, &nz);
+        mh = kst::fnv(mh, &ichunks);
+        mh = kst::fnv(mh, &sz);
+        mh = kst::fnv(mh, &itz);
         h[15] = mh;
         hb.truncate(120);
         hb.extend_from_slice(&h[15].to_le_bytes());
@@ -390,3 +389,212 @@ fn vget(b: &[u8], mut i: usize) -> (u64, usize) {
 }
 
 fn io(e: std::io::Error) -> String { e.to_string() }
+
+
+/* ------------------------------------------------- choosing a codec */
+/// The eight candidates the default search tries, beside zstd. Codec 0 means
+/// zstd, so bare rANS order 0 is spelled 0x100.
+pub const CAND_FAST: [i32; 8] = [
+    0x100, 1, 65, 521,
+    ffi::CODEC_ARITH, ffi::CODEC_ARITH | 1,
+    ffi::CODEC_BZIP3 | 16, ffi::CODEC_BZIP3 | 64,
+];
+
+/// bzip3 decodes at about 8 MB/s against zstd's ~1000, so it is the wrong
+/// pick for a file a query will seek into.
+fn fast_enough(codec: i32) -> bool {
+    codec & ffi::CODEC_BZIP3 == 0
+}
+
+pub struct Pick {
+    pub id: i32,
+    pub len: i32,
+}
+
+/// `samples` are whole blocks: (lens frame, ids frame).
+pub fn pick(samples: &[(&[u8], &[u8])], seekable: bool, level: i32,
+            forced_id: Option<i32>, forced_len: Option<i32>) -> Pick {
+    if let (Some(i), Some(l)) = (forced_id, forced_len) {
+        return Pick { id: i, len: l };
+    }
+    // 4 MB per block when seekable: a smaller sample cannot show what a BWT
+    // codec does to a 100 MB stream.
+    let scap = if seekable { 4 << 20 } else { 96 << 20 };
+    let mut maxstream = 0usize;
+    for (l, i) in samples {
+        maxstream = maxstream.max(l.len()).max(i.len());
+    }
+    let big = maxstream >= 0x7fff_ffff;
+
+    let mut zi = 0usize;
+    let mut zl = 0usize;
+    let mut ci = [0usize; CAND_FAST.len()];
+    let mut cl = [0usize; CAND_FAST.len()];
+    const BAD: usize = usize::MAX / 2;
+
+    for (lens, ids) in samples {
+        let nl = lens.len().min(scap);
+        let ni = ids.len().min(scap);
+        if ni > 0 { zi += ffi::zstd(&ids[..ni], level).len(); }
+        if nl > 0 { zl += ffi::zstd(&lens[..nl], level).len(); }
+        for (k, &c) in CAND_FAST.iter().enumerate() {
+            // Size alone does not qualify a codec: it must decode back.
+            ci[k] = accumulate(ci[k], &ids[..ni], c, BAD);
+            cl[k] = accumulate(cl[k], &lens[..nl], c, BAD);
+        }
+    }
+
+    let (mut wi, mut wl) = (0i32, 0i32);
+    let (mut bi, mut bl) = (zi, zl);
+    // The 0.5% margin, in the C's exact arithmetic.
+    let need_i = (0.995_f64 * zi as f64) as usize;
+    let need_l = (0.995_f64 * zl as f64) as usize;
+    for (k, &c) in CAND_FAST.iter().enumerate() {
+        let ok = (!seekable || fast_enough(c)) && (!big || c & ffi::CODEC_BZIP3 != 0);
+        if zi > 0 && ci[k] < bi && ci[k] < need_i && ok { bi = ci[k]; wi = c; }
+        if zl > 0 && cl[k] < bl && cl[k] < need_l && ok { bl = cl[k]; wl = c; }
+    }
+    Pick { id: forced_id.unwrap_or(wi), len: forced_len.unwrap_or(wl) }
+}
+
+fn accumulate(acc: usize, src: &[u8], codec: i32, bad: usize) -> usize {
+    if src.is_empty() { return acc; }
+    if acc >= bad { return bad; }
+    match ffi::paycomp(src, codec) {
+        Some(t) => match ffi::paydecomp(&t, codec, src.len()) {
+            Some(v) if v == src => acc + t.len(),
+            _ => bad,
+        },
+        None => bad,
+    }
+}
+
+/// The lengths frame: a forced codec, else zstd.
+pub fn comp_lens(src: &[u8], codec: i32, level: i32) -> Option<Vec<u8>> {
+    if codec != 0 { ffi::paycomp(src, codec) } else { Some(ffi::zstd(src, level)) }
+}
+
+/// The ids frame, same rule.
+pub fn comp_ids(src: &[u8], codec: i32, level: i32) -> Option<Vec<u8>> {
+    if codec != 0 { ffi::paycomp(src, codec) } else { Some(ffi::zstd(src, level)) }
+}
+
+/* ------------------------------------------------- the name stream */
+
+
+/// 0 zstd, 1 integer deltas, 2 the CRAM tokeniser.
+pub struct BestNames {
+    pub bytes: Vec<u8>,
+    pub kind: u8,
+}
+
+/// Names that are integers but not exact row indices become zigzag deltas.
+/// Refuses on an empty name, a leading zero, a non-digit, or a short count,
+/// which is what makes the choice safe to reverse.
+pub fn int_names(names: &[u8], n: u64) -> Option<Vec<u8>> {
+    let mut v = Vec::new();
+    let mut prev: i64 = 0;
+    let mut p = 0usize;
+    for _ in 0..n {
+        if p >= names.len() || names[p] == b'\n' { return None; }
+        if names[p] == b'0' && p + 1 < names.len() && names[p + 1] != b'\n' { return None; }
+        let mut x: i64 = 0;
+        while p < names.len() && names[p] != b'\n' {
+            let c = names[p];
+            if !c.is_ascii_digit() || x > 1i64 << 50 { return None; }
+            x = x * 10 + (c - b'0') as i64;
+            p += 1;
+        }
+        if p >= names.len() { return None; }
+        p += 1;
+        let d = x - prev;
+        prev = x;
+        kst::put(&mut v, kst::zz(d));
+    }
+    if p != names.len() { return None; }
+    Some(v)
+}
+
+/// The tokeniser, over the chunk sizes the C tries. In fast mode it tries
+/// only the ends of the list, which is what the default encode does.
+pub fn tok_best(names: &[u8]) -> Option<Vec<u8>> {
+    const TCAND: [usize; 4] = [250_000, 1_000_000, 3_000_000, 9_000_000];
+    let mut best: Option<Vec<u8>> = None;
+    for (i, &chunk) in TCAND.iter().enumerate() {
+        if i > 0 && i + 1 < TCAND.len() { continue; }   // fast mode: ends only
+        if let Some(b) = tok_chunked(names, chunk) {
+            if best.as_ref().is_none_or(|x| b.len() < x.len()) { best = Some(b); }
+        }
+    }
+    best
+}
+
+/// One tokeniser blob: a chunk table, then each chunk's output.
+fn tok_chunked(names: &[u8], chunk: usize) -> Option<Vec<u8>> {
+    if names.is_empty() { return None; }
+    let mut offs = vec![0usize];
+    let mut p = 0usize;
+    while p < names.len() {
+        let mut c = 0usize;
+        let mut e = p;
+        while e < names.len() && c < chunk {
+            if names[e] == b'\n' { c += 1; }
+            e += 1;
+        }
+        offs.push(e);
+        p = e;
+    }
+    let nchunk = offs.len() - 1;
+    let mut blobs = Vec::with_capacity(nchunk);
+    for i in 0..nchunk {
+        blobs.push(ffi::tok_encode(&names[offs[i]..offs[i + 1]])?);
+    }
+    // chunk size, chunk count, then the raw length of each chunk and the
+    // coded length of each, then the blobs. c/karyozip.c tokc().
+    let mut out = Vec::new();
+    out.extend_from_slice(&(chunk as u32).to_le_bytes());
+    out.extend_from_slice(&(nchunk as u32).to_le_bytes());
+    for i in 0..nchunk {
+        out.extend_from_slice(&((offs[i + 1] - offs[i]) as u32).to_le_bytes());
+    }
+    for b in &blobs {
+        out.extend_from_slice(&(b.len() as u32).to_le_bytes());
+    }
+    for b in &blobs { out.extend_from_slice(b); }
+    Some(out)
+}
+
+/// Smallest of zstd, integer deltas and the tokeniser. The losers are
+/// dropped. zstd and the tokeniser are independent and neither gains from
+/// threads on a buffer this size, so they run side by side.
+pub fn best_names(names: &[u8], n: u64, level: i32) -> BestNames {
+    let (z, t) = rayon::join(
+        || ffi::zstd(names, level),
+        || tok_best(names),
+    );
+    let i = int_names(names, n).map(|v| ffi::zstd(&v, level));
+    let mut out = BestNames { bytes: z, kind: 0 };
+    if let Some(v) = i {
+        if !v.is_empty() && v.len() < out.bytes.len() { out = BestNames { bytes: v, kind: 1 }; }
+    }
+    if let Some(v) = t {
+        if !v.is_empty() && v.len() < out.bytes.len() { out = BestNames { bytes: v, kind: 2 }; }
+    }
+    out
+}
+
+/// A repeated sequence name would make the index ambiguous, so it is refused.
+pub fn check_unique(names: &[u8]) -> Result<(), String> {
+    let mut seen: HashSet<u64> = HashSet::new();
+    let mut exact: HashSet<&[u8]> = HashSet::new();
+    for line in names.split(|&c| c == b'\n') {
+        if line.is_empty() { continue; }
+        let h = kst::fnv(FNV0, line);
+        if !seen.insert(h) && !exact.insert(line) {
+            return Err(format!("sequence {} appears twice",
+                               String::from_utf8_lossy(line)));
+        }
+        exact.insert(line);
+    }
+    Ok(())
+}

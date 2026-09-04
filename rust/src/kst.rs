@@ -1,3 +1,4 @@
+//! Format primitives shared by the writer and, later, the reader.
 //! The format's number encoding: LEB128 unsigned, and zigzag for signed.
 
 pub fn put(out: &mut Vec<u8>, mut v: u64) {

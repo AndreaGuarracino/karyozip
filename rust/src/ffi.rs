@@ -55,17 +55,6 @@ pub fn zstd(src: &[u8], level: i32) -> Vec<u8> {
     }
 }
 
-pub fn zstd_decompress(src: &[u8], raw: usize) -> Option<Vec<u8>> {
-    // SAFETY: out is sized to the caller's expected length.
-    unsafe {
-        let mut out = vec![0u8; raw];
-        let n = zstd_sys::ZSTD_decompress(out.as_mut_ptr() as *mut c_void, raw,
-                                          src.as_ptr() as *const c_void, src.len());
-        if zstd_sys::ZSTD_isError(n) != 0 || n != raw { return None; }
-        Some(out)
-    }
-}
-
 pub fn zstd_version() -> String {
     // SAFETY: a static string from the linked libzstd.
     unsafe { std::ffi::CStr::from_ptr(zstd_sys::ZSTD_versionString()).to_string_lossy().into_owned() }

@@ -39,6 +39,14 @@ static inline double nowsec(void) {
 }
 #define PH_ADD(i, t0) do { if (PROF) PH[i] += nowsec() - (t0); } while (0)
 static double WALL0 = 0;
+static int nthreads(void) {       /* --threads, else one per core, else 1 */
+#ifdef _OPENMP
+    return NTHREADS > 0 ? NTHREADS : omp_get_max_threads();
+#else
+    return NTHREADS > 0 ? NTHREADS : 1;
+#endif
+}
+
 static void profdump(void) {
     if (!PROF) return;
     double tot = 0;
@@ -56,7 +64,7 @@ static void profdump(void) {
         fprintf(stderr, "  cpu %.3f s over %.3f s wall = %.2f cores busy"
                         " (%d allowed), peak rss %.2f GB\n",
                 cpu, wall, wall > 0 ? cpu / wall : 0.0,
-                NTHREADS > 0 ? NTHREADS : omp_get_max_threads(),
+                nthreads(),
                 ru.ru_maxrss / 1048576.0);
     }
 }
@@ -337,16 +345,15 @@ static size_t tokc(buf *in, uint8_t **out, uint32_t chunk) {
     for (size_t p2 = 0; p2 < in->n; ) {
         size_t end = p2; uint32_t c = 0;
         while (end < in->n && c < chunk) { if (base[end] == '\n') c++; end++; }
-        if (nchunk + 1 >= cap) { cap *= 2; off = xrealloc(off, (cap + 1) * sizeof *off);
-                                 if (!off) die("oom"); }
+        if (nchunk + 1 >= cap) { cap *= 2; off = xrealloc(off, (cap + 1) * sizeof *off); }
         off[++nchunk] = end; p2 = end;
     }
 
     uint8_t **blob = xcalloc(nchunk, sizeof *blob);
     uint32_t *clen = xmalloc(mul(nchunk, 4));
     _Atomic int failed = 0;
+    int nthr = nthreads();
 #ifdef _OPENMP
-    int nthr = NTHREADS; if (nthr < 1) nthr = omp_get_max_threads();
 #pragma omp parallel for schedule(dynamic, 1) num_threads(nthr)
 #endif
     for (size_t i = 0; i < nchunk; i++) {
@@ -399,8 +406,8 @@ static char *tokd(const uint8_t *b, size_t n, size_t *outn) {
     char *o = xmalloc(raw + 1);
     const uint8_t *p = b + hdr;
     _Atomic int failed = 0;
+    int nthr = nthreads();
 #ifdef _OPENMP
-    int nthr = NTHREADS; if (nthr < 1) nthr = omp_get_max_threads();
 #pragma omp parallel for schedule(dynamic, 1) num_threads(nthr)
 #endif
     for (uint32_t i = 0; i < nchunk; i++) {
@@ -1032,7 +1039,7 @@ static void loadordinals(const char *path) {
         if (n && ln[n - 1] == '\r') ln[--n] = 0;
         if (!c && (ln[0] == '>' || ln[0] == '@')) die("--names on encode takes a plain list, one name a line");
         if (c == nord) { nord = nord ? nord * 2 : 1 << 16;
-                         ORD = xrealloc(ORD, nord * sizeof *ORD); if (!ORD) die("oom"); }
+                         ORD = xrealloc(ORD, nord * sizeof *ORD); }
         ORD[c++] = xstrdup(ln);
     }
     free(ln); fclose(f); nord = c;
@@ -1331,7 +1338,7 @@ static int srec_cmp(const void *a, const void *b) {
 }
 
 static void psort(srec *v, size_t n) {
-    int P = NTHREADS > 0 ? NTHREADS : omp_get_max_threads();
+    int P = nthreads();
     if (P > 64) P = 64;
     while (P & (P - 1)) P &= P - 1;        /* the merge needs a power of two */
     if (n < 1u << 16 || P < 2) { qsort(v, n, sizeof *v, srec_cmp); return; }
@@ -1488,9 +1495,9 @@ static void sortpush(const char *nm, size_t nlen, uint64_t st, uint64_t len,
     SORTBP = newrec ? len : SORTBP + len;
     if (newrec) {
         if (rrecn == rrecc) { rrecc = rrecc ? rrecc * 2 : 1 << 16;
-            rrec = xrealloc(rrec, rrecc * sizeof *rrec); if (!rrec) die("oom"); }
+            rrec = xrealloc(rrec, rrecc * sizeof *rrec); }
         if (rbufn + nlen + 1 > rbufc) { rbufc = (rbufn + nlen + 1) * 2;
-            rbuf = xrealloc(rbuf, rbufc); if (!rbuf) die("oom"); }
+            rbuf = xrealloc(rbuf, rbufc); }
         rrec[rrecn].off = (uint32_t)rrunn;
         rrec[rrecn].nrun = 0;
         rrec[rrecn].nam = rbufn;
@@ -1522,7 +1529,7 @@ static void sortpush(const char *nm, size_t nlen, uint64_t st, uint64_t len,
     }
     if (!rrecn) die("a sequence does not start at 0");
     if (rrunn == rrunc) { rrunc = rrunc ? rrunc * 2 : 1 << 20;
-        rrun = xrealloc(rrun, rrunc * sizeof *rrun); if (!rrun) die("oom"); }
+        rrun = xrealloc(rrun, rrunc * sizeof *rrun); }
     if (len > 0xffffffffu) die("run longer than 4 GB");
     rrun[rrunn].len = (uint32_t)len;
     rrun[rrunn].lab = (uint32_t)intern(lab, llen);
@@ -1536,7 +1543,7 @@ static void encode(void) {
                      uint64_t st, len; } prow;
     const size_t SLAB = 1 << 24;
     char *slab = xmalloc(SLAB + 1);
-    int T = NTHREADS > 0 ? NTHREADS : omp_get_max_threads();
+    int T = nthreads();
     if (T > 32) T = 32;
     prow **pr = xcalloc((size_t)T, sizeof *pr);
     size_t *prn = xcalloc((size_t)T, sizeof *prn), *prc = xcalloc((size_t)T, sizeof *prc);
@@ -1729,8 +1736,8 @@ static void pickcodecs(buf *rawblocks, const size_t *rawoff, const size_t *rawle
                           if (ZSTD_isError(g)) die("sample compress failed");
                           z22l += g; } }
 
+            int cthr = nthreads();
 #ifdef _OPENMP
-            int cthr = NTHREADS > 0 ? NTHREADS : omp_get_max_threads();
 #pragma omp parallel for schedule(dynamic, 1) num_threads(cthr)
 #endif
             for (unsigned k = 0; k < NCAND; k++) {
@@ -1785,7 +1792,7 @@ static void pickcodecs(buf *rawblocks, const size_t *rawoff, const size_t *rawle
                 const uint8_t *src = rawblocks->d + rawoff[b2];
                 size_t nl = rawlens[b2], ni = rawlen[b2] - nl;
 #ifdef _OPENMP
-#pragma omp parallel for schedule(dynamic, 1) num_threads(NTHREADS > 0 ? NTHREADS : omp_get_max_threads())
+#pragma omp parallel for schedule(dynamic, 1) num_threads(nthreads())
 #endif
                 for (unsigned k = 0; k < NCAND + 2; k++) {
                     if (!live[k]) continue;
@@ -1909,12 +1916,7 @@ static void ktw_close(ktw *w) {
     {
         /* Parallel: compress apart, write in order. */
         double _tc = nowsec();
-        int nthr = NTHREADS;
-#ifdef _OPENMP
-        if (nthr < 1) nthr = omp_get_max_threads();
-#else
-        nthr = 1;
-#endif
+        int nthr = nthreads();
         _Atomic int failed = 0, wfail = 0;
 #ifdef _OPENMP
 #pragma omp parallel num_threads(nthr)
@@ -2565,7 +2567,7 @@ static char *readnamefile(uint64_t nreads) {
             size_t L = strcspn(q, fq == 2 ? "\r\n" : " \t\r\n");   /* a list keeps spaces */
             if (!L) continue;
             if (L >= 512) die("--names: a name is longer than any the track could hold");
-            while (w + L + 2 > cap) { cap *= 2; names = xrealloc(names, cap); if (!names) die("oom"); }
+            while (w + L + 2 > cap) { cap *= 2; names = xrealloc(names, cap); }
             memcpy(names + w, q, L); w += L; names[w++] = '\n'; got++;
         }
         if (ferror(nf)) die("read error on the file given to --names");
@@ -3393,13 +3395,11 @@ static void smoothcmd(const char *path, const char *hier, const char *fs,
                if (first < 0) die("sequence not found");
                last = first + 1; }
 
-    int nthr = NTHREADS;
-#ifdef _OPENMP
-    if (nthr < 1) nthr = omp_get_max_threads();
-    if (last - first < 64) nthr = 1;
-#else
-    nthr = 1;
+    int nthr = nthreads();
+#ifndef _OPENMP
+    nthr = 1;                             /* no threaded path without OpenMP */
 #endif
+    if (last - first < 64) nthr = 1;      /* not worth a team */
     if (nthr > 1) {
         smooth_mt(path, r, first, last, labmap, lo, hi, v1, nthr);
         rclose(r);            /* the threaded path returned without this */

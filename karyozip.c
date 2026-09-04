@@ -3790,7 +3790,9 @@ int main(int argc, char **argv) {
             "  with --aln:  --aln-names FILE, on encode and decode, when the track\n"
             "               names rows by ordinal\n"
             "  smooth:      --max-gap N  --halo N  --v1\n"
-            "  TMPDIR is read when --tmp-dir is not given; no other variable is.";
+            "  Two variables are read, and neither changes the stored bytes:\n"
+            "    TMPDIR         where temp files go, when --tmp-dir is not given\n"
+            "    OMP_NUM_THREADS  the thread count, when --threads is not given";
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) { puts(USAGE); return 0; }
         /* The codec versions decide the stored bytes, so print them. */

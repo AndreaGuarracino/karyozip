@@ -2,7 +2,7 @@
 
 Reads and writes the **KaryoScope Track (KST)** binary format: lossless, compact storage and O(1) random access for k-mer annotation tracks. Files are `.kst`, and there is only ever one of them: `karyozip index F` appends the index to the track itself.
 
-Compresses a BED-like track (`seq  start  end  label`, sorted, gapless, one block of rows per sequence) and gives it back byte-identical. Build with `make`. Every knob is a flag, and every flag is read before the command runs, so it works on either side of the command name. `karyozip --help` prints the usage. The only environment variable read is `TMPDIR`, and only when `--tmp-dir` is not given; nothing else changes what karyozip does.
+Compresses a BED-like track (`seq  start  end  label`, sorted, gapless, one block of rows per sequence) and gives it back byte-identical. Build with `make`. Every knob is a flag, and every flag is read before the command runs, so it works on either side of the command name. `karyozip --help` prints the usage. Two environment variables are read, and neither changes the bytes karyozip stores: `TMPDIR`, where temp files go when `--tmp-dir` is not given, and `OMP_NUM_THREADS`, the thread count when `--threads` is not given, so a SLURM allocation is honoured. Nothing else changes what karyozip does.
 
 Two compression modes: none (quick-decoding codecs) and `--slow` (smaller, slower both ways). Names live in one of two places: in the track, or outside it, in which case decode needs `--names FILE`.
 
@@ -64,7 +64,7 @@ karyozip aln-pack P.paf REF.bed OUT      packs a PAF to only what --aln reads
 
 | flag | effect |
 |---|---|
-| `--threads N`, `-t N` | threads, 1 to 1024, default all cores. |
+| `--threads N`, `-t N` | threads, 1 to 1024. Default `OMP_NUM_THREADS`, else all cores. Output is byte-identical at every count. |
 | `--profile` | phase times and peak memory on stderr. |
 | `--tmp-dir DIR` | where the block temp file goes, else `TMPDIR`, else `/tmp`. |
 

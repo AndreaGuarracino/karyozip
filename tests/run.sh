@@ -23,6 +23,7 @@ $KT decode --aln "$D/p.paf" --ref "$D/ref.bed" "$W/d.kt" 2>/dev/null > "$W/rt"
 cmp -s "$W/rt" "$D/s.bed" && echo "aln restore: byte-identical" || { echo "aln restore: WRONG"; fail=1; }
 
 $KT encode < "$D/s.bed" > "$W/p.kt" 2>/dev/null
+$KT encode < "$D/db.rall.bed" > "$W/omp.ref" 2>/dev/null
 $KT decode "$W/p.kt" 2>/dev/null | cmp -s - "$D/s.bed" && echo "plain: byte-identical" || { echo "plain: WRONG"; fail=1; }
 
 for f in --sort "--sort --names drop" "--block all" "--block 4"; do
@@ -731,6 +732,16 @@ $KT --tmp-dir "$W" encode < "$D/s.bed" 2>/dev/null | cmp -s - "$W/p.kt" && echo 
 # 2^31-1 bytes under rANS wrote an unreadable file; arith X_EXT double-freed;
 # numeric options took junk suffixes.
 OMP_NUM_THREADS=100000 $KT encode < "$D/s.bed" 2>/dev/null | cmp -s - "$W/p.kt" && echo "OMP_NUM_THREADS 100000: capped" || { echo "OMP_NUM_THREADS 100000: WRONG"; fail=1; }
+# OMP_NUM_THREADS is documented to steer the thread count and nothing else:
+# a SLURM allocation sets it, and honouring it is right. It must never move
+# a stored byte, at any value, with or without --threads.
+ok=1
+for e in 1 3 16; do
+  OMP_NUM_THREADS=$e $KT encode < "$D/db.rall.bed" 2>/dev/null | cmp -s - "$W/omp.ref" || ok=0
+  OMP_NUM_THREADS=$e $KT --threads 2 encode < "$D/db.rall.bed" 2>/dev/null | cmp -s - "$W/omp.ref" || ok=0
+done
+[ $ok = 1 ] && echo "OMP_NUM_THREADS: no effect on the stored bytes" \
+  || { echo "OMP_NUM_THREADS: MOVED THE STORED BYTES"; fail=1; }
 must_fail "--id-codec with arith X_EXT" $KT --id-codec 0x10004 encode < "$D/s.bed"
 must_fail "--level abc" $KT encode --level abc < "$D/s.bed"
 must_fail "--block 4abc" $KT encode --block 4abc < "$D/s.bed"

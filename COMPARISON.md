@@ -26,12 +26,12 @@ cli: 69 forms give the same words and code
 
 |                        |     C |  Rust |
 |------------------------|------:|------:|
-| lines, excluding vendored C | 4,218 | 3,637 |
+| lines, excluding vendored C | 4,218 | 3,993 |
 | files                  |     2 |    10 |
-| `unsafe` blocks        |     — |    14 |
-| stripped binary        | 358 KB | 2,457 KB |
+| `unsafe` blocks        |     — |    15 |
+| stripped binary        | 358 KB | 2,491 KB |
 
-The Rust is 14% shorter. Some of that is real, the parallel arrays and the
+The Rust is 5% shorter. Some of that is real, the parallel arrays and the
 manual memory management that `Vec` and ownership remove; some is that the
 C carries its own hash tables and buffer type where the Rust uses the
 standard library. The command line is `clap`, which costs 589 KB of binary
@@ -44,23 +44,28 @@ of `c/karyozip.c` at build time, so `--help` is the same bytes from both by
 construction. The htscodecs and bzip3 version strings come the same way,
 from `c/htscodecs/version.h` and `c/Makefile`.
 
-All 14 `unsafe` blocks are in `src/ffi.rs`, the one module that calls the
+All 15 `unsafe` blocks are in `src/ffi.rs`, the one module that calls the
 vendored C codecs. Nothing else in the crate is unsafe.
 
 ## Speed
 
-Fastest of 11 interleaved runs, on 4,000,000 rows, 99,354,996 B of BED in,
-7,586,839 B of `.kst` out, byte-identical from both.
+Fastest of 9 to 11 interleaved runs. The small case is 4,000,000 rows,
+99,354,996 B of BED in; the large one 40,000,000 rows over 658 sequences,
+1,390,855,987 B in, 27,940,756 B of `.kst` out. Byte-identical from both at
+every flag combination and every thread count.
 
-|          |    C |  Rust |
-|----------|-----:|------:|
-| encode   | 0.31 s, 55 MB | 0.35 s, 73 MB |
-| decode   | 0.39 s, 9 MB | 0.40 s, 12 MB |
-| build from clean | 14.2 s | 30.4 s |
+|          | C, 4M | Rust, 4M | C, 40M | Rust, 40M |
+|----------|------:|---------:|-------:|----------:|
+| encode   | 0.31 s, 55 MB | 0.35 s, 73 MB | 1.78 s, 43 MB | 2.02 s, 78 MB |
+| decode   | 0.39 s, 9 MB | 0.40 s, 12 MB | 1.33 s, 8 MB | 1.26 s, 10 MB |
+| `--slow` | | | 32.8 s, 103 MB | 36.7 s, 120 MB |
+| build from clean | 14.2 s | 30.4 s | | |
 
-Decode is a tie. Encode is 13% apart, and the phase breakdown says where:
-the Rust searches codecs faster (0.120 s against 0.123 s at equal work,
-after both were fixed) and appends rows slower (0.083 s against 0.067 s).
+Decode is a tie, and the Rust wins it at 40M rows. Encode is 13% apart at
+both sizes, and the phase breakdown says where. At 4M rows the codec search
+dominates and is now a tie; at 40M the parser is half of encode and is the
+Rust's alone to lose, with parse:lines at 0.300 s against 0.272 s and
+parse:append at 1.026 s against 0.812 s.
 
 Both were much slower before profiling. The search compressed two bzip3
 candidates that the seekable-track rule then refused, and both ran their

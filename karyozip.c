@@ -3280,49 +3280,13 @@ static void emitflush(void) {   /* runs from atexit: die would recurse */
     if (fflush(stdout)) { fprintf(stderr, "karyozip: write failed\n"); _exit(1); }
 }
 
-static void emit(const char *seq, uint64_t *st, uint64_t *en, int *feat,
-                 uint8_t *novel, uint64_t n, uint64_t lo, uint64_t hi, int v1) {
-    if (!n) return;
-    uint64_t cs = st[0], ce = en[0];
-    int cf = feat[0]; uint8_t cn = novel[0];
-    for (uint64_t k = 1; k <= n; k++) {
-        int same = k < n && feat[k] == cf && st[k] == ce
-                   && (cf != ROOTID || novel[k] == cn);
-        if (same) { ce = en[k]; continue; }
-        if ((hi == 0 && lo == 0) || (ce > lo && (hi == 0 || cs < hi))) {
-            const char *nm = (cf == ROOTID && cn) ? "novel" : NODE[cf];
-            size_t ml = strlen(nm);
-            if (v1 && cf != ROOTID && ml > 9 && !strcmp(nm + ml - 9, "_specific")) ml -= 9;
-
-            size_t sl = strlen(seq);
-            if (eo + sl + ml + 48 > sizeof out) {
-                if (fwrite(out, 1, eo, stdout) != eo) die("write failed");
-                eo = 0;
-            }
-            if (sl + ml + 48 > sizeof out) {
-                char nb[48]; char *q2 = nb; q2 = putu64(q2, cs); *q2++ = '\t'; q2 = putu64(q2, ce);
-                if (fwrite(seq, 1, sl, stdout) != sl || fputc('\t', stdout) < 0
-                    || fwrite(nb, 1, (size_t)(q2 - nb), stdout) != (size_t)(q2 - nb) || fputc('\t', stdout) < 0
-                    || fwrite(nm, 1, ml, stdout) != ml || fputc('\n', stdout) < 0) die("write failed");
-                cs = st[k]; ce = en[k]; cf = feat[k]; cn = novel[k];
-                if (k == n) break;
-                continue;
-            }
-            char *q = out + eo;
-            memcpy(q, seq, sl); q += sl; *q++ = '\t';
-            q = putu64(q, cs); *q++ = '\t';
-            q = putu64(q, ce); *q++ = '\t';
-            memcpy(q, nm, ml); q += ml; *q++ = '\n';
-            eo = (size_t)(q - out);
-        }
-        if (k == n) break;
-        cs = st[k]; ce = en[k]; cf = feat[k]; cn = novel[k];
-    }
-}
-
-static void emit_buf(char **ob, size_t *cap, size_t *len, const char *seq,
-                     uint64_t *st, uint64_t *en, int *feat, uint8_t *novel,
-                     uint64_t n, uint64_t lo, uint64_t hi, int v1) {
+/* One row emitter. With a FILE it flushes a fixed buffer and can write a
+   row larger than that buffer straight through; without one it grows the
+   caller's buffer. The run merging and the label choice are the same either
+   way, which is why they used to be written out twice. */
+static void emit_to(char **ob, size_t *cap, size_t *len, FILE *f,
+                    const char *seq, uint64_t *st, uint64_t *en, int *feat,
+                    uint8_t *novel, uint64_t n, uint64_t lo, uint64_t hi, int v1) {
     if (!n) return;
     size_t sl = strlen(seq);
     uint64_t cs = st[0], ce = en[0];
@@ -3335,21 +3299,45 @@ static void emit_buf(char **ob, size_t *cap, size_t *len, const char *seq,
             const char *nm = (cf == ROOTID && cn) ? "novel" : NODE[cf];
             size_t ml = strlen(nm);
             if (v1 && cf != ROOTID && ml > 9 && !strcmp(nm + ml - 9, "_specific")) ml -= 9;
-            if (*len + sl + ml + 48 > *cap) {
-                *cap = (*cap * 2) + sl + ml + 64;
-                *ob = xrealloc(*ob, *cap);
-                if (!*ob) die("oom");
+            size_t need = sl + ml + 48;
+            if (*len + need > *cap) {
+                if (f) {
+                    if (*len && fwrite(*ob, 1, *len, f) != *len) die("write failed");
+                    *len = 0;
+                } else {
+                    *cap = *cap * 2 + sl + ml + 64;
+                    *ob = xrealloc(*ob, *cap);
+                }
             }
-            char *q = *ob + *len;
-            memcpy(q, seq, sl); q += sl; *q++ = '\t';
-            q = putu64(q, cs); *q++ = '\t';
-            q = putu64(q, ce); *q++ = '\t';
-            memcpy(q, nm, ml); q += ml; *q++ = '\n';
-            *len = (size_t)(q - *ob);
+            if (f && need > *cap) {                /* one row is bigger than the buffer */
+                char nb[48]; char *q2 = nb; q2 = putu64(q2, cs); *q2++ = '\t'; q2 = putu64(q2, ce);
+                if (fwrite(seq, 1, sl, f) != sl || fputc('\t', f) < 0
+                    || fwrite(nb, 1, (size_t)(q2 - nb), f) != (size_t)(q2 - nb) || fputc('\t', f) < 0
+                    || fwrite(nm, 1, ml, f) != ml || fputc('\n', f) < 0) die("write failed");
+            } else {
+                char *q = *ob + *len;
+                memcpy(q, seq, sl); q += sl; *q++ = '\t';
+                q = putu64(q, cs); *q++ = '\t';
+                q = putu64(q, ce); *q++ = '\t';
+                memcpy(q, nm, ml); q += ml; *q++ = '\n';
+                *len = (size_t)(q - *ob);
+            }
         }
         if (k == n) break;
         cs = st[k]; ce = en[k]; cf = feat[k]; cn = novel[k];
     }
+}
+
+static void emit(const char *seq, uint64_t *st, uint64_t *en, int *feat,
+                 uint8_t *novel, uint64_t n, uint64_t lo, uint64_t hi, int v1) {
+    char *o = out; size_t cap = sizeof out;      /* f is set, so never grown */
+    emit_to(&o, &cap, &eo, stdout, seq, st, en, feat, novel, n, lo, hi, v1);
+}
+
+static void emit_buf(char **ob, size_t *cap, size_t *len, const char *seq,
+                     uint64_t *st, uint64_t *en, int *feat, uint8_t *novel,
+                     uint64_t n, uint64_t lo, uint64_t hi, int v1) {
+    emit_to(ob, cap, len, NULL, seq, st, en, feat, novel, n, lo, hi, v1);
 }
 
 static void rclose(R *r) {

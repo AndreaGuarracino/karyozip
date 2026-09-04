@@ -108,7 +108,30 @@ done
 [ $fbad = 0 ] && echo "reader flags: $fok forms identical" \
   || { echo "reader flags: $fbad DIFFER"; fail=1; }
 
-# 8. the same refusals, with the same words.
+# 8. smooth: the same rows, over a real hierarchy shape.
+printf 'feature_set\tchild\tparent\nfs\tA\tcategorized\nfs\tB\tcategorized\nfs\tC\tcategorized\nfs\tD\tcategorized\n' > "$W/h.tsv"
+sok=0; sbad=0
+for f in ls.bed s.bed db.rall.bed; do
+  "$C" encode < "$D/$f" > "$W/t.kst" 2>/dev/null
+  for q in "" "--v1" "--max-gap 5" "--max-gap 100000" "--halo 1"; do
+    "$C" $q smooth "$W/t.kst" "$W/h.tsv" fs > "$W/c.out" 2>/dev/null; c1=$?
+    "$R" $q smooth "$W/t.kst" "$W/h.tsv" fs > "$W/r.out" 2>/dev/null; c2=$?
+    if cmp -s "$W/c.out" "$W/r.out" && [ $c1 = $c2 ]; then sok=$((sok+1))
+    else sbad=$((sbad+1)); echo "  smooth differs: $f [$q]"; fi
+  done
+  for seq in $(awk -F'\t' '{print $1}' "$D/$f" | uniq | head -2); do
+    for q in "$seq" "$seq 0 100"; do
+      "$C" smooth "$W/t.kst" "$W/h.tsv" fs $q > "$W/c.out" 2>/dev/null; c1=$?
+      "$R" smooth "$W/t.kst" "$W/h.tsv" fs $q > "$W/r.out" 2>/dev/null; c2=$?
+      if cmp -s "$W/c.out" "$W/r.out" && [ $c1 = $c2 ]; then sok=$((sok+1))
+      else sbad=$((sbad+1)); echo "  smooth differs: $f [$q]"; fi
+    done
+  done
+done
+[ $sbad = 0 ] && echo "smooth: $sok forms identical" \
+  || { echo "smooth: $sbad DIFFER"; fail=1; }
+
+# 9. the same refusals, with the same words.
 for bad_in in 'r1\t0\t10' 'r1\t5\t10\tA' 'r1\t0\t0\tA' '\t0\t10\tA' 'r1\tx\t10\tA'; do
   cm=$(printf "$bad_in\n" | "$C" encode 2>&1 >/dev/null | tail -1)
   rm2=$(printf "$bad_in\n" | "$R" encode 2>&1 >/dev/null | tail -1)

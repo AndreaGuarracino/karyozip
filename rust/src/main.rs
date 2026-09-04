@@ -1,6 +1,7 @@
 mod ffi;
 mod kst;
 mod reader;
+mod smooth;
 mod writer;
 
 use std::io::{BufWriter, Read, Write};
@@ -37,6 +38,7 @@ fn main() {
     let mut opt = writer::Options::default();
     let mut tmpdir = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".into());
     let mut ro = reader::ReadOpts::default();
+    let (mut maxgap, mut halo, mut v1) = (1000u64, 200u64, false);
     let mut cmd = None;
     let mut pos: Vec<String> = Vec::new();
     let mut i = 1;
@@ -71,6 +73,9 @@ fn main() {
             }
             "--slow" => opt.slow = true,
             "--raw" => ro.raw = true,
+            "--max-gap" => maxgap = val().parse().unwrap_or_else(|_| die("--max-gap needs a number")),
+            "--halo" => halo = val().parse().unwrap_or_else(|_| die("--halo needs a number")),
+            "--v1" => v1 = true,
             "--tail" => {
                 let v = val();
                 opt.tail = Some(match v.as_str() { "0" => false, "1" => true,
@@ -98,6 +103,22 @@ fn main() {
     }
     match cmd.as_deref() {
         Some("encode") => encode(opt, std::path::Path::new(&tmpdir)),
+        Some("smooth") => {
+            if pos.len() < 3 { die("bad command or missing arguments"); }
+            let n = |s: &str, w: &str| -> u64 { s.parse().unwrap_or_else(|_| die(w)) };
+            let (seq, lo, hi) = match pos.len() {
+                3 => (None, 0, 0),
+                4 => (Some(pos[3].as_bytes()), 0, 0),
+                6 => (Some(pos[3].as_bytes()),
+                      n(&pos[4], "smooth: start is not a number"),
+                      n(&pos[5], "smooth: end is not a number")),
+                _ => die("bad command or missing arguments"),
+            };
+            let stdout = std::io::stdout();
+            let mut o = BufWriter::new(stdout.lock());
+            smooth::run(&pos[0], &pos[1], pos[2].as_bytes(), seq, lo, hi, v1, maxgap, halo, &ro, &mut o);
+            o.flush().unwrap_or_else(|e| die(&e.to_string()));
+        }
         Some("index") => {
             let f = pos.first().unwrap_or_else(|| die("index needs a track"));
             reader::Reader::open_with(f, &ro).build_index(f);

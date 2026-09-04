@@ -87,6 +87,10 @@ pub struct Reader {
     ibx: Vec<u8>,
     hasidx: bool,
     mhash: u64,
+    cur_ri: u64,
+    cur_q: usize,
+    cur_pend: u64,
+    cached: Option<(usize, std::rc::Rc<Vec<u8>>, usize, u64)>,
 }
 
 fn rd<T>(r: Result<T, std::io::Error>, what: &str) -> T {
@@ -320,14 +324,14 @@ impl Reader {
             f, nreads: h[0], rows: h[4], lab, block: blk, b, data0,
             idcodec: h[9] as u32 as i32, lencodec: h[5] as u32 as i32,
             taildec, tailpred: h[12], tailskip: h[13] & 0xff, names, ibx,
-            hasidx, mhash: h[15],
+            hasidx, mhash: h[15], cur_ri: 0, cur_q: 0, cur_pend: 0, cached: None,
         }
     }
 
     /// Every sequence, in order. One forward pass over the blocks.
     pub fn decode(&mut self, out: &mut impl std::io::Write) {
         let mut buf: Vec<u8> = Vec::with_capacity(1 << 22);
-        let mut c = Cursor { blk: usize::MAX, data: Vec::new(), lp: 0, ip: 0, left: 0 };
+        let mut c = Cursor { blk: usize::MAX, data: std::rc::Rc::new(Vec::new()), lp: 0, ip: 0, left: 0 };
         let (mut ipos, mut emitted) = (0usize, 0u64);
         let tskip = self.tailskip;
         for i in 0..self.nreads {
@@ -362,8 +366,20 @@ impl Reader {
         }
     }
 
-    /// Decodes one block: its two frames back to back, the split, its rows.
-    fn load(&mut self, b: usize) -> (Vec<u8>, usize, u64) {
+    /// One block's two frames back to back, the split, its rows. The last
+    /// block stays decoded: without that, a track whose sequences share a
+    /// block is decompressed once per sequence.
+    fn load(&mut self, b: usize) -> (std::rc::Rc<Vec<u8>>, usize, u64) {
+        if let Some((cb, d, sp, r)) = &self.cached {
+            if *cb == b { return (d.clone(), *sp, *r); }
+        }
+        let (d, sp, r) = self.load_raw(b);
+        let d = std::rc::Rc::new(d);
+        self.cached = Some((b, d.clone(), sp, r));
+        (d, sp, r)
+    }
+
+    fn load_raw(&mut self, b: usize) -> (Vec<u8>, usize, u64) {
         if b >= self.b.len() { crate::bail("corrupt index: a block number is past the end"); }
         let m = &self.b[b];
         let mut cb = vec![0u8; m.size as usize];
@@ -459,24 +475,26 @@ fn unzz(v: u64) -> u64 { ((v >> 1) as i64 ^ -((v & 1) as i64)) as u64 }
 
 /// A position in the row stream: the block, its bytes, a cursor per frame,
 /// and how many of its rows are left.
-struct Cursor { blk: usize, data: Vec<u8>, lp: usize, ip: usize, left: u64 }
+struct Cursor { blk: usize, data: std::rc::Rc<Vec<u8>>, lp: usize, ip: usize, left: u64 }
 
 impl Reader {
-    /// (block, offset in it, run count) for sequence `ri`.
-    fn locate(&self, ri: u64) -> (usize, u64, u64) {
-        let (mut q, mut cpend) = (0usize, 0u64);
+    /// (block, offset in it, run count) for sequence `ri`. A forward cursor,
+    /// so walking every sequence is linear and not quadratic.
+    fn locate(&mut self, ri: u64) -> (usize, u64, u64) {
+        if ri < self.cur_ri { self.cur_ri = 0; self.cur_q = 0; self.cur_pend = 0; }
         let mut nruns = 0u64;
-        for _ in 0..=ri {
-            let (n, next) = vget(&self.ibx, q);
-            q = next;
-            if cpend / self.block > u32::MAX as u64 {
+        while self.cur_ri <= ri {
+            let (n, next) = vget(&self.ibx, self.cur_q);
+            self.cur_q = next;
+            if self.cur_pend / self.block > u32::MAX as u64 {
                 crate::bail("corrupt index: a block number past 32 bits");
             }
             nruns = n;
-            cpend += n;
+            self.cur_pend += n;
+            self.cur_ri += 1;
         }
-        let start = cpend - nruns;
-        (( start / self.block) as usize, start % self.block, nruns)
+        let start = self.cur_pend - nruns;
+        ((start / self.block) as usize, start % self.block, nruns)
     }
 
     fn at(&mut self, blk: usize, off: u64) -> Cursor {
@@ -631,5 +649,38 @@ impl Reader {
         rd(f.flush(), "index write failed");
         eprintln!("index: {} sequences, {} B appended, {dup} hash collisions",
                   self.nreads, 32 + n * 20);
+    }
+}
+
+impl Reader {
+    pub fn nlabels(&self) -> usize { self.lab.len() }
+    pub fn label_at(&self, i: usize) -> &[u8] { &self.lab[i] }
+    pub fn name_at(&self, i: u64) -> &[u8] { &self.names[i as usize] }
+    pub fn find_seq(&self, s: &[u8]) -> i64 { self.find(s) }
+
+    /// One sequence as arrays: starts, ends, hierarchy node per run, and
+    /// whether the label was "novel". What smoothing works on.
+    pub fn seq_rows(&mut self, ri: u64, labmap: &[i32], isnovel: &[u8], root: i32)
+        -> (Vec<u64>, Vec<u64>, Vec<i32>, Vec<u8>) {
+        let (blk, off, nruns) = self.locate(ri);
+        let mut c = self.at(blk, off);
+        let n = nruns as usize;
+        let (mut st, mut en) = (Vec::with_capacity(n), Vec::with_capacity(n));
+        let (mut feat, mut nov) = (Vec::with_capacity(n), Vec::with_capacity(n));
+        let tskip = self.tailskip;
+        let mut s = 0u64;
+        for k in 0..nruns {
+            let (len, f) = self.step(&mut c, s, k + 1 == nruns && ri >= tskip);
+            if f as usize >= self.lab.len() && !self.lab.is_empty() {
+                crate::bail("corrupt block: a label id past the table");
+            }
+            let isnov = isnovel.get(f as usize).copied().unwrap_or(0);
+            st.push(s);
+            en.push(s + len);
+            nov.push(isnov);
+            feat.push(if isnov != 0 { root } else { *labmap.get(f as usize).unwrap_or(&root) });
+            s += len;
+        }
+        (st, en, feat, nov)
     }
 }

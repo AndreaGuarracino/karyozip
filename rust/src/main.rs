@@ -1,3 +1,4 @@
+mod aln;
 mod db;
 mod ffi;
 mod kst;
@@ -41,6 +42,7 @@ fn main() {
     let mut ro = reader::ReadOpts::default();
     let (mut maxgap, mut halo, mut v1) = (1000u64, 200u64, false);
     let (mut dbfeats, mut outdir): (Option<String>, Option<String>) = (None, None);
+    let (mut alnpaf, mut alnref): (Option<String>, Option<String>) = (None, None);
     let mut cmd = None;
     let mut pos: Vec<String> = Vec::new();
     let mut i = 1;
@@ -77,6 +79,8 @@ fn main() {
             "--sort" => opt.sort = true,
             "--db" => { dbfeats = Some(val()); ro.db = true; }
             "--out" => outdir = Some(val()),
+            "--aln" => alnpaf = Some(val()),
+            "--ref" => alnref = Some(val()),
             "--raw" => ro.raw = true,
             "--max-gap" => maxgap = val().parse().unwrap_or_else(|_| die("--max-gap needs a number")),
             "--halo" => halo = val().parse().unwrap_or_else(|_| die("--halo needs a number")),
@@ -126,7 +130,10 @@ fn main() {
                     o.flush().unwrap_or_else(|e| die(&e.to_string()));
                     report(&st);
                 }
-                None => encode(opt, std::path::Path::new(&tmpdir)),
+                None => {
+                    let a = load_aln(&alnpaf, &alnref);
+                    encode(opt, std::path::Path::new(&tmpdir), a)
+                }
             }
         }
         Some("smooth") => {
@@ -144,6 +151,14 @@ fn main() {
             let mut o = BufWriter::new(stdout.lock());
             smooth::run(&pos[0], &pos[1], pos[2].as_bytes(), seq, lo, hi, v1, maxgap, halo, &ro, &mut o);
             o.flush().unwrap_or_else(|e| die(&e.to_string()));
+        }
+        Some("aln-pack") => {
+            if pos.len() != 3 { die("usage: karyozip aln-pack P.paf REF.bed OUT"); }
+            let mut a = aln::Aln::default();
+            a.load_ref(&pos[1]);
+            let rh = aln::refhash(&a);
+            a.load_paf(&pos[0]);
+            aln::pack(&a, &pos[2], rh);
         }
         Some("index") => {
             let f = pos.first().unwrap_or_else(|| die("index needs a track"));
@@ -173,6 +188,7 @@ fn main() {
         Some("decode") => {
             if pos.len() > 1 { die("decode takes one track"); }
             let f = pos.first().unwrap_or_else(|| die("decode needs a track"));
+            ro.aln = load_aln(&alnpaf, &alnref);
             let mut r = reader::Reader::open_with(f, &ro);
             match (&dbfeats, &outdir) {
                 (Some(fp), Some(d)) => {
@@ -239,9 +255,26 @@ fn parse_codec(s: &str) -> i32 {
     }
 }
 
-fn encode(opt: writer::Options, tmpdir: &std::path::Path) {
+/// --aln needs --ref, and the two are read once, before any row.
+fn load_aln(paf: &Option<String>, refbed: &Option<String>) -> Option<aln::Aln> {
+    match (paf, refbed) {
+        (None, None) => None,
+        (Some(_), None) => die("encode --aln needs --ref"),
+        (None, Some(_)) => die("--ref does nothing without --aln"),
+        (Some(p), Some(r)) => {
+            let mut a = aln::Aln::default();
+            a.load_ref(r);
+            a.load_paf(p);
+            Some(a)
+        }
+    }
+}
+
+fn encode(opt: writer::Options, tmpdir: &std::path::Path, a: Option<aln::Aln>) {
     let mut w = writer::Writer::new(opt, tmpdir)
         .unwrap_or_else(|e| die(&format!("cannot create a temp file under {}: {e}", tmpdir.display())));
+    let aln_on = a.is_some();
+    if let Some(x) = a { w.set_aln(x); }
     // A slab at a time, like the C. Reading the whole input first would cost
     // the input's size in memory, 2.3 GB on the benchmark track.
     const SLAB: usize = 1 << 24;
@@ -276,8 +309,15 @@ fn encode(opt: writer::Options, tmpdir: &std::path::Path) {
 
     let stdout = std::io::stdout();
     let mut out = BufWriter::new(stdout.lock());
+    let hits = w.aln_hit();
+    let rows_before = 0u64;
+    let _ = rows_before;
     let st = w.close(&mut out).unwrap_or_else(|m| die(&m));
     out.flush().unwrap_or_else(|e| die(&e.to_string()));
+    if aln_on {
+        eprintln!("aln: {hits} of {} rows matched the reference ({:.1}%)",
+                  st.rows, if st.rows > 0 { 100.0 * hits as f64 / st.rows as f64 } else { 0.0 });
+    }
     report(&st);
 }
 

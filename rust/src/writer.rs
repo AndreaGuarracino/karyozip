@@ -15,7 +15,9 @@ const TOKFLAG: u64 = 1 << 63;
 const INTFLAG: u64 = 1 << 62;
 const DROPPED: u64 = 1 << 60;
 const SIDEFLAG: u64 = 1 << 57;
+const ALNFLAG: u64 = 1 << 59;
 const DBFLAG: u64 = 1 << 58;
+const LENFLAG: u64 = 1 << 56;
 const PERMFLAG: u64 = 1 << 54;
 const PERMTOK: u64 = 1 << 53;
 const TAILFLAG: u64 = 1 << 55;
@@ -47,7 +49,8 @@ impl Default for Options {
 }
 
 /// One staged block, while its payload waits in the staging file.
-struct BlkMeta { off: u64, len: usize, lens: usize, rows: u64, bp: u64 }
+struct BlkMeta { off: u64, len: usize, lens: usize, rows: u64, bp: u64,
+                 aoff: [usize; 2], alen: [usize; 2] }
 
 pub struct Writer {
     opt: Options,
@@ -68,6 +71,7 @@ pub struct Writer {
     nblk: u64,
     rows: u64,
     plen: u64,
+    pval: u64,
     phas: bool,
     tailsamp: Vec<u64>,
     tailpred: u64,
@@ -79,6 +83,14 @@ pub struct Writer {
     perm_on: bool,
     natord: bool,
     feathash: Option<u64>,
+    /// --aln: the alignment, the query it is on, and the two alternate
+    /// length spellings each block also keeps.
+    aln: Option<crate::aln::Aln>,
+    alnq: Option<usize>,
+    alnhit: u64,
+    lalt: [Vec<u8>; 2],
+    rawalt: [Vec<u8>; 2],
+    prev_rev: bool,
     raw: std::fs::File,
     tmpdir: std::path::PathBuf,
     rawlen: u64,
@@ -99,6 +111,15 @@ impl Writer {
     /// --db binds the track to the features.tsv it came from.
     pub fn set_feathash(&mut self, h: u64) { self.feathash = Some(h); }
 
+    /// The reference's labels share the track's table: loadref interns them
+    /// first, so the ids the reference answers with are the track's ids.
+    pub fn set_aln(&mut self, a: crate::aln::Aln) {
+        for l in a.labs.clone() { self.intern(&l); }
+        self.aln = Some(a);
+    }
+    pub fn aln_hash(&self) -> u64 { self.aln.as_ref().map_or(0, |a| a.hash) }
+    pub fn aln_hit(&self) -> u64 { self.alnhit }
+
     pub fn new(opt: Options, tmpdir: &std::path::Path) -> std::io::Result<Self> {
         let perm_on = opt.sort && opt.names_out.is_none();
         Ok(Writer {
@@ -106,8 +127,11 @@ impl Writer {
             opt, lens: Vec::new(), ids: Vec::new(), names: Vec::new(), ibx: Vec::new(),
             nidx: 0, ordok: true, labtab: Vec::new(), labmap: HashMap::new(), lastid: None,
             cur: Vec::new(), currun: 0, curbp: 0, blkbp0: 0, pend: 0, nblk: 0, rows: 0,
-            plen: 0, phas: false, tailsamp: Vec::new(), tailpred: 0, tailon: None,
+            plen: 0, pval: 0, phas: false, tailsamp: Vec::new(), tailpred: 0, tailon: None,
             srec: Vec::new(), sortbp: 0, natbuf: Vec::new(), natord: true, feathash: None,
+            aln: None, alnq: None, alnhit: 0,
+            lalt: [Vec::new(), Vec::new()], rawalt: [Vec::new(), Vec::new()],
+            prev_rev: false,
             raw: tmpfile(tmpdir)?, tmpdir: tmpdir.to_path_buf(), rawlen: 0, bm: Vec::new(),
         })
     }
@@ -127,6 +151,16 @@ impl Writer {
         id
     }
 
+    /// The lengths frame, plus the two alternate spellings --aln keeps.
+    fn lensput(&mut self, v: u64) {
+        kst::put(&mut self.lens, v);
+        if self.aln.is_some() {
+            kst::put(&mut self.lalt[0], self.plen);
+            let x = if self.prev_rev { self.plen } else { v };
+            kst::put(&mut self.lalt[1], x);
+        }
+    }
+
     /// The held row was the last of its sequence: its length is either stored
     /// plainly or, once the predictor is on, as a delta from the median.
     fn tail(&mut self) {
@@ -143,16 +177,21 @@ impl Writer {
                 self.tailon = Some(self.opt.tail
                     .unwrap_or(dev * 12 <= self.tailpred * TAILSKIP as u64));
             }
-            kst::put(&mut self.lens, self.plen);
+            self.lensput(self.pval);
             self.phas = false;
             return;
         }
         if self.tailon != Some(true) {
-            kst::put(&mut self.lens, self.plen);
+            self.lensput(self.pval);
             self.phas = false;
             return;
         }
-        kst::put(&mut self.lens, kst::zz(self.curbp as i64 - self.tailpred as i64));
+        let z = kst::zz(self.curbp as i64 - self.tailpred as i64);
+        kst::put(&mut self.lens, z);
+        if self.aln.is_some() {
+            kst::put(&mut self.lalt[0], z);
+            kst::put(&mut self.lalt[1], z);
+        }
         self.phas = false;
     }
 
@@ -179,12 +218,20 @@ impl Writer {
 
     fn flush(&mut self) -> std::io::Result<()> {
         if self.pend == 0 { return Ok(()); }
+        let mut aoff = [0usize; 2];
+        let mut alen = [0usize; 2];
+        for v in 0..2 {
+            aoff[v] = self.rawalt[v].len();
+            alen[v] = self.lalt[v].len();
+            let take = std::mem::take(&mut self.lalt[v]);
+            self.rawalt[v].extend_from_slice(&take);
+        }
         let off = self.rawlen;
         self.raw.seek(SeekFrom::Start(off))?;
         self.raw.write_all(&self.lens)?;
         self.raw.write_all(&self.ids)?;
         let len = self.lens.len() + self.ids.len();
-        self.bm.push(BlkMeta { off, len, lens: self.lens.len(), rows: self.pend, bp: self.blkbp0 });
+        self.bm.push(BlkMeta { off, len, lens: self.lens.len(), rows: self.pend, bp: self.blkbp0, aoff, alen });
         self.rawlen += len as u64;
         self.nblk += 1;
         self.lens.clear();
@@ -273,6 +320,7 @@ impl Writer {
             self.pushread();
             self.cur.clear();
             self.cur.extend_from_slice(name);
+            self.alnq = self.aln.as_ref().and_then(|a| a.find(name));
             self.currun = 0;
             self.curbp = 0;
             if self.pend > 0 && self.pend >= self.opt.block { self.flush().map_err(io)?; }
@@ -280,15 +328,31 @@ impl Writer {
         if start != self.curbp {
             return Err("gap or overlap: start is not the previous end".into());
         }
-        let id = self.intern(label) as u64;
-        if self.phas {
-            kst::put(&mut self.lens, self.plen);
-            self.phas = false;
+        // The C interns first and then decides, so the label joins the table
+        // even when the reference answers for it.
+        let mut id = self.intern(label);
+        if self.aln.is_some() {
+            if label == b"=" { return Err("a label \"=\" is reserved under --aln".into()); }
+            if let Some(q) = self.alnq {
+                let rl = self.aln.as_ref().unwrap().row(q, start, run_len);
+                if rl != u32::MAX && rl == id {
+                    id = self.intern(b"=");
+                    self.alnhit += 1;
+                }
+            }
         }
+        let id = id as u64;
+        if self.phas { self.lensput(self.pval); self.phas = false; }
         if self.pend >= self.opt.block { self.flush().map_err(io)?; }
         if self.pend == 0 { self.blkbp0 = self.curbp; }
         self.plen = run_len;
         self.phas = true;
+        self.pval = run_len;
+        if let (Some(a), Some(q)) = (&self.aln, self.alnq) {
+            let (e, rev) = a.end(q, start);
+            self.prev_rev = rev;
+            if e == start + run_len { self.pval = 0; }
+        }
         kst::put(&mut self.ids, id);
         self.pend += 1;
         self.currun += 1;
@@ -313,6 +377,8 @@ impl Writer {
         let level = p.level;
         let (lvl_id, lvl_len) = (if p.lvl_id < 0 { level } else { p.lvl_id },
                                  if p.lvl_len < 0 { level } else { p.lvl_len });
+        let aln_on = self.aln.is_some();
+        let fast_aln = aln_on && !self.opt.slow;
 
         // Compress apart, write in order, a batch at a time. Holding every
         // compressed block would cost the whole file in memory; the C stages
@@ -322,16 +388,41 @@ impl Writer {
         let (mut byt_lens, mut byt_labs) = (0u64, 0u64);
         let batch = rayon::current_num_threads() * 4;
         for chunk in (0..self.bm.len()).collect::<Vec<_>>().chunks(batch) {
-            let done: Vec<(Vec<u8>, Vec<u8>, usize, usize, u64, u64)> = chunk
+            let done: Vec<(Vec<u8>, Vec<u8>, usize, usize, u64, u64, u64)> = chunk
                 .par_iter()
                 .map(|&i| {
                     let (lens, ids) = self.read_block(i).expect("staged block");
-                    let a = comp_lens(&lens, p.len, lvl_len).expect("lens frame");
+                    // Under --aln a block keeps the smallest of three length
+                    // spellings: every sentinel, plus-strand sentinels only,
+                    // or plain lengths. Zeros do not always compress better.
+                    let m = &self.bm[i];
+                    let mut vs: [Option<&[u8]>; 3] = [Some(&lens), None, None];
+                    if aln_on {
+                        for v in 0..2 {
+                            let alt = &self.rawalt[v][m.aoff[v]..m.aoff[v] + m.alen[v]];
+                            if alt.is_empty() || (alt.len() == lens.len() && alt == &lens[..]) { continue; }
+                            if v == 1 {
+                                if let Some(x) = vs[1] { if x == alt { continue; } }
+                            }
+                            vs[v + 1] = Some(alt);
+                        }
+                    }
+                    const ORDER: [usize; 3] = [1, 2, 0];
+                    let (mut best, mut bv, mut fa) = (0usize, usize::MAX, Vec::new());
+                    for &v in &ORDER {
+                        let Some(src) = vs[v] else { continue };
+                        let f2 = comp_lens(src, p.len, lvl_len).expect("lens frame");
+                        let a2 = f2.len();
+                        if bv == usize::MAX || a2 + if fast_aln { a2 / 100 } else { 0 } < best {
+                            best = a2; bv = v; fa = f2;
+                        }
+                    }
+                    let nl = vs[bv].unwrap().len();
                     let b = comp_ids(&ids, p.id, lvl_id).expect("ids frame");
-                    (a, b, lens.len(), ids.len(), self.bm[i].rows, self.bm[i].bp)
+                    (fa, b, nl, ids.len(), m.rows, m.bp, bv as u64)
                 })
                 .collect();
-            for (a, b, nl, ni, rows, bp) in &done {
+            for (a, b, nl, ni, rows, bp, nosent) in &done {
                 body.write_all(a).map_err(io)?;
                 body.write_all(b).map_err(io)?;
                 byt_lens += a.len() as u64;
@@ -339,7 +430,7 @@ impl Writer {
                 kst::put(&mut sizes, a.len() as u64);
                 kst::put(&mut sizes, b.len() as u64);
                 kst::put(&mut sizes, *ni as u64);
-                kst::put(&mut sizes, *nl as u64);
+                kst::put(&mut sizes, if aln_on { (*nl as u64) << 2 | nosent } else { *nl as u64 });
                 kst::put(&mut sizes, *rows);
                 kst::put(&mut sizes, *bp);
                 kst::put(&mut sizes, kst::fnv(kst::fnv(FNV0, a), b));
@@ -457,6 +548,7 @@ impl Writer {
              | if npl > 0 || (perm_on && self.opt.drop_names) { PERMFLAG } else { 0 }
              | if permtok { PERMTOK } else { 0 }
              | if self.feathash.is_some() { DBFLAG } else { 0 }
+             | if aln_on { ALNFLAG | LENFLAG } else { 0 }
              | if self.tailon == Some(true) { TAILFLAG } else { 0 };
         h[2] = ichunks.len() as u64;
         h[3] = sz.len() as u64;
@@ -469,7 +561,7 @@ impl Writer {
         h[10] = nichunk;
         h[11] = itz.len() as u64;
         h[12] = self.tailpred;
-        h[13] = TAILSKIP as u64;
+        h[13] = TAILSKIP as u64 | if aln_on { self.aln_hash() << 8 } else { 0 };
         h[14] = npl as u64;
         let mut hb = Vec::with_capacity(128);
         for v in h { hb.extend_from_slice(&v.to_le_bytes()); }

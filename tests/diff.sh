@@ -171,7 +171,33 @@ done
 [ $dn = 0 ] && echo "--db decode: restores all six inputs" \
   || { echo "--db decode: $dn inputs not restored"; fail=1; }
 
-# 10. the same refusals, with the same words.
+# 10. --aln, both directions, and aln-pack.
+aok=0; abad=0
+for pair in "s.bed p.paf ref.bed" "ls.bed lp.paf lref.bed"; do
+  set -- $pair
+  for fl in "" "--block 4" "--slow"; do
+    "$C" $fl encode --aln "$D/$2" --ref "$D/$3" < "$D/$1" > "$W/c.kst" 2>/dev/null; c1=$?
+    "$R" $fl encode --aln "$D/$2" --ref "$D/$3" < "$D/$1" > "$W/r.kst" 2>/dev/null; c2=$?
+    if cmp -s "$W/c.kst" "$W/r.kst" && [ $c1 = $c2 ]; then aok=$((aok+1))
+    else abad=$((abad+1)); echo "  --aln encode differs: $1 [$fl]"; fi
+  done
+  "$C" encode --aln "$D/$2" --ref "$D/$3" < "$D/$1" > "$W/a.kst" 2>/dev/null
+  "$C" decode --aln "$D/$2" --ref "$D/$3" "$W/a.kst" > "$W/c.out" 2>/dev/null; c1=$?
+  "$R" decode --aln "$D/$2" --ref "$D/$3" "$W/a.kst" > "$W/r.out" 2>/dev/null; c2=$?
+  if cmp -s "$W/c.out" "$W/r.out" && [ $c1 = $c2 ] && cmp -s "$W/r.out" "$D/$1"; then aok=$((aok+1))
+  else abad=$((abad+1)); echo "  --aln decode differs: $1"; fi
+done
+for pair in "p.paf ref.bed" "lp.paf lref.bed" "db.self.paf db.rall.bed"; do
+  set -- $pair
+  "$C" aln-pack "$D/$1" "$D/$2" "$W/c.pk" >/dev/null 2>&1; c1=$?
+  "$R" aln-pack "$D/$1" "$D/$2" "$W/r.pk" >/dev/null 2>&1; c2=$?
+  if cmp -s "$W/c.pk" "$W/r.pk" && [ $c1 = $c2 ]; then aok=$((aok+1))
+  else abad=$((abad+1)); echo "  aln-pack differs: $1"; fi
+done
+[ $abad = 0 ] && echo "--aln and aln-pack: $aok forms identical" \
+  || { echo "--aln: $abad DIFFER"; fail=1; }
+
+# 11. the same refusals, with the same words.
 for bad_in in 'r1\t0\t10' 'r1\t5\t10\tA' 'r1\t0\t0\tA' '\t0\t10\tA' 'r1\tx\t10\tA'; do
   cm=$(printf "$bad_in\n" | "$C" encode 2>&1 >/dev/null | tail -1)
   rm2=$(printf "$bad_in\n" | "$R" encode 2>&1 >/dev/null | tail -1)

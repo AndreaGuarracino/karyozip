@@ -67,6 +67,7 @@ struct Blk { off: u64, size: u64, l: u64, raw: u64, lraw: u64, rows: u64, hash: 
 pub struct ReadOpts {
     pub raw: bool,
     pub db: bool,
+    pub aln: Option<crate::aln::Aln>,
     pub ordnames: bool,
     pub names_file: Option<String>,
 }
@@ -93,6 +94,10 @@ pub struct Reader {
     cur_pend: u64,
     cached: Option<(usize, std::rc::Rc<Vec<u8>>, usize, u64)>,
     feathash: u64,
+    aln: Option<crate::aln::Aln>,
+    lenfile: bool,
+    alnq: Option<usize>,
+    blk_nos: Vec<u8>,
 }
 
 fn rd<T>(r: Result<T, std::io::Error>, what: &str) -> T {
@@ -148,8 +153,11 @@ impl Reader {
         let was_side = h[1] & SIDEFLAG != 0;
         let dropped = h[1] & DROPPED != 0;
         if !o.raw {
-            if h[1] & ALNFLAG != 0 {
+            if h[1] & ALNFLAG != 0 && o.aln.is_none() {
                 crate::bail("this track was written with --aln: decode it with --aln PAF --ref R, or --raw to see what is stored");
+            }
+            if h[1] & ALNFLAG == 0 && o.aln.is_some() {
+                crate::bail("this track was not written with --aln");
             }
             if h[1] & DBFLAG != 0 && !o.db {
                 crate::bail("this track holds featureIDs: decode it with --db features.tsv --out DIR, or --raw to see what is stored");
@@ -157,8 +165,13 @@ impl Reader {
             if h[1] & DBFLAG == 0 && o.db {
                 crate::bail("this track does not hold featureIDs");
             }
-            if h[1] & LENFLAG != 0 {
+            if h[1] & LENFLAG != 0 && o.aln.is_none() {
                 crate::bail("this track leaves out every length the reference implies: decode it with --aln PAF --ref R");
+            }
+        }
+        if let Some(a) = &o.aln {
+            if h[1] & ALNFLAG != 0 && (h[13] >> 8) != (a.hash & ((1u64 << 56) - 1)) {
+                crate::bail("this PAF, reference or name map is not the one the track was encoded with");
             }
         }
         let was_perm = h[1] & PERMFLAG != 0;
@@ -251,6 +264,8 @@ impl Reader {
         let _ = nz_off;
 
         // The block table.
+        let was_len = h[1] & LENFLAG != 0;
+        let mut blk_nos: Vec<u8> = Vec::new();
         let sbuf = zdec(&sz, "block sizes");
         let mut b = Vec::new();
         let (mut q, mut acc) = (0usize, 0u64);
@@ -258,7 +273,9 @@ impl Reader {
             let (a, n1) = vget(&sbuf, q);
             let (b2, n2) = vget(&sbuf, n1);
             let (c2, n3) = vget(&sbuf, n2);
-            let (d2, n4) = vget(&sbuf, n3);
+            let (mut d2, n4) = vget(&sbuf, n3);
+            let nos = if was_len { let x = (d2 & 3) as u8; d2 >>= 2; x } else { 0 };
+            blk_nos.push(nos);
             let (e2, n5) = vget(&sbuf, n4);
             let (_bp, n6) = vget(&sbuf, n5);
             let (g2, n7) = vget(&sbuf, n6);
@@ -367,6 +384,7 @@ impl Reader {
             taildec, tailpred: h[12], tailskip: h[13] & 0xff, names, ibx,
             hasidx, mhash: h[15], cur_ri: 0, cur_q: 0, cur_pend: 0, cached: None,
             feathash: (h[5] >> 32) | ((h[9] >> 32) << 32),
+            aln: o.aln.clone(), lenfile: h[1] & LENFLAG != 0 && !o.raw, alnq: None, blk_nos,
         }
     }
 
@@ -380,14 +398,12 @@ impl Reader {
             let (nruns, next) = vget(&self.ibx, ipos);
             ipos = next;
             let name = std::mem::take(&mut self.names[i as usize]);
+            self.alnq = self.aln.as_ref().and_then(|a| a.find(&name));
             let mut st = 0u64;
             for k in 0..nruns {
                 let (len, id) = self.step(&mut c, st, k + 1 == nruns && i >= tskip);
-                let lab: Vec<u8> = match self.lab.get(id as usize) {
-                    Some(l) => l.clone(),
-                    None if self.lab.is_empty() => id.to_string().into_bytes(),
-                    None => crate::bail("corrupt block: a label id past the table"),
-                };
+                let mut lab = Vec::new();
+                self.label(id, &mut lab, st, len);
                 f(&name, st, st + len, &lab);
                 st += len;
                 emitted += 1;
@@ -410,6 +426,7 @@ impl Reader {
             let (nruns, next) = vget(&self.ibx, ipos);
             ipos = next;
             let name = std::mem::take(&mut self.names[i as usize]);
+            self.alnq = self.aln.as_ref().and_then(|a| a.find(&name));
             let mut st = 0u64;
             for k in 0..nruns {
                 let (len, f) = self.step(&mut c, st, k + 1 == nruns && i >= tskip);
@@ -420,7 +437,7 @@ impl Reader {
                 buf.push(b'\t');
                 buf.extend_from_slice(en.to_string().as_bytes());
                 buf.push(b'\t');
-                self.label(f, &mut buf);
+                self.label(f, &mut buf, st, len);
                 buf.push(b'\n');
                 if buf.len() > (1 << 22) - 4096 {
                     rd(out.write_all(&buf), "write failed");
@@ -577,7 +594,8 @@ impl Reader {
         c
     }
 
-    /// Next row: (length, label id). Steps to the next block when this one ends.
+    /// Next row: (length, label id). Steps to the next block when this one
+    /// ends. Under --aln a zero length means "ask the reference".
     fn step(&mut self, c: &mut Cursor, st: u64, last: bool) -> (u64, u64) {
         if c.left == 0 {
             let b = if c.blk == usize::MAX { 0 } else { c.blk + 1 };
@@ -590,9 +608,15 @@ impl Reader {
             let t = self.tailpred.wrapping_add(unzz(v));
             if t <= st { crate::bail("corrupt track: sequence total is not past its last run"); }
             t - st
-        } else {
-            if v == 0 { crate::bail("corrupt track: a zero length outside a sentinel block"); }
+        } else if v != 0 {
             v
+        } else {
+            let lendec = self.lenfile && self.blk_nos.get(c.blk).copied().unwrap_or(0) != 1;
+            if !lendec { crate::bail("corrupt track: a zero length outside a sentinel block"); }
+            let q = self.alnq.unwrap_or_else(|| crate::bail("a length sentinel has no reference answer: wrong PAF or --ref"));
+            let (e, _) = self.aln.as_ref().unwrap().end(q, st);
+            if e <= st { crate::bail("a length sentinel has no reference answer: wrong PAF or --ref"); }
+            e - st
         };
         let (f, i2) = vget(&c.data, c.ip);
         c.ip = i2;
@@ -600,12 +624,20 @@ impl Reader {
         (len, f)
     }
 
-    fn label(&self, f: u64, out: &mut Vec<u8>) {
-        match self.lab.get(f as usize) {
-            Some(l) => out.extend_from_slice(l),
-            None if self.lab.is_empty() => out.extend_from_slice(f.to_string().as_bytes()),
+    fn label(&self, f: u64, out: &mut Vec<u8>, st: u64, len: u64) {
+        let l: &[u8] = match self.lab.get(f as usize) {
+            Some(l) => l,
+            None if self.lab.is_empty() => { out.extend_from_slice(f.to_string().as_bytes()); return; }
             None => crate::bail("corrupt block: a label id past the table"),
+        };
+        if l == b"=" && self.aln.is_some() {
+            let q = self.alnq.unwrap_or_else(|| crate::bail("a delta row has no reference answer: wrong PAF or reference track"));
+            let rl = self.aln.as_ref().unwrap().row(q, st, len);
+            if rl == u32::MAX { crate::bail("a delta row has no reference answer: wrong PAF or reference track"); }
+            out.extend_from_slice(&self.lab[rl as usize]);
+            return;
         }
+        out.extend_from_slice(l);
     }
 
     fn find(&self, seq: &[u8]) -> i64 {
@@ -618,6 +650,7 @@ impl Reader {
         let ri = self.find(seq);
         if ri < 0 { crate::bail("sequence not found"); }
         let ri = ri as u64;
+        self.alnq = self.aln.as_ref().and_then(|a| a.find(seq));
         let (blk, off, nruns) = self.locate(ri);
         let tskip = self.tailskip;
         let last_of = |k: u64| k + 1 == nruns && ri >= tskip;
@@ -657,7 +690,7 @@ impl Reader {
                 buf.push(b'\t');
                 buf.extend_from_slice(en.to_string().as_bytes());
                 buf.push(b'\t');
-                self.label(f, &mut buf);
+                self.label(f, &mut buf, st, len);
                 buf.push(b'\n');
                 if buf.len() > (1 << 20) - 4096 {
                     rd(out.write_all(&buf), "write failed");
@@ -735,6 +768,8 @@ impl Reader {
     pub fn seq_rows(&mut self, ri: u64, labmap: &[i32], isnovel: &[u8], root: i32)
         -> (Vec<u64>, Vec<u64>, Vec<i32>, Vec<u8>) {
         let (blk, off, nruns) = self.locate(ri);
+        self.alnq = { let nm = self.names[ri as usize].clone();
+                      self.aln.as_ref().and_then(|a| a.find(&nm)) };
         let mut c = self.at(blk, off);
         let n = nruns as usize;
         let (mut st, mut en) = (Vec::with_capacity(n), Vec::with_capacity(n));

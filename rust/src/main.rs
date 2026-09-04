@@ -1,5 +1,6 @@
 mod ffi;
 mod kst;
+mod reader;
 mod writer;
 
 use std::io::{BufWriter, Read, Write};
@@ -8,6 +9,7 @@ fn die(msg: &str) -> ! {
     eprintln!("karyozip: {msg}");
     std::process::exit(1);
 }
+pub fn bail(msg: &str) -> ! { die(msg) }
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -59,6 +61,15 @@ fn main() {
     }
     match cmd.as_deref() {
         Some("encode") => encode(opt, std::path::Path::new(&tmpdir)),
+        Some("decode") => {
+            let f = args.iter().skip(1).find(|a| !a.starts_with('-') && *a != "decode")
+                        .unwrap_or_else(|| die("decode needs a track"));
+            let mut r = reader::Reader::open(f);
+            let stdout = std::io::stdout();
+            let mut o = BufWriter::new(stdout.lock());
+            r.decode(&mut o);
+            o.flush().unwrap_or_else(|e| die(&e.to_string()));
+        }
         Some(c) => die(&format!("bad command {c}")),
         None => {
             eprintln!("usage: karyozip encode [--block N|all] [--level N] [--names keep] < in.bed > out.kst");

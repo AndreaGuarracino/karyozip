@@ -33,7 +33,19 @@ done
 [ $bad = 0 ] && echo "encode: $ok forms byte-identical" \
   || { echo "encode: $bad of $((ok+bad)) DIFFER"; fail=1; }
 
-# 3. the C must read what the Rust wrote.
+# 3. decode: the Rust must give back exactly what was encoded.
+dok=0; dbad=0
+for f in "$D"/*.bed; do
+  for fl in "" "--block 4" "--block all" "--level 3" "--names keep"; do
+    "$C" $fl encode < "$f" > "$W/t.kst" 2>/dev/null
+    "$R" decode "$W/t.kst" 2>/dev/null | cmp -s - "$f" && dok=$((dok+1)) \
+      || { dbad=$((dbad+1)); echo "  decode differs: $(basename "$f") [$fl]"; }
+  done
+done
+[ $dbad = 0 ] && echo "decode: $dok forms give the input back" \
+  || { echo "decode: $dbad of $((dok+dbad)) DIFFER"; fail=1; }
+
+# 4. the C must read what the Rust wrote.
 for f in "$D"/ls.bed "$D"/db.rall.bed; do
   "$R" encode < "$f" > "$W/r.kst" 2>/dev/null
   "$C" decode "$W/r.kst" 2>/dev/null | cmp -s - "$f" \
@@ -41,7 +53,7 @@ for f in "$D"/ls.bed "$D"/db.rall.bed; do
 done
 echo "cross-decode: the C reads the Rust's files"
 
-# 4. the same refusals, with the same words.
+# 5. the same refusals, with the same words.
 for bad_in in 'r1\t0\t10' 'r1\t5\t10\tA' 'r1\t0\t0\tA' '\t0\t10\tA' 'r1\tx\t10\tA'; do
   cm=$(printf "$bad_in\n" | "$C" encode 2>&1 >/dev/null | tail -1)
   rm2=$(printf "$bad_in\n" | "$R" encode 2>&1 >/dev/null | tail -1)

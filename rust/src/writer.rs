@@ -590,7 +590,7 @@ impl Writer {
         let (mut nz, mut tokused, mut intused) = if ordinal {
             (Vec::new(), false, false)
         } else {
-            let b = best_names(&self.names, self.nidx, level);
+            let b = best_names(&self.names, self.nidx, level, self.opt.slow);
             (b.bytes, b.kind == 2, b.kind == 1)
         };
         // --sort keeps identity by storing a rank per record. Storing the
@@ -615,9 +615,9 @@ impl Writer {
                 srt.extend_from_slice(nt[v as usize]);
                 srt.push(b'\n');
             }
-            let b = best_names(&srt, self.nidx, level);
+            let b = best_names(&srt, self.nidx, level, self.opt.slow);
             let p1 = ffi::zstd(&self.natbuf, level);
-            let p2 = tok_best(&self.natbuf);
+            let p2 = tok_best(&self.natbuf, self.opt.slow);
             let (pbest, ptok) = match p2 {
                 Some(t) if t.len() < p1.len() => (t, true),
                 _ => (p1, false),
@@ -889,11 +889,18 @@ pub fn pick(all: &dyn Fn(usize) -> (Vec<u8>, Vec<u8>), nraw: usize, rawtot: usiz
             let (lens, ids) = all(b);
             let step: Vec<(usize, usize)> = (0..nc + 2).into_par_iter().map(|k| {
                 if !live[k] { return (0, 0); }
+                // An empty stream costs nothing and is not compressed, as
+                // the C's `if (ni)` and `if (nl)` guards have it.
+                let each = |s: &[u8], f: &dyn Fn(&[u8]) -> usize| {
+                    if s.is_empty() { 0 } else { f(s) }
+                };
                 if k < nc {
-                    (sz(ffi::paycomp(&ids, cand[k])), sz(ffi::paycomp(&lens, cand[k])))
+                    (each(&ids, &|s| sz(ffi::paycomp(s, cand[k]))),
+                     each(&lens, &|s| sz(ffi::paycomp(s, cand[k]))))
                 } else {
                     let lv = if k == nc { level } else { 22 };
-                    (ffi::zstd(&ids, lv).len(), ffi::zstd(&lens, lv).len())
+                    (each(&ids, &|s| ffi::zstd(s, lv).len()),
+                     each(&lens, &|s| ffi::zstd(s, lv).len()))
                 }
             }).collect();
             for k in 0..nc + 2 { ti[k] += step[k].0; tl[k] += step[k].1; }
@@ -939,7 +946,7 @@ fn verifies(src: &[u8], codec: i32) -> bool {
 }
 
 fn accumulate(acc: usize, src: &[u8], codec: i32, bad: usize) -> usize {
-    if src.is_empty() { return acc; }
+    if src.is_empty() { return bad; }
     if acc >= bad { return bad; }
     match ffi::paycomp(src, codec) {
         Some(t) => match ffi::paydecomp(&t, codec, src.len()) {
@@ -998,11 +1005,12 @@ pub fn int_names(names: &[u8], n: u64) -> Option<Vec<u8>> {
 
 /// The tokeniser, over the chunk sizes the C tries. In fast mode it tries
 /// only the ends of the list, which is what the default encode does.
-pub fn tok_best(names: &[u8]) -> Option<Vec<u8>> {
+pub fn tok_best(names: &[u8], slow: bool) -> Option<Vec<u8>> {
     const TCAND: [usize; 4] = [250_000, 1_000_000, 3_000_000, 9_000_000];
     let mut best: Option<Vec<u8>> = None;
     for (i, &chunk) in TCAND.iter().enumerate() {
-        if i > 0 && i + 1 < TCAND.len() { continue; }   // fast mode: ends only
+        // The default takes the two ends; --slow tries every chunk size.
+        if !slow && i > 0 && i + 1 < TCAND.len() { continue; }
         if let Some(b) = tok_chunked(names, chunk) {
             if best.as_ref().is_none_or(|x| b.len() < x.len()) { best = Some(b); }
         }
@@ -1048,10 +1056,10 @@ fn tok_chunked(names: &[u8], chunk: usize) -> Option<Vec<u8>> {
 /// Smallest of zstd, integer deltas and the tokeniser. The losers are
 /// dropped. zstd and the tokeniser are independent and neither gains from
 /// threads on a buffer this size, so they run side by side.
-pub fn best_names(names: &[u8], n: u64, level: i32) -> BestNames {
+pub fn best_names(names: &[u8], n: u64, level: i32, slow: bool) -> BestNames {
     let (z, t) = rayon::join(
         || ffi::zstd(names, level),
-        || tok_best(names),
+        || tok_best(names, slow),
     );
     let i = int_names(names, n).map(|v| ffi::zstd(&v, level));
     let mut out = BestNames { bytes: z, kind: 0 };

@@ -7,8 +7,9 @@ karyozip calls:
 
 1. bz3_compress, block_size clamp
      ours:     if (block_size > in_size) block_size = bz3_bound(in_size);
-     upstream: if (block_size > in_size) block_size = in_size + 16;
-   bz3_bound is the real worst case; in_size + 16 is a guess.
+     1.5.1:    if (block_size > in_size) block_size = in_size + 16;
+   bz3_bound is the real worst case; in_size + 16 is a guess. 1.5.3 has
+   adopted this one, so it is no longer a local patch against 1.5.3.
 
 2. bz3_compress, the size of the last block
      ours:     size = (i == n_blocks - 1 ? in_size - in_offset : block_size)
@@ -16,7 +17,10 @@ karyozip calls:
    The upstream form yields 0 whenever in_size is an exact multiple of
    block_size, which is every single-block call and every aligned input.
    karyozip drives bzip3 at 8 to 256 MB block sizes, so an aligned
-   payload is reachable.
+   payload is reachable. Reproduced, lastblock_check.c: 133120 bytes at
+   the 65 KiB minimum block size gives, on 1.5.3, out=1133 and 66560
+   bytes back with rc=0 from both calls. Half the input, silently. Our
+   copy returns all 133120 and the bytes match.
 
 3. bz3_decompress, the per-block size check
      ours:     if (size < 0 || size > (s32)bz3_bound(block_size)) ...
@@ -30,4 +34,8 @@ bz3_decompress, upstream adopted in a later release.
 DO NOT BUMP TO 1.5.3. Checked 2026-09-04: 1.5.3 still carries the
 upstream form of 2 and 3, so taking it would reintroduce both. Its only
 changes relative to this file are those two regressions. Re-check on the
-next release; if upstream fixes them, resync and delete this note.
+next release with lastblock_check.c; if upstream fixes them, resync and
+delete this note. Not yet reported upstream.
+
+  gcc -O2 -DVERSION='"x"' -Ibzip3 -o lbc bzip3/lastblock_check.c \
+      bzip3/libbz3.c -lpthread && ./lbc

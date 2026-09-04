@@ -95,7 +95,7 @@ A track built this way is byte-identical to `karyozip encode` on the equivalent 
 ## tests
 
 ```
-make test                                    # about 210 checks and five fuzz stages
+make test                                    # about 230 checks, LeakSanitizer, five fuzz stages
 bash ../scripts/quicktest.sh                 # the above plus five real cells, 80 s
 bash ../scripts/realtest.sh BINARY           # one real cell, 21 checks
 ```

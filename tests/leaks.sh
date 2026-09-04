@@ -1,0 +1,65 @@
+#!/bin/bash
+# LeakSanitizer over every command path. fuzz.sh builds an ASan binary but
+# runs it on damaged files, where an early die is expected and a leak on that
+# path tells you nothing. This runs the clean paths, where nothing may leak.
+#   bash leaks.sh [SANITIZER_BINARY]
+set -u
+D=$(cd "$(dirname "$0")" && pwd)
+SRC=$D/..
+SAN=${1:-${KARYOZIP_SAN:-}}
+if [ -z "$SAN" ]; then
+  command -v gcc >/dev/null || { echo "leaks: skipped, no gcc"; exit 0; }
+  SAN=$(mktemp -u /tmp/kz-lsan.XXXXXX)
+  gcc -O1 -g -fsanitize=address -std=gnu11 -fopenmp -DVERSION='"1.5.3"' \
+      -o "$SAN" "$SRC"/karyozip.c "$SRC"/htscodecs/tokenise_name3.c \
+      "$SRC"/htscodecs/rANS_static4x16pr.c "$SRC"/htscodecs/rANS_static32x16pr.c \
+      "$SRC"/htscodecs/arith_dynamic.c "$SRC"/htscodecs/rle.c "$SRC"/htscodecs/pack.c \
+      "$SRC"/htscodecs/utils.c "$SRC"/bzip3/libbz3.c -I"$SRC" -lzstd -lm -lpthread \
+      >/dev/null 2>&1 || { echo "leaks: skipped, sanitizer build failed"; exit 0; }
+  trap 'rm -f "$SAN"' EXIT
+fi
+W=$(mktemp -d); trap 'rm -rf "$W" "${SAN:-}"' EXIT
+fail=0
+run() {   # description, then the command
+  local what=$1; shift
+  printf '  %-46s ' "$what"
+  if "$@" >/dev/null 2>"$W/err"; then
+    if grep -q LeakSanitizer "$W/err"; then echo "LEAKED"; fail=1; else echo clean; fi
+  else
+    if grep -q LeakSanitizer "$W/err"; then echo "LEAKED"; fail=1
+    else echo "clean (refused)"; fi
+  fi
+}
+printf 'feature_set\tchild\tparent\nfs\tA\tcategorized\nfs\tB\tcategorized\nfs\tC\tcategorized\nfs\tD\tcategorized\n' > "$W/h.tsv"
+"$SAN" encode < "$D/ls.bed" > "$W/p.kt" 2>/dev/null
+"$SAN" encode --names drop:"$W/side" < "$D/ls.bed" > "$W/s.kt" 2>/dev/null
+"$SAN" encode --aln "$D/lp.paf" --ref "$D/lref.bed" < "$D/ls.bed" > "$W/a.kt" 2>/dev/null
+DB="$D/db.acrocentric.bed $D/db.chromosome.bed $D/db.gene.bed $D/db.region.bed $D/db.repeat.bed $D/db.subtelomeric.bed"
+"$SAN" encode --db "$D/db.features.tsv" $DB > "$W/f.kt" 2>/dev/null
+mkdir -p "$W/out"
+run "encode"                       "$SAN" encode < "$D/ls.bed"
+run "encode --slow"                "$SAN" --slow encode < "$D/ls.bed"
+run "encode --block all"           "$SAN" --block all encode < "$D/ls.bed"
+run "encode --sort"                "$SAN" --sort encode < "$D/ls.bed"
+run "encode --sort=1M"             "$SAN" --tmp-dir "$W" --sort=1M encode < "$D/ls.bed"
+run "encode --names drop:F"        "$SAN" encode --names drop:"$W/side2" < "$D/ls.bed"
+run "encode --aln --ref"           "$SAN" encode --aln "$D/lp.paf" --ref "$D/lref.bed" < "$D/ls.bed"
+run "encode --db"                  "$SAN" encode --db "$D/db.features.tsv" $DB
+run "decode"                       "$SAN" decode "$W/p.kt"
+run "decode --raw"                 "$SAN" decode --raw "$W/p.kt"
+run "decode --names F"             "$SAN" --names "$W/side" decode "$W/s.kt"
+run "decode --aln --ref"           "$SAN" decode --aln "$D/lp.paf" --ref "$D/lref.bed" "$W/a.kt"
+run "decode --db --out"            "$SAN" decode --db "$D/db.features.tsv" --out "$W/out" "$W/f.kt"
+run "region, a name that is there" "$SAN" region "$W/p.kt" r1
+run "region, a name that is not"   "$SAN" region "$W/p.kt" nosuchname
+run "region SEQ POS"               "$SAN" region "$W/p.kt" r1 150
+run "region SEQ START END HALO"    "$SAN" region "$W/p.kt" r1 0 200 3
+run "index"                        "$SAN" index "$W/p.kt"
+run "region, after index"          "$SAN" region "$W/p.kt" r1 150
+run "smooth"                       "$SAN" smooth "$W/p.kt" "$W/h.tsv" fs
+run "smooth, one sequence"         "$SAN" smooth "$W/p.kt" "$W/h.tsv" fs r1
+run "aln-pack"                     "$SAN" aln-pack "$D/lp.paf" "$D/lref.bed" "$W/pk"
+run "--help"                       "$SAN" --help
+run "--version"                    "$SAN" --version
+[ $fail = 0 ] && echo "leaks: clean" || echo "leaks: FOUND SOMETHING"
+exit $fail

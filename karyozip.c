@@ -1711,6 +1711,11 @@ static void encode(void) {
             prn[t] = n; perr[t] = e;
         }
         PH_ADD(5, _tpar);                       /* threaded: split the lines */
+        /* Pipelining this loop, so the workers parse slab N+1 while one
+           thread drains slab N, has a ceiling of parse:lines, 0.25 s against
+           parse:append's 1.004 s. Append is the larger of the pair, so it
+           stays on the critical path whatever overlaps it. 3% of encode, on
+           the loop that carries every input-side refusal. Declined. */
         for (int t = 0; t < T; t++) if (perr[t]) die(perr[t]);
         double _tser = nowsec();
         for (int t = 0; t < T; t++)
@@ -1798,6 +1803,12 @@ static void pickcodecs(int rawfd, const blkmeta *bm, size_t nraw) {
         }
 
         size_t pick[3], np = 0;
+        /* Sampling the first, middle and last block is why compression cannot
+           start until parsing has finished: the choice needs the last block.
+           Overlapping the two phases would be worth about 26% of encode, they
+           are 2.24 s each at -t 8 and strictly sequential, but sampling the
+           first three blocks instead changes which codec wins on every encode
+           and changes what --slow means. Measured and declined. */
         if (nraw) { pick[np++] = 0;
                     if (nraw > 2) pick[np++] = nraw / 2;
                     if (nraw > 1) pick[np++] = nraw - 1; }

@@ -12,7 +12,7 @@ SAN=${KARYOZIP_SAN:-}
 if [ -z "$SAN" ] && command -v gcc >/dev/null; then
   SRC=$(dirname "$0")/..
   SAN=$(mktemp -u /tmp/kz-san.XXXXXX)
-  gcc -O1 -g -fsanitize=address,undefined -std=gnu11 -fopenmp -DVERSION='"1.5.1"' \
+  gcc -O1 -g -fsanitize=address,undefined -std=gnu11 -fopenmp -DVERSION='"1.5.3"' \
       -o "$SAN" "$SRC"/karyozip.c "$SRC"/htscodecs/tokenise_name3.c "$SRC"/htscodecs/rANS_static4x16pr.c \
       "$SRC"/htscodecs/rANS_static32x16pr.c "$SRC"/htscodecs/arith_dynamic.c "$SRC"/htscodecs/rle.c \
       "$SRC"/htscodecs/pack.c "$SRC"/htscodecs/utils.c "$SRC"/bzip3/libbz3.c -I"$SRC" -lzstd -lm -lpthread \

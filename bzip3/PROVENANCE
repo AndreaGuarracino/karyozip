@@ -1,41 +1,35 @@
-kspalaiologos/bzip3, release 1.5.1, plus three local fixes.
+kspalaiologos/bzip3, release 1.5.3, plus two fixes.
 Upstream: https://github.com/kspalaiologos/bzip3
 
-libbz3.c differs from upstream 1.5.1 in three places, all inside
-bz3_compress and bz3_decompress, which are the only bzip3 entry points
-karyozip calls:
+libbz3.h, common.h and libsais.h are byte-identical to 1.5.3.
+libbz3.c is 1.5.3 with two changes, both inside bz3_compress and
+bz3_decompress, the only bzip3 entry points karyozip calls. Applying
+these two to a fresh 1.5.3 reproduces this file byte for byte; that was
+checked, not assumed.
 
-1. bz3_compress, block_size clamp
-     ours:     if (block_size > in_size) block_size = bz3_bound(in_size);
-     1.5.1:    if (block_size > in_size) block_size = in_size + 16;
-   bz3_bound is the real worst case; in_size + 16 is a guess. 1.5.3 has
-   adopted this one, so it is no longer a local patch against 1.5.3.
-
-2. bz3_compress, the size of the last block
+1. bz3_compress, the size of the last block
      ours:     size = (i == n_blocks - 1 ? in_size - in_offset : block_size)
      upstream: size = block_size; if (i == n_blocks - 1) size = in_size % block_size;
    The upstream form yields 0 whenever in_size is an exact multiple of
-   block_size, which is every single-block call and every aligned input.
-   karyozip drives bzip3 at 8 to 256 MB block sizes, so an aligned
-   payload is reachable. Reproduced, lastblock_check.c: 133120 bytes at
-   the 65 KiB minimum block size gives, on 1.5.3, out=1133 and 66560
-   bytes back with rc=0 from both calls. Half the input, silently. Our
-   copy returns all 133120 and the bytes match.
+   block_size. karyozip drives bzip3 at 8 to 256 MB block sizes, so an
+   aligned payload is reachable. Reproduced with lastblock_check.c:
+   133120 bytes at the 65 KiB minimum block size gives, on stock 1.5.3,
+   out=1133 and 66560 bytes back, with rc=0 from both calls. Half the
+   input, silently. With this fix all 133120 come back and match.
 
-3. bz3_decompress, the per-block size check
+2. bz3_decompress, the per-block size check
      ours:     if (size < 0 || size > (s32)bz3_bound(block_size)) ...
      upstream: if (size < 0 || size > block_size) ...
    A block that compresses larger than its raw size is legal and fits
-   bz3_bound; the upstream bound rejects it.
+   bz3_bound; the upstream bound rejects it, so the decoder can refuse a
+   block the encoder just wrote.
 
-A fourth difference against 1.5.1, a free(compression_buf) in
-bz3_decompress, upstream adopted in a later release.
+A third fix this tree used to carry, block_size = bz3_bound(in_size)
+rather than in_size + 16, upstream adopted in 1.5.3.
 
-DO NOT BUMP TO 1.5.3. Checked 2026-09-04: 1.5.3 still carries the
-upstream form of 2 and 3, so taking it would reintroduce both. Its only
-changes relative to this file are those two regressions. Re-check on the
-next release with lastblock_check.c; if upstream fixes them, resync and
-delete this note. Not yet reported upstream.
+Checked 2026-09-04 against 1.5.3, the current release. Re-check on the
+next one with lastblock_check.c; if upstream takes these two, resync and
+delete this note. Neither is reported upstream yet.
 
   gcc -O2 -DVERSION='"x"' -Ibzip3 -o lbc bzip3/lastblock_check.c \
       bzip3/libbz3.c -lpthread && ./lbc

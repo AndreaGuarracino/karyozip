@@ -4,7 +4,7 @@ CC      ?= gcc
 CFLAGS  ?= -O3 -std=gnu11 -Wall -Wextra -fopenmp
 # VERSION is bzip3's, which libbz3.c needs; the KST format version is in
 # the magic. They are not the same number and never were.
-BZIP3_VERSION ?= 1.5.1
+BZIP3_VERSION ?= 1.5.3
 CFLAGS  += -DVERSION='"$(BZIP3_VERSION)"' -I.
 ZSTD_CFLAGS := $(shell pkg-config --cflags libzstd 2>/dev/null)
 ZSTD_LIBS   := $(shell pkg-config --libs libzstd 2>/dev/null || echo -lzstd)

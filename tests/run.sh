@@ -362,7 +362,7 @@ $KT --names "$W/sp.names.txt" decode "$W/sp.kt" 2>/dev/null | cmp -s - "$W/sp.be
 cp "$D/s.bed" "$W/keep.bed"; $KT encode "$W/keep.bed" < /dev/null > /dev/null 2>&1 && { echo "encode FILE: ACCEPTED"; fail=1; }
 cmp -s "$W/keep.bed" "$D/s.bed" && echo "encode FILE: refused, input intact" || { echo "encode FILE: INPUT DESTROYED"; fail=1; }
 
-# A third audit. region lost halo runs in an earlier block; a stale .idx
+# A third audit. region lost halo runs in an earlier block; a stale index
 # answered for another sequence; an input label "=" under --aln decoded as
 # the reference label; a sequence total past 2^63 broke the tail predictor;
 # a cyclic hierarchy hung smooth; a full disk exited 0; a NUL in a row was
@@ -542,7 +542,7 @@ must_fail "a name file with a repeat, on query" $KT --names "$W/dupn2.txt" regio
 printf 'featureID acrocentric chromosome\n1\tA\tX\n' > "$W/notab.tsv"; printf 's\t0\t10\t1\n' > "$W/ids1.bed"
 must_fail "features.tsv whose first line has no tab" $KT encode --db "$W/notab.tsv" "$W/ids1.bed"
 
-# Round 15: a .idx answered an absent name whose 64-bit hash matched a
+# Round 15: an index answered an absent name whose 64-bit hash matched a
 # stored one, and one built under a name file answered under another.
 printf 'aaa\t0\t10\tA\nYo5P2GphlrB\t0\t10\tB\nYo5P2GphlrB\t10\t30\tC\nzzz\t0\t10\tD\n' > "$W/hc.bed"
 $KT encode < "$W/hc.bed" > "$W/hc.kt" 2>/dev/null; $KT index "$W/hc.kt" >/dev/null 2>&1
@@ -564,9 +564,13 @@ cp "$W/B.txt" "$W/A.txt"
   && echo "index after the name file changed: ignored" || { echo "index after the name file changed: WRONG"; fail=1; }
 python3 - "$W" <<'PY'
 import struct, sys
-W = sys.argv[1]; d = bytearray(open(W + "/hc.kt.idx", "rb").read()); n = struct.unpack_from("<Q", d, 8)[0]
-o = 32 + 16 * n; ords = list(struct.unpack_from("<%dI" % n, d, o)); ords[0], ords[-1] = ords[-1], ords[0]
-struct.pack_into("<%dI" % n, d, o, *ords); open(W + "/hc.kt.idx", "wb").write(d)
+# the index is a trailer inside the track: n, dup, bind, magic in the last
+# four words, and n*20 bytes of table before them
+W = sys.argv[1]; d = bytearray(open(W + "/hc.kt", "rb").read())
+n = struct.unpack_from("<Q", d, len(d) - 32)[0]
+base = len(d) - 32 - n * 20
+o = base + 16 * n; ords = list(struct.unpack_from("<%dI" % n, d, o)); ords[0], ords[-1] = ords[-1], ords[0]
+struct.pack_into("<%dI" % n, d, o, *ords); open(W + "/hc.kt", "wb").write(d)
 PY
 $KT region "$W/hc.kt" aaa 2>/dev/null | cmp -s - <(grep -P '^aaa\t' "$W/hc.bed") \
   && echo "index with edited ordinals: not trusted" || { echo "index with edited ordinals: WRONG"; fail=1; }

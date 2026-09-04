@@ -1,6 +1,6 @@
 # karyozip
 
-Reads and writes the **KaryoScope Track (KST)** binary format: lossless, compact storage and O(1) random access for k-mer annotation tracks. Files are `.kst`; `karyozip index F` writes `F.idx`, so `sample.kst.idx`.
+Reads and writes the **KaryoScope Track (KST)** binary format: lossless, compact storage and O(1) random access for k-mer annotation tracks. Files are `.kst`, and there is only ever one of them: `karyozip index F` appends the index to the track itself.
 
 Compresses a BED-like track (`seq  start  end  label`, sorted, gapless, one block of rows per sequence) and gives it back byte-identical. Build with `make`. Every knob is a flag, and every flag is read before the command runs, so it works on either side of the command name. `karyozip --help` prints the usage. The only environment variable read is `TMPDIR`, and only when `--tmp-dir` is not given; nothing else changes what karyozip does.
 
@@ -52,7 +52,7 @@ karyozip region F SEQ START END HALO      plus HALO runs on each side
 karyozip smooth F HIER FS                promote noisy runs, whole track
 karyozip smooth F HIER FS SEQ            one sequence
 karyozip smooth F HIER FS SEQ START END  one range
-karyozip index  F                        writes F.idx, faster lookups
+karyozip index  F                        appends an index to F, faster lookups
 karyozip aln-pack P.paf REF.bed OUT      packs a PAF to only what --aln reads
 ```
 

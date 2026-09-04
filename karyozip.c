@@ -28,6 +28,7 @@ static int LEVELSET = 0;              /* --level was given: do not override */
 static int LEVEL_L = -1, LEVEL_I = -1;   /* per stream, chosen by the search */
 
 static const char MAGIC[8] = "KST00001";   /* KaryoScope Track, format version 1 */
+#define IDXMAGIC 0x313058444954534bULL   /* "KSTIDX01", the index trailer */
 #define KARYOZIP_VERSION "0.2.0"
 
 static int PROF = 0;
@@ -2194,6 +2195,7 @@ typedef struct {
     const uint8_t *cp, *cpe;   /* cpe: end of the decoded index chunk */
     uint64_t ci, cpend; int cvalid; rec crec;
     off_t nz_off; uint64_t mhash, feathash;
+    uint64_t fsz; int hasidx;   /* data size, and whether an index trailer follows it */
     uint8_t *pz; size_t pzl; int perm_tok, perm_ext;  /* names in input order */
     char *namebuf, *natbufp;
     int name_borrowed;         /* the table belongs to another reader */
@@ -2270,6 +2272,16 @@ static R *ropen(const char *path) {
 
     if (fseeko(r->f, 0, SEEK_END)) die("seek");
     uint64_t fsz = (uint64_t)ftello(r->f);
+    /* An index trailer, if any, sits past the data: take it off fsz so every
+       size check below still bounds the data alone. Magic last, so a torn
+       append is simply not seen. */
+    if (fsz >= 32 + 8 + 128) {
+        uint64_t t[4];
+        if (fseeko(r->f, (off_t)fsz - 32, SEEK_SET) || fread(t, 8, 4, r->f) != 4) die("seek");
+        if (t[3] == IDXMAGIC && t[0] == h[0] && t[0] <= (fsz - 32) / 20
+            && fsz - 32 - t[0] * 20 >= 8 + 128) { fsz -= 32 + t[0] * 20; r->hasidx = 1; }
+    }
+    r->fsz = fsz;
     ALLOCMAX = (size_t)1 << 38;
     if (fseeko(r->f, 8 + 128, SEEK_SET)) die("seek");
     uint64_t nml = h[1] & ~(TOKFLAG | INTFLAG | DROPPED | ALNFLAG | DBFLAG
@@ -2678,7 +2690,6 @@ static void ensurenames(R *r) {
 ranks_are_names: ;
 }
 
-#define IDXMAGIC 0x313058444954534bULL   /* "KSTIDX01" */
 
 typedef struct { uint64_t h; uint32_t i; } idxrec;
 
@@ -2703,8 +2714,7 @@ static void rclose(R *r);
 static void buildindex(const char *path) {
     R *r = ropen(path);
     ensurenames(r);
-    char out[4096];
-    snprintf(out, sizeof out, "%s.idx", path);
+    if (r->hasidx) { fprintf(stderr, "karyozip: %s already carries an index\n", path); rclose(r); return; }
     if (r->nreads > 0xffffffffu)
         die("more than 2^32 sequences: the index stores the ordinal in 32 bits");
 
@@ -2725,40 +2735,44 @@ static void buildindex(const char *path) {
         if (i && key[i] == key[i - 1]) dup++;
     }
     free(pair);
-    FILE *f = fopen(out, "wb");
-    if (!f) die("cannot write index");
-    uint64_t hdr[4] = { IDXMAGIC, r->nreads, dup, r->mhash ^ namesrc() };
-    if (fwrite(hdr, 8, 4, f) != 4) die("index write failed");
-    if (fwrite(key, 8, r->nreads, f) != r->nreads) die("index write failed");
-    if (fwrite(key2, 8, r->nreads, f) != r->nreads) die("index write failed");
-    if (fwrite(ord, 4, r->nreads, f) != r->nreads) die("index write failed");
+    /* Appended to the track, magic last: a torn write leaves no magic and
+       the reader simply does not see an index. One file, not two. */
+    uint64_t off0 = (uint64_t)r->fsz;
+    FILE *f = fopen(path, "r+b");
+    if (!f || fseeko(f, 0, SEEK_END)) die("cannot append the index to the track");
+    uint64_t tail[4] = { r->nreads, dup, r->mhash ^ namesrc(), IDXMAGIC };
+    int bad = fwrite(key, 8, r->nreads, f) != r->nreads
+           || fwrite(key2, 8, r->nreads, f) != r->nreads
+           || fwrite(ord, 4, r->nreads, f) != r->nreads
+           || fwrite(tail, 8, 4, f) != 4 || fflush(f);
+    if (bad) { (void)!ftruncate(fileno(f), (off_t)off0); fclose(f); die("index write failed"); }
     if (fclose(f)) die("index write failed");
     free(key); free(key2); free(ord);
-    fprintf(stderr, "index %s: %llu sequences, %llu B, %llu hash collisions\n",
-            out, (unsigned long long)r->nreads,
+    fprintf(stderr, "index: %llu sequences, %llu B appended, %llu hash collisions\n",
+            (unsigned long long)r->nreads,
             (unsigned long long)(32 + r->nreads * 20), (unsigned long long)dup);
     rclose(r);
 }
 
 /* Returns the ordinal, or -1 when absent. */
 static int64_t idxlookup(R *r, const char *path, const char *nm) {
-    char p[4096];
-    snprintf(p, sizeof p, "%s.idx", path);
-    int fd = open(p, O_RDONLY);
+    int fd = open(path, O_RDONLY);
     if (fd < 0) return -1;
     struct stat st;
-    if (fstat(fd, &st) || (size_t)st.st_size < 32) { close(fd); return -1; }   /* 4 header words */
+    if (fstat(fd, &st) || (size_t)st.st_size < 32) { close(fd); return -1; }
     void *m = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
     close(fd);
     if (m == MAP_FAILED) return -1;
-    const uint64_t *hdr = (const uint64_t *)m;
-    uint64_t n = hdr[1];
-
-    if (hdr[0] != IDXMAGIC || n != r->nreads || (size_t)st.st_size != 32 + n * 20
-        || hdr[3] != (r->mhash ^ namesrc())) { munmap(m, (size_t)st.st_size); return -1; }
-    const uint64_t *key = (const uint64_t *)((const char *)m + 32);
-    const uint64_t *key2 = (const uint64_t *)((const char *)m + 32 + n * 8);
-    const uint32_t *ord = (const uint32_t *)((const char *)m + 32 + n * 16);
+    /* the trailer is the last four words, magic last */
+    const uint64_t *tail = (const uint64_t *)((const char *)m + st.st_size - 32);
+    uint64_t n = tail[0];
+    if (tail[3] != IDXMAGIC || n != r->nreads || n > (uint64_t)st.st_size / 20
+        || (uint64_t)st.st_size < 32 + n * 20
+        || tail[2] != (r->mhash ^ namesrc())) { munmap(m, (size_t)st.st_size); return -1; }
+    const char *base = (const char *)m + st.st_size - 32 - n * 20;
+    const uint64_t *key = (const uint64_t *)base;
+    const uint64_t *key2 = (const uint64_t *)(base + n * 8);
+    const uint32_t *ord = (const uint32_t *)(base + n * 16);
     uint64_t want = fnvstr(nm), want2 = h64b(nm);
     int64_t out = -1;
     uint64_t lo = 0, hi = n;
@@ -3765,7 +3779,7 @@ int main(int argc, char **argv) {
             "  karyozip region F SEQ POS             the run covering POS\n"
             "  karyozip region F SEQ START END [HALO]\n"
             "  karyozip smooth F HIER FS [SEQ [START END]]\n"
-            "  karyozip index  F                     writes F.idx beside the track\n"
+            "  karyozip index  F                     appends an index to the track itself\n"
             "  any command: --threads N, -t N  --profile  --tmp-dir DIR  --help, -h\n"
             "               --version prints the zstd, libbz3 and htscodecs versions\n"
             "  encode:      --block N|all  --level N  --slow  --sort[=MEM]\n"

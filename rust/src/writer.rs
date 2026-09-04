@@ -65,7 +65,7 @@ pub struct Writer {
     nidx: u64,
     ordok: bool,
     labtab: Vec<Vec<u8>>,
-    labmap: HashMap<Vec<u8>, u32>,
+    labmap: HashMap<Vec<u8>, u32, kst::Fnv>,
     lastid: Option<u32>,
     cur: Vec<u8>,
     currun: u64,
@@ -129,7 +129,7 @@ impl Writer {
         Ok(Writer {
             perm_on,
             opt, lens: Vec::new(), ids: Vec::new(), names: Vec::new(), ibx: Vec::new(),
-            nidx: 0, ordok: true, labtab: Vec::new(), labmap: HashMap::new(), lastid: None,
+            nidx: 0, ordok: true, labtab: Vec::new(), labmap: HashMap::default(), lastid: None,
             cur: Vec::new(), currun: 0, curbp: 0, blkbp0: 0, pend: 0, nblk: 0, rows: 0,
             plen: 0, pval: 0, phas: false, tailsamp: Vec::new(), tailpred: 0, tailon: None,
             srec: Vec::new(), sortbp: 0, natbuf: Vec::new(), natord: true, feathash: None,

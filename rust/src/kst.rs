@@ -38,3 +38,19 @@ pub fn putu64(out: &mut Vec<u8>, v: u64) {
     }
     out.extend_from_slice(&b[i..]);
 }
+
+/// FNV-1a as a `HashMap` hasher. The default is SipHash, which on a
+/// one-byte label costs more than the lookup it protects, and these keys
+/// come from the file the caller already chose to read.
+#[derive(Default, Clone, Copy)]
+pub struct Fnv;
+pub struct FnvHasher(u64);
+
+impl std::hash::BuildHasher for Fnv {
+    type Hasher = FnvHasher;
+    fn build_hasher(&self) -> FnvHasher { FnvHasher(FNV0) }
+}
+impl std::hash::Hasher for FnvHasher {
+    fn finish(&self) -> u64 { self.0 }
+    fn write(&mut self, b: &[u8]) { self.0 = fnv(self.0, b); }
+}

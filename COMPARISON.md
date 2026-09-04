@@ -26,12 +26,12 @@ cli: 69 forms give the same words and code
 
 |                        |     C |  Rust |
 |------------------------|------:|------:|
-| lines, excluding vendored C | 4,209 | 3,525 |
-| files                  |     2 |     9 |
+| lines, excluding vendored C | 4,218 | 3,637 |
+| files                  |     2 |    10 |
 | `unsafe` blocks        |     — |    14 |
-| stripped binary        | 358 KB | 2,485 KB |
+| stripped binary        | 358 KB | 2,457 KB |
 
-The Rust is 16% shorter. Some of that is real, the parallel arrays and the
+The Rust is 14% shorter. Some of that is real, the parallel arrays and the
 manual memory management that `Vec` and ownership remove; some is that the
 C carries its own hash tables and buffer type where the Rust uses the
 standard library. The command line is `clap`, which costs 589 KB of binary
@@ -49,19 +49,32 @@ vendored C codecs. Nothing else in the crate is unsafe.
 
 ## Speed
 
-Interleaved medians of five, on a realistic 40M-row track built by tiling a
-real ONT chromosome track, 2.3 GB of BED in, 22.3 MB of `.kst` out.
+Fastest of 11 interleaved runs, on 4,000,000 rows, 99,354,996 B of BED in,
+7,586,839 B of `.kst` out, byte-identical from both.
 
 |          |    C |  Rust |
 |----------|-----:|------:|
-| encode   | 4.23 s, 273 MB | 5.32 s, 405 MB |
-| decode   | 0.74 s, 12 MB | 0.98 s, 17 MB |
+| encode   | 0.31 s, 55 MB | 0.35 s, 73 MB |
+| decode   | 0.39 s, 9 MB | 0.40 s, 12 MB |
 | build from clean | 14.2 s | 30.4 s |
 
-The C is 26% faster on encode and 32% on decode. Both numbers were much
-worse before profiling: the Rust encode started at 55% slower because its
-parser was serial, and decode at 2.5x because `to_string()` allocated a
-`String` per coordinate, which was a quarter of decode's time.
+Decode is a tie. Encode is 13% apart, and the phase breakdown says where:
+the Rust searches codecs faster (0.120 s against 0.123 s at equal work,
+after both were fixed) and appends rows slower (0.083 s against 0.067 s).
+
+Both were much slower before profiling. The search compressed two bzip3
+candidates that the seekable-track rule then refused, and both ran their
+zstd baselines serially ahead of the parallel sweep; fixing those took the
+C from 0.63 s to 0.31 s and the Rust from 0.77 s to 0.35 s, with no change
+to a single stored byte. On the Rust side the parser also built its row
+array twice, and the label table hashed one-byte keys with SipHash.
+
+The memory difference is glibc, not the program. Rust peak scales with
+threads (43 MB at `-t 1`, below the C's 53 MB; 69 MB at `-t 8`) because
+every codec call allocates its own `Vec`, and each rayon worker keeps its
+own malloc arena. `MALLOC_ARENA_MAX=1` brings it to 57 MB and costs 13% of
+the encode. That trade is left alone: the tool sets no environment
+variable, and the memory is bounded either way.
 
 ## Deployment
 

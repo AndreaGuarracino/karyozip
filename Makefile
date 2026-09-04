@@ -19,7 +19,9 @@ SRC := karyozip.c \
        htscodecs/rle.c htscodecs/pack.c htscodecs/utils.c \
        bzip3/libbz3.c
 
-all: build/karyozip build/libkaryozip.a
+# libtest is in all on purpose: a stale one silently compares the wrong
+# binary and every library check "differs".
+all: build/karyozip build/libkaryozip.a build/libtest
 
 build/karyozip: $(SRC)
 	mkdir -p build

@@ -2319,6 +2319,27 @@ void kt_level(kt_writer *w, int level) {
 }
 void kt_row(kt_writer *w, const char *name, size_t nlen,
             uint64_t run_len, const char *label, size_t llen, uint64_t start) {
+    /* The CLI gets these for free: its parser split on tabs and newlines, so
+       a name or label can never hold one, and a zero-length run cannot reach
+       the writer. A library caller can produce all of them, and a track with
+       a newline in a label does not decode: the label table is newline
+       separated, so it comes back as "the label table has more lines than
+       its count". Refusing here is what keeps encode lossless. */
+    if (!nlen) die("empty sequence name");
+    if (!run_len) die("end equals start: a run must cover at least one base");
+    if (start > UINT64_MAX - run_len) die("a coordinate does not fit in 64 bits");
+    int bad = -1;                          /* one pass per string, not five memchrs */
+    for (size_t i = 0; i < nlen; i++) {
+        unsigned char c = (unsigned char)name[i];
+        if (c == 0 || c == '\n' || c == '\t') { bad = c; break; }
+    }
+    for (size_t i = 0; bad < 0 && i < llen; i++) {
+        unsigned char c = (unsigned char)label[i];
+        if (c == 0 || c == '\n') { bad = c; break; }
+    }
+    if (bad == 0) die("a NUL byte inside a row");
+    if (bad == '\n') die("a newline inside a name or label");
+    if (bad == '\t') die("a tab inside a sequence name");
     ktw_row(w, name, nlen, run_len, label, llen, start, 0);
 }
 void kt_close(kt_writer *w) {

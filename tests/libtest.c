@@ -5,8 +5,40 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Contract violations, one per case. Each must be refused with the message
+   the CLI gives, or the header's promise is false. */
+static int abuse(int c) {
+    FILE *f = fopen("/dev/null", "wb");
+    kt_writer *w = kt_open(f);
+    char big[4096]; memset(big, 'x', sizeof big);
+    switch (c) {
+    case 1: kt_row(w, "r1", 2, 10, "A", 1, 5); break;             /* not at 0 */
+    case 2: kt_row(w, "r1", 2, 10, "A", 1, 0);
+            kt_row(w, "r1", 2, 10, "A", 1, 50); break;            /* a gap */
+    case 3: kt_row(w, "r1", 2, 10, "A", 1, 0);
+            kt_row(w, "r1", 2, 10, "A", 1, 5); break;             /* an overlap */
+    case 4: kt_row(w, "r1", 2, 10, "A", 1, 0);
+            kt_row(w, "r2", 2, 10, "A", 1, 0);
+            kt_row(w, "r1", 2, 10, "A", 1, 10); break;            /* a sequence returns */
+    case 5: kt_row(w, "r1", 2, 0, "A", 1, 0); break;              /* zero-length run */
+    case 6: kt_row(w, big, sizeof big, 10, "A", 1, 0); break;     /* name too long */
+    case 7: kt_row(w, "", 0, 10, "A", 1, 0); break;               /* empty name */
+    case 8: kt_row(w, "r1", 2, 10, "A\nB", 3, 0); break;          /* newline label */
+    case 9: kt_row(w, "r\0x", 3, 10, "A", 1, 0); break;           /* NUL in the name */
+    case 10: kt_row(w, "a\tb", 3, 10, "A", 1, 0); break;          /* tab in the name */
+    case 11: kt_row(w, "r1", 2, ~0ULL, "A", 1, 0);
+             kt_row(w, "r1", 2, 10, "A", 1, ~0ULL); break;        /* coordinate overflow */
+    case 12: kt_level(w, 99); break;                              /* level out of range */
+    default: return 2;
+    }
+    kt_close(w);
+    return 0;
+}
+
 int main(int argc, char **argv) {
-    if (argc < 3) { fprintf(stderr, "usage: libtest IN.bed OUT.kst [BLOCK]\n"); return 2; }
+    if (argc == 3 && !strcmp(argv[1], "-abuse")) return abuse(atoi(argv[2]));
+    if (argc < 3) { fprintf(stderr, "usage: libtest IN.bed OUT.kst [BLOCK]\n"
+                                    "       libtest -abuse N\n"); return 2; }
     FILE *in = fopen(argv[1], "r"), *out = fopen(argv[2], "wb");
     if (!in || !out) { perror("open"); return 2; }
     kt_writer *w = kt_open(out);

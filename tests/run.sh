@@ -862,6 +862,16 @@ if [ -x "$LT" ]; then
   cmp -s "$W/lc.kt" "$W/ll.kt" || { lok=0; echo "  library differs on --block 4"; }
   [ $lok = 1 ] && echo "library API: same bytes as the CLI" \
     || { echo "library API: DIFFERS from the CLI"; fail=1; }
+  # Round 32: the header promises the library refuses what the CLI refuses.
+  # It did not. A newline in a label produced a track that would not decode,
+  # "the label table has more lines than its count", which breaks the one
+  # contract the tool has. These are the twelve ways in.
+  aok=1
+  for c in 1 2 3 4 5 6 7 8 9 10 11 12; do
+    $LT -abuse $c >/dev/null 2>&1 && { aok=0; echo "  library accepted abuse case $c"; }
+  done
+  [ $aok = 1 ] && echo "library API: every contract violation refused" \
+    || { echo "library API: A CONTRACT VIOLATION WAS ACCEPTED"; fail=1; }
 else
   echo "library API: skipped, build/libtest not built"
 fi

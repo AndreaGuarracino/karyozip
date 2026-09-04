@@ -15,6 +15,7 @@ const TOKFLAG: u64 = 1 << 63;
 const INTFLAG: u64 = 1 << 62;
 const DROPPED: u64 = 1 << 60;
 const SIDEFLAG: u64 = 1 << 57;
+const DBFLAG: u64 = 1 << 58;
 const PERMFLAG: u64 = 1 << 54;
 const PERMTOK: u64 = 1 << 53;
 const TAILFLAG: u64 = 1 << 55;
@@ -77,6 +78,7 @@ pub struct Writer {
     natbuf: Vec<u8>,
     perm_on: bool,
     natord: bool,
+    feathash: Option<u64>,
     raw: std::fs::File,
     tmpdir: std::path::PathBuf,
     rawlen: u64,
@@ -94,6 +96,9 @@ fn tmpfile(dir: &std::path::Path) -> std::io::Result<std::fs::File> {
 }
 
 impl Writer {
+    /// --db binds the track to the features.tsv it came from.
+    pub fn set_feathash(&mut self, h: u64) { self.feathash = Some(h); }
+
     pub fn new(opt: Options, tmpdir: &std::path::Path) -> std::io::Result<Self> {
         let perm_on = opt.sort && opt.names_out.is_none();
         Ok(Writer {
@@ -102,7 +107,7 @@ impl Writer {
             nidx: 0, ordok: true, labtab: Vec::new(), labmap: HashMap::new(), lastid: None,
             cur: Vec::new(), currun: 0, curbp: 0, blkbp0: 0, pend: 0, nblk: 0, rows: 0,
             plen: 0, phas: false, tailsamp: Vec::new(), tailpred: 0, tailon: None,
-            srec: Vec::new(), sortbp: 0, natbuf: Vec::new(), natord: true,
+            srec: Vec::new(), sortbp: 0, natbuf: Vec::new(), natord: true, feathash: None,
             raw: tmpfile(tmpdir)?, tmpdir: tmpdir.to_path_buf(), rawlen: 0, bm: Vec::new(),
         })
     }
@@ -451,15 +456,16 @@ impl Writer {
              | if intused { INTFLAG } else { 0 }
              | if npl > 0 || (perm_on && self.opt.drop_names) { PERMFLAG } else { 0 }
              | if permtok { PERMTOK } else { 0 }
+             | if self.feathash.is_some() { DBFLAG } else { 0 }
              | if self.tailon == Some(true) { TAILFLAG } else { 0 };
         h[2] = ichunks.len() as u64;
         h[3] = sz.len() as u64;
         h[4] = self.rows;
-        h[5] = p.len as u32 as u64;
+        h[5] = p.len as u32 as u64 | self.feathash.map_or(0, |f| (f & 0xffff_ffff) << 32);
         h[6] = lz.len() as u64;
         h[7] = self.labtab.len() as u64;
         h[8] = self.opt.block;
-        h[9] = p.id as u32 as u64;
+        h[9] = p.id as u32 as u64 | self.feathash.map_or(0, |f| (f >> 32) << 32);
         h[10] = nichunk;
         h[11] = itz.len() as u64;
         h[12] = self.tailpred;

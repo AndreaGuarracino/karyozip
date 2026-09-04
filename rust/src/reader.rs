@@ -66,6 +66,7 @@ struct Blk { off: u64, size: u64, l: u64, raw: u64, lraw: u64, rows: u64, hash: 
 #[derive(Default)]
 pub struct ReadOpts {
     pub raw: bool,
+    pub db: bool,
     pub ordnames: bool,
     pub names_file: Option<String>,
 }
@@ -91,6 +92,7 @@ pub struct Reader {
     cur_q: usize,
     cur_pend: u64,
     cached: Option<(usize, std::rc::Rc<Vec<u8>>, usize, u64)>,
+    feathash: u64,
 }
 
 fn rd<T>(r: Result<T, std::io::Error>, what: &str) -> T {
@@ -98,6 +100,8 @@ fn rd<T>(r: Result<T, std::io::Error>, what: &str) -> T {
 }
 
 impl Reader {
+
+    pub fn feathash(&self) -> u64 { self.feathash }
 
     pub fn open_with(path: &str, o: &ReadOpts) -> Reader {
         let mut f = rd(std::fs::File::open(path), "open");
@@ -147,8 +151,11 @@ impl Reader {
             if h[1] & ALNFLAG != 0 {
                 crate::bail("this track was written with --aln: decode it with --aln PAF --ref R, or --raw to see what is stored");
             }
-            if h[1] & DBFLAG != 0 {
+            if h[1] & DBFLAG != 0 && !o.db {
                 crate::bail("this track holds featureIDs: decode it with --db features.tsv --out DIR, or --raw to see what is stored");
+            }
+            if h[1] & DBFLAG == 0 && o.db {
+                crate::bail("this track does not hold featureIDs");
             }
             if h[1] & LENFLAG != 0 {
                 crate::bail("this track leaves out every length the reference implies: decode it with --aln PAF --ref R");
@@ -359,6 +366,37 @@ impl Reader {
             idcodec: h[9] as u32 as i32, lencodec: h[5] as u32 as i32,
             taildec, tailpred: h[12], tailskip: h[13] & 0xff, names, ibx,
             hasidx, mhash: h[15], cur_ri: 0, cur_q: 0, cur_pend: 0, cached: None,
+            feathash: (h[5] >> 32) | ((h[9] >> 32) << 32),
+        }
+    }
+
+    /// Every row, in order, to a callback. decode and --db share it.
+    pub fn for_each_row(&mut self, f: &mut dyn FnMut(&[u8], u64, u64, &[u8])) {
+        let mut c = Cursor { blk: usize::MAX, data: std::rc::Rc::new(Vec::new()),
+                             lp: 0, ip: 0, left: 0 };
+        let (mut ipos, mut emitted) = (0usize, 0u64);
+        let tskip = self.tailskip;
+        for i in 0..self.nreads {
+            let (nruns, next) = vget(&self.ibx, ipos);
+            ipos = next;
+            let name = std::mem::take(&mut self.names[i as usize]);
+            let mut st = 0u64;
+            for k in 0..nruns {
+                let (len, id) = self.step(&mut c, st, k + 1 == nruns && i >= tskip);
+                let lab: Vec<u8> = match self.lab.get(id as usize) {
+                    Some(l) => l.clone(),
+                    None if self.lab.is_empty() => id.to_string().into_bytes(),
+                    None => crate::bail("corrupt block: a label id past the table"),
+                };
+                f(&name, st, st + len, &lab);
+                st += len;
+                emitted += 1;
+            }
+            self.names[i as usize] = name;
+        }
+        if emitted != self.rows {
+            eprintln!("karyozip: emitted {emitted} rows, the header says {}", self.rows);
+            crate::bail("file is truncated");
         }
     }
 

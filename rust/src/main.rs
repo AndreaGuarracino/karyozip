@@ -1,3 +1,4 @@
+mod db;
 mod ffi;
 mod kst;
 mod reader;
@@ -39,6 +40,7 @@ fn main() {
     let mut tmpdir = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".into());
     let mut ro = reader::ReadOpts::default();
     let (mut maxgap, mut halo, mut v1) = (1000u64, 200u64, false);
+    let (mut dbfeats, mut outdir): (Option<String>, Option<String>) = (None, None);
     let mut cmd = None;
     let mut pos: Vec<String> = Vec::new();
     let mut i = 1;
@@ -73,6 +75,8 @@ fn main() {
             }
             "--slow" => opt.slow = true,
             "--sort" => opt.sort = true,
+            "--db" => { dbfeats = Some(val()); ro.db = true; }
+            "--out" => outdir = Some(val()),
             "--raw" => ro.raw = true,
             "--max-gap" => maxgap = val().parse().unwrap_or_else(|_| die("--max-gap needs a number")),
             "--halo" => halo = val().parse().unwrap_or_else(|_| die("--halo needs a number")),
@@ -107,7 +111,24 @@ fn main() {
         i += 1;
     }
     match cmd.as_deref() {
-        Some("encode") => encode(opt, std::path::Path::new(&tmpdir)),
+        Some("encode") => {
+            match dbfeats {
+                Some(fp) => {
+                    let feats = db::Feats::load(&fp);
+                    eprintln!("features: {} ids, {} sets", feats.id2lab.len(), feats.sets.len());
+                    let mut w = writer::Writer::new(opt, std::path::Path::new(&tmpdir))
+                        .unwrap_or_else(|e| die(&e.to_string()));
+                    w.set_feathash(feats.hash);
+                    db::encode(&pos, &feats, &mut w);
+                    let stdout = std::io::stdout();
+                    let mut o = BufWriter::new(stdout.lock());
+                    let st = w.close(&mut o).unwrap_or_else(|m| die(&m));
+                    o.flush().unwrap_or_else(|e| die(&e.to_string()));
+                    report(&st);
+                }
+                None => encode(opt, std::path::Path::new(&tmpdir)),
+            }
+        }
         Some("smooth") => {
             if pos.len() < 3 { die("bad command or missing arguments"); }
             let n = |s: &str, w: &str| -> u64 { s.parse().unwrap_or_else(|_| die(w)) };
@@ -153,10 +174,23 @@ fn main() {
             if pos.len() > 1 { die("decode takes one track"); }
             let f = pos.first().unwrap_or_else(|| die("decode needs a track"));
             let mut r = reader::Reader::open_with(f, &ro);
-            let stdout = std::io::stdout();
-            let mut o = BufWriter::new(stdout.lock());
-            r.decode(&mut o);
-            o.flush().unwrap_or_else(|e| die(&e.to_string()));
+            match (&dbfeats, &outdir) {
+                (Some(fp), Some(d)) => {
+                    let feats = db::Feats::load(fp);
+                    eprintln!("features: {} ids, {} sets", feats.id2lab.len(), feats.sets.len());
+                    if r.feathash() != feats.hash {
+                        die("this features.tsv is not the one the track was encoded with");
+                    }
+                    db::decode(&mut r, &feats, d);
+                }
+                (Some(_), None) => die("decode --db needs --out DIR for the per-set BEDs"),
+                _ => {
+                    let stdout = std::io::stdout();
+                    let mut o = BufWriter::new(stdout.lock());
+                    r.decode(&mut o);
+                    o.flush().unwrap_or_else(|e| die(&e.to_string()));
+                }
+            }
         }
         Some(c) => die(&format!("bad command {c}")),
         None => {
@@ -244,6 +278,10 @@ fn encode(opt: writer::Options, tmpdir: &std::path::Path) {
     let mut out = BufWriter::new(stdout.lock());
     let st = w.close(&mut out).unwrap_or_else(|m| die(&m));
     out.flush().unwrap_or_else(|e| die(&e.to_string()));
+    report(&st);
+}
+
+fn report(st: &writer::Stats) {
     eprintln!("encoded rows={} reads={} blocks={} names={}B{} index={}B offs={}B lens={}B labs={}B raw={}B",
               st.rows, st.reads, st.blocks, st.names,
               if st.ordinal { " (ordinal, not stored)" }
@@ -268,7 +306,7 @@ fn row(w: &mut writer::Writer, line: &[u8]) {
     w.row(name, en - st, label, st).unwrap_or_else(|m| die(&m));
 }
 
-fn bedcoord(b: &[u8], what: &str) -> u64 {
+pub fn bedcoord(b: &[u8], what: &str) -> u64 {
     let mut v: u64 = 0;
     for &c in b {
         if !c.is_ascii_digit() { die(what); }

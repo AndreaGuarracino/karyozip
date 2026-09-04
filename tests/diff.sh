@@ -152,7 +152,26 @@ done
 [ $sbad = 0 ] && echo "smooth: $sok forms identical" \
   || { echo "smooth: $sbad DIFFER"; fail=1; }
 
-# 9. the same refusals, with the same words.
+# 9. --db, both directions.
+DB="$D/db.acrocentric.bed $D/db.chromosome.bed $D/db.gene.bed $D/db.region.bed $D/db.repeat.bed $D/db.subtelomeric.bed"
+"$C" encode --db "$D/db.features.tsv" $DB > "$W/cdb.kst" 2>/dev/null
+"$R" encode --db "$D/db.features.tsv" $DB > "$W/rdb.kst" 2>/dev/null
+if cmp -s "$W/cdb.kst" "$W/rdb.kst"; then echo "--db encode: identical"
+else echo "--db encode: DIFFERS"; fail=1; fi
+rm -rf "$W/co" "$W/ro"; mkdir -p "$W/co" "$W/ro"
+"$C" decode --db "$D/db.features.tsv" --out "$W/co" "$W/cdb.kst" >/dev/null 2>&1
+"$R" decode --db "$D/db.features.tsv" --out "$W/ro" "$W/cdb.kst" >/dev/null 2>&1
+if diff -r "$W/co" "$W/ro" >/dev/null 2>&1; then echo "--db decode: identical"
+else echo "--db decode: DIFFERS"; fail=1; fi
+dn=0
+for b in $DB; do
+  n=$(basename "$b" .bed); n=${n#db.}
+  cmp -s "$W/ro/$n.bed" "$b" || dn=$((dn+1))
+done
+[ $dn = 0 ] && echo "--db decode: restores all six inputs" \
+  || { echo "--db decode: $dn inputs not restored"; fail=1; }
+
+# 10. the same refusals, with the same words.
 for bad_in in 'r1\t0\t10' 'r1\t5\t10\tA' 'r1\t0\t0\tA' '\t0\t10\tA' 'r1\tx\t10\tA'; do
   cm=$(printf "$bad_in\n" | "$C" encode 2>&1 >/dev/null | tail -1)
   rm2=$(printf "$bad_in\n" | "$R" encode 2>&1 >/dev/null | tail -1)

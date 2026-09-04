@@ -28,6 +28,7 @@ static int LEVELSET = 0;              /* --level was given: do not override */
 static int LEVEL_L = -1, LEVEL_I = -1;   /* per stream, chosen by the search */
 
 static const char MAGIC[8] = "KST00001";   /* KaryoScope Track, format version 1 */
+#define KARYOZIP_VERSION "0.2.0"
 
 static int PROF = 0;
 static double PH[8];
@@ -330,6 +331,7 @@ static int TOKSET = 0, V1 = 0;
 static const char *TMPD = NULL;         /* --tmp-dir, else TMPDIR, else /tmp */
 
 #include "htscodecs/tokenise_name3.h"
+#include "htscodecs/version.h"
 #include "htscodecs/rANS_static4x16.h"
 #include "htscodecs/arith_dynamic.h"
 #include "bzip3/libbz3.h"
@@ -3765,6 +3767,7 @@ int main(int argc, char **argv) {
             "  karyozip smooth F HIER FS [SEQ [START END]]\n"
             "  karyozip index  F                     writes F.idx beside the track\n"
             "  any command: --threads N, -t N  --profile  --tmp-dir DIR  --help, -h\n"
+            "               --version prints the zstd, libbz3 and htscodecs versions\n"
             "  encode:      --block N|all  --level N  --slow  --sort[=MEM]\n"
             "               --names keep|drop|drop:FILE  --db F  --aln P --ref R\n"
             "               --tail 0|1  --tok-chunk N  --id-codec N  --len-codec N\n"
@@ -3774,11 +3777,20 @@ int main(int argc, char **argv) {
             "               names rows by ordinal\n"
             "  smooth:      --max-gap N  --halo N  --v1\n"
             "  TMPDIR is read when --tmp-dir is not given; no other variable is.";
-    for (int i = 1; i < argc; i++)
+    for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) { puts(USAGE); return 0; }
+        /* The codec versions decide the stored bytes, so print them. */
+        if (!strcmp(argv[i], "--version")) {
+            printf("karyozip %s, format %.8s\n", KARYOZIP_VERSION, MAGIC);
+            printf("  zstd       %s\n", ZSTD_versionString());
+            printf("  libbz3     %s\n", bz3_version());
+            printf("  htscodecs  %s\n", HTSCODECS_VERSION_TEXT);
+            return 0;
+        }
+    }
     if (argc < 2) die(USAGE);
     static const struct { const char *f; int nv; } FLAGS[] = {
-        {"--threads",1},{"-t",1},{"--profile",0},{"--tmp-dir",1},{"--names",1},
+        {"--version",0},{"--threads",1},{"-t",1},{"--profile",0},{"--tmp-dir",1},{"--names",1},
         {"--tok-chunk",1},{"--tail",1},{"--id-codec",1},{"--len-codec",1},
         {"--max-gap",1},{"--halo",1},{"--v1",0},{"--aln-names",1},{"--sort",0},
         {"--slow",0},

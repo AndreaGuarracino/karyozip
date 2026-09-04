@@ -1,0 +1,12 @@
+samtools/htscodecs, release v1.6.6 (see version.h).
+Upstream: https://github.com/samtools/htscodecs
+
+Only the files karyozip's Makefile compiles, and the headers they reach,
+are kept. Deleted from the upstream tree: fqzcomp_qual, rANS_static,
+rANS_byte.h, htscodecs.c/.h, permute.h, varint2.h, tokchunk, and the
+AVX2, AVX512, NEON and SSE4 rANS variants, which rANS_static32x16pr.c
+never references under this config.h.
+
+Every file here is byte-identical to upstream. Keep it that way: fix
+things in karyozip.c, and resync by copying the same subset from a new
+upstream tag.

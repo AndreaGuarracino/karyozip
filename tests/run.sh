@@ -828,6 +828,18 @@ $KT encode < "$D/s.bed" 2>&1 >/dev/null | grep -qi "htscodecs" \
 
 # Generative stage. The checks above are one fixed case per bug already found;
 # this one searches input space instead of remembering it.
+# The stored bytes are a function of the codec versions, and zstd does not
+# promise identical output across its own releases. Pin them here: a bump
+# has to be a deliberate act that re-records this line, never a silent one
+# that invalidates every ratio already measured.
+want=e3f9edf95b404c3cd58e8b337d8da59c183b7e77bcbe79eec7fb267883ba9071
+got=$($KT --block 4 encode < "$D/db.rall.bed" 2>/dev/null | sha256sum | cut -d' ' -f1)
+if [ "$got" = "$want" ]; then echo "codec versions: stored bytes unchanged"
+else
+  echo "codec versions: STORED BYTES MOVED"; fail=1
+  echo "  want $want"; echo "  got  $got"; $KT --version | sed 's/^/  /'
+fi
+
 if bash "$D/fuzz.sh" "$KT"; then echo "fuzz: clean"; else echo "fuzz: FOUND SOMETHING"; fail=1; fi
 
 exit $fail

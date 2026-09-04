@@ -21,6 +21,8 @@ pub struct Aln {
     qsix: HashMap<Vec<u8>, usize>,
     pub labs: Vec<Vec<u8>>,
     labix: HashMap<Vec<u8>, u32>,
+    /// --aln-names: ordinal N is line N+1, for tracks named by ordinal.
+    pub ord: Vec<Vec<u8>>,
     pub hash: u64,
     /// the last segment answered, so a walk in order does not re-search
     cur: std::sync::Arc<std::sync::atomic::AtomicU64>,
@@ -177,7 +179,35 @@ impl Aln {
         eprintln!("alignment: {} query contigs, {nblk} collinear blocks", self.qs.len());
     }
 
-    pub fn find(&self, nm: &[u8]) -> Option<usize> { self.qsix.get(nm).copied() }
+    /// A bare ordinal resolves through the map when one was given.
+    pub fn find(&self, nm: &[u8]) -> Option<usize> {
+        if !self.ord.is_empty() && !nm.is_empty() && nm.iter().all(|c| c.is_ascii_digit()) {
+            let i: usize = std::str::from_utf8(nm).unwrap().parse().ok()?;
+            if i >= self.ord.len() { return None; }
+            return self.qsix.get(&self.ord[i]).copied();
+        }
+        self.qsix.get(nm).copied()
+    }
+
+    /// One name a line, in the order the annotator produced them.
+    pub fn load_ordinals(&mut self, path: &str) {
+        let data = std::fs::read(path)
+            .unwrap_or_else(|_| crate::bail("cannot open the file given to --names"));
+        let mut h = FNV0;
+        for line in data.split(|&c| c == b'\n') {
+            let mut l = line;
+            if l.last() == Some(&b'\r') { l = &l[..l.len() - 1]; }
+            if self.ord.is_empty() && (l.first() == Some(&b'>') || l.first() == Some(&b'@')) {
+                crate::bail("--names on encode takes a plain list, one name a line");
+            }
+            if l.is_empty() && self.ord.len() as u64 > 0 { continue; }
+            self.ord.push(l.to_vec());
+            h = kst::fnv(h, l);
+            h = kst::fnv(h, &[0]);
+        }
+        self.hash ^= h;
+        eprintln!("ordinal map: {} names", self.ord.len());
+    }
 
     /// The last segment whose query start is at or before `pos`.
     fn segat(&self, qi: usize, pos: u64) -> Option<&Seg> {

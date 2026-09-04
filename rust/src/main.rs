@@ -43,6 +43,7 @@ fn main() {
     let (mut maxgap, mut halo, mut v1) = (1000u64, 200u64, false);
     let (mut dbfeats, mut outdir): (Option<String>, Option<String>) = (None, None);
     let (mut alnpaf, mut alnref): (Option<String>, Option<String>) = (None, None);
+    let mut alnnames: Option<String> = None;
     let mut cmd = None;
     let mut pos: Vec<String> = Vec::new();
     let mut i = 1;
@@ -81,6 +82,7 @@ fn main() {
             "--out" => outdir = Some(val()),
             "--aln" => alnpaf = Some(val()),
             "--ref" => alnref = Some(val()),
+            "--aln-names" => alnnames = Some(val()),
             "--raw" => ro.raw = true,
             "--max-gap" => maxgap = val().parse().unwrap_or_else(|_| die("--max-gap needs a number")),
             "--halo" => halo = val().parse().unwrap_or_else(|_| die("--halo needs a number")),
@@ -131,7 +133,7 @@ fn main() {
                     report(&st);
                 }
                 None => {
-                    let a = load_aln(&alnpaf, &alnref);
+                    let a = load_aln(&alnpaf, &alnref, &alnnames);
                     encode(opt, std::path::Path::new(&tmpdir), a)
                 }
             }
@@ -161,7 +163,7 @@ fn main() {
             aln::pack(&a, &pos[2], rh);
         }
         Some("index") => {
-            let f = pos.first().unwrap_or_else(|| die("index needs a track"));
+            let f = pos.first().unwrap_or_else(|| die("bad command or missing arguments"));
             reader::Reader::open_with(f, &ro).build_index(f);
         }
         Some("region") => {
@@ -187,8 +189,8 @@ fn main() {
         }
         Some("decode") => {
             if pos.len() > 1 { die("decode takes one track"); }
-            let f = pos.first().unwrap_or_else(|| die("decode needs a track"));
-            ro.aln = load_aln(&alnpaf, &alnref);
+            let f = pos.first().unwrap_or_else(|| die("bad command or missing arguments"));
+            ro.aln = load_aln(&alnpaf, &alnref, &alnnames);
             let mut r = reader::Reader::open_with(f, &ro);
             match (&dbfeats, &outdir) {
                 (Some(fp), Some(d)) => {
@@ -256,7 +258,9 @@ fn parse_codec(s: &str) -> i32 {
 }
 
 /// --aln needs --ref, and the two are read once, before any row.
-fn load_aln(paf: &Option<String>, refbed: &Option<String>) -> Option<aln::Aln> {
+fn load_aln(paf: &Option<String>, refbed: &Option<String>,
+            ordfile: &Option<String>) -> Option<aln::Aln> {
+    if paf.is_none() && ordfile.is_some() { die("--aln-names does nothing without --aln"); }
     match (paf, refbed) {
         (None, None) => None,
         (Some(_), None) => die("encode --aln needs --ref"),
@@ -264,6 +268,7 @@ fn load_aln(paf: &Option<String>, refbed: &Option<String>) -> Option<aln::Aln> {
         (Some(p), Some(r)) => {
             let mut a = aln::Aln::default();
             a.load_ref(r);
+            if let Some(o) = ordfile { a.load_ordinals(o); }
             a.load_paf(p);
             Some(a)
         }

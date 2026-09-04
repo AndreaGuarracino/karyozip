@@ -1,0 +1,24 @@
+[package]
+name         = "karyozip"
+version      = "0.2.0"
+edition      = "2024"
+rust-version = "1.85"
+
+[[bin]]
+name = "karyozip"
+path = "src/main.rs"
+
+[dependencies]
+# The latest zstd-sys, and it bundles exactly the 1.5.7 the C links. The
+# pin is deliberate: zstd does not promise identical output across its own
+# releases, so it is what makes byte-identity with c/ testable at all.
+zstd-sys = "=2.0.16"
+rayon    = "1.12.0"
+memmap2  = "0.9.11"
+
+[build-dependencies]
+cc = "1.4.5"
+
+[profile.release]
+opt-level = 3
+debug     = true

@@ -377,7 +377,9 @@ impl Writer {
         // why it cannot run until every row has arrived. --slow reads them all.
         let rawtot: usize = self.bm.iter().map(|b| b.len).sum();
         let get = |i: usize| self.read_block(i).expect("staged block");
+        let _s = crate::prof::span(8);
         let p = pick(&get, self.bm.len(), rawtot, level, &self.opt);
+        drop(_s);
         let level = p.level;
         let (lvl_id, lvl_len) = (if p.lvl_id < 0 { level } else { p.lvl_id },
                                  if p.lvl_len < 0 { level } else { p.lvl_len });
@@ -387,6 +389,7 @@ impl Writer {
         // Compress apart, write in order, a batch at a time. Holding every
         // compressed block would cost the whole file in memory; the C stages
         // them in a temp file for the same reason.
+        let _s = crate::prof::span(1);
         let mut sizes = Vec::new();
         let mut body = tmpfile(&self.tmpdir).map_err(io)?;
         let (mut byt_lens, mut byt_labs) = (0u64, 0u64);
@@ -441,6 +444,8 @@ impl Writer {
             }
         }
 
+        drop(_s);
+        let _s = crate::prof::span(2);
         let mut labs = Vec::new();
         for l in &self.labtab { labs.extend_from_slice(l); labs.push(b'\n'); }
 
@@ -515,6 +520,8 @@ impl Writer {
         }
         let npl = if perm_on { permblob.len() } else { 0 };
 
+        drop(_s);
+        let _s = crate::prof::span(3);
         // The index is chunked so a lookup decodes 65536 entries, not all.
         let meta = if level < 19 { level } else { 19 };
         let (mut ichunks, mut itab, mut nichunk) = (Vec::new(), Vec::new(), 0u64);
@@ -580,6 +587,8 @@ impl Writer {
         hb.truncate(120);
         hb.extend_from_slice(&h[15].to_le_bytes());
 
+        drop(_s);
+        let _s = crate::prof::span(7);
         out.write_all(MAGIC).map_err(io)?;
         out.write_all(&hb).map_err(io)?;
         out.write_all(&lz).map_err(io)?;
@@ -597,6 +606,7 @@ impl Writer {
         body.seek(SeekFrom::Start(0)).map_err(io)?;
         std::io::copy(&mut body, out).map_err(io)?;
         out.flush().map_err(io)?;
+        drop(_s);
 
         Ok(Stats {
             rows: self.rows, reads: self.nidx, blocks: self.nblk,

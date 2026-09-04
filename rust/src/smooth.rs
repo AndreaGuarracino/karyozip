@@ -209,7 +209,9 @@ pub fn run(path: &str, hier: &str, fs: &[u8], seq: Option<&[u8]>,
     };
     let mut buf = Vec::with_capacity(1 << 20);
     for ri in first..last {
+        let _s = crate::prof::span(6);
         let (st, en, mut feat, novel) = r.seq_rows(ri, &labmap, &novelid, h.root);
+        drop(_s);
         let n = feat.len();
         let (mut a, mut b) = (0usize, n);
         if hi > 0 {
@@ -219,9 +221,13 @@ pub fn run(path: &str, hier: &str, fs: &[u8], seq: Option<&[u8]>,
             a = f.saturating_sub(halo as usize);
             b = if n - l - 1 <= halo as usize { n } else { l + halo as usize + 1 };
         }
+        let _s = crate::prof::span(4);
         smooth_one(&h, &st[a..b], &en[a..b], &mut feat[a..b], maxgap);
+        drop(_s);
         let name = r.name_at(ri).to_vec();
+        let _s = crate::prof::span(5);
         emit(&h, &mut buf, &name, &st[a..b], &en[a..b], &feat[a..b], &novel[a..b], lo, hi, v1);
+        drop(_s);
         if buf.len() > (1 << 20) - 4096 {
             out.write_all(&buf).unwrap_or_else(|_| crate::bail("write failed"));
             buf.clear();

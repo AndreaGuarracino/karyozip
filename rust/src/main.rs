@@ -3,6 +3,7 @@ mod cli;
 mod db;
 mod ffi;
 mod kst;
+mod prof;
 mod reader;
 mod smooth;
 mod writer;
@@ -12,6 +13,7 @@ use std::io::{BufWriter, Read, Write};
 
 fn die(msg: &str) -> ! {
     eprintln!("karyozip: {msg}");
+    prof::dump();
     std::process::exit(1);
 }
 pub fn bail(msg: &str) -> ! { die(msg) }
@@ -73,6 +75,7 @@ fn main() {
     opt.len_codec = c.len_codec.as_deref().map(|v| parse_codec(v, "--len-codec"));
 
     let Some(cmd) = c.cmd.as_ref() else { die(cli::USAGE) };
+    prof::start(c.profile, n);
     // The C tests each predicate over both codecs before the next one.
     let ks = [opt.id_codec, opt.len_codec];
     let any = |f: fn(i32) -> bool| ks.iter().flatten().any(|&k| f(k));
@@ -214,6 +217,7 @@ fn main() {
             aln::pack(&a, dest, rh);
         }
     }
+    prof::dump();
 }
 
 /// Writes the file and reports, for both encode paths.
@@ -301,6 +305,7 @@ fn encode(opt: writer::Options, tmpdir: &std::path::Path, a: Option<aln::Aln>) {
     let nthr = rayon::current_num_threads().min(32);
     let mut stdin = std::io::stdin().lock();
     let mut eof = false;
+    let _p = prof::span(0);
     loop {
         while !eof && have < SLAB {
             match stdin.read(&mut slab[have..]) {
@@ -319,22 +324,25 @@ fn encode(opt: writer::Options, tmpdir: &std::path::Path, a: Option<aln::Aln>) {
         };
         // Split the lines on threads, append in order. The append is
         // serial because the streams come out in row order.
+        let _s = prof::span(5);
         let rows = parse_slab(&slab[..end], nthr);
-        for r in &rows {
-            w.row(&slab[r.nm.0..r.nm.1], r.en - r.st,
-                  &slab[r.lab.0..r.lab.1], r.st)
+        drop(_s);
+        let _s = prof::span(6);
+        for r in rows.iter().flatten() {
+            w.row(&slab[r.nm.0 as usize..r.nm.1 as usize], r.en - r.st,
+                  &slab[r.lab.0 as usize..r.lab.1 as usize], r.st)
                 .unwrap_or_else(|m| die(&m));
         }
+        drop(_s);
         slab.copy_within(end..have, 0);
         have -= end;
         if eof && have == 0 { break; }
     }
 
+    drop(_p);
     let stdout = std::io::stdout();
     let mut out = BufWriter::new(stdout.lock());
     let hits = w.aln_hit();
-    let rows_before = 0u64;
-    let _ = rows_before;
     let st = w.close(&mut out).unwrap_or_else(|m| die(&m));
     out.flush().unwrap_or_else(|e| die(&e.to_string()));
     if aln_on {
@@ -354,12 +362,14 @@ fn report(st: &writer::Stats) {
 }
 
 /// One parsed row: byte ranges into the slab, and the coordinates.
-struct Row { nm: (usize, usize), lab: (usize, usize), st: u64, en: u64 }
+/// Offsets into the slab, which is 16 MB, so u32 is enough and the row is
+/// 32 bytes instead of 48.
+struct Row { nm: (u32, u32), lab: (u32, u32), st: u64, en: u64 }
 
 /// Splits `s` at line boundaries into `t` chunks, parses each on its own
 /// thread, and returns the rows in order. A worker records the first thing
 /// it refuses; main reports the earliest chunk's.
-fn parse_slab(s: &[u8], t: usize) -> Vec<Row> {
+fn parse_slab(s: &[u8], t: usize) -> Vec<Vec<Row>> {
     use rayon::prelude::*;
     let mut cut = vec![0usize];
     for k in 1..t {
@@ -373,11 +383,7 @@ fn parse_slab(s: &[u8], t: usize) -> Vec<Row> {
         .into_par_iter()
         .map(|k| parse_chunk(s, cut[k], cut[k + 1]))
         .collect();
-    let mut out = Vec::new();
-    for p in parts {
-        match p { Ok(mut v) => out.append(&mut v), Err(m) => die(m) }
-    }
-    out
+    parts.into_iter().map(|p| p.unwrap_or_else(|m| die(m))).collect()
 }
 
 fn parse_chunk(s: &[u8], from: usize, to: usize) -> Result<Vec<Row>, &'static str> {
@@ -399,7 +405,8 @@ fn parse_chunk(s: &[u8], from: usize, to: usize) -> Result<Vec<Row>, &'static st
         if en < st { return Err("end is before start"); }
         if en == st { return Err("end equals start: a run must cover at least one base"); }
         if t1 == 0 { return Err("empty sequence name"); }
-        out.push(Row { nm: (p, p + t1), lab: (p + t3 + 1, nl), st, en });
+        out.push(Row { nm: (p as u32, (p + t1) as u32),
+                       lab: ((p + t3 + 1) as u32, nl as u32), st, en });
         p = nl + 1;
     }
     Ok(out)

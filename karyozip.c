@@ -32,22 +32,33 @@ static const char MAGIC[8] = "KST00001";   /* KaryoScope Track, format version 1
 #define KARYOZIP_VERSION "0.2.0"
 
 static int PROF = 0;
-static double PH[8];
-static const char *PHN[8] = {"parse", "compress", "names", "index",
-                             "smooth", "emit", "loadseq", "write"};
+static double PH[9];
+static const char *PHN[9] = {"parse", "compress", "names", "index",
+                             "smooth", "parse:lines", "parse:append", "write", "codec search"};
 static inline double nowsec(void) {
     struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
     return t.tv_sec + 1e-9 * t.tv_nsec;
 }
 #define PH_RSS(i) do { if (PROF) PHRSS[i] = rss_now(); } while (0)
 #define PH_ADD(i, t0) do { if (PROF) { PH[i] += nowsec() - (t0); PHRSS[i] = rss_now(); } } while (0)
-static size_t PHRSS[8];
+static size_t PHRSS[9];
 static double WALL0 = 0;
-static int nthreads(void) {       /* --threads, else one per core, else 1 */
+/* --threads, else OMP_NUM_THREADS, else one per core capped at 8. The cap is
+   measured, not guessed: encode is about half serial, so past 8 threads the
+   extra ones only spin at barriers. On a 40M-row track, 16 cores:
+     -t 4   5.09 s wall  13.7 s cpu
+     -t 8   4.41 s wall  19.5 s cpu   <- the knee
+     -t 16  4.69 s wall  35.3 s cpu
+   An explicit --threads or OMP_NUM_THREADS overrides it. */
+#define THRCAP 8
+static int nthreads(void) {
+    if (NTHREADS > 0) return NTHREADS;
 #ifdef _OPENMP
-    return NTHREADS > 0 ? NTHREADS : omp_get_max_threads();
+    int m = omp_get_max_threads();
+    if (m > THRCAP && !getenv("OMP_NUM_THREADS")) m = THRCAP;
+    return m;
 #else
-    return NTHREADS > 0 ? NTHREADS : 1;
+    return 1;
 #endif
 }
 
@@ -58,13 +69,12 @@ static size_t rss_now(void) {          /* VmHWM: the true high-water mark */
     while (fgets(l, sizeof l, f)) if (!strncmp(l, "VmHWM:", 6)) { kb = (size_t)strtoul(l + 6, NULL, 10); break; }
     fclose(f); return kb;
 }
-static size_t PHRSS[8];
 
 static void profdump(void) {
     if (!PROF) return;
     double tot = 0;
-    for (int i = 0; i < 8; i++) tot += PH[i];
-    for (int i = 0; i < 8; i++)
+    for (int i = 0; i < 9; i++) tot += PH[i];
+    for (int i = 0; i < 9; i++)
         if (PH[i] > 0)
             fprintf(stderr, "  phase %-12s %8.3f s  %5.1f%%   hwm %5zu MB\n",
                     PHN[i], PH[i], 100 * PH[i] / (tot > 0 ? tot : 1), PHRSS[i] / 1024);
@@ -457,7 +467,11 @@ static size_t tokbest(buf *in, uint8_t **out) {
 /* smallest of zstd, integer deltas, tokeniser; losers freed; kind 0/1/2 */
 static size_t bestnames(buf *b, uint64_t n, uint8_t **out, int *kind) {
     uint8_t *a1 = NULL, *a2 = NULL, *a3 = NULL;
-    size_t s1 = zc(b, &a1), s2 = intnames(b, n, &a2), s3 = tokbest(b, &a3);
+    double _t1 = nowsec(); size_t s1 = zc(b, &a1);
+    double _t2 = nowsec(); size_t s2 = intnames(b, n, &a2);
+    double _t3 = nowsec(); size_t s3 = tokbest(b, &a3);
+    if (PROF) fprintf(stderr, "  names %zu B: zstd %.3f s, int %.3f s, tok %.3f s\n",
+                      b->n, _t2 - _t1, _t3 - _t2, nowsec() - _t3);
     size_t best = s1; *kind = 0; *out = a1;
     if (s2 && s2 < best) { best = s2; *kind = 1; *out = a2; }
     if (s3 && s3 < best) { best = s3; *kind = 2; *out = a3; }
@@ -1615,6 +1629,7 @@ static void encode(void) {
         cb[T] = span2;
         for (int t = 1; t <= T; t++) if (cb[t] < cb[t - 1]) cb[t] = cb[t - 1];
         const char *perr[33] = {0};   /* a worker records, main dies after the region */
+        double _tpar = nowsec();
 #pragma omp parallel for schedule(static) num_threads(T)
         for (int t = 0; t < T; t++) {
             size_t n = 0;
@@ -1649,7 +1664,9 @@ static void encode(void) {
             }
             prn[t] = n; perr[t] = e;
         }
+        PH_ADD(5, _tpar);                       /* threaded: split the lines */
         for (int t = 0; t < T; t++) if (perr[t]) die(perr[t]);
+        double _tser = nowsec();
         for (int t = 0; t < T; t++)
             for (size_t k = 0; k < prn[t]; k++) {
                 prow *q = &pr[t][k];
@@ -1668,6 +1685,7 @@ static void encode(void) {
                 if (SORT) sortpush(q->nm, q->nlen, q->st, q->len, lab, llen);
                 else ktw_row(w, q->nm, q->nlen, q->len, lab, llen, q->st);
             }
+        PH_ADD(6, _tser);                       /* serial: append the rows */
         have -= span2;
         if (have) memmove(slab, slab + span2, have);
         if (!eof && have == SLAB) die("a BED line is longer than the read buffer");
@@ -1938,7 +1956,9 @@ static void ktw_close(ktw *w) {
     FILE *tmp = w->tmp;
     const blkmeta *bm = w->bm; size_t nraw = w->nraw;
 
+    double _ts = nowsec();
     pickcodecs(w->rawfd, bm, nraw);
+    PH_ADD(8, _ts);
 
     size_t maxraw = 0;
     for (size_t i = 0; i < nraw; i++) {
@@ -2084,10 +2104,16 @@ static void ktw_close(ktw *w) {
               q = nl + 1; smpn++; }
           smp.n = smp.cap = (size_t)((const uint8_t *)q - names.d); }
         uint8_t *smpz = NULL; int pick;               /* rank on the sample, run the winner */
-        bestnames(&smp, smpn, &smpz, &pick);
-        free(smpz);
-        if (pick == 1) { nzl = intnames(&names, nidx, &nz); intused = nzl != 0; }
-        else if (pick == 2) { nzl = tokbest(&names, &nz); tokused = nzl != 0; }
+        size_t smpl = bestnames(&smp, smpn, &smpz, &pick);
+        if (smp.n == names.n) {                       /* the sample was the whole
+                                                         buffer: the winner is done */
+            nz = smpz; nzl = smpl;
+            intused = pick == 1; tokused = pick == 2;
+        } else {
+            free(smpz);
+            if (pick == 1) { nzl = intnames(&names, nidx, &nz); intused = nzl != 0; }
+            else if (pick == 2) { nzl = tokbest(&names, &nz); tokused = nzl != 0; }
+        }
         if (!nzl) { nzl = zc(&names, &nz); tokused = intused = 0; }  /* refused */
         /* The rows carry a rank per record. */
         if (PERMON && NAMEMODE == 1) { free(natbuf.d); natbuf.n = 0; natbuf.d = NULL; }

@@ -442,6 +442,19 @@ static size_t tokbest(buf *in, uint8_t **out) {
     return best;
 }
 
+/* smallest of zstd, integer deltas, tokeniser; losers freed; kind 0/1/2 */
+static size_t bestnames(buf *b, uint64_t n, uint8_t **out, int *kind) {
+    uint8_t *a1 = NULL, *a2 = NULL, *a3 = NULL;
+    size_t s1 = zc(b, &a1), s2 = intnames(b, n, &a2), s3 = tokbest(b, &a3);
+    size_t best = s1; *kind = 0; *out = a1;
+    if (s2 && s2 < best) { best = s2; *kind = 1; *out = a2; }
+    if (s3 && s3 < best) { best = s3; *kind = 2; *out = a3; }
+    if (*out != a1) free(a1);
+    if (*out != a2) free(a2);
+    if (*out != a3) free(a3);
+    return best;
+}
+
 #ifdef KARYOZIP_TOK
 
 static int nosz(int c) { unsigned u = (unsigned)c; return u && !(u & CODEC_BZIP3) && (u & 0x10); }
@@ -2061,14 +2074,9 @@ static void ktw_close(ktw *w) {
               if (!nl) break;
               q = nl + 1; smpn++; }
           smp.n = smp.cap = (size_t)((const uint8_t *)q - names.d); }
-        uint8_t *a1 = NULL, *a2 = NULL, *a3 = NULL;
-        size_t s1 = zc(&smp, &a1);
-        size_t s2 = intnames(&smp, smpn, &a2);
-        size_t s3 = tokbest(&smp, &a3);
-        free(a1); free(a2); free(a3);
-        int pick = 0;                                    /* 0 zstd, 1 int, 2 tok */
-        if (s2 && s2 < s1) pick = 1;
-        if (s3 && s3 < (pick == 1 ? s2 : s1)) pick = 2;
+        uint8_t *smpz = NULL; int pick;               /* rank on the sample, run the winner */
+        bestnames(&smp, smpn, &smpz, &pick);
+        free(smpz);
         if (pick == 1) { nzl = intnames(&names, nidx, &nz); intused = nzl != 0; }
         else if (pick == 2) { nzl = tokbest(&names, &nz); tokused = nzl != 0; }
         if (!nzl) { nzl = zc(&names, &nz); tokused = intused = 0; }  /* refused */
@@ -2092,11 +2100,8 @@ static void ktw_close(ktw *w) {
                   if (e5 != nl4 || e5 == q4 || v >= nidx) die("a stored rank is not a record number");
                   bput(&srt, nt[v], strlen(nt[v])); bput(&srt, "\n", 1);
                   q4 = nl4 + 1; } }
-            uint8_t *sa = NULL, *sb = NULL, *sc = NULL;
-            size_t l1 = zc(&srt, &sa), l2 = intnames(&srt, nidx, &sb), l3 = tokbest(&srt, &sc);
-            size_t best = l1; int bpick = 0; uint8_t *bp = sa;
-            if (l2 && l2 < best) { best = l2; bpick = 1; bp = sb; }
-            if (l3 && l3 < best) { best = l3; bpick = 2; bp = sc; }
+            uint8_t *bp = NULL; int bpick;
+            size_t best = bestnames(&srt, nidx, &bp, &bpick);
             uint8_t *na = NULL, *nb2 = NULL;
             size_t p1 = zc(&natbuf, &na), p2 = tokbest(&natbuf, &nb2);
             size_t pbest = p1; uint8_t *pp = na; int ptok = 0;
@@ -2104,16 +2109,13 @@ static void ktw_close(ktw *w) {
             if (best && best <= nzl + pbest) {     /* sorted names win: no rank */
                 free(nz); nz = bp; nzl = best;
                 tokused = bpick == 2; intused = bpick == 1;
-                if (bp != sa) free(sa);
-                if (bp != sb) free(sb);
-                if (bp != sc) free(sc);
                 free(na); free(nb2); free(natbuf.d); natbuf.n = 0; natbuf.d = NULL;
                 PERMON = 0;
             } else {
                 PERMBLOB = pp; PERMBLOBLEN = pbest; PERMBLOBTOK = ptok;
                 if (pp != na) free(na);
                 if (pp != nb2) free(nb2);
-                free(sa); free(sb); free(sc);
+                free(bp);                          /* the sorted-name form loses */
             }
             free(srt.d); free(nt);
         }

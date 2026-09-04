@@ -5,3 +5,4 @@ __pycache__/
 *.kst
 *.kst.idx
 *.kst.names
+notes/

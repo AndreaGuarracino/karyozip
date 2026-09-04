@@ -441,7 +441,18 @@ $KT decode --aln "$W/mn.paf" --ref "$W/mn.ref" "$W/mn.kt" 2>/dev/null | cmp -s -
 
 # A NOSZ codec carries no size, so a forged index could not be caught: refused
 # from the environment and in a header.
-must_fail "$KT --id-codec 0x10" --id-codec 0x10 encode < "$D/s.bed"
+must_fail "--id-codec 0x10, a NOSZ codec" $KT --id-codec 0x10 encode < "$D/s.bed"
+
+# Round 32: flags with no command dereferenced argv[1] past the end of a
+# compacted argv and segfaulted (exit 139). The argc<2 guard ran before the
+# compaction, so it never saw these.
+must_fail "--profile with no command" $KT --profile
+must_fail "--threads with no command" $KT --threads 4
+must_fail "--tmp-dir with no command" $KT --tmp-dir /tmp
+must_fail "--slow with no command" $KT --slow
+$KT --profile 2>&1 | grep -q '^karyozip: usage:' \
+  && echo "flags with no command: usage, not a crash" \
+  || { echo "flags with no command: WRONG"; fail=1; }
 python3 "$D/kt.py" "$W/p.kt" "$W/nosz.kt" lo9 0x10
 must_fail "a header naming a NOSZ codec" $KT decode "$W/nosz.kt"
 

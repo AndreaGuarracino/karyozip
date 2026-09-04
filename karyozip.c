@@ -68,15 +68,23 @@ static void ckalloc(size_t n) {
     if (ALLOCMAX && n > ALLOCMAX) die("corrupt file: an impossible allocation size");
 }
 
-static uint64_t bedcoord(const char *p, const char *end, const char *what) {
-    if (p == end) die("empty start or end column");
+/* the reporting form: a thread inside a parallel region must not exit */
+static uint64_t bedcoord_e(const char *p, const char *end, const char *what,
+                           const char **err) {
+    if (p == end) { *err = "empty start or end column"; return 0; }
     uint64_t v = 0;
     for (; p < end; p++) {
-        if (*p < '0' || *p > '9') die(what);
+        if (*p < '0' || *p > '9') { *err = what; return 0; }
         if (v > (UINT64_MAX - (uint64_t)(*p - '0')) / 10)
-            die("a coordinate does not fit in 64 bits");
+            { *err = "a coordinate does not fit in 64 bits"; return 0; }
         v = v * 10 + (uint64_t)(*p - '0');
     }
+    return v;
+}
+static uint64_t bedcoord(const char *p, const char *end, const char *what) {
+    const char *err = NULL;
+    uint64_t v = bedcoord_e(p, end, what, &err);
+    if (err) die(err);
     return v;
 }
 
@@ -465,7 +473,9 @@ static size_t paycomp(const uint8_t *src, size_t n, int codec, uint8_t **out) {
     }
     if (codec & CODEC_ARITH) {
 
-        ol = (unsigned int)n * 2 + 1024; *out = malloc(ol);
+        uint64_t ob = (uint64_t)n * 2 + 1024;   /* 32-bit here wraps near 2 GB */
+        if (ob > 0xffffffffu) { *out = NULL; return 0; }
+        ol = (unsigned int)ob; *out = malloc(ol);
         if (!*out) return 0;
         if (!arith_compress_to((unsigned char *)src, (unsigned int)n,
                                *out, &ol, codec & 0xffff)) { if (!(codec & 0x04)) free(*out); *out = NULL; return 0; }
@@ -1127,7 +1137,10 @@ static uint64_t refend(const qseg *Q, uint64_t pos) {
 }
 
 static uint64_t refend_at(const char *nm, uint64_t pos) {
-    static const qseg *cq = NULL; static char cn[512];
+    /* __thread like every other reader cursor: smooth refuses --aln tracks
+       today, so no threaded path reaches this, but a shared cursor here
+       would be a silent wrong-length race the day one does. */
+    static __thread const qseg *cq = NULL; static __thread char cn[512];
     if (strcmp(nm, cn)) { cq = qlookup(nm); snprintf(cn, sizeof cn, "%s", nm); }
     return refend(cq, pos);
 }
@@ -1573,39 +1586,42 @@ static void encode(void) {
         }
         cb[T] = span2;
         for (int t = 1; t <= T; t++) if (cb[t] < cb[t - 1]) cb[t] = cb[t - 1];
+        const char *perr[33] = {0};   /* a worker records, main dies after the region */
 #pragma omp parallel for schedule(static) num_threads(T)
         for (int t = 0; t < T; t++) {
             size_t n = 0;
+            const char *e = NULL;
             char *p = slab + cb[t], *e2 = slab + cb[t + 1], *nlp;
             while (p < e2 && (nlp = memchr(p, '\n', (size_t)(e2 - p)))) {
                 *nlp = 0;
                 ssize_t len = (ssize_t)(nlp - p);
                 char *line = p;
                 p = nlp + 1;
-                if (memchr(line, 0, (size_t)len)) die("a NUL byte inside a row");
-                char *t1 = memchr(line, '\t', (size_t)len); if (!t1) die("bad line");
-                char *t2 = memchr(t1 + 1, '\t', (size_t)(len - (t1 + 1 - line))); if (!t2) die("bad line");
-                char *t3 = memchr(t2 + 1, '\t', (size_t)(len - (t2 + 1 - line))); if (!t3) die("bad line");
-                if (t1 + 1 == t2 || t2 + 1 == t3) die("empty start or end column");
+                if (memchr(line, 0, (size_t)len)) { e = "a NUL byte inside a row"; break; }
+                char *t1 = memchr(line, '\t', (size_t)len); if (!t1) { e = "bad line"; break; }
+                char *t2 = memchr(t1 + 1, '\t', (size_t)(len - (t1 + 1 - line))); if (!t2) { e = "bad line"; break; }
+                char *t3 = memchr(t2 + 1, '\t', (size_t)(len - (t2 + 1 - line))); if (!t3) { e = "bad line"; break; }
+                if (t1 + 1 == t2 || t2 + 1 == t3) { e = "empty start or end column"; break; }
                 uint64_t st = 0, en = 0;
-                st = bedcoord(t1 + 1, t2, "start is not a number");
-                en = bedcoord(t2 + 1, t3, "end is not a number");
-                if (en < st) die("end is before start");
+                st = bedcoord_e(t1 + 1, t2, "start is not a number", &e); if (e) break;
+                en = bedcoord_e(t2 + 1, t3, "end is not a number", &e); if (e) break;
+                if (en < st) { e = "end is before start"; break; }
 
-                if (en == st) die("end equals start: a run must cover at least one base");
-                if (t1 == line) die("empty sequence name");
+                if (en == st) { e = "end equals start: a run must cover at least one base"; break; }
+                if (t1 == line) { e = "empty sequence name"; break; }
                 if (n == prc[t]) {
                     prc[t] = prc[t] ? prc[t] * 2 : 1 << 16;
                     pr[t] = realloc(pr[t], prc[t] * sizeof **pr);
-                    if (!pr[t]) die("oom");
+                    if (!pr[t]) { e = "oom"; break; }
                 }
                 pr[t][n].nm = line; pr[t][n].nlen = (uint32_t)(t1 - line);
                 pr[t][n].lab = t3 + 1; pr[t][n].llen = (uint32_t)(len - (t3 + 1 - line));
                 pr[t][n].st = st; pr[t][n].len = en - st;
                 n++;
             }
-            prn[t] = n;
+            prn[t] = n; perr[t] = e;
         }
+        for (int t = 0; t < T; t++) if (perr[t]) die(perr[t]);
         for (int t = 0; t < T; t++)
             for (size_t k = 0; k < prn[t]; k++) {
                 prow *q = &pr[t][k];
@@ -1925,7 +1941,7 @@ static void ktw_close(ktw *w) {
 #else
         nthr = 1;
 #endif
-        _Atomic int failed = 0;
+        _Atomic int failed = 0, wfail = 0;
 #ifdef _OPENMP
 #pragma omp parallel num_threads(nthr)
 #endif
@@ -1990,7 +2006,7 @@ static void ktw_close(ktw *w) {
 #pragma omp ordered
 #endif
                 {
-                    if (fwrite(fa, 1, a, tmp) != a || fwrite(ids, 1, b2, tmp) != b2) die("tmp write");
+                    if (fwrite(fa, 1, a, tmp) != a || fwrite(ids, 1, b2, tmp) != b2) wfail = 1;
                     bvar(&sizes, a); bvar(&sizes, b2);
                     bvar(&sizes, ni); bvar(&sizes, ALNPAF ? nl << 2 | nosent : nl);
                     bvar(&sizes, rawrows[i]); bvar(&sizes, rawbp[i]);
@@ -2000,6 +2016,7 @@ static void ktw_close(ktw *w) {
             }
             ZSTD_freeCCtx(tc);
         }
+        if (wfail) die("tmp write");
         if (failed) die("block compression failed");
         free(rawblocks.d); rawblocks.d = NULL; rawblocks.n = rawblocks.cap = 0;
         PH_ADD(1, _tc);
@@ -2082,8 +2099,8 @@ static void ktw_close(ktw *w) {
               while (q4 < e4) {
                   const char *nl4 = memchr(q4, 10, (size_t)(e4 - q4));
                   if (!nl4) break;
-                  unsigned long long v = strtoull(q4, NULL, 10);
-                  if (v >= nidx) die("a stored rank is not a record number");
+                  char *e5; unsigned long long v = strtoull(q4, &e5, 10);
+                  if (e5 != nl4 || e5 == q4 || v >= nidx) die("a stored rank is not a record number");
                   bput(&srt, nt[v], strlen(nt[v])); bput(&srt, "\n", 1);
                   q4 = nl4 + 1; } }
             uint8_t *sa = NULL, *sb = NULL, *sc = NULL;
@@ -2795,7 +2812,7 @@ static int64_t idxlookup(R *r, const char *path, const char *nm) {
     int fd = open(p, O_RDONLY);
     if (fd < 0) return -1;
     struct stat st;
-    if (fstat(fd, &st) || (size_t)st.st_size < 24) { close(fd); return -1; }
+    if (fstat(fd, &st) || (size_t)st.st_size < 32) { close(fd); return -1; }   /* 4 header words */
     void *m = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
     close(fd);
     if (m == MAP_FAILED) return -1;
@@ -3050,7 +3067,7 @@ static void region(const char *path, const char *seq, uint64_t lo, uint64_t hi,
             }
             s2 = e2;
         }
-        if (first > last) { if (fclose(stdout)) die("write failed"); rclose(r); return; }
+        if (first > last) { rclose(r); return; }   /* atexit emitflush does the flush */
         kfirst = first > halo ? first - halo : 0;
         klast = q.nruns - last - 1 <= halo ? q.nruns : last + halo + 1;   /* no wrap */
         if (klast > q.nruns) klast = q.nruns;
@@ -3379,7 +3396,7 @@ static void smooth_mt(const char *path, R *r0, int64_t first, int64_t last,
 
     const int64_t CHUNK = 4096;
     int64_t nchunk = (last - first + CHUNK - 1) / CHUNK;
-    _Atomic int failed = 0;
+    _Atomic int failed = 0, wfail = 0;
 #ifdef _OPENMP
 #pragma omp parallel num_threads(nthr)
 #endif
@@ -3418,12 +3435,13 @@ static void smooth_mt(const char *path, R *r0, int64_t first, int64_t last,
 #pragma omp ordered
 #endif
             {
-                if (len && fwrite(ob, 1, len, stdout) != len) die("write failed");
+                if (len && fwrite(ob, 1, len, stdout) != len) wfail = 1;
             }
         }
         free(ob);
         if (rr) rclose(rr);
     }
+    if (wfail) die("write failed");
     if (failed) die("threaded smoothing failed");
 }
 
@@ -3749,7 +3767,10 @@ static void decode_db(const char *path, const char *dir) {
                     die("a delta row has no reference answer: wrong PAF or --ref");
                 idtxt = labtab[rl];
             }
-            uint32_t id = idtxt ? (uint32_t)strtoul(idtxt, NULL, 10) : (uint32_t)f;
+            /* the label text IS the featureID: parse it as strictly as encode did */
+            uint32_t id = idtxt ? (uint32_t)num_arg(idtxt, (1u << 26) - 1,
+                              "corrupt --db track: a label is not a featureID")
+                                : (uint32_t)f;
             if (id && (id >= nfid || !fid2lab[id]))
                 die("a featureID in the track is not in the features table");
             for (size_t j = 0; j < nfset; j++) {
@@ -3919,6 +3940,7 @@ int main(int argc, char **argv) {
         if (take && !ok) { fprintf(stderr, "karyozip: %s does not apply to %s\n", a, cmd); exit(1); }
         if (take) { for (int j = i; j + take <= argc; j++) argv[j] = argv[j + take]; argc -= take; i--; }
     }
+    if (!*cmd) die(USAGE);   /* flags but no command: argv[1] is now past the end */
     if ((IDCODEC >= 0 && badcodec(IDCODEC)) || (LENCODEC >= 0 && badcodec(LENCODEC))) die("--id-codec and --len-codec take a codec id, not any number");
     if (nosz(IDCODEC) || nosz(LENCODEC)) die("a NOSZ codec (0x10) stores no size and is not accepted");
     if (noext(IDCODEC) || noext(LENCODEC)) die("arith X_EXT (0x04) needs libbz2 and is not accepted");

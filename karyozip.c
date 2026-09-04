@@ -39,7 +39,9 @@ static inline double nowsec(void) {
     struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
     return t.tv_sec + 1e-9 * t.tv_nsec;
 }
-#define PH_ADD(i, t0) do { if (PROF) PH[i] += nowsec() - (t0); } while (0)
+#define PH_RSS(i) do { if (PROF) PHRSS[i] = rss_now(); } while (0)
+#define PH_ADD(i, t0) do { if (PROF) { PH[i] += nowsec() - (t0); PHRSS[i] = rss_now(); } } while (0)
+static size_t PHRSS[8];
 static double WALL0 = 0;
 static int nthreads(void) {       /* --threads, else one per core, else 1 */
 #ifdef _OPENMP
@@ -49,14 +51,23 @@ static int nthreads(void) {       /* --threads, else one per core, else 1 */
 #endif
 }
 
+static size_t rss_now(void) {          /* VmHWM: the true high-water mark */
+    FILE *f = fopen("/proc/self/status", "r");
+    if (!f) return 0;
+    char l[256]; size_t kb = 0;
+    while (fgets(l, sizeof l, f)) if (!strncmp(l, "VmHWM:", 6)) { kb = (size_t)strtoul(l + 6, NULL, 10); break; }
+    fclose(f); return kb;
+}
+static size_t PHRSS[8];
+
 static void profdump(void) {
     if (!PROF) return;
     double tot = 0;
     for (int i = 0; i < 8; i++) tot += PH[i];
     for (int i = 0; i < 8; i++)
         if (PH[i] > 0)
-            fprintf(stderr, "  phase %-12s %8.3f s  %5.1f%%\n",
-                    PHN[i], PH[i], 100 * PH[i] / (tot > 0 ? tot : 1));
+            fprintf(stderr, "  phase %-12s %8.3f s  %5.1f%%   hwm %5zu MB\n",
+                    PHN[i], PH[i], 100 * PH[i] / (tot > 0 ? tot : 1), PHRSS[i] / 1024);
 
     struct rusage ru;
     if (!getrusage(RUSAGE_SELF, &ru)) {
@@ -272,6 +283,7 @@ static const char *DBFEATS = NULL;    /* --db features.tsv */
 static int DBIDS = 0;
 static const char *ALNPAF = NULL;     /* --aln alignment.paf */
 static uint64_t ALNHIT = 0;           /* rows the reference already answered */
+static size_t RAWHELD = 0;            /* raw block payload held in memory at the peak */
 static int RAW = 0;
 static const char *OUTDIR = NULL;   /* --out DIR, for decode --db */
 static int ORDNAMES = 0;              /* --names ordinal: accept dropped names */
@@ -522,9 +534,9 @@ static __thread int TAILDEC = 0;          /* the file being read uses it */
 static __thread uint64_t TAILPRED_R = 0;  /* its predictor, from the header */
 static __thread uint64_t TAILSKIP_R = 0;  /* sequences before this store a plain length */
 
-/* one pending block, while the raw payload waits in rawblocks */
+/* one pending block, while the raw payload waits in the staging file */
 typedef struct {
-    size_t off, len, lens, rows, bp;   /* into rawblocks, then its two frames */
+    size_t off, len, lens, rows, bp;   /* into the staging file, then its two frames */
     size_t aoff[2], alen[2];           /* the same for the two --aln spellings */
 } blkmeta;
 
@@ -535,10 +547,26 @@ typedef struct {
     FILE *tmp;
     char cur[512]; size_t curlen;
     uint64_t currun, curoff, curblk, curbp, blkbp0;
-    buf rawblocks; blkmeta *bm; size_t nraw, rawcap;
+    int rawfd;                    /* raw block payloads, staged not held */
+    blkmeta *bm; size_t nraw, rawcap;
     buf lalt[2], rawalt[2];       /* plain; plus-strand sentinels only */
     uint64_t plen, pval; int phas, prev;
 } ktw;
+
+static void rawput(int fd, off_t off, const void *p, size_t n) {
+    while (n) {
+        ssize_t k = pwrite(fd, p, n, off);
+        if (k <= 0) die("cannot stage a block: is the temp filesystem full?");
+        p = (const char *)p + k; off += k; n -= (size_t)k;
+    }
+}
+static void rawget(int fd, off_t off, void *p, size_t n) {
+    while (n) {
+        ssize_t k = pread(fd, p, n, off);
+        if (k <= 0) die("cannot read back a staged block");
+        p = (char *)p + k; off += k; n -= (size_t)k;
+    }
+}
 
 static void ktw_flush(ktw *w) {
     if (!w->pend) return;
@@ -551,10 +579,12 @@ static void ktw_flush(ktw *w) {
         m->aoff[v] = w->rawalt[v].n; m->alen[v] = w->lalt[v].n;
         bput(&w->rawalt[v], w->lalt[v].d, w->lalt[v].n); w->lalt[v].n = 0;
     }
-    m->off = w->rawblocks.n; m->len = w->lens.n + w->ids.n;
+    m->off = w->nraw ? w->bm[w->nraw - 1].off + w->bm[w->nraw - 1].len : 0;
+    m->len = w->lens.n + w->ids.n;
     m->lens = w->lens.n; m->rows = w->pend;
     m->bp = w->blkbp0; w->blkbp0 = 0; w->nraw++;
-    bput(&w->rawblocks, w->lens.d, w->lens.n); bput(&w->rawblocks, w->ids.d, w->ids.n);
+    rawput(w->rawfd, (off_t)m->off, w->lens.d, w->lens.n);
+    rawput(w->rawfd, (off_t)(m->off + w->lens.n), w->ids.d, w->ids.n);
     w->nblk++;
     w->lens.n = 0; w->ids.n = 0; w->pend = 0;
 }
@@ -631,6 +661,10 @@ static ktw *ktw_open(void) {
     unlink(tp); free(tp);
     w->tmp = fdopen(tfd, "w+b");
     if (!w->tmp) die("tmpfile");
+    if (asprintf(&tp, "%s/karyozip.raw.XXXXXX", td) < 0) die("oom");
+    w->rawfd = mkstemp(tp);
+    if (w->rawfd < 0) { fprintf(stderr, "karyozip: cannot create a temp file under %s (set TMPDIR)\n", td); exit(1); }
+    unlink(tp); free(tp);
     return w;
 }
 
@@ -1656,7 +1690,7 @@ static int fastenough(int codec) {
     return (codec & CODEC_BZIP3) == 0;
 }
 
-static void pickcodecs(buf *rawblocks, const blkmeta *bm, size_t nraw) {
+static void pickcodecs(int rawfd, const blkmeta *bm, size_t nraw) {
 
     if (IDCODEC >= 0 && LENCODEC >= 0) return;
 
@@ -1707,8 +1741,12 @@ static void pickcodecs(buf *rawblocks, const blkmeta *bm, size_t nraw) {
 
         ZSTD_CCtx *sc = ZSTD_createCCtx();
         uint8_t *zo = xmalloc(ZSTD_compressBound(SCAP) + 1024);
+        uint8_t *sbuf = NULL; size_t sbcap = 0;
         for (size_t j = 0; j < np; j++) {
-            const uint8_t *src = rawblocks->d + bm[pick[j]].off;
+            size_t need = bm[pick[j]].len;
+            if (need > sbcap) { sbcap = need; sbuf = xrealloc(sbuf, sbcap ? sbcap : 1); }
+            rawget(rawfd, (off_t)bm[pick[j]].off, sbuf, need);
+            const uint8_t *src = sbuf;
             size_t nl = bm[pick[j]].lens, ni = bm[pick[j]].len - nl;
             const uint8_t *ids = src + nl;
             if (nl > SCAP) nl = SCAP;
@@ -1781,7 +1819,9 @@ static void pickcodecs(buf *rawblocks, const blkmeta *bm, size_t nraw) {
                 live[k] = ((ci[k] < (size_t)-1 / 4) || (cl[k] < (size_t)-1 / 4)) && (!big || (CAND[k] & CODEC_BZIP3));
             live[NCAND] = 1; live[NCAND + 1] = !LEVELSET;
             for (size_t b2 = 0; b2 < nraw; b2++) {
-                const uint8_t *src = rawblocks->d + bm[b2].off;
+                if (bm[b2].len > sbcap) { sbcap = bm[b2].len; sbuf = xrealloc(sbuf, sbcap); }
+                rawget(rawfd, (off_t)bm[b2].off, sbuf, bm[b2].len);
+                const uint8_t *src = sbuf;
                 size_t nl = bm[b2].lens, ni = bm[b2].len - nl;
 #ifdef _OPENMP
 #pragma omp parallel for schedule(dynamic, 1) num_threads(nthreads())
@@ -1814,7 +1854,9 @@ static void pickcodecs(buf *rawblocks, const blkmeta *bm, size_t nraw) {
                 }
                 int bad_i = 0, bad_l = 0;
                 for (size_t b2 = 0; b2 < nraw && !(bad_i && bad_l); b2++) {
-                    const uint8_t *src = rawblocks->d + bm[b2].off;
+                    if (bm[b2].len > sbcap) { sbcap = bm[b2].len; sbuf = xrealloc(sbuf, sbcap); }
+                    rawget(rawfd, (off_t)bm[b2].off, sbuf, bm[b2].len);
+                    const uint8_t *src = sbuf;
                     size_t nl = bm[b2].lens, ni = bm[b2].len - nl;
                     uint8_t *t = NULL, *v = NULL; size_t g;
                     if (qi < NCAND && ni && !bad_i) {
@@ -1839,6 +1881,7 @@ static void pickcodecs(buf *rawblocks, const blkmeta *bm, size_t nraw) {
             free(ti); free(tl); free(live);
         }
         free(zo); ZSTD_freeCCtx(sc);
+        free(sbuf);
         if (IDCODEC < 0) IDCODEC = wi;
         if (LENCODEC < 0) LENCODEC = wl;
         fprintf(stderr, "codec: len=0x%x id=0x%x from %zu sample blocks, %s\n",
@@ -1891,10 +1934,9 @@ static void ktw_close(ktw *w) {
     size_t nidx = w->nidx;
     uint64_t nblk = w->nblk, rows = w->rows;
     FILE *tmp = w->tmp;
-    buf rawblocks = w->rawblocks;
     const blkmeta *bm = w->bm; size_t nraw = w->nraw;
 
-    pickcodecs(&rawblocks, bm, nraw);
+    pickcodecs(w->rawfd, bm, nraw);
 
     size_t maxraw = 0;
     for (size_t i = 0; i < nraw; i++) {
@@ -1914,15 +1956,16 @@ static void ktw_close(ktw *w) {
 #endif
         {
             ZSTD_CCtx *tc = ZSTD_createCCtx();
-            if (!tc) failed = 1;
+            uint8_t *o = malloc(2 * obound + 64);        /* one per thread */
+            uint8_t *rb = malloc(maxraw ? maxraw : 1);   /* the block, read back */
+            if (!tc || !o || !rb) failed = 1;
 #ifdef _OPENMP
 #pragma omp for ordered schedule(dynamic, 1)
 #endif
             for (size_t i = 0; i < nraw; i++) {
                 if (failed) continue;
-                uint8_t *o = malloc(2 * obound + 64);
-                if (!o) { failed = 1; continue; }   /* out of memory, not a codec fault */
-                const uint8_t *src = rawblocks.d + bm[i].off;
+                rawget(w->rawfd, (off_t)bm[i].off, rb, bm[i].len);
+                const uint8_t *src = rb;
                 size_t nl = bm[i].lens, ni = bm[i].len - nl;
                 const uint8_t *idsrc = src + nl;   /* fixed: nl may change below */
                 size_t a = 0, b2; uint64_t nosent = 0;
@@ -1977,13 +2020,14 @@ static void ktw_close(ktw *w) {
                     bvar(&sizes, bm[i].rows); bvar(&sizes, bm[i].bp);
                     bvar(&sizes, fnvbuf(fnvbuf(FNV0, fa, a), ids, b2));
                 }
-                free(o); free(fa); free(fb);
+                free(fa); free(fb);
             }
+            free(o); free(rb);
             ZSTD_freeCCtx(tc);
         }
         if (wfail) die("tmp write");
         if (failed) die("block compression failed");
-        free(rawblocks.d); rawblocks.d = NULL; rawblocks.n = rawblocks.cap = 0;
+        RAWHELD = nraw ? bm[nraw - 1].off + bm[nraw - 1].len : 0;   /* staged, not held */
         PH_ADD(1, _tc);
     }
 
@@ -2162,16 +2206,17 @@ static void ktw_close(ktw *w) {
                 (unsigned long long)ALNHIT, (unsigned long long)rows,
                 rows ? 100.0 * (double)ALNHIT / (double)rows : 0.0, "\n");
     fprintf(stderr, "encoded rows=%llu reads=%zu blocks=%llu names=%zuB%s index=%zuB offs=%zuB "
-            "lens=%lluB labs=%lluB\n",
+            "lens=%lluB labs=%lluB raw=%zuB\n",
             (unsigned long long)rows, nidx, (unsigned long long)nblk,
             nzl, dropnames ? " (dropped, needs --names FILE)" : ordinal ? " (ordinal, not stored)" : tokused ? " (tokenised)" : intused ? " (int deltas)" : "", izl, szl,
-            (unsigned long long)BYT_LENS, (unsigned long long)BYT_LABS);
+            (unsigned long long)BYT_LENS, (unsigned long long)BYT_LABS, RAWHELD);
 
     free(itab.d); free(ichunks.d);
     free(lz); free(nz); free(sz); free(itz); free(npz);
     free(names.d); free(sizes.d); free(labs.d);
     free(w->bm);
     for (int v = 0; v < 2; v++) { free(w->rawalt[v].d); free(w->lalt[v].d); }
+    close(w->rawfd);
     free(w->lens.d); free(w->ids.d); free(w->ibx.d);
     free(w);
 }

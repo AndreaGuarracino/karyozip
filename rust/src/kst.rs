@@ -23,3 +23,18 @@ pub fn fnv(mut h: u64, b: &[u8]) -> u64 {
     }
     h
 }
+
+/// Decimal digits straight into the buffer. `to_string()` allocates a String
+/// per number, which is a quarter of decode's time on a 40M-row track.
+pub fn putu64(out: &mut Vec<u8>, v: u64) {
+    let mut b = [0u8; 20];
+    let mut i = b.len();
+    let mut n = v;
+    loop {
+        i -= 1;
+        b[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 { break; }
+    }
+    out.extend_from_slice(&b[i..]);
+}

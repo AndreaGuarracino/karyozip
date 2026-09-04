@@ -23,7 +23,7 @@ const ICHUNK: u64 = 65536;
 
 fn ordinals(n: u64) -> Vec<u8> {
     let mut v = Vec::with_capacity(n as usize * 8);
-    for i in 0..n { v.extend_from_slice(i.to_string().as_bytes()); v.push(b'\n'); }
+    for i in 0..n { crate::kst::putu64(&mut v, i); v.push(b'\n'); }
     v
 }
 
@@ -433,9 +433,9 @@ impl Reader {
                 let en = st + len;
                 buf.extend_from_slice(&name);
                 buf.push(b'\t');
-                buf.extend_from_slice(st.to_string().as_bytes());
+                kst::putu64(&mut buf, st);
                 buf.push(b'\t');
-                buf.extend_from_slice(en.to_string().as_bytes());
+                kst::putu64(&mut buf, en);
                 buf.push(b'\t');
                 self.label(f, &mut buf, st, len);
                 buf.push(b'\n');
@@ -512,7 +512,7 @@ fn int_names_d(b: &[u8], cnt: u64) -> Vec<u8> {
         q = n;
         cur = cur.wrapping_add(unzz(u));
         if cur > 1 << 50 { crate::bail("corrupt names: an integer name past 2^50"); }
-        o.extend_from_slice(cur.to_string().as_bytes());
+        kst::putu64(&mut o, cur);
         o.push(b'\n');
     }
     if q != v.len() { crate::bail("corrupt names: the integer stream has more than the count"); }
@@ -628,7 +628,7 @@ impl Reader {
     fn label(&self, f: u64, out: &mut Vec<u8>, st: u64, len: u64) {
         let l: &[u8] = match self.lab.get(f as usize) {
             Some(l) => l,
-            None if self.lab.is_empty() => { out.extend_from_slice(f.to_string().as_bytes()); return; }
+            None if self.lab.is_empty() => { kst::putu64(out, f); return; }
             None => crate::bail("corrupt block: a label id past the table"),
         };
         if l == b"=" && self.aln.is_some() {
@@ -687,9 +687,9 @@ impl Reader {
             if k >= kfirst && en > lo && (hi == 0 || st < hi) {
                 buf.extend_from_slice(seq);
                 buf.push(b'\t');
-                buf.extend_from_slice(st.to_string().as_bytes());
+                kst::putu64(&mut buf, st);
                 buf.push(b'\t');
-                buf.extend_from_slice(en.to_string().as_bytes());
+                kst::putu64(&mut buf, en);
                 buf.push(b'\t');
                 self.label(f, &mut buf, st, len);
                 buf.push(b'\n');

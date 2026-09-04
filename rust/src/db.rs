@@ -166,8 +166,9 @@ pub fn encode(files: &[String], feats: &Feats, w: &mut crate::writer::Writer) {
         }
         prevfid = id;
         lastend = hi;
-        let lab = id.to_string();
-        w.row(&b[0].seq, hi - lo, lab.as_bytes(), lo)
+        let mut lab = Vec::with_capacity(12);
+        kst::putu64(&mut lab, id as u64);
+        w.row(&b[0].seq, hi - lo, &lab, lo)
             .unwrap_or_else(|m| crate::bail(&m));
         rows += 1;
         for x in b.iter_mut() {
@@ -232,9 +233,9 @@ fn wr(f: &mut impl Write, seq: &[u8], st: u64, en: u64, lab: &[u8]) {
     let mut v = Vec::with_capacity(seq.len() + lab.len() + 24);
     v.extend_from_slice(seq);
     v.push(b'\t');
-    v.extend_from_slice(st.to_string().as_bytes());
+    crate::kst::putu64(&mut v, st);
     v.push(b'\t');
-    v.extend_from_slice(en.to_string().as_bytes());
+    crate::kst::putu64(&mut v, en);
     v.push(b'\t');
     v.extend_from_slice(lab);
     v.push(b'\n');

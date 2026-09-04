@@ -176,9 +176,9 @@ fn emit(h: &Hier, out: &mut Vec<u8>, seq: &[u8], st: &[u64], en: &[u64],
             if v1 && cf != h.root && ml > 9 && &nm[ml - 9..] == b"_specific" { ml -= 9; }
             out.extend_from_slice(seq);
             out.push(b'\t');
-            out.extend_from_slice(cs.to_string().as_bytes());
+            crate::kst::putu64(out, cs);
             out.push(b'\t');
-            out.extend_from_slice(ce.to_string().as_bytes());
+            crate::kst::putu64(out, ce);
             out.push(b'\t');
             out.extend_from_slice(&nm[..ml]);
             out.push(b'\n');

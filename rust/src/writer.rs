@@ -85,6 +85,8 @@ pub struct Writer {
     sortbp: u64,
     natbuf: Vec<u8>,
     perm_on: bool,
+    /// --sort writes ranks; the PAF still wants the real name.
+    alnname: Option<Vec<u8>>,
     natord: bool,
     feathash: Option<u64>,
     /// --aln: the alignment, the query it is on, and the two alternate
@@ -127,7 +129,7 @@ impl Writer {
     pub fn new(opt: Options, tmpdir: &std::path::Path) -> std::io::Result<Self> {
         let perm_on = opt.sort && opt.names_out.is_none();
         Ok(Writer {
-            perm_on,
+            perm_on, alnname: None,
             opt, lens: Vec::new(), ids: Vec::new(), names: Vec::new(), ibx: Vec::new(),
             nidx: 0, ordok: true, labtab: Vec::new(), labmap: HashMap::default(), lastid: None,
             cur: Vec::new(), currun: 0, curbp: 0, blkbp0: 0, pend: 0, nblk: 0, rows: 0,
@@ -247,6 +249,14 @@ impl Writer {
     /// --sort: hold the record; the order is decided at close.
     fn sortpush(&mut self, name: &[u8], run_len: u64, label: &[u8], start: u64)
         -> Result<(), String> {
+        if name.is_empty() { return Err("empty sequence name".into()); }
+        if name.len() >= 512 { return Err("name too long".into()); }
+        if run_len == 0 {
+            return Err("end equals start: a run must cover at least one base".into());
+        }
+        if start > u64::MAX - run_len {
+            return Err("a coordinate does not fit in 64 bits".into());
+        }
         let newrec = start == 0
             || self.srec.last().is_none_or(|r| r.0 != name);
         if newrec && start != 0 { return Err("a sequence does not start at 0".into()); }
@@ -291,10 +301,11 @@ impl Writer {
             let (nm, runs) = &recs[i];
             let rank = i.to_string();
             let name: &[u8] = if self.perm_on { rank.as_bytes() } else { nm };
+            self.alnname = Some(nm.clone());
             let mut pos = 0u64;
             for &(len, id) in runs {
                 let l = self.labtab[id as usize].clone();
-                self.row_inner(name, len, &l, pos)?;
+                self.row_inner(name, len, &l, pos, false)?;
                 pos += len;
             }
         }
@@ -304,12 +315,19 @@ impl Writer {
 
     pub fn row(&mut self, name: &[u8], run_len: u64, label: &[u8], start: u64)
         -> Result<(), String> {
-        if self.opt.sort { return self.sortpush(name, run_len, label, start); }
-        self.row_inner(name, run_len, label, start)
+        self.row_hint(name, run_len, label, start, false)
     }
 
-    fn row_inner(&mut self, name: &[u8], run_len: u64, label: &[u8], start: u64)
-        -> Result<(), String> {
+    /// `same` is the caller's promise that `name` repeats the row before it,
+    /// which saves a compare on the one serial phase of encode.
+    pub fn row_hint(&mut self, name: &[u8], run_len: u64, label: &[u8], start: u64,
+                    same: bool) -> Result<(), String> {
+        if self.opt.sort { return self.sortpush(name, run_len, label, start); }
+        self.row_inner(name, run_len, label, start, same)
+    }
+
+    fn row_inner(&mut self, name: &[u8], run_len: u64, label: &[u8], start: u64,
+                 same: bool) -> Result<(), String> {
         if name.is_empty() { return Err("empty sequence name".into()); }
         if run_len == 0 {
             return Err("end equals start: a run must cover at least one base".into());
@@ -317,14 +335,16 @@ impl Writer {
         if start > u64::MAX - run_len {
             return Err("a coordinate does not fit in 64 bits".into());
         }
-        if name != self.cur.as_slice() {
+        if !same && name != self.cur.as_slice() {
             if start != 0 { return Err("a sequence does not start at 0".into()); }
             if name.len() >= 512 { return Err("name too long".into()); }
             self.tail();
             self.pushread();
             self.cur.clear();
             self.cur.extend_from_slice(name);
-            self.alnq = self.aln.as_ref().and_then(|a| a.find(name));
+            // --sort writes ranks; the PAF still wants the real name.
+            let ln: &[u8] = self.alnname.as_deref().unwrap_or(name);
+            self.alnq = self.aln.as_ref().and_then(|a| a.find(ln));
             self.currun = 0;
             self.curbp = 0;
             if self.pend > 0 && self.pend >= self.opt.block { self.flush().map_err(io)?; }
@@ -459,6 +479,14 @@ impl Writer {
             check_unique(if perm_on { &self.natbuf } else { &self.names })?;
         }
         let mut dropnames = self.opt.drop_names;
+        // Dropping names that are not dense ordinals leaves --aln with no way
+        // back to the PAF, so they are kept as integer deltas instead.
+        if dropnames && aln_on && !ordinal {
+            eprintln!("--names drop: the names are not dense ordinals and --aln \
+                       needs them to reach the PAF, so they are stored as \
+                       integer deltas");
+            dropnames = false;
+        }
         if dropnames && perm_on { dropnames = false; ordinal = false; }
         else if dropnames { ordinal = true; }
         if !ordinal && self.ordok && self.names.is_empty() && self.nidx > 0 {
@@ -634,16 +662,7 @@ pub struct Stats {
     pub tokused: bool, pub intused: bool, pub ordinal: bool,
 }
 
-fn vget(b: &[u8], mut i: usize) -> (u64, usize) {
-    let (mut v, mut s) = (0u64, 0u32);
-    loop {
-        let c = b[i];
-        i += 1;
-        v |= ((c & 0x7f) as u64) << s;
-        s += 7;
-        if c < 0x80 { return (v, i); }
-    }
-}
+use crate::kst::vget;
 
 fn io(e: std::io::Error) -> String { e.to_string() }
 

@@ -1,7 +1,7 @@
 //! --aln: labels and run ends the reference already implies are not stored.
 //! The alignment is read for one thing only, the collinear M/=/X segments.
 
-use crate::kst::{self, FNV0};
+use crate::kst::{self, unzz, vget, FNV0};
 use std::collections::HashMap;
 
 /// One collinear block: where it starts on the query, which reference
@@ -155,6 +155,19 @@ impl Aln {
             s.sort_by_key(|g| (g.q, g.t, g.tp, g.rev, g.n));
         }
         // The binding hash: this PAF and this reference, or nothing.
+        self.seghash();
+        if badpaf > 0 || nocg > 0 || noref > 0 {
+            eprintln!("alignment: skipped {badpaf} malformed PAF lines, {nocg} without a cg:Z: tag, {noref} whose target is not in the reference");
+        }
+        if nblk == 0 {
+            if noref > 0 { crate::bail("alignment: no PAF record maps to a contig of the reference track"); }
+            crate::bail("alignment: no usable PAF record, so --aln would silently do nothing. Check the PAF carries cg:Z: CIGAR tags");
+        }
+        eprintln!("alignment: {} query contigs, {nblk} collinear blocks", self.qs.len());
+    }
+
+    /// The alignment's own hash, which binds a track to its PAF.
+    fn seghash(&mut self) {
         let mut sum = 0u64;
         for (nm, segs) in &self.qs {
             let mut h = kst::fnv(FNV0, nm);
@@ -169,14 +182,95 @@ impl Aln {
             if !segs.is_empty() { sum = sum.wrapping_add(h); }
         }
         self.hash ^= sum;
-        if badpaf > 0 || nocg > 0 || noref > 0 {
-            eprintln!("alignment: skipped {badpaf} malformed PAF lines, {nocg} without a cg:Z: tag, {noref} whose target is not in the reference");
+    }
+
+    /// A packed alignment if the file is one, else a PAF, as the C does.
+    pub fn load_aln(&mut self, path: &str) {
+        if !self.load_packed(path) { self.load_paf(path); }
+    }
+
+    /// aln-pack's own format: five coded streams behind a magic and the
+    /// reference's contig-order hash. Returns false when it is not one.
+    fn load_packed(&mut self, path: &str) -> bool {
+        let Ok(d) = std::fs::read(path) else { return false };
+        if d.len() < 6 || &d[..6] != b"KSTAL1" { return false; }
+        if d.len() < 14 { crate::bail("truncated packed alignment"); }
+        let rh = u64::from_le_bytes(d[6..14].try_into().unwrap());
+        if rh != refhash(self) {
+            crate::bail("this packed alignment was made against another reference, or another contig order");
         }
-        if nblk == 0 {
-            if noref > 0 { crate::bail("alignment: no PAF record maps to a contig of the reference track"); }
-            crate::bail("alignment: no usable PAF record, so --aln would silently do nothing. Check the PAF carries cg:Z: CIGAR tags");
+        let body = &d[14..];
+        let mut i = 0usize;
+        let mut sec: Vec<Vec<u8>> = Vec::with_capacity(5);
+        for _ in 0..5 {
+            let (cd, j) = vget(body, i);
+            let (rl, j) = vget(body, j);
+            let (cl, j) = vget(body, j);
+            let cl = cl as usize;
+            if cl > body.len() - j { crate::bail("corrupt packed alignment: a stream overruns the file"); }
+            let src = &body[j..j + cl];
+            i = j + cl;
+            sec.push(match cd {
+                0 => Vec::new(),
+                2 => crate::reader::tok_d(src),
+                1 => crate::ffi::zstd_decompress(src, rl as usize)
+                        .unwrap_or_else(|| crate::bail("corrupt packed alignment: a stream does not decompress")),
+                _ => crate::ffi::paydecomp(src, (cd - 3) as i32, rl as usize)
+                        .unwrap_or_else(|| crate::bail("corrupt packed alignment: a stream does not decompress")),
+            });
         }
-        eprintln!("alignment: {} query contigs, {nblk} collinear blocks", self.qs.len());
+        let (nms, cnt, pos, len, tgt) = (&sec[0], &sec[1], &sec[2], &sec[3], &sec[4]);
+        let (mut ci, mut pi, mut li, mut si) = (0usize, 0usize, 0usize, 0usize);
+        let nrc = self.rc.len() as u64;
+        let mut nb = 0usize;
+        let mut at = 0usize;
+        while at < nms.len() {
+            let Some(k) = memchr::memchr(b'\n', &nms[at..]) else {
+                crate::bail("corrupt packed alignment: a name has no newline")
+            };
+            let name = nms[at..at + k].to_vec();
+            at += k + 1;
+            let (cn, j) = vget(cnt, ci); ci = j;
+            let qi = *self.qsix.entry(name.clone()).or_insert_with(|| {
+                self.qs.push((name, Vec::new()));
+                self.qs.len() - 1
+            });
+            let segs = &mut self.qs[qi].1;
+            segs.clear();
+            segs.reserve(cn as usize);
+            let (mut pq, mut pt, mut tx) = (0u64, 0u64, 0u32);
+            let (mut rev, mut fresh, mut left) = (false, true, 0u64);
+            for _ in 0..cn {
+                if left == 0 {
+                    let (xr, j) = vget(tgt, si);
+                    rev = xr & 1 != 0;
+                    if xr >> 1 >= nrc { crate::bail("corrupt packed alignment: a target is not in the reference"); }
+                    tx = (xr >> 1) as u32;
+                    let (l, j2) = vget(tgt, j); si = j2;
+                    if l == 0 { crate::bail("corrupt packed alignment: an empty target run"); }
+                    left = l;
+                    fresh = true;
+                }
+                let (q, tp);
+                if fresh {
+                    let (a, j) = vget(pos, pi);
+                    let (b, j2) = vget(pos, j); pi = j2;
+                    q = a; tp = b; fresh = false;
+                } else {
+                    let (a, j) = vget(pos, pi);
+                    let (b, j2) = vget(pos, j); pi = j2;
+                    q = pq.wrapping_add(unzz(a));
+                    tp = pt.wrapping_add(unzz(b));
+                }
+                let (n, j) = vget(len, li); li = j;
+                segs.push(Seg { q, t: tx, n: n as u32, tp, rev });
+                pq = q + n; pt = tp + n; left -= 1;
+            }
+            nb += segs.len();
+        }
+        eprintln!("packed alignment: {} query contigs, {nb} collinear blocks", self.qs.len());
+        self.seghash();
+        true
     }
 
     /// A bare ordinal resolves through the map when one was given.

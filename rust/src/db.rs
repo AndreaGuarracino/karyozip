@@ -72,7 +72,8 @@ fn num(b: &[u8], max: u32, what: &str) -> u32 {
 }
 
 /// One input BED, read a row at a time.
-struct Brd { lines: Vec<Vec<u8>>, i: usize, seq: Vec<u8>, st: u64, en: u64, lab: Vec<u8>, eof: bool }
+struct Brd { lines: Vec<Vec<u8>>, i: usize, seq: Vec<u8>, st: u64, en: u64, lab: Vec<u8>,
+             pseq: Vec<u8>, pen: u64, plab: Vec<u8>, had: bool, eof: bool }
 
 impl Brd {
     fn open(path: &str) -> Brd {
@@ -87,9 +88,13 @@ impl Brd {
                 crate::bail("cannot open an input BED")
             })
         };
+        if !data.is_empty() && data.last() != Some(&b'\n') {
+            crate::bail("input does not end with a newline");
+        }
         let lines = data.split(|&c| c == b'\n').filter(|l| !l.is_empty())
             .map(|l| l.to_vec()).collect();
-        let mut b = Brd { lines, i: 0, seq: Vec::new(), st: 0, en: 0, lab: Vec::new(), eof: false };
+        let mut b = Brd { lines, i: 0, seq: Vec::new(), st: 0, en: 0, lab: Vec::new(),
+                          pseq: Vec::new(), pen: 0, plab: Vec::new(), had: false, eof: false };
         b.next();
         if b.eof { crate::bail("an input BED is empty"); }
         b
@@ -103,10 +108,24 @@ impl Brd {
         let c: Vec<&[u8]> = line.splitn(4, |&x| x == b'\t').collect();
         if c.len() < 4 { crate::bail("bad line"); }
         if c[0].len() >= 512 { crate::bail("name too long"); }
+        if c[0].is_empty() { crate::bail("empty sequence name"); }
+        if self.had {
+            self.pseq = std::mem::take(&mut self.seq);
+            self.pen = self.en;
+            self.plab = std::mem::take(&mut self.lab);
+        }
         self.seq = c[0].to_vec();
         self.st = crate::bedcoord(c[1], "start is not a number");
         self.en = crate::bedcoord(c[2], "end is not a number");
+        if self.en < self.st { crate::bail("end is before start"); }
+        if self.en == self.st {
+            crate::bail("end equals start: a run must cover at least one base");
+        }
         self.lab = c[3].to_vec();
+        if self.had && self.st == self.pen && self.seq == self.pseq && self.lab == self.plab {
+            crate::bail("two touching runs carry the same label: merge them first");
+        }
+        self.had = true;
     }
 }
 
@@ -181,15 +200,36 @@ pub fn encode(files: &[String], feats: &Feats, w: &mut crate::writer::Writer) {
 }
 
 /// decode --db --out DIR: one BED per feature set, the featureIDs expanded.
+/// The staged BEDs of a decode in flight, removed by `die` and on the way
+/// out, so a failed run never leaves half an output behind.
+static TMP: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+pub fn drop_tmp() {
+    if let Ok(mut v) = TMP.lock() {
+        for p in v.drain(..) { let _ = std::fs::remove_file(&p); }
+    }
+}
+
 pub fn decode(r: &mut crate::reader::Reader, feats: &Feats, dir: &str) {
     let n = feats.sets.len();
     std::fs::create_dir_all(dir).unwrap_or_else(|_| crate::bail("cannot create the output directory"));
-    let mut out: Vec<std::io::BufWriter<std::fs::File>> = feats.sets.iter()
-        .map(|s| {
-            let p = format!("{dir}/{}.bed", String::from_utf8_lossy(s));
-            std::io::BufWriter::new(std::fs::File::create(&p)
-                .unwrap_or_else(|_| crate::bail("cannot write a derived BED")))
-        }).collect();
+    let name = |s: &[u8]| String::from_utf8_lossy(s).into_owned();
+    let pid = std::process::id();
+    for s in &feats.sets {
+        let p = format!("{dir}/{}.bed", name(s));
+        if p.len() + 16 >= 4096 { crate::bail("--out: the output path is too long"); }
+        if let Ok(m) = std::fs::symlink_metadata(&p) {
+            if !m.is_file() { crate::bail("--out: a set's BED exists and is not a regular file"); }
+        }
+    }
+    // Write beside the old BEDs, then swap them in together.
+    let tmps: Vec<String> = feats.sets.iter()
+        .map(|s| format!("{dir}/{}.bed.tmp.{pid}", name(s))).collect();
+    *TMP.lock().unwrap() = tmps.clone();
+    let mut out: Vec<std::io::BufWriter<std::fs::File>> = tmps.iter()
+        .map(|p| std::io::BufWriter::new(std::fs::File::create(p)
+                .unwrap_or_else(|_| crate::bail("cannot write a derived BED"))))
+        .collect();
     // One open run per set, extended while its label does not change.
     let mut cur: Vec<Option<(u64, u64, Vec<u8>)>> = vec![None; n];
     let mut cseq: Vec<u8> = Vec::new();
@@ -224,6 +264,9 @@ pub fn decode(r: &mut crate::reader::Reader, feats: &Feats, dir: &str) {
         if let Some((a, b2, l)) = cur[j].take() { wr(&mut out[j], &cseq, a, b2, &l); }
         out[j].flush().unwrap_or_else(|_| crate::bail("write failed"));
     }
+    drop(out);
+    swap_in(dir, &feats.sets, &tmps);
+    TMP.lock().unwrap().clear();
     eprintln!("db: {rows} rows into {n} tracks under {dir}");
 }
 
@@ -238,4 +281,36 @@ fn wr(f: &mut impl Write, seq: &[u8], st: u64, en: u64, lab: &[u8]) {
     v.extend_from_slice(lab);
     v.push(b'\n');
     f.write_all(&v).unwrap_or_else(|_| crate::bail("write failed"));
+}
+
+/// Move every staged BED into place, or put back what was there.
+fn swap_in(dir: &str, sets: &[Vec<u8>], tmps: &[String]) {
+    let pid = std::process::id();
+    let live = |s: &[u8]| format!("{dir}/{}.bed", String::from_utf8_lossy(s));
+    let mut old: Vec<Option<String>> = vec![None; sets.len()];
+    let mut bad = false;
+    for (j, s) in sets.iter().enumerate() {
+        if bad { break; }
+        let o = format!("{}.old.{pid}", live(s));
+        match std::fs::rename(live(s), &o) {
+            Ok(()) => old[j] = Some(o),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => bad = true,
+        }
+    }
+    let mut moved = 0usize;
+    for (j, s) in sets.iter().enumerate() {
+        if bad { break; }
+        if std::fs::rename(&tmps[j], live(s)).is_err() { bad = true; } else { moved = j + 1; }
+    }
+    if bad {
+        for (j, s) in sets.iter().enumerate().take(moved) {
+            let _ = std::fs::rename(live(s), &tmps[j]);
+        }
+        for (j, s) in sets.iter().enumerate() {
+            if let Some(o) = &old[j] { let _ = std::fs::rename(o, live(s)); }
+        }
+        crate::bail("cannot rename a derived BED into place");
+    }
+    for o in old.into_iter().flatten() { let _ = std::fs::remove_file(o); }
 }

@@ -13,6 +13,7 @@ use std::io::{BufWriter, Read, Write};
 
 fn die(msg: &str) -> ! {
     eprintln!("karyozip: {msg}");
+    db::drop_tmp();
     prof::dump();
     std::process::exit(1);
 }
@@ -32,6 +33,12 @@ fn need(v: &Option<String>) -> &str {
 }
 
 fn main() {
+    ffi::ignore_sigxfsz();
+    for fd in 0..3 {
+        if std::fs::read_link(format!("/proc/self/fd/{fd}")).is_err() {
+            die("stdin, stdout or stderr is closed");
+        }
+    }
     let c = Cli::get();
     // --threads, else OMP_NUM_THREADS, else one per core capped at 8, which
     // is what the C does. The pool is always explicit, so RAYON_NUM_THREADS
@@ -63,6 +70,9 @@ fn main() {
     opt.slow = c.slow;
     if let Some(m) = &c.sort {
         opt.sort = true;
+        // clap cannot tell "--sort" from "--sort=", and the C refuses the
+        // second, so the empty size is looked for in argv itself.
+        if m.is_empty() && std::env::args().any(|a| a == "--sort=") { mem_arg(""); }
         if !m.is_empty() { mem_arg(m); }
     }
     if let Some(t) = &c.tail {
@@ -88,8 +98,14 @@ fn main() {
     // clear the other, and drop plus drop:FILE is a refusal.
     for n in &c.names {
         match n.as_str() {
-            "keep" => { opt.keep_names = true; opt.drop_names = false; }
-            "drop" => { opt.drop_names = true; opt.keep_names = false; }
+            "keep" => {
+                if opt.drop_names { die("--names keep and --names drop are exclusive"); }
+                opt.keep_names = true;
+            }
+            "drop" => {
+                if opt.keep_names { die("--names keep and --names drop are exclusive"); }
+                opt.drop_names = true;
+            }
             _ if n.starts_with("drop:") => {
                 if n.len() == 5 { die("--names drop:FILE needs a file"); }
                 opt.names_out = Some(n[5..].to_string());
@@ -194,6 +210,7 @@ fn main() {
                 (None, None) => (0, 0),
                 _ => die("smooth: give SEQ, or SEQ START END"),
             };
+            if start.is_some() && lo >= hi { die("smooth: end must be past start"); }
             let so = std::io::stdout();
             let mut o = BufWriter::new(so.lock());
             smooth::run(track, hier, fs.as_bytes(), seq.as_ref().map(|s| s.as_bytes()),
@@ -283,10 +300,12 @@ fn load_aln(paf: &Option<String>, refbed: &Option<String>,
         (Some(_), None) => die(&format!("{who}--aln needs --ref")),
         (None, Some(_)) => die("--ref does nothing without --aln"),
         (Some(p), Some(r)) => {
+            // The C loads the ordinal map first, and the diagnostics are
+            // compared line for line.
             let mut a = aln::Aln::default();
-            a.load_ref(r);
             if let Some(o) = ordfile { a.load_ordinals(o); }
-            a.load_paf(p);
+            a.load_ref(r);
+            a.load_aln(p);
             Some(a)
         }
     }
@@ -387,18 +406,15 @@ fn parse_slab(s: &[u8], t: usize) -> Vec<Vec<Row>> {
 }
 
 fn parse_chunk(s: &[u8], from: usize, to: usize) -> Result<Vec<Row>, &'static str> {
-    let mut out = Vec::new();
+    let mut out: Vec<Row> = Vec::new();
     let mut p = from;
     while p < to {
-        let nl = match s[p..to].iter().position(|&c| c == b'\n') {
-            Some(i) => p + i,
-            None => break,
-        };
+        let Some(nl) = memchr::memchr(b'\n', &s[p..to]).map(|i| p + i) else { break };
         let line = &s[p..nl];
-        if line.contains(&0) { return Err("a NUL byte inside a row"); }
-        let t1 = line.iter().position(|&c| c == b'\t').ok_or("bad line")?;
-        let t2 = line[t1 + 1..].iter().position(|&c| c == b'\t').ok_or("bad line")? + t1 + 1;
-        let t3 = line[t2 + 1..].iter().position(|&c| c == b'\t').ok_or("bad line")? + t2 + 1;
+        if memchr::memchr(0, line).is_some() { return Err("a NUL byte inside a row"); }
+        let t1 = memchr::memchr(b'\t', line).ok_or("bad line")?;
+        let t2 = memchr::memchr(b'\t', &line[t1 + 1..]).ok_or("bad line")? + t1 + 1;
+        let t3 = memchr::memchr(b'\t', &line[t2 + 1..]).ok_or("bad line")? + t2 + 1;
         if t1 + 1 == t2 || t2 + 1 == t3 { return Err("empty start or end column"); }
         let st = bedcoord_r(&line[t1 + 1..t2], "start is not a number")?;
         let en = bedcoord_r(&line[t2 + 1..t3], "end is not a number")?;

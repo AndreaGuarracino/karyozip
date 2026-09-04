@@ -9,6 +9,21 @@ pub fn put(out: &mut Vec<u8>, mut v: u64) {
     out.push(v as u8);
 }
 
+/// LEB128 back out, with the bound the forged-file fuzzing needs.
+pub fn vget(b: &[u8], mut i: usize) -> (u64, usize) {
+    let (mut v, mut s) = (0u64, 0u32);
+    loop {
+        if i >= b.len() || s > 63 { crate::bail("corrupt varint"); }
+        let c = b[i];
+        i += 1;
+        v |= ((c & 0x7f) as u64) << s;
+        s += 7;
+        if c < 0x80 { return (v, i); }
+    }
+}
+
+pub fn unzz(v: u64) -> u64 { ((v >> 1) as i64 ^ -((v & 1) as i64)) as u64 }
+
 pub fn zz(v: i64) -> u64 {
     ((v as u64) << 1) ^ ((v >> 63) as u64)
 }

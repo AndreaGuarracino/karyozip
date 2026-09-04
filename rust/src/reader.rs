@@ -2,6 +2,7 @@
 //! sidecar, no permutation. Every refusal message is the C's, because the
 //! two are meant to be interchangeable.
 
+use std::collections::HashMap;
 use crate::ffi;
 use crate::kst::{self, FNV0};
 use std::io::{Read, Seek, SeekFrom};
@@ -33,7 +34,10 @@ fn read_name_file(path: &str, nreads: u64) -> Vec<u8> {
     if data.len() > 1 && data[0] == 0x1f && data[1] == 0x8b {
         crate::bail("the file given to --names is gzipped; decompress it first");
     }
-    let lines: Vec<&[u8]> = data.split(|&c| c == b'\n').collect();
+    // getline gives no line after a final newline, and the split does, which
+    // made an @-line index land on the empty tail.
+    let mut lines: Vec<&[u8]> = data.split(|&c| c == b'\n').collect();
+    if data.last() == Some(&b'\n') { lines.pop(); }
     // 1 fastq, 0 fasta, 2 a plain list.
     let fq = if lines.len() >= 3 && lines[0].first() == Some(&b'@') && lines[2].first() == Some(&b'+') { 1 }
              else if lines.len() >= 2 && lines[0].first() == Some(&b'>') && lines[1].first() != Some(&b'>') { 0 }
@@ -42,7 +46,7 @@ fn read_name_file(path: &str, nreads: u64) -> Vec<u8> {
     let mut got = 0u64;
     for (i, ln) in lines.iter().enumerate() {
         let mut q: &[u8] = ln;
-        if fq == 1 { if i % 4 != 0 { continue; } q = &q[1..]; }
+        if fq == 1 { if i % 4 != 0 || q.is_empty() { continue; } q = &q[1..]; }
         else if fq == 0 { if q.first() != Some(&b'>') { continue; } q = &q[1..]; }
         let stop: &[u8] = if fq == 2 { b"\r" } else { b" \t\r" };
         let l = q.iter().position(|c| stop.contains(c)).unwrap_or(q.len());
@@ -89,6 +93,9 @@ pub struct Reader {
     tailpred: u64,
     tailskip: u64,
     pub names: Vec<Vec<u8>>,
+    /// name -> rank, built on the first lookup, which is also where the C
+    /// notices that two sequences share a name.
+    nameix: std::cell::OnceCell<HashMap<Vec<u8>, u64>>,
     ibx: Vec<u8>,
     hasidx: bool,
     mhash: u64,
@@ -99,6 +106,8 @@ pub struct Reader {
     feathash: u64,
     aln: Option<crate::aln::Aln>,
     lenfile: bool,
+    /// --raw shows what is stored, so a zero length is the answer, not a fault.
+    raw: bool,
     alnq: Option<usize>,
     blk_nos: Vec<u8>,
 }
@@ -324,8 +333,12 @@ impl Reader {
             ibx.extend_from_slice(&zdec(&iz[coff[c] as usize..coff[c + 1] as usize], "index chunk"));
         }
 
+        // A permutation track with no stored blob keeps its names outside,
+        // so --names FILE is the source there, not a replacement.
+        let perm_ext = was_perm && pz.is_empty();
+
         // The names, by whichever codec stored them.
-        let namebuf = if let (Some(f), false) = (&o.names_file, was_side) {
+        let namebuf = if let (Some(f), false) = (&o.names_file, was_side || perm_ext) {
             if !dropped && nzl > 0 {
                 crate::bail("this track stores its own names: --names FILE would replace them, so it is refused. Unset it to read the names in the file");
             }
@@ -351,7 +364,6 @@ impl Reader {
         }
         // --sort stores a rank per record; the input-order names sit beside
         // them, or come from --names FILE when the blob is empty.
-        let perm_ext = was_perm && pz.is_empty();
         if (was_perm && !pz.is_empty()) || perm_ext {
             let resolve = if perm_ext {
                 match &o.names_file {
@@ -379,14 +391,23 @@ impl Reader {
             }
         }
 
+        let (lenc, idc) = (h[5] as u32 as i32, h[9] as u32 as i32);
+        if crate::ffi::nosz(lenc) || crate::ffi::nosz(idc) {
+            crate::bail("corrupt file: a NOSZ codec cannot be size-checked");
+        }
+        if h[5] as u32 >> 31 != 0 || h[9] as u32 >> 31 != 0 {
+            crate::bail("corrupt file: codec id out of range");
+        }
         let data0 = 8 + 128 + lzl as u64 + nml + h[2] + h[3] + h[11] + pz.len() as u64;
         Reader {
             f, nreads: h[0], rows: h[4], lab, block: blk, b, data0,
-            idcodec: h[9] as u32 as i32, lencodec: h[5] as u32 as i32,
+            nameix: std::cell::OnceCell::new(),
+            idcodec: idc, lencodec: lenc,
             taildec, tailpred: h[12], tailskip: h[13] & 0xff, names, ibx,
             hasidx, mhash: h[15], cur_ri: 0, cur_q: 0, cur_pend: 0, cached: None,
             feathash: (h[5] >> 32) | ((h[9] >> 32) << 32),
-            aln: o.aln.clone(), lenfile: h[1] & LENFLAG != 0 && !o.raw, alnq: None, blk_nos,
+            aln: o.aln.clone(), lenfile: h[1] & LENFLAG != 0 && !o.raw, raw: o.raw,
+            alnq: None, blk_nos,
         }
     }
 
@@ -521,7 +542,7 @@ fn int_names_d(b: &[u8], cnt: u64) -> Vec<u8> {
     o
 }
 
-fn tok_d(b: &[u8]) -> Vec<u8> {
+pub fn tok_d(b: &[u8]) -> Vec<u8> {
     if b.len() < 8 { crate::bail("truncated tokenised names"); }
     let nchunk = u32::from_le_bytes(b[4..8].try_into().unwrap()) as usize;
     let hdr = 8 + 8 * nchunk;
@@ -549,19 +570,7 @@ fn tok_d(b: &[u8]) -> Vec<u8> {
     o
 }
 
-pub fn vget(b: &[u8], mut i: usize) -> (u64, usize) {
-    let (mut v, mut s) = (0u64, 0u32);
-    loop {
-        if i >= b.len() || s > 63 { crate::bail("corrupt varint"); }
-        let c = b[i];
-        i += 1;
-        v |= ((c & 0x7f) as u64) << s;
-        s += 7;
-        if c < 0x80 { return (v, i); }
-    }
-}
-
-fn unzz(v: u64) -> u64 { ((v >> 1) as i64 ^ -((v & 1) as i64)) as u64 }
+pub use crate::kst::{unzz, vget};
 
 /* ------------------------------------------------ one sequence at a time */
 
@@ -613,6 +622,8 @@ impl Reader {
             t - st
         } else if v != 0 {
             v
+        } else if self.raw {
+            0
         } else {
             let lendec = self.lenfile && self.blk_nos.get(c.blk).copied().unwrap_or(0) != 1;
             if !lendec { crate::bail("corrupt track: a zero length outside a sentinel block"); }
@@ -644,7 +655,16 @@ impl Reader {
     }
 
     fn find(&self, seq: &[u8]) -> i64 {
-        self.names.iter().position(|n| n == seq).map_or(-1, |i| i as i64)
+        let ix = self.nameix.get_or_init(|| {
+            let mut m = HashMap::with_capacity(self.names.len());
+            for (i, n) in self.names.iter().enumerate() {
+                if m.insert(n.clone(), i as u64).is_some() {
+                    crate::bail("a sequence name repeats: the names are not usable");
+                }
+            }
+            m
+        });
+        ix.get(seq).map_or(-1, |&i| i as i64)
     }
 
     /// region F SEQ | SEQ POS | SEQ START END [HALO].

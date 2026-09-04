@@ -55,6 +55,15 @@ unsafe extern "C" {
     fn free(p: *mut c_void);
 }
 
+/// Let a write past the file-size limit return EFBIG instead of killing us,
+/// which is what the C does. SIGXFSZ is 25 on Linux, the only target this
+/// tree builds for: the reader already reads /proc.
+pub fn ignore_sigxfsz() {
+    unsafe extern "C" { fn signal(sig: c_int, handler: usize) -> usize; }
+    // SAFETY: SIG_IGN is 1, and signal takes no argument we own.
+    unsafe { signal(25, 1); }
+}
+
 /// The vendored htscodecs, from its own version.h at build time.
 pub const HTSCODECS_VERSION: &str = env!("HTSCODECS_VERSION");
 

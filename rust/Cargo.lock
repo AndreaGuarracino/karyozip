@@ -260,6 +260,7 @@ version = "0.2.0"
 dependencies = [
  "cc",
  "clap",
+ "memchr",
  "memmap2",
  "rayon",
  "zstd-sys",

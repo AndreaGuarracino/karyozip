@@ -24,7 +24,7 @@ karyozip encode [flags] < in.bed > out.kst        # or: producer | karyozip enco
 | `--sort` | order records by label tuple, then lengths, then input rank. |
 | `--sort=MEM` | the same, spilling past `MEM` bytes instead of holding every record. `1M` and up; spills under `--tmp-dir`. |
 | `--db features.tsv` | inputs are one BED per feature set, or one merged featureID track. |
-| `--aln P.paf --ref R` | labels and lengths the reference already gives are not stored. |
+| `--aln P.paf --ref R` | labels and lengths the reference already gives are not stored. Keep the packed alignment beside the track: it is part of the stored size. |
 | `--aln-names F` | for `--aln` on a track that names rows by ordinal: ordinal N is line N+1 of `F`. |
 | `--tail 0\|1` | force the tail predictor off or on. |
 | `--tok-chunk N` | names per tokeniser chunk. |

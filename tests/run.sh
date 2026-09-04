@@ -843,6 +843,29 @@ $KT encode < "$D/s.bed" 2>&1 >/dev/null | grep -qi "htscodecs" \
 
 # Generative stage. The checks above are one fixed case per bug already found;
 # this one searches input space instead of remembering it.
+# The library and the CLI must produce the same file: an annotator that
+# calls kt_row instead of writing a BED gets byte-identical output, or the
+# whole point of the API is lost.
+LT="$(dirname "$KT")/libtest"
+if [ -x "$LT" ]; then
+  lok=1
+  for f in s.bed ls.bed db.rall.bed db.chromosome.bed ord.bed; do
+    $KT encode < "$D/$f" > "$W/lc.kt" 2>/dev/null
+    $LT "$D/$f" "$W/ll.kt" 2>/dev/null
+    cmp -s "$W/lc.kt" "$W/ll.kt" || { lok=0; echo "  library differs on $f"; }
+  done
+  $KT --block all encode < "$D/db.rall.bed" > "$W/lc.kt" 2>/dev/null
+  $LT "$D/db.rall.bed" "$W/ll.kt" 0 2>/dev/null
+  cmp -s "$W/lc.kt" "$W/ll.kt" || { lok=0; echo "  library differs on --block all"; }
+  $KT --block 4 encode < "$D/db.rall.bed" > "$W/lc.kt" 2>/dev/null
+  $LT "$D/db.rall.bed" "$W/ll.kt" 4 2>/dev/null
+  cmp -s "$W/lc.kt" "$W/ll.kt" || { lok=0; echo "  library differs on --block 4"; }
+  [ $lok = 1 ] && echo "library API: same bytes as the CLI" \
+    || { echo "library API: DIFFERS from the CLI"; fail=1; }
+else
+  echo "library API: skipped, build/libtest not built"
+fi
+
 # The stored bytes are a function of the codec versions, and zstd does not
 # promise identical output across its own releases. Pin them here: a bump
 # has to be a deliberate act that re-records this line, never a silent one

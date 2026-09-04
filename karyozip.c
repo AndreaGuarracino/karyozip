@@ -8,6 +8,7 @@
 #include <stdint.h>
 #include <time.h>
 #include <zstd.h>
+#include "karyozip.h"
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <errno.h>
@@ -593,13 +594,14 @@ typedef struct {
     size_t aoff[2], alen[2];           /* the same for the two --aln spellings */
 } blkmeta;
 
-typedef struct {
+typedef struct ktw {
     buf names, lens, ids, sizes;
     buf ibx; size_t nidx; int ordok;
     uint64_t nblk, pend, rows;
     FILE *tmp;
     char cur[512]; size_t curlen;
     uint64_t currun, curoff, curblk, curbp, blkbp0;
+    FILE *out;                    /* where the finished track goes */
     int rawfd;                    /* raw block payloads, staged not held */
     blkmeta *bm; size_t nraw, rawcap;
     buf lalt[2], rawalt[2];       /* plain; plus-strand sentinels only */
@@ -704,7 +706,7 @@ static void ktw_pushread(ktw *w) {
 
 static void ktw_close(ktw *w);
 
-static ktw *ktw_open(void) {
+static ktw *ktw_open(FILE *out) {
     ktw *w = xcalloc(1, sizeof(ktw));
     w->ordok = 1;
     const char *td = TMPD; if (!td || !*td) td = getenv("TMPDIR"); if (!td || !*td) td = "/tmp";
@@ -712,6 +714,7 @@ static ktw *ktw_open(void) {
     int tfd = mkstemp(tp);
     if (tfd < 0) { fprintf(stderr, "karyozip: cannot create a temp file under %s (set TMPDIR)\n", td); exit(1); }
     unlink(tp); free(tp);
+    w->out = out;
     w->tmp = fdopen(tfd, "w+b");
     if (!w->tmp) die("tmpfile");
     if (asprintf(&tp, "%s/karyozip.raw.XXXXXX", td) < 0) die("oom");
@@ -1630,7 +1633,7 @@ static void sortpush(const char *nm, size_t nlen, uint64_t st, uint64_t len,
 }
 
 static void encode(void) {
-    ktw *w = ktw_open();
+    ktw *w = ktw_open(stdout);
 
     typedef struct { const char *nm; uint32_t nlen, llen; const char *lab;
                      uint64_t st, len; int same; } prow;   /* same: name equals the row before */
@@ -2229,7 +2232,7 @@ static void ktw_close(ktw *w) {
     size_t lzl = labs.n ? zc(&labs, &lz) : 0;
 
 #define WR(buf, n) do { size_t _n = (n); \
-    if (_n && fwrite((buf), 1, _n, stdout) != _n) die("write failed"); } while (0)
+    if (_n && fwrite((buf), 1, _n, w->out) != _n) die("write failed"); } while (0)
 
     uint8_t *npz = PERMBLOB; size_t npl = PERMON ? PERMBLOBLEN : 0;
     int permtok = PERMBLOBTOK;
@@ -2251,7 +2254,7 @@ static void ktw_close(ktw *w) {
         mh = fnvbuf(mh, iz, izl); mh = fnvbuf(mh, sz, szl); mh = fnvbuf(mh, itz, itl);
         h[15] = fnvbuf(mh, npz, npl);
     }
-    if (fwrite(h, 8, 16, stdout) != 16) die("write failed");
+    if (fwrite(h, 8, 16, w->out) != 16) die("write failed");
     WR(lz, lzl);
     if (NAMES_OUT) {
         FILE *nf = fopen(NAMES_OUT, "wb");
@@ -2269,7 +2272,7 @@ static void ktw_close(ktw *w) {
     char cp[1 << 20]; size_t r;
     while ((r = fread(cp, 1, sizeof cp, tmp)) > 0) WR(cp, r);
     if (ferror(tmp)) die("read error on the temporary file");
-    if (fflush(stdout)) die("write failed");
+    if (fflush(w->out)) die("write failed");
     PH_ADD(7, _tw);
     fclose(tmp);
     if (ALNPAF)
@@ -2291,6 +2294,29 @@ static void ktw_close(ktw *w) {
     free(w->lens.d); free(w->ids.d); free(w->ibx.d);
     free(w);
 }
+
+/* ------------------------------------------------------- the library API */
+/* karyozip.h documents the contract. These are thin: the CLI and a caller
+   that skips the BED go through exactly the same writer, so a track built
+   row by row is byte-identical to one encoded from the equivalent BED. */
+kt_writer *kt_open(FILE *out) { return ktw_open(out); }
+void kt_block(kt_writer *w, uint64_t rows) { (void)w; BLOCK = rows ? rows : UINT64_MAX; BLOCKSET = 1; }
+void kt_level(kt_writer *w, int level) {
+    (void)w;
+    if (level < 1 || level > 22) die("kt_level: a zstd level is 1 to 22");
+    LEVEL = level; LEVELSET = 1;
+}
+void kt_row(kt_writer *w, const char *name, size_t nlen,
+            uint64_t run_len, const char *label, size_t llen, uint64_t start) {
+    ktw_row(w, name, nlen, run_len, label, llen, start, 0);
+}
+void kt_close(kt_writer *w) {
+    ktw_tail(w);        /* the held row was the last of its sequence */
+    ktw_pushread(w);
+    ktw_flush(w);
+    ktw_close(w);
+}
+const char *kt_version(void) { return KARYOZIP_VERSION; }
 
 /* --------------------------------------------------------------- decoding */
 /* one block: file offset, both frame sizes, both decoded sizes, rows, bp,
@@ -3633,7 +3659,7 @@ static void encode_db(int nfiles, char **files) {
         bnext(&b[i]);
         if (b[i].eof) die("an input BED is empty");
     }
-    ktw *w = ktw_open();
+    ktw *w = ktw_open(stdout);
     buf keyb = {0}; char idbuf[24];
     uint64_t rows = 0, missing = 0;
     size_t seqlen = 0;
@@ -3876,6 +3902,7 @@ static void decode_aln(const char *path) {
     dump(path);
 }
 
+#ifndef KARYOZIP_LIB
 int main(int argc, char **argv) {
     signal(SIGXFSZ, SIG_IGN);
     for (int fd = 0; fd < 3; fd++) if (fcntl(fd, F_GETFD) < 0) die("stdin, stdout or stderr is closed");
@@ -4087,3 +4114,4 @@ int main(int argc, char **argv) {
     else die("bad command or missing arguments");
     return 0;
 }
+#endif   /* KARYOZIP_LIB: the library has no main */

@@ -19,13 +19,22 @@ SRC := karyozip.c \
        htscodecs/rle.c htscodecs/pack.c htscodecs/utils.c \
        bzip3/libbz3.c
 
-all: build/karyozip
+all: build/karyozip build/libkaryozip.a
 
 build/karyozip: $(SRC)
 	mkdir -p build
 	$(CC) $(CFLAGS) $(ZSTD_CFLAGS) -o $@ $(SRC) $(LDFLAGS) $(ZSTD_LIBS) -lm -lpthread
 
-test: build/karyozip
+# the same sources, minus main: an annotator can write .kst without a BED
+build/libkaryozip.a: $(SRC) karyozip.h
+	mkdir -p build/lib
+	$(CC) $(CFLAGS) $(ZSTD_CFLAGS) -DKARYOZIP_LIB -c $(SRC) && mv *.o build/lib/
+	$(AR) rcs $@ build/lib/*.o
+
+build/libtest: build/libkaryozip.a tests/libtest.c
+	$(CC) $(CFLAGS) $(ZSTD_CFLAGS) -o $@ tests/libtest.c build/libkaryozip.a $(LDFLAGS) $(ZSTD_LIBS) -lm -lpthread
+
+test: build/karyozip build/libtest
 	KT=$(CURDIR)/build/karyozip tests/run.sh
 
 clean:

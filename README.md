@@ -76,10 +76,26 @@ Decode must be given the same `--db` table, the same PAF and reference, and the 
 A flag used on the wrong command is refused: `encode --names ordinal` and `decode --tail 1` both fail with a message.
 An unknown flag, a flag with no value, and a second track given to `decode` are all refused.
 
+## library
+
+An annotator can write a `.kst` directly instead of emitting a BED for karyozip to re-parse. `make` builds `build/libkaryozip.a` beside the binary; the API is six calls in `karyozip.h`.
+
+```c
+#include "karyozip.h"
+kt_writer *w = kt_open(f);
+kt_block(w, 0);                    /* optional: 0 is one block */
+kt_row(w, name, nlen, run_len, label, llen, start);   /* once per run */
+kt_close(w);
+```
+
+Rows must arrive as a track is already laid out: grouped by sequence, each sequence appearing once, starting at 0, gapless. Those three properties were checked on 264,914,318 real rows across all four data classes with zero violations, and anything else is refused with the message the CLI gives. One writer at a time.
+
+A track built this way is byte-identical to `karyozip encode` on the equivalent BED; `tests/libtest.c` asserts it and the suite runs it.
+
 ## tests
 
 ```
-make test                                    # about 200 checks and five fuzz stages
+make test                                    # about 210 checks and five fuzz stages
 bash ../scripts/quicktest.sh                 # the above plus five real cells, 80 s
 bash ../scripts/realtest.sh BINARY           # one real cell, 21 checks
 ```

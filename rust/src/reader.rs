@@ -527,8 +527,9 @@ fn tok_d(b: &[u8]) -> Vec<u8> {
         crate::bail("corrupt tokenised names header");
     }
     let mut coff = vec![0usize];
-    for i in 0..nchunk {
-        let cl = u32::from_le_bytes(b[8 + 4 * (nchunk + i)..12 + 4 * (nchunk + i)].try_into().unwrap());
+    for (i, _) in (0..nchunk).enumerate() {
+        let o = 8 + 4 * (nchunk + i);
+        let cl = u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
         coff.push(coff[i] + cl as usize);
     }
     if coff[nchunk] > b.len() - hdr {

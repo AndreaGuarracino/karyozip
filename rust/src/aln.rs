@@ -152,7 +152,7 @@ impl Aln {
             }
         }
         for (_, s) in self.qs.iter_mut() {
-            s.sort_by(|x, y| (x.q, x.t, x.tp, x.rev, x.n).cmp(&(y.q, y.t, y.tp, y.rev, y.n)));
+            s.sort_by_key(|g| (g.q, g.t, g.tp, g.rev, g.n));
         }
         // The binding hash: this PAF and this reference, or nothing.
         let mut sum = 0u64;

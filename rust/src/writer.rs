@@ -48,6 +48,10 @@ impl Default for Options {
     }
 }
 
+/// A compressed block: lens frame, ids frame, both raw sizes, rows, bases
+/// before it, and which length spelling won.
+type Done = (Vec<u8>, Vec<u8>, usize, usize, u64, u64, u64);
+
 /// One staged block, while its payload waits in the staging file.
 struct BlkMeta { off: u64, len: usize, lens: usize, rows: u64, bp: u64,
                  aoff: [usize; 2], alen: [usize; 2] }
@@ -172,7 +176,7 @@ impl Writer {
                 s.sort_unstable();
                 self.tailpred = s[TAILSKIP / 2];
                 let dev: u64 = self.tailsamp.iter()
-                    .map(|&v| if v > self.tailpred { v - self.tailpred } else { self.tailpred - v })
+                    .map(|&v| v.abs_diff(self.tailpred))
                     .sum();
                 self.tailon = Some(self.opt.tail
                     .unwrap_or(dev * 12 <= self.tailpred * TAILSKIP as u64));
@@ -331,15 +335,16 @@ impl Writer {
         // The C interns first and then decides, so the label joins the table
         // even when the reference answers for it.
         let mut id = self.intern(label);
-        if self.aln.is_some() {
+        if let Some(a) = self.aln.take() {
             if label == b"=" { return Err("a label \"=\" is reserved under --aln".into()); }
             if let Some(q) = self.alnq {
-                let rl = self.aln.as_ref().unwrap().row(q, start, run_len);
+                let rl = a.row(q, start, run_len);
                 if rl != u32::MAX && rl == id {
                     id = self.intern(b"=");
                     self.alnhit += 1;
                 }
             }
+            self.aln = Some(a);
         }
         let id = id as u64;
         if self.phas { self.lensput(self.pval); self.phas = false; }
@@ -388,7 +393,7 @@ impl Writer {
         let (mut byt_lens, mut byt_labs) = (0u64, 0u64);
         let batch = rayon::current_num_threads() * 4;
         for chunk in (0..self.bm.len()).collect::<Vec<_>>().chunks(batch) {
-            let done: Vec<(Vec<u8>, Vec<u8>, usize, usize, u64, u64, u64)> = chunk
+            let done: Vec<Done> = chunk
                 .par_iter()
                 .map(|&i| {
                     let (lens, ids) = self.read_block(i).expect("staged block");
@@ -684,7 +689,7 @@ pub fn pick(all: &dyn Fn(usize) -> (Vec<u8>, Vec<u8>), nraw: usize, rawtot: usiz
     if slow {
         let mut want = 0usize;
         for i in 0..nraw { let (l, d) = all(i); want = want.max(l.len()).max(d.len()); }
-        scap = want.min(2048 << 20).max(4 << 20);
+        scap = want.clamp(4 << 20, 2048 << 20);
     }
     let mut maxstream = 0usize;
     for i in 0..nraw { let (l, d) = all(i); maxstream = maxstream.max(l.len()).max(d.len()); }

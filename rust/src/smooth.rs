@@ -144,8 +144,8 @@ fn smooth_one(h: &Hier, st: &[u64], en: &[u64], feat: &mut [i32], maxgap: u64) {
             if we > ws {
                 let l = h.lca[feat[ws] as usize * nn + feat[we] as usize] as i32;
                 if l >= 0 {
-                    for w in ws + 1..we {
-                        if feat[w] != l && h.is_anc(l, feat[w]) { feat[w] = l; changes = true; }
+                    for x in feat.iter_mut().take(we).skip(ws + 1) {
+                        if *x != l && h.is_anc(l, *x) { *x = l; changes = true; }
                     }
                 }
             }

@@ -1826,8 +1826,6 @@ static void pickcodecs(int rawfd, const blkmeta *bm, size_t nraw) {
 
         size_t z22i = 0, z22l = 0;
 
-        ZSTD_CCtx *sc = ZSTD_createCCtx();
-        uint8_t *zo = xmalloc(ZSTD_compressBound(SCAP) + 1024);
         uint8_t *sbuf = NULL; size_t sbcap = 0;
         for (size_t j = 0; j < np; j++) {
             size_t need = bm[pick[j]].len;
@@ -1838,26 +1836,26 @@ static void pickcodecs(int rawfd, const blkmeta *bm, size_t nraw) {
             const uint8_t *ids = src + nl;
             if (nl > SCAP) nl = SCAP;
             if (ni > SCAP) ni = SCAP;
-            if (ni) { size_t g = ZSTD_compressCCtx(sc, zo, ZSTD_compressBound(ni), ids, ni, LEVEL);
-                      if (ZSTD_isError(g)) die("sample compress failed");
-                      zi += g;
-                      if (SLOW && !LEVELSET) {
-                          g = ZSTD_compressCCtx(sc, zo, ZSTD_compressBound(ni), ids, ni, 22);
-                          if (ZSTD_isError(g)) die("sample compress failed");
-                          z22i += g; } }
-            if (nl) { size_t g = ZSTD_compressCCtx(sc, zo, ZSTD_compressBound(nl), src, nl, LEVEL);
-                      if (ZSTD_isError(g)) die("sample compress failed");
-                      zl += g;
-                      if (SLOW && !LEVELSET) {
-                          g = ZSTD_compressCCtx(sc, zo, ZSTD_compressBound(nl), src, nl, 22);
-                          if (ZSTD_isError(g)) die("sample compress failed");
-                          z22l += g; } }
-
+            /* The two zstd baselines are two more tasks in the same sweep,
+               so the search is parallel from its first block. */
+            size_t zb[2][2] = {{0, 0}, {0, 0}};
+            int z22 = SLOW && !LEVELSET;
             int cthr = nthreads();
 #ifdef _OPENMP
 #pragma omp parallel for schedule(dynamic, 1) num_threads(cthr)
 #endif
-            for (unsigned k = 0; k < NCAND; k++) {
+            for (unsigned k = 0; k < NCAND + 2; k++) {
+                if (k >= NCAND) {
+                    if (k == NCAND + 1 && !z22) continue;
+                    int lv = k == NCAND ? LEVEL : 22;
+                    ZSTD_CCtx *sc = ZSTD_createCCtx();
+                    size_t cap = ZSTD_compressBound(ni > nl ? ni : nl) + 1024;
+                    uint8_t *zo = xmalloc(cap);
+                    if (ni) zb[k - NCAND][0] = ZSTD_compressCCtx(sc, zo, cap, ids, ni, lv);
+                    if (nl) zb[k - NCAND][1] = ZSTD_compressCCtx(sc, zo, cap, src, nl, lv);
+                    free(zo); ZSTD_freeCCtx(sc);
+                    continue;
+                }
                 /* A candidate the selection below cannot take is not worth
                    compressing. On a seekable track that is both bzip3
                    entries, whose bz3_new alone asks for its 16 or 64 MB. */
@@ -1884,6 +1882,11 @@ static void pickcodecs(int rawfd, const blkmeta *bm, size_t nraw) {
                 } else cl[k] = (size_t)-1 / 2;
                 free(t);
             }
+            if (ZSTD_isError(zb[0][0]) || ZSTD_isError(zb[0][1])
+                || ZSTD_isError(zb[1][0]) || ZSTD_isError(zb[1][1]))
+                die("sample compress failed");
+            zi += zb[0][0]; zl += zb[0][1];
+            z22i += zb[1][0]; z22l += zb[1][1];
         }
 
         int wi = 0, wl = 0;
@@ -1974,7 +1977,6 @@ static void pickcodecs(int rawfd, const blkmeta *bm, size_t nraw) {
                     (size_t)NCAND + 2, nraw);
             free(ti); free(tl); free(live);
         }
-        free(zo); ZSTD_freeCCtx(sc);
         free(sbuf);
         if (IDCODEC < 0) IDCODEC = wi;
         if (LENCODEC < 0) LENCODEC = wl;

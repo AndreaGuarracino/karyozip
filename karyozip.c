@@ -2186,11 +2186,14 @@ static void ktw_close(ktw *w) {
 }
 
 /* --------------------------------------------------------------- decoding */
+/* one block: file offset, both frame sizes, both decoded sizes, rows, bp,
+   its FNV, and which of the three length spellings it used */
+typedef struct { uint64_t off, size, l, raw, lraw, rows, bp, hash; uint8_t nos; } blk;
 typedef struct {
     FILE *f; uint64_t nreads, rows, data0, block;
     char **name; char **lab; uint64_t nlab;
-    uint64_t *boff; uint64_t *bsize, *bl, *braw, *blraw, *brows, *bbp, *bhash; uint64_t nblk;
-    uint8_t *bnos; int lenfile;   /* per block: plain lengths; file: --aln lengths */
+    blk *b; uint64_t nblk;
+    int lenfile;                  /* per block: plain lengths; file: --aln lengths */
     const uint8_t *lp0, *ip0;
     uint32_t *htab; uint64_t hmask;
     ZSTD_DCtx *d; uint8_t *blkbuf; size_t blkcap;
@@ -2253,7 +2256,7 @@ static rec getidx(R *r, uint64_t i) {
     }
     r->ci = i; r->crec = out; r->cvalid = 1;
 
-    if (out.blk >= r->nblk || out.off > r->brows[out.blk]
+    if (out.blk >= r->nblk || out.off > r->b[out.blk].rows
         || out.nruns > r->rows || (uint64_t)out.off + out.nruns > r->rows)
         die("corrupt index: a sequence points outside the block table");
     return out;
@@ -2468,19 +2471,13 @@ static R *ropen(const char *path) {
     if (ZSTD_isError(ZSTD_decompress(sbuf, sb, sz, h[3])))
         die("block sizes decompress failed");
     { const uint8_t *p = sbuf, *end = sbuf + sb; uint64_t n = 0, cap = 1 << 16;
-      r->bsize = xmalloc(mul(cap, 8)); r->bl = xmalloc(mul(cap, 8)); r->bhash = xmalloc(mul(cap, 8));
-      r->braw = xmalloc(mul(cap, 8)); r->blraw = xmalloc(mul(cap, 8));
-      r->brows = xmalloc(mul(cap, 8)); r->bbp = xmalloc(mul(cap, 8)); r->boff = xmalloc(mul(cap, 8));
-      r->bnos = xmalloc(cap);
+      r->b = xmalloc(mul(cap, sizeof *r->b));
       uint64_t acc = 0;
-      while (p < end) { if (n == cap) { cap *= 2; r->bsize = xrealloc(r->bsize, cap * 8); r->bhash = xrealloc(r->bhash, cap * 8);
-            r->bl = xrealloc(r->bl, cap * 8); r->braw = xrealloc(r->braw, cap * 8); r->blraw = xrealloc(r->blraw, cap * 8);
-            r->brows = xrealloc(r->brows, cap * 8); r->bbp = xrealloc(r->bbp, cap * 8); r->bnos = xrealloc(r->bnos, cap);
-            r->boff = xrealloc(r->boff, cap * 8); }
+      while (p < end) { if (n == cap) { cap *= 2; r->b = xrealloc(r->b, mul(cap, sizeof *r->b)); }
         uint64_t a = vgetb(&p, end), b2 = vgetb(&p, end),
                  c2 = vgetb(&p, end), d2 = vgetb(&p, end), e2 = vgetb(&p, end),
                  f2 = vgetb(&p, end), g2 = vgetb(&p, end);
-        if (was_len) { r->bnos[n] = d2 & 3; d2 >>= 2; } else r->bnos[n] = 0;
+        if (was_len) { r->b[n].nos = d2 & 3; d2 >>= 2; } else r->b[n].nos = 0;
 
         if (a > fsz || b2 > fsz || a + b2 > fsz || acc + a + b2 > fsz)
             die("corrupt index: a block runs past the end of the file");
@@ -2488,13 +2485,13 @@ static R *ropen(const char *path) {
         if (e2 && (!c2 || !d2)) die("corrupt index: a block with rows but an empty stream");
         if (c2 > r->rows * 16 + 64 || d2 > r->rows * 16 + 64)
             die("corrupt index: a block claims an impossible decoded size");
-        r->bl[n] = a; r->bsize[n] = a + b2; r->braw[n] = c2; r->blraw[n] = d2; r->brows[n] = e2; r->bbp[n] = f2; r->bhash[n] = g2;
-        r->boff[n] = acc; acc += a + b2; n++; }
+        r->b[n] = (blk){ acc, a + b2, a, c2, d2, e2, f2, g2, r->b[n].nos };
+        acc += a + b2; n++; }
       r->nblk = n;
       uint64_t tot = 0;
       for (uint64_t i = 0; i < n; i++) {
-          tot += r->brows[i];
-          if (i + 1 < n ? r->brows[i] != r->block : !r->brows[i] || r->brows[i] > r->block)
+          tot += r->b[i].rows;
+          if (i + 1 < n ? r->b[i].rows != r->block : !r->b[i].rows || r->b[i].rows > r->block)
               die("corrupt index: a block does not hold the block size of rows");
       }
       if (tot != r->rows || (!n && r->rows)) die("corrupt index: the blocks do not add up to the row count"); }
@@ -2504,7 +2501,7 @@ static R *ropen(const char *path) {
     r->d = ZSTD_createDCtx();
     { uint64_t mx = 0;
       for (uint64_t i = 0; i < r->nblk; i++) {
-          uint64_t t = r->blraw[i] + r->braw[i];
+          uint64_t t = r->b[i].lraw + r->b[i].raw;
           if (t > mx) mx = t; }
       r->blkcap = mx ? mx + 64 : (1 << 16); }
     r->blkbuf = xmalloc(r->blkcap + VGUARD);
@@ -2814,28 +2811,28 @@ static void loadblk(R *r, uint64_t b) {
     if (b >= r->nblk) die("corrupt index: a block number is past the end");
     if (r->cached == b) return;
     r->curblk = UINT64_MAX;   /* a new block invalidates the cursor */
-    uint8_t *cb = xmalloc(r->bsize[b]);
-    if (fseeko(r->f, (off_t)(r->data0 + r->boff[b]), SEEK_SET)) die("seek");
-    if (fread(cb, 1, r->bsize[b], r->f) != r->bsize[b])
+    uint8_t *cb = xmalloc(r->b[b].size);
+    if (fseeko(r->f, (off_t)(r->data0 + r->b[b].off), SEEK_SET)) die("seek");
+    if (fread(cb, 1, r->b[b].size, r->f) != r->b[b].size)
         die("file is truncated: a block is missing or short");
-    if (fnvbuf(FNV0, cb, r->bsize[b]) != r->bhash[b])
+    if (fnvbuf(FNV0, cb, r->b[b].size) != r->b[b].hash)
         die("corrupt block: its bytes do not match the stored hash");
-    LENDEC = r->lenfile && r->bnos[b] != 1;
-    uint64_t la = r->bl[b], lb = r->bsize[b] - la;
+    LENDEC = r->lenfile && r->b[b].nos != 1;
+    uint64_t la = r->b[b].l, lb = r->b[b].size - la;
     size_t g, h2;
     PAYEND = NULL;                    /* not valid until this block decodes */
-    if (r->lencodec) { g = paydecomp(cb, la, r->lencodec, r->blkbuf, r->blraw[b]);
-                       if (!g && r->blraw[b]) die("frame decode failed"); }
+    if (r->lencodec) { g = paydecomp(cb, la, r->lencodec, r->blkbuf, r->b[b].lraw);
+                       if (!g && r->b[b].lraw) die("frame decode failed"); }
     else
     { g = ZSTD_decompressDCtx(r->d, r->blkbuf, r->blkcap, cb, la);
       if (ZSTD_isError(g)) die(ZSTD_getErrorName(g)); }
-    if (r->idcodec) { h2 = paydecomp(cb + la, lb, r->idcodec, r->blkbuf + g, r->braw[b]);
-                      if (!h2 && r->braw[b]) die("frame decode failed"); }
+    if (r->idcodec) { h2 = paydecomp(cb + la, lb, r->idcodec, r->blkbuf + g, r->b[b].raw);
+                      if (!h2 && r->b[b].raw) die("frame decode failed"); }
     else
     { h2 = ZSTD_decompressDCtx(r->d, r->blkbuf + g, r->blkcap - g, cb + la, lb);
       if (ZSTD_isError(h2)) die(ZSTD_getErrorName(h2)); }
     free(cb);
-    if (g != r->blraw[b] || h2 != r->braw[b])
+    if (g != r->b[b].lraw || h2 != r->b[b].raw)
         die("corrupt block: a stream decodes to a size the index does not claim");
     r->lp0 = r->blkbuf; r->ip0 = r->blkbuf + g;
     PAYEND = r->blkbuf + g + h2;
@@ -2861,7 +2858,7 @@ static uint64_t rlen(const uint8_t **lp, const char *nm, uint64_t st, int last) 
 static inline void spannext(R *r, span *sp, const uint8_t **lp, const uint8_t **ip) {
     if (sp->left) return;
     loadblk(r, ++sp->blk);
-    *lp = r->lp0; *ip = r->ip0; sp->left = r->brows[sp->blk];
+    *lp = r->lp0; *ip = r->ip0; sp->left = r->b[sp->blk].rows;
 }
 
 typedef struct { uint64_t blk, off; const uint8_t *lp, *ip; } cur_t;
@@ -2877,13 +2874,13 @@ static void seqptrs(R *r, uint64_t ri, cur_t *c, const uint8_t **lp,
         *lp = r->lp0; *ip = r->ip0; skip = q.off;
     }
     for (uint64_t k = 0; k < skip; k++) { vget(lp); vget(ip); }
-    sp->blk = q.blk; sp->left = r->brows[q.blk] - q.off;
+    sp->blk = q.blk; sp->left = r->b[q.blk].rows - q.off;
 }
 
 static void seqdone(R *r, uint64_t ri, cur_t *c, const uint8_t *lp,
                     const uint8_t *ip, span *sp) {
     getidx(r, ri);          /* advances the cursor; result unused */
-    c->blk = sp->blk; c->off = r->brows[sp->blk] - sp->left;
+    c->blk = sp->blk; c->off = r->b[sp->blk].rows - sp->left;
     c->lp = lp; c->ip = ip;
 }
 
@@ -2984,17 +2981,17 @@ static void region(const char *path, const char *seq, uint64_t lo, uint64_t hi,
     uint64_t st = 0, kfirst = 0, klast = q.nruns;
     if (lo) {
         while (jump + 1 < r->nblk && (jump + 1) * (uint64_t)r->block < endrun
-               && r->bbp[jump + 1] && r->bbp[jump + 1] <= lo) jump++;
+               && r->b[jump + 1].bp && r->b[jump + 1].bp <= lo) jump++;
     }
     span sp;
     if (jump != q.blk) {           /* the block's first run is the sequence's */
         kskip = jump * (uint64_t)r->block - start;
-        st = r->bbp[jump];
+        st = r->b[jump].bp;
         loadblk(r, jump); lp = r->lp0; ip = r->ip0;
-        sp.blk = jump; sp.left = r->brows[jump];
+        sp.blk = jump; sp.left = r->b[jump].rows;
     } else {
         for (uint64_t k = 0; k < q.off; k++) { vget(&lp); vget(&ip); }
-        sp.blk = q.blk; sp.left = r->brows[q.blk] - q.off;
+        sp.blk = q.blk; sp.left = r->b[q.blk].rows - q.off;
     }
     if (halo && (lo || hi)) {
 
@@ -3019,10 +3016,10 @@ static void region(const char *path, const char *seq, uint64_t lo, uint64_t hi,
         if (kfirst < kskip) { jump = q.blk; kskip = 0; }   /* the halo reaches back */
         loadblk(r, jump); lp = r->lp0; ip = r->ip0;   /* the pre-pass moved us */
         sp.blk = jump;
-        if (jump != q.blk) sp.left = r->brows[jump];
+        if (jump != q.blk) sp.left = r->b[jump].rows;
         else { for (uint64_t k = 0; k < q.off; k++) { vget(&lp); vget(&ip); }
-               sp.left = r->brows[q.blk] - q.off; }
-        st = jump != q.blk ? r->bbp[jump] : 0;
+               sp.left = r->b[q.blk].rows - q.off; }
+        st = jump != q.blk ? r->b[jump].bp : 0;
     }
 
     size_t nlen = strlen(seq), maxlab = 20;
@@ -3213,7 +3210,7 @@ static uint64_t loadseq(R *r, int64_t ri, uint64_t **st, uint64_t **en, int **fe
         lp = r->lp0; ip = r->ip0; skip = q.off;
     }
     for (uint64_t k = 0; k < skip; k++) { vget(&lp); vget(&ip); }
-    span sp = { q.blk, r->brows[q.blk] - q.off };
+    span sp = { q.blk, r->b[q.blk].rows - q.off };
     uint64_t n = q.nruns;
     if (n > r->scap) {                 /* grown, never freed per sequence */
         uint64_t c = r->scap ? r->scap : 64;
@@ -3313,9 +3310,7 @@ static void rclose(R *r) {
     if (r->d) ZSTD_freeDCtx(r->d);
     if (!r->name_borrowed) { free(r->namebuf); free(r->natbufp); free(r->name); }
     if (r->lab) { free(r->lab[0]); free(r->lab); }
-    free(r->blkbuf); free(r->boff);
-    free(r->bsize); free(r->bl); free(r->braw); free(r->blraw); free(r->bnos);
-    free(r->brows); free(r->bbp); free(r->bhash);
+    free(r->blkbuf); free(r->b);
     free(r->nz_keep); free(r->pz); free(r->ibuf); free(r->ichunk);
     free(r->coff); free(r->cpendv); free(r->htab);
     free(r->sst); free(r->sen); free(r->sfeat); free(r->snov);

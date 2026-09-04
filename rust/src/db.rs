@@ -129,9 +129,9 @@ pub fn encode(files: &[String], feats: &Feats, w: &mut crate::writer::Writer) {
         }
         let lo = b[0].st;
         let mut hi = b[0].en;
-        for i in 1..b.len() {
-            if b[i].st != lo { crate::bail("the input BEDs disagree on a run start"); }
-            if b[i].en < hi { hi = b[i].en; }        // cut at the first change
+        for x in &b[1..] {
+            if x.st != lo { crate::bail("the input BEDs disagree on a run start"); }
+            if x.en < hi { hi = x.en; }              // cut at the first change
         }
         if !haveseq || lastseq != b[0].seq {
             haveseq = true;
@@ -176,9 +176,7 @@ pub fn encode(files: &[String], feats: &Feats, w: &mut crate::writer::Writer) {
             if x.st == x.en { x.next(); }
         }
     }
-    for i in 1..b.len() {
-        if !b[i].eof { crate::bail("the input BEDs have different lengths"); }
-    }
+    if b[1..].iter().any(|x| !x.eof) { crate::bail("the input BEDs have different lengths"); }
     eprintln!("db: {rows} rows from {} tracks, {missing} all-novel", b.len());
 }
 

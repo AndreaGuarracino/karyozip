@@ -72,7 +72,9 @@ static size_t rss_now(void) {          /* VmHWM: the true high-water mark */
 }
 
 static void profdump(void) {
-    if (!PROF) return;
+    /* WALL0 is still 0 when we die before the run starts, and the timings
+       would then be the machine uptime. */
+    if (!PROF || WALL0 == 0) return;
     double tot = 0;
     for (int i = 0; i < 9; i++) tot += PH[i];
     for (int i = 0; i < 9; i++)

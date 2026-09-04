@@ -63,6 +63,9 @@ fn read_name_file(path: &str, nreads: u64) -> Vec<u8> {
 /// the bases before it, and its own hash.
 struct Blk { off: u64, size: u64, l: u64, raw: u64, lraw: u64, rows: u64, hash: u64 }
 
+/// seq, start, end, label, as decode hands each row out.
+pub type RowFn<'a> = dyn FnMut(&[u8], u64, u64, &[u8]) + 'a;
+
 #[derive(Default)]
 pub struct ReadOpts {
     pub raw: bool,
@@ -218,7 +221,6 @@ impl Reader {
         rd(f.read_exact(&mut itz), "short index table");
 
         // A sidecar holds the names --names drop:FILE wrote.
-        let mut nz = nz;
         let mut nzl = nzl;
         if nzl == 0 && was_side {
             let side = o.names_file.clone()
@@ -389,7 +391,7 @@ impl Reader {
     }
 
     /// Every row, in order, to a callback. decode and --db share it.
-    pub fn for_each_row(&mut self, f: &mut dyn FnMut(&[u8], u64, u64, &[u8])) {
+    pub fn for_each_row(&mut self, f: &mut RowFn) {
         let mut c = Cursor { blk: usize::MAX, data: std::rc::Rc::new(Vec::new()),
                              lp: 0, ip: 0, left: 0 };
         let (mut ipos, mut emitted) = (0usize, 0u64);
@@ -631,9 +633,9 @@ impl Reader {
             None if self.lab.is_empty() => { kst::putu64(out, f); return; }
             None => crate::bail("corrupt block: a label id past the table"),
         };
-        if l == b"=" && self.aln.is_some() {
+        if let (b"=", Some(a)) = (l, self.aln.as_ref()) {
             let q = self.alnq.unwrap_or_else(|| crate::bail("a delta row has no reference answer: wrong PAF or reference track"));
-            let rl = self.aln.as_ref().unwrap().row(q, st, len);
+            let rl = a.row(q, st, len);
             if rl == u32::MAX { crate::bail("a delta row has no reference answer: wrong PAF or reference track"); }
             out.extend_from_slice(&self.lab[rl as usize]);
             return;

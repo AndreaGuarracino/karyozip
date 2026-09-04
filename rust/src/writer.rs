@@ -81,7 +81,7 @@ pub struct Writer {
     tailpred: u64,
     tailon: Option<bool>,
     /// --sort holds every record until close: (name, runs as (len, label id)).
-    srec: Vec<(Vec<u8>, Vec<(u64, u32)>)>,
+    srec: Vec<SRec>,
     sortbp: u64,
     natbuf: Vec<u8>,
     perm_on: bool,
@@ -377,8 +377,7 @@ impl Writer {
         // why it cannot run until every row has arrived. --slow reads them all.
         let rawtot: usize = self.bm.iter().map(|b| b.len).sum();
         let get = |i: usize| self.read_block(i).expect("staged block");
-        let p = pick(&get, self.bm.len(), rawtot, self.opt.block, self.opt.slow,
-                     self.opt.levelset, level, self.opt.id_codec, self.opt.len_codec);
+        let p = pick(&get, self.bm.len(), rawtot, level, &self.opt);
         let level = p.level;
         let (lvl_id, lvl_len) = (if p.lvl_id < 0 { level } else { p.lvl_id },
                                  if p.lvl_len < 0 { level } else { p.lvl_len });
@@ -664,13 +663,17 @@ pub const CAND_SLOW: [i32; 46] = [
 /// pick for a file a query will seek into.
 fn fast_enough(codec: i32) -> bool { codec & ffi::CODEC_BZIP3 == 0 }
 
+/// One --sort record: the name, then its (length, label id) runs.
+type SRec = (Vec<u8>, Vec<(u64, u32)>);
+
 pub struct Pick { pub id: i32, pub len: i32, pub lvl_id: i32, pub lvl_len: i32, pub level: i32 }
 
 /// `blocks` yields every block as (lens, ids); the default search reads three
 /// of them, --slow reads them all, twice.
 pub fn pick(all: &dyn Fn(usize) -> (Vec<u8>, Vec<u8>), nraw: usize, rawtot: usize,
-            block: u64, slow: bool, levelset: bool, mut level: i32,
-            forced_id: Option<i32>, forced_len: Option<i32>) -> Pick {
+            mut level: i32, o: &Options) -> Pick {
+    let (block, slow, levelset) = (o.block, o.slow, o.levelset);
+    let (forced_id, forced_len) = (o.id_codec, o.len_codec);
     let cand: &[i32] = if slow { &CAND_SLOW } else { &CAND_FAST };
     let nc = cand.len();
     if let (Some(i), Some(l)) = (forced_id, forced_len) {

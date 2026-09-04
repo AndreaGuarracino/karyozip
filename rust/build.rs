@@ -5,6 +5,12 @@
 fn main() {
     let c = std::path::Path::new("../c");
     println!("cargo:rerun-if-changed=../c");
+    // The two vendored versions come from the vendored trees, never a copy.
+    println!("cargo:rustc-env=HTSCODECS_VERSION={}", grab(&c.join("htscodecs/version.h"), "HTSCODECS_VERSION_TEXT"));
+    let bz3 = grab(&c.join("Makefile"), "BZIP3_VERSION ?=");
+    // The usage text is the C's own, so the two cannot drift apart.
+    let out = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap());
+    std::fs::write(out.join("usage.txt"), usage(&c.join("karyozip.c"))).unwrap();
     cc::Build::new()
         .files([
             c.join("htscodecs/tokenise_name3.c"),
@@ -17,8 +23,33 @@ fn main() {
             c.join("bzip3/libbz3.c"),
         ])
         .include(c)
-        .define("VERSION", "\"1.5.3\"")
+        .define("VERSION", format!("{bz3:?}").as_str())
         .opt_level(3)
         .warnings(false)
         .compile("kzcodecs");
+}
+
+/// The quoted or trailing word on the one line naming `key`.
+fn grab(path: &std::path::Path, key: &str) -> String {
+    let t = std::fs::read_to_string(path)
+        .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    let line = t.lines().find(|l| l.contains(key))
+        .unwrap_or_else(|| panic!("{}: no {key}", path.display()));
+    match line.split('"').nth(1) {
+        Some(v) => v.to_string(),
+        None => line.split_whitespace().last().unwrap().to_string(),
+    }
+}
+
+/// The C's USAGE string literal, unescaped back into plain text.
+fn usage(path: &std::path::Path) -> String {
+    let t = std::fs::read_to_string(path).unwrap();
+    let i = t.find("static const char *const USAGE =").expect("no USAGE in karyozip.c");
+    let j = t[i..].find(";\n").expect("unterminated USAGE") + i;
+    let mut s = String::new();
+    for part in t[i..j].split('"').skip(1).step_by(2) {
+        s.push_str(&part.replace("\\n", "\n"));
+    }
+    assert!(s.starts_with("usage:\n"), "USAGE did not parse");
+    s
 }

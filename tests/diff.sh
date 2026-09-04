@@ -205,5 +205,38 @@ for bad_in in 'r1\t0\t10' 'r1\t5\t10\tA' 'r1\t0\t0\tA' '\t0\t10\tA' 'r1\tx\t10\t
 done
 echo "refusals: same message from both"
 
+# 12. the command line itself: the same words and the same exit code for
+# every malformed form, including --help and --version.
+cok=0; cbad=0
+cli() {
+  co=$("$C" "$@" </dev/null 2>&1 | tr -d '\0'); cr=$?
+  ro=$("$R" "$@" </dev/null 2>&1 | tr -d '\0'); rr=$?
+  if [ "$co" = "$ro" ] && [ "$cr" = "$rr" ]; then cok=$((cok+1)); return; fi
+  cbad=$((cbad+1)); echo "  cli differs: [$*]"; echo "    c=[$(echo "$co" | head -1)]"
+  echo "    rust=[$(echo "$ro" | head -1)]"
+}
+cli; cli --help; cli -h; cli --version; cli --bogus; cli --bogus encode
+cli decode; cli encode extra; cli --profile; cli --threads; cli --threads 4
+cli badcmd; cli region; cli region f; cli index; cli smooth f; cli aln-pack
+cli encode --names ordinal; cli decode --tail 1; cli index --slow
+cli encode --block; cli encode --level 99; cli encode --block 0
+cli -t; cli -t 0; cli -t 99999; cli --tmp-dir; cli decode --raw x --raw
+cli index --block 0; cli aln-pack a b; cli smooth f h; cli region f s 1 2 3 4
+cli encode --sort=0; cli encode --names foo; cli decode --names keep
+cli aln-pack --names foo a b c; cli encode --db; cli --version encode
+cli index f x; cli decode f x; cli smooth f h fs a b c d; cli aln-pack a b c d
+cli smooth f h fs a b; cli smooth f h fs a b c; cli region f s 1
+cli encode --tok-chunk 0; cli encode --id-codec zz; cli smooth --max-gap x f h fs
+cli decode --out D; cli region --halo 3 f s; cli encode --tail 2
+cli encode --id-codec 0x10; cli encode --id-codec 999999; cli encode --len-codec 0x10004
+cli encode --id-codec 0x10 --len-codec 999999; cli encode --aln p; cli encode --ref r
+cli decode --aln-names f; cli index --names ordinal; cli encode --sort --sort=1M
+cli decode --aln p; cli decode --ref r; cli decode --aln p --ref r
+cli encode --names drop --aln p --ref r; cli decode --db f; cli encode --db f
+cli encode --names drop --names drop:x; cli encode --names drop:
+cli encode --sort --names drop --aln p --ref r --aln-names q
+[ $cbad = 0 ] && echo "cli: $cok forms give the same words and code" \
+  || { echo "cli: $cbad of $((cok+cbad)) DIFFER"; fail=1; }
+
 [ $fail = 0 ] && echo "DIFF_PASS" || echo "DIFF_FAIL"
 exit $fail

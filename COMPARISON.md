@@ -19,21 +19,30 @@ smooth: 27 forms identical
 --db encode / decode: identical, restores all six inputs
 --aln and aln-pack: 11 forms identical
 refusals: same message from both
+cli: 69 forms give the same words and code
 ```
 
 ## Size
 
 |                        |     C |  Rust |
 |------------------------|------:|------:|
-| lines, excluding vendored C | 4,207 | 3,170 |
-| files                  |     2 |     8 |
+| lines, excluding vendored C | 4,209 | 3,525 |
+| files                  |     2 |     9 |
 | `unsafe` blocks        |     — |    14 |
-| stripped binary        | 358 KB | 1,896 KB |
+| stripped binary        | 358 KB | 2,485 KB |
 
-The Rust is 25% shorter. Some of that is real, the parallel arrays and the
+The Rust is 16% shorter. Some of that is real, the parallel arrays and the
 manual memory management that `Vec` and ownership remove; some is that the
 C carries its own hash tables and buffer type where the Rust uses the
-standard library.
+standard library. The command line is `clap`, which costs 589 KB of binary
+and buys back nothing in lines, because the C's exact refusal wording still
+has to be reproduced by hand around it. What it does buy is that the flag
+table, the scope rules and the parser cannot drift apart.
+
+The usage text is not copied. `rust/build.rs` lifts the `USAGE` literal out
+of `c/karyozip.c` at build time, so `--help` is the same bytes from both by
+construction. The htscodecs and bzip3 version strings come the same way,
+from `c/htscodecs/version.h` and `c/Makefile`.
 
 All 14 `unsafe` blocks are in `src/ffi.rs`, the one module that calls the
 vendored C codecs. Nothing else in the crate is unsafe.

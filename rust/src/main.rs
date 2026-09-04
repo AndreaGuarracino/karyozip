@@ -1,4 +1,5 @@
 mod aln;
+mod cli;
 mod db;
 mod ffi;
 mod kst;
@@ -6,6 +7,7 @@ mod reader;
 mod smooth;
 mod writer;
 
+use cli::{Cli, Cmd};
 use std::io::{BufWriter, Read, Write};
 
 fn die(msg: &str) -> ! {
@@ -14,185 +16,130 @@ fn die(msg: &str) -> ! {
 }
 pub fn bail(msg: &str) -> ! { die(msg) }
 
-const USAGE: &str = "usage:
-  karyozip encode [--block N|all] [--level N] [--slow: smaller, slower]
-                  [--names keep|drop|drop:FILE]
-  karyozip decode F   --names F|ordinal   --raw
-  karyozip region F SEQ | SEQ POS | SEQ START END [HALO]
-  karyozip index  F                     appends an index to the track itself
-  any command: --threads N, -t N  --tmp-dir DIR  --help, -h  --version";
+/// The C's wording for a number that is not one.
+fn num(v: &Option<String>, lo: u64, hi: u64, what: &'static str) -> Option<u64> {
+    let s = v.as_ref()?;
+    let n: u64 = s.parse().unwrap_or_else(|_| die(what));
+    if n < lo || n > hi { die(what); }
+    Some(n)
+}
+
+/// A positional the command cannot run without.
+fn need(v: &Option<String>) -> &str {
+    v.as_deref().unwrap_or_else(|| die("bad command or missing arguments"))
+}
 
 fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    if args.iter().any(|a| a == "--help" || a == "-h") {
-        println!("{USAGE}");
-        return;
-    }
-    if args.iter().any(|a| a == "--version") {
-        println!("karyozip {} (rust), format KST00001", env!("CARGO_PKG_VERSION"));
-        println!("  zstd       {}", ffi::zstd_version());
-        println!("  libbz3     {}", ffi::bzip3_version());
-        return;
-    }
-    // The codec probe tests/diff.sh uses.
-    if args.len() == 3 && args[1] == "codecs" { return probe(&args[2]); }
+    let c = Cli::get();
+    // --threads, else OMP_NUM_THREADS, else one per core capped at 8, which
+    // is what the C does. The pool is always explicit, so RAYON_NUM_THREADS
+    // cannot reach it and the two binaries read the one same variable.
+    const THRCAP: usize = 8;
+    let n = match num(&c.threads, 1, 1024, "--threads is a number of 1 to 1024") {
+        Some(t) => t as usize,
+        None => match std::env::var("OMP_NUM_THREADS").ok().and_then(|s| s.parse().ok()) {
+            Some(m @ 1..) => usize::min(m, 1024),
+            _ => std::thread::available_parallelism().map_or(1, |p| p.get()).min(THRCAP),
+        },
+    };
+    rayon::ThreadPoolBuilder::new().num_threads(n).build_global().ok();
+    let tmpdir = c.tmp_dir.clone()
+        .or_else(|| std::env::var("TMPDIR").ok())
+        .unwrap_or_else(|| "/tmp".into());
 
     let mut opt = writer::Options::default();
-    let mut tmpdir = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".into());
-    let mut ro = reader::ReadOpts::default();
-    let (mut maxgap, mut halo, mut v1) = (1000u64, 200u64, false);
-    let (mut dbfeats, mut outdir): (Option<String>, Option<String>) = (None, None);
-    let (mut alnpaf, mut alnref): (Option<String>, Option<String>) = (None, None);
-    let mut alnnames: Option<String> = None;
-    let mut cmd = None;
-    let mut pos: Vec<String> = Vec::new();
-    let mut i = 1;
-    while i < args.len() {
-        let a = args[i].as_str();
-        let mut val = || -> String {
-            i += 1;
-            args.get(i).cloned().unwrap_or_else(|| die(&format!("{a} needs a value")))
+    if let Some(b) = &c.block {
+        opt.block = if b == "all" { u64::MAX } else {
+            b.parse().unwrap_or_else(|_| die("--block is a number of runs, 1 or more, or \"all\""))
         };
-        match a {
-            "--block" => {
-                let v = val();
-                opt.block = if v == "all" { u64::MAX }
-                            else { v.parse().unwrap_or_else(|_| die("--block is a number of runs, 1 or more, or \"all\"")) };
-                if opt.block == 0 { die("--block is a number of runs, 1 or more, or \"all\""); }
-            }
-            "--level" => {
-                let v = val();
-                opt.level = v.parse().unwrap_or_else(|_| die("--level is a zstd level, 1 to 22"));
-                if !(1..=22).contains(&opt.level) { die("--level is a zstd level, 1 to 22"); }
-                opt.levelset = true;
-            }
-            "--names" => {
-                let v = val();
-                if v == "keep" { opt.keep_names = true; }
-                else if v == "ordinal" { ro.ordnames = true; }
-                else if v == "drop" { opt.drop_names = true; }
-                else if let Some(f) = v.strip_prefix("drop:") {
-                    if f.is_empty() { die("--names drop:FILE needs a file"); }
-                    opt.names_out = Some(f.to_string());
-                } else { ro.names_file = Some(v); }
-            }
-            "--slow" => opt.slow = true,
-            "--sort" => opt.sort = true,
-            "--db" => { dbfeats = Some(val()); ro.db = true; }
-            "--out" => outdir = Some(val()),
-            "--aln" => alnpaf = Some(val()),
-            "--ref" => alnref = Some(val()),
-            "--aln-names" => alnnames = Some(val()),
-            "--raw" => ro.raw = true,
-            "--max-gap" => maxgap = val().parse().unwrap_or_else(|_| die("--max-gap needs a number")),
-            "--halo" => halo = val().parse().unwrap_or_else(|_| die("--halo needs a number")),
-            "--v1" => v1 = true,
-            "--tail" => {
-                let v = val();
-                opt.tail = Some(match v.as_str() { "0" => false, "1" => true,
-                                                   _ => die("--tail is 0 or 1") });
-            }
-            "--tok-chunk" => {
-                let v: usize = val().parse().unwrap_or_else(|_| die("--tok-chunk needs a number"));
-                if v == 0 { die("--tok-chunk needs a number"); }
-                opt.tok_chunk = Some(v.min(9_000_000));
-            }
-            "--profile" => {}
-            "--tmp-dir" => tmpdir = val(),
-            "--id-codec" => { opt.id_codec = Some(parse_codec(&val())); }
-            "--len-codec" => { opt.len_codec = Some(parse_codec(&val())); }
-            "-t" | "--threads" => {
-                let v: usize = val().parse().unwrap_or_else(|_| die("--threads is a number of 1 to 1024"));
-                if !(1..=1024).contains(&v) { die("--threads is a number of 1 to 1024"); }
-                // Explicit, so RAYON_NUM_THREADS cannot reach it.
-                rayon::ThreadPoolBuilder::new().num_threads(v).build_global().ok();
-            }
-            _ if a.starts_with("--sort=") => {
-                opt.sort = true;
-                mem_arg(&a[7..]);
-            }
-            _ if a.starts_with('-') && a.len() > 1 => die(&format!("unknown flag {a}")),
-            _ => { if cmd.is_none() { cmd = Some(a.to_string()); } else { pos.push(a.to_string()); } }
-        }
-        i += 1;
+        if opt.block == 0 { die("--block is a number of runs, 1 or more, or \"all\""); }
     }
-    match cmd.as_deref() {
-        Some("encode") => {
-            match dbfeats {
+    if let Some(l) = num(&c.level, 1, 22, "--level is a zstd level, 1 to 22") {
+        opt.level = l as i32;
+        opt.levelset = true;
+    }
+    opt.slow = c.slow;
+    if let Some(m) = &c.sort {
+        opt.sort = true;
+        if !m.is_empty() { mem_arg(m); }
+    }
+    if let Some(t) = &c.tail {
+        opt.tail = Some(match t.as_str() { "0" => false, "1" => true, _ => die("--tail is 0 or 1") });
+    }
+    if let Some(k) = num(&c.tok_chunk, 1, 0x7fff_ffff, "--tok-chunk needs a number") {
+        opt.tok_chunk = Some((k as usize).min(9_000_000));
+    }
+    opt.id_codec = c.id_codec.as_deref().map(|v| parse_codec(v, "--id-codec"));
+    opt.len_codec = c.len_codec.as_deref().map(|v| parse_codec(v, "--len-codec"));
+
+    let Some(cmd) = c.cmd.as_ref() else { die(cli::USAGE) };
+    // The C tests each predicate over both codecs before the next one.
+    let ks = [opt.id_codec, opt.len_codec];
+    let any = |f: fn(i32) -> bool| ks.iter().flatten().any(|&k| f(k));
+    if any(ffi::badcodec) { die("--id-codec and --len-codec take a codec id, not any number"); }
+    if any(ffi::nosz) { die("a NOSZ codec (0x10) stores no size and is not accepted"); }
+    if any(ffi::noext) { die("arith X_EXT (0x04) needs libbz2 and is not accepted"); }
+    c.check_scope().unwrap_or_else(|m| die(&m));
+    let mut ro = reader::ReadOpts { raw: c.raw, db: c.db.is_some(), ..Default::default() };
+    // The C keeps a mode and a file separately, so a repeat of one does not
+    // clear the other, and drop plus drop:FILE is a refusal.
+    for n in &c.names {
+        match n.as_str() {
+            "keep" => { opt.keep_names = true; opt.drop_names = false; }
+            "drop" => { opt.drop_names = true; opt.keep_names = false; }
+            _ if n.starts_with("drop:") => {
+                if n.len() == 5 { die("--names drop:FILE needs a file"); }
+                opt.names_out = Some(n[5..].to_string());
+            }
+            "ordinal" => ro.ordnames = true,
+            _ => ro.names_file = Some(n.clone()),
+        }
+    }
+
+    match cmd {
+        Cmd::Encode { files } => {
+            if c.db.is_none() && !files.is_empty() {
+                die("without --db, encode reads one BED on stdin");
+            }
+            if opt.drop_names && opt.names_out.is_some() {
+                die("--names drop and --names drop:FILE are exclusive");
+            }
+            if c.aln.is_some() && c.refbed.is_none() { die("--aln needs --ref"); }
+            if c.aln.is_some() && opt.drop_names && c.aln_names.is_none() {
+                die("--aln with --names drop needs --aln-names: without the names \
+                     decode cannot reach the alignment");
+            }
+            if c.aln.is_some() && opt.sort && opt.drop_names {
+                die("--aln with --sort and --names drop cannot be decoded: sorting \
+                     reorders the records, so the ordinal name map is invalid");
+            }
+            if c.db.is_some() && files.is_empty() { die("--db: give one BED per feature set"); }
+            let a = load_aln(&c.aln, &c.refbed, &c.aln_names, "");
+            match &c.db {
                 Some(fp) => {
-                    let feats = db::Feats::load(&fp);
+                    let feats = db::Feats::load(fp);
                     eprintln!("features: {} ids, {} sets", feats.id2lab.len(), feats.sets.len());
                     let mut w = writer::Writer::new(opt, std::path::Path::new(&tmpdir))
                         .unwrap_or_else(|e| die(&e.to_string()));
                     w.set_feathash(feats.hash);
-                    db::encode(&pos, &feats, &mut w);
-                    let stdout = std::io::stdout();
-                    let mut o = BufWriter::new(stdout.lock());
-                    let st = w.close(&mut o).unwrap_or_else(|m| die(&m));
-                    o.flush().unwrap_or_else(|e| die(&e.to_string()));
-                    report(&st);
+                    let aln_on = a.is_some();
+                    if let Some(x) = a { w.set_aln(x); }
+                    let files: Vec<String> = if files.is_empty() { vec!["-".into()] } else { files.clone() };
+                    db::encode(&files, &feats, &mut w);
+                    finish(w, aln_on);
                 }
                 None => {
-                    let a = load_aln(&alnpaf, &alnref, &alnnames);
+                    if !files.is_empty() { die("without --db, encode reads one BED on stdin"); }
                     encode(opt, std::path::Path::new(&tmpdir), a)
                 }
             }
         }
-        Some("smooth") => {
-            if pos.len() < 3 { die("bad command or missing arguments"); }
-            let n = |s: &str, w: &str| -> u64 { s.parse().unwrap_or_else(|_| die(w)) };
-            let (seq, lo, hi) = match pos.len() {
-                3 => (None, 0, 0),
-                4 => (Some(pos[3].as_bytes()), 0, 0),
-                6 => (Some(pos[3].as_bytes()),
-                      n(&pos[4], "smooth: start is not a number"),
-                      n(&pos[5], "smooth: end is not a number")),
-                _ => die("bad command or missing arguments"),
-            };
-            let stdout = std::io::stdout();
-            let mut o = BufWriter::new(stdout.lock());
-            smooth::run(&pos[0], &pos[1], pos[2].as_bytes(), seq, lo, hi, v1, maxgap, halo, &ro, &mut o);
-            o.flush().unwrap_or_else(|e| die(&e.to_string()));
-        }
-        Some("aln-pack") => {
-            if pos.len() != 3 { die("usage: karyozip aln-pack P.paf REF.bed OUT"); }
-            let mut a = aln::Aln::default();
-            a.load_ref(&pos[1]);
-            let rh = aln::refhash(&a);
-            a.load_paf(&pos[0]);
-            aln::pack(&a, &pos[2], rh);
-        }
-        Some("index") => {
-            let f = pos.first().unwrap_or_else(|| die("bad command or missing arguments"));
-            reader::Reader::open_with(f, &ro).build_index(f);
-        }
-        Some("region") => {
-            if pos.len() < 2 { die("bad command or missing arguments"); }
-            let n = |s: &str, w: &str| -> u64 {
-                s.parse().unwrap_or_else(|_| die(w)) };
-            let (lo, hi, halo) = match pos.len() {
-                2 => (0, 0, 0),
-                3 => { let p = n(&pos[2], "region: start is not a number"); (p, p + 1, 0) }
-                4 | 5 => {
-                    let a = n(&pos[2], "region: start is not a number");
-                    let b = n(&pos[3], "region: end is not a number");
-                    if a >= b { die("region: give START END with END past START"); }
-                    (a, b, if pos.len() == 5 { n(&pos[4], "region: halo is not a number") } else { 0 })
-                }
-                _ => die("bad command or missing arguments"),
-            };
-            let mut r = reader::Reader::open_with(&pos[0], &ro);
-            let stdout = std::io::stdout();
-            let mut o = BufWriter::new(stdout.lock());
-            r.region(pos[1].as_bytes(), lo, hi, halo, &mut o);
-            o.flush().unwrap_or_else(|e| die(&e.to_string()));
-        }
-        Some("decode") => {
-            if pos.len() > 1 { die("decode takes one track"); }
-            let f = pos.first().unwrap_or_else(|| die("bad command or missing arguments"));
-            ro.aln = load_aln(&alnpaf, &alnref, &alnnames);
-            let mut r = reader::Reader::open_with(f, &ro);
-            match (&dbfeats, &outdir) {
+        Cmd::Decode { track, rest } => {
+            if !rest.is_empty() { die("decode takes one track"); }
+            let track = need(track);
+            ro.aln = load_aln(&c.aln, &c.refbed, &c.aln_names, "decode ");
+            let mut r = reader::Reader::open_with(track, &ro);
+            match (&c.db, &c.out) {
                 (Some(fp), Some(d)) => {
                     let feats = db::Feats::load(fp);
                     eprintln!("features: {} ids, {} sets", feats.id2lab.len(), feats.sets.len());
@@ -203,20 +150,86 @@ fn main() {
                 }
                 (Some(_), None) => die("decode --db needs --out DIR for the per-set BEDs"),
                 _ => {
-                    let stdout = std::io::stdout();
-                    let mut o = BufWriter::new(stdout.lock());
+                    let so = std::io::stdout();
+                    let mut o = BufWriter::new(so.lock());
                     r.decode(&mut o);
                     o.flush().unwrap_or_else(|e| die(&e.to_string()));
                 }
             }
         }
-        Some(c) => die(&format!("bad command {c}")),
-        None => {
-            eprintln!("usage: karyozip encode [--block N|all] [--level N] [--names keep] < in.bed > out.kst");
-            std::process::exit(1);
+        Cmd::Region { track, seq, a, b, hl, rest: _ } => {
+            let (track, seq) = (need(track), need(seq));
+            let p = |v: &Option<String>, w: &'static str| -> u64 {
+                v.as_ref().unwrap().parse().unwrap_or_else(|_| die(w))
+            };
+            let (lo, hi, hlo) = match (a, b) {
+                (None, _) => (0, 0, 0),
+                (Some(_), None) => { let x = p(a, "region: start is not a number"); (x, x + 1, 0) }
+                (Some(_), Some(_)) => {
+                    let x = p(a, "region: start is not a number");
+                    let y = p(b, "region: end is not a number");
+                    if x >= y { die("region: give START END with END past START"); }
+                    (x, y, hl.as_ref().map_or(0, |_| p(hl, "region: halo is not a number")))
+                }
+            };
+            ro.aln = load_aln(&c.aln, &c.refbed, &c.aln_names, "");
+            let mut r = reader::Reader::open_with(track, &ro);
+            let so = std::io::stdout();
+            let mut o = BufWriter::new(so.lock());
+            r.region(seq.as_bytes(), lo, hi, hlo, &mut o);
+            o.flush().unwrap_or_else(|e| die(&e.to_string()));
+        }
+        Cmd::Smooth { track, hier, fs, seq, start, end, rest } => {
+            let (track, hier, fs) = (need(track), need(hier), need(fs));
+            if !rest.is_empty() { die("smooth: give SEQ, or SEQ START END"); }
+            let maxgap = num(&c.max_gap, 0, u64::MAX, "--max-gap needs a number").unwrap_or(1000);
+            let halo = num(&c.halo, 0, u64::MAX, "--halo needs a number").unwrap_or(200);
+            let (lo, hi) = match (start, end) {
+                (Some(a), Some(b)) => (
+                    a.parse().unwrap_or_else(|_| die("smooth: start is not a number")),
+                    b.parse().unwrap_or_else(|_| die("smooth: end is not a number"))),
+                (None, None) => (0, 0),
+                _ => die("smooth: give SEQ, or SEQ START END"),
+            };
+            let so = std::io::stdout();
+            let mut o = BufWriter::new(so.lock());
+            smooth::run(track, hier, fs.as_bytes(), seq.as_ref().map(|s| s.as_bytes()),
+                        lo, hi, c.v1, maxgap, halo, &ro, &mut o);
+            o.flush().unwrap_or_else(|e| die(&e.to_string()));
+        }
+        Cmd::Index { track, rest: _ } => {
+            let track = need(track);
+            reader::Reader::open_with(track, &ro).build_index(track)
+        }
+        Cmd::Codecs { file } => probe(need(file)),
+        Cmd::AlnPack { paf, rbed, dest, rest } => {
+            let (paf, rbed, dest) = match (paf, rbed, dest) {
+                (Some(p), Some(r), Some(o)) if rest.is_empty() => (p, r, o),
+                _ => die("usage: karyozip aln-pack P.paf REF.bed OUT"),
+            };
+            let mut a = aln::Aln::default();
+            a.load_ref(rbed);
+            let rh = aln::refhash(&a);
+            a.load_paf(paf);
+            aln::pack(&a, dest, rh);
         }
     }
 }
+
+/// Writes the file and reports, for both encode paths.
+fn finish(w: writer::Writer, aln_on: bool) {
+    let hits = w.aln_hit();
+    let so = std::io::stdout();
+    let mut o = BufWriter::new(so.lock());
+    let st = w.close(&mut o).unwrap_or_else(|m| die(&m));
+    o.flush().unwrap_or_else(|e| die(&e.to_string()));
+    if aln_on {
+        eprintln!("aln: {hits} of {} rows matched the reference ({:.1}%)",
+                  st.rows, if st.rows > 0 { 100.0 * hits as f64 / st.rows as f64 } else { 0.0 });
+    }
+    report(&st);
+}
+
 
 /// --sort=MEM: digits and an optional K, M, G or T. The C spells the
 /// refusals this way, so these do too.
@@ -247,23 +260,23 @@ fn mem_arg(p: &str) -> u64 {
     m
 }
 
-fn parse_codec(s: &str) -> i32 {
+fn parse_codec(s: &str, flag: &str) -> i32 {
     let v = if let Some(h) = s.strip_prefix("0x") {
         i64::from_str_radix(h, 16)
     } else { s.parse::<i64>() };
     match v {
         Ok(v) if (0..=0x7fff_ffff).contains(&v) => v as i32,
-        _ => die("--id-codec and --len-codec take a codec id, not any number"),
+        _ => die(&format!("{flag} needs a codec id")),
     }
 }
 
 /// --aln needs --ref, and the two are read once, before any row.
 fn load_aln(paf: &Option<String>, refbed: &Option<String>,
-            ordfile: &Option<String>) -> Option<aln::Aln> {
+            ordfile: &Option<String>, who: &str) -> Option<aln::Aln> {
     if paf.is_none() && ordfile.is_some() { die("--aln-names does nothing without --aln"); }
     match (paf, refbed) {
         (None, None) => None,
-        (Some(_), None) => die("encode --aln needs --ref"),
+        (Some(_), None) => die(&format!("{who}--aln needs --ref")),
         (None, Some(_)) => die("--ref does nothing without --aln"),
         (Some(p), Some(r)) => {
             let mut a = aln::Aln::default();

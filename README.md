@@ -16,8 +16,13 @@ make diff       # the C and the Rust must agree
 
 ## Commands
 
+Every text input may be plain or gzipped, and is inflated on the fly: the
+BED on stdin, the `--db` BEDs, `--ref`, the PAF, `--aln-names`, `--names F`
+and the hierarchy. A bgzipped file works too, being many gzip members.
+
 ```
-karyozip encode [flags] < in.bed > out.kst
+karyozip encode [flags] < in.bed        > out.kst
+karyozip encode [flags] < in.bed.gz     > out.kst
 karyozip decode F
 karyozip region F SEQ | SEQ POS | SEQ START END [HALO]
 karyozip smooth F HIER FS [SEQ [START END]]

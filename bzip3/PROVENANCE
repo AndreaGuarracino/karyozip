@@ -1,0 +1,33 @@
+kspalaiologos/bzip3, release 1.5.1, plus three local fixes.
+Upstream: https://github.com/kspalaiologos/bzip3
+
+libbz3.c differs from upstream 1.5.1 in three places, all inside
+bz3_compress and bz3_decompress, which are the only bzip3 entry points
+karyozip calls:
+
+1. bz3_compress, block_size clamp
+     ours:     if (block_size > in_size) block_size = bz3_bound(in_size);
+     upstream: if (block_size > in_size) block_size = in_size + 16;
+   bz3_bound is the real worst case; in_size + 16 is a guess.
+
+2. bz3_compress, the size of the last block
+     ours:     size = (i == n_blocks - 1 ? in_size - in_offset : block_size)
+     upstream: size = block_size; if (i == n_blocks - 1) size = in_size % block_size;
+   The upstream form yields 0 whenever in_size is an exact multiple of
+   block_size, which is every single-block call and every aligned input.
+   karyozip drives bzip3 at 8 to 256 MB block sizes, so an aligned
+   payload is reachable.
+
+3. bz3_decompress, the per-block size check
+     ours:     if (size < 0 || size > (s32)bz3_bound(block_size)) ...
+     upstream: if (size < 0 || size > block_size) ...
+   A block that compresses larger than its raw size is legal and fits
+   bz3_bound; the upstream bound rejects it.
+
+A fourth difference against 1.5.1, a free(compression_buf) in
+bz3_decompress, upstream adopted in a later release.
+
+DO NOT BUMP TO 1.5.3. Checked 2026-09-04: 1.5.3 still carries the
+upstream form of 2 and 3, so taking it would reintroduce both. Its only
+changes relative to this file are those two regressions. Re-check on the
+next release; if upstream fixes them, resync and delete this note.

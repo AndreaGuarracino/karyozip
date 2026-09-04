@@ -8,7 +8,7 @@ use crate::kst::{self, FNV0};
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::io::{Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 
 pub const MAGIC: &[u8; 8] = b"KST00001";
 const TOKFLAG: u64 = 1 << 63;
@@ -35,13 +35,15 @@ pub struct Options {
     pub tail: Option<bool>,
     pub tok_chunk: Option<usize>,
     pub sort: bool,
+    /// --sort=MEM: bytes held before a spill, 0 for none.
+    pub sortmem: u64,
     pub id_codec: Option<i32>,
     pub len_codec: Option<i32>,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { block: 262144, level: 17, levelset: false, slow: false,
+        Options { block: 262144, level: 17, levelset: false, slow: false, sortmem: 0,
                   keep_names: false, drop_names: false, names_out: None,
                   tail: None, tok_chunk: None, sort: false,
                   id_codec: None, len_codec: None }
@@ -87,6 +89,10 @@ pub struct Writer {
     perm_on: bool,
     /// --sort writes ranks; the PAF still wants the real name.
     alnname: Option<Vec<u8>>,
+    /// --sort=MEM: the bytes held, the runs already spilled, the next rank.
+    held: u64,
+    spill: Vec<std::fs::File>,
+    natn: u32,
     natord: bool,
     feathash: Option<u64>,
     /// --aln: the alignment, the query it is on, and the two alternate
@@ -129,7 +135,7 @@ impl Writer {
     pub fn new(opt: Options, tmpdir: &std::path::Path) -> std::io::Result<Self> {
         let perm_on = opt.sort && opt.names_out.is_none();
         Ok(Writer {
-            perm_on, alnname: None,
+            perm_on, alnname: None, held: 0, spill: Vec::new(), natn: 0,
             opt, lens: Vec::new(), ids: Vec::new(), names: Vec::new(), ibx: Vec::new(),
             nidx: 0, ordok: true, labtab: Vec::new(), labmap: HashMap::default(), lastid: None,
             cur: Vec::new(), currun: 0, curbp: 0, blkbp0: 0, pend: 0, nblk: 0, rows: 0,
@@ -257,8 +263,9 @@ impl Writer {
         if start > u64::MAX - run_len {
             return Err("a coordinate does not fit in 64 bits".into());
         }
+        if run_len > 0xffff_ffff { return Err("run longer than 4 GB".into()); }
         let newrec = start == 0
-            || self.srec.last().is_none_or(|r| r.0 != name);
+            || self.srec.last().is_none_or(|r| r.nm != name);
         if newrec && start != 0 { return Err("a sequence does not start at 0".into()); }
         if !newrec && start != self.sortbp {
             return Err("gap or overlap: start is not the previous end".into());
@@ -271,42 +278,106 @@ impl Writer {
                 self.natbuf.extend_from_slice(name);
                 self.natbuf.push(b'\n');
             }
-            self.srec.push((name.to_vec(), Vec::new()));
+            self.srec.push(SRec { nm: name.to_vec(), runs: Vec::new(), idx: self.natn });
+            self.natn += 1;
+            self.held += name.len() as u64 + 1 + 16;
+            // Spill at a record boundary only, holding the one just opened.
+            if self.opt.sortmem > 0 && self.held > self.opt.sortmem {
+                let last = self.srec.pop().unwrap();
+                self.spill_write()?;
+                self.held = last.nm.len() as u64 + 1 + 16;
+                self.srec.push(last);
+            }
         }
         let id = self.intern(label);
-        self.srec.last_mut().unwrap().1.push((run_len, id));
+        self.held += 8;
+        self.srec.last_mut().unwrap().runs.push((run_len as u32, id));
+        Ok(())
+    }
+
+    /// One sorted run to a temp file: nrun, name length, rank, name, runs.
+    fn spill_write(&mut self) -> Result<(), String> {
+        if self.srec.is_empty() { return Ok(()); }
+        self.srec.sort_by(srec_cmp);
+        let mut f = tmpfile(&self.tmpdir)
+            .map_err(|_| "cannot create a sort temp file: check --tmp-dir".to_string())?;
+        let mut buf = Vec::with_capacity(1 << 20);
+        for r in &self.srec {
+            buf.extend_from_slice(&(r.runs.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&(r.nm.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&r.idx.to_le_bytes());
+            buf.extend_from_slice(&r.nm);
+            for &(l, b) in &r.runs {
+                buf.extend_from_slice(&l.to_le_bytes());
+                buf.extend_from_slice(&b.to_le_bytes());
+            }
+            if buf.len() > (1 << 20) {
+                f.write_all(&buf).map_err(|_| "sort spill write failed: is --tmp-dir full?".to_string())?;
+                buf.clear();
+            }
+        }
+        f.write_all(&buf).map_err(|_| "sort spill write failed: is --tmp-dir full?".to_string())?;
+        f.flush().map_err(|_| "sort spill write failed: is --tmp-dir full?".to_string())?;
+        eprintln!("spill {}: {} records", self.spill.len(), self.srec.len());
+        self.spill.push(f);
+        self.srec.clear();
+        self.held = 0;
+        Ok(())
+    }
+
+    /// The k-way merge over the spilled runs, in the same order.
+    fn spillmerge(&mut self) -> Result<(), String> {
+        let mut files = std::mem::take(&mut self.spill);
+        let mut head: Vec<Option<SRec>> = Vec::with_capacity(files.len());
+        for f in files.iter_mut() {
+            f.seek(SeekFrom::Start(0)).map_err(io)?;
+            head.push(srd_next(f)?);
+        }
+        let mut out = 0u64;
+        loop {
+            let mut best = usize::MAX;
+            for i in 0..head.len() {
+                if head[i].is_none() { continue; }
+                if best == usize::MAX
+                   || srec_cmp(head[i].as_ref().unwrap(), head[best].as_ref().unwrap())
+                      == std::cmp::Ordering::Less { best = i; }
+            }
+            if best == usize::MAX { break; }
+            let r = head[best].take().unwrap();
+            let rank = r.idx.to_string();
+            let name: &[u8] = if self.perm_on { rank.as_bytes() } else { &r.nm };
+            self.alnname = Some(r.nm.clone());
+            let mut pos = 0u64;
+            for &(len, id) in &r.runs {
+                let l = self.labtab[id as usize].clone();
+                self.row_inner(name, len as u64, &l, pos, false)?;
+                pos += len as u64;
+            }
+            out += 1;
+            head[best] = srd_next(&mut files[best])?;
+        }
+        eprintln!("external sort: {out} records merged from {} runs", files.len());
         Ok(())
     }
 
     /// Order by label tuple, then run count, then lengths, then input rank.
     fn sortflush(&mut self) -> Result<(), String> {
-        let lab = std::mem::take(&mut self.labtab);
-        let mut idx: Vec<usize> = (0..self.srec.len()).collect();
-        idx.sort_by(|&a, &b| {
-            let (p, q) = (&self.srec[a].1, &self.srec[b].1);
-            let n = p.len().min(q.len());
-            for i in 0..n {
-                if p[i].1 != q[i].1 { return p[i].1.cmp(&q[i].1); }
-            }
-            if p.len() != q.len() { return p.len().cmp(&q.len()); }
-            for i in 0..n {
-                if p[i].0 != q[i].0 { return p[i].0.cmp(&q[i].0); }
-            }
-            a.cmp(&b)
-        });
-        let recs = std::mem::take(&mut self.srec);
-        self.labtab = lab;
+        if !self.spill.is_empty() {
+            self.spill_write()?;
+            return self.spillmerge();
+        }
+        let mut recs = std::mem::take(&mut self.srec);
+        recs.sort_by(srec_cmp);
         let n = recs.len();
-        for &i in &idx {
-            let (nm, runs) = &recs[i];
-            let rank = i.to_string();
-            let name: &[u8] = if self.perm_on { rank.as_bytes() } else { nm };
-            self.alnname = Some(nm.clone());
+        for r in &recs {
+            let rank = r.idx.to_string();
+            let name: &[u8] = if self.perm_on { rank.as_bytes() } else { &r.nm };
+            self.alnname = Some(r.nm.clone());
             let mut pos = 0u64;
-            for &(len, id) in runs {
+            for &(len, id) in &r.runs {
                 let l = self.labtab[id as usize].clone();
-                self.row_inner(name, len, &l, pos, false)?;
-                pos += len;
+                self.row_inner(name, len as u64, &l, pos, false)?;
+                pos += len as u64;
             }
         }
         eprintln!("sorted {n} records by label tuple then lengths");
@@ -693,8 +764,22 @@ pub const CAND_SLOW: [i32; 46] = [
 /// pick for a file a query will seek into.
 fn fast_enough(codec: i32) -> bool { codec & ffi::CODEC_BZIP3 == 0 }
 
-/// One --sort record: the name, then its (length, label id) runs.
-type SRec = (Vec<u8>, Vec<(u64, u32)>);
+/// One --sort record: the name, its (length, label id) runs, and the input
+/// rank, which travels with it across a spill.
+struct SRec { nm: Vec<u8>, runs: Vec<(u32, u32)>, idx: u32 }
+
+/// Labels lead, then the run count, then the lengths, then the input rank.
+fn srec_cmp(a: &SRec, b: &SRec) -> std::cmp::Ordering {
+    let n = a.runs.len().min(b.runs.len());
+    for i in 0..n {
+        if a.runs[i].1 != b.runs[i].1 { return a.runs[i].1.cmp(&b.runs[i].1); }
+    }
+    if a.runs.len() != b.runs.len() { return a.runs.len().cmp(&b.runs.len()); }
+    for i in 0..n {
+        if a.runs[i].0 != b.runs[i].0 { return a.runs[i].0.cmp(&b.runs[i].0); }
+    }
+    a.idx.cmp(&b.idx)
+}
 
 pub struct Pick { pub id: i32, pub len: i32, pub lvl_id: i32, pub lvl_len: i32, pub level: i32 }
 
@@ -979,4 +1064,26 @@ pub fn check_unique(names: &[u8]) -> Result<(), String> {
         exact.insert(line);
     }
     Ok(())
+}
+/// One record back out of a spill file.
+fn srd_next(f: &mut std::fs::File) -> Result<Option<SRec>, String> {
+    let mut h = [0u8; 12];
+    match f.read_exact(&mut h) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(_) => return Err("sort temp is corrupt".into()),
+    }
+    let nrun = u32::from_le_bytes(h[0..4].try_into().unwrap()) as usize;
+    let nl = u32::from_le_bytes(h[4..8].try_into().unwrap()) as usize;
+    let idx = u32::from_le_bytes(h[8..12].try_into().unwrap());
+    if nl >= 512 { return Err("sort temp is corrupt".into()); }
+    let mut nm = vec![0u8; nl];
+    let mut rb = vec![0u8; nrun * 8];
+    f.read_exact(&mut nm).map_err(|_| "sort temp is corrupt".to_string())?;
+    f.read_exact(&mut rb).map_err(|_| "sort temp is corrupt".to_string())?;
+    let runs = rb.chunks_exact(8)
+        .map(|c| (u32::from_le_bytes(c[0..4].try_into().unwrap()),
+                  u32::from_le_bytes(c[4..8].try_into().unwrap())))
+        .collect();
+    Ok(Some(SRec { nm, runs, idx }))
 }

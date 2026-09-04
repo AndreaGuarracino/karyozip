@@ -73,7 +73,7 @@ fn main() {
         // clap cannot tell "--sort" from "--sort=", and the C refuses the
         // second, so the empty size is looked for in argv itself.
         if m.is_empty() && std::env::args().any(|a| a == "--sort=") { mem_arg(""); }
-        if !m.is_empty() { mem_arg(m); }
+        if !m.is_empty() { opt.sortmem = mem_arg(m); }
     }
     if let Some(t) = &c.tail {
         opt.tail = Some(match t.as_str() { "0" => false, "1" => true, _ => die("--tail is 0 or 1") });

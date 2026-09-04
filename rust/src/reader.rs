@@ -154,7 +154,8 @@ impl Reader {
                 crate::bail("this track leaves out every length the reference implies: decode it with --aln PAF --ref R");
             }
         }
-        if h[1] & PERMFLAG != 0 { crate::bail("this build does not read sorted tracks"); }
+        let was_perm = h[1] & PERMFLAG != 0;
+        let perm_tok = h[1] & PERMTOK != 0;
         rd(f.seek(SeekFrom::Start(8 + 128)), "seek");
 
         let lzl = h[6] as usize;
@@ -211,6 +212,9 @@ impl Reader {
                 }
             }
         }
+        let mut pz = vec![0u8; if was_perm { h[14] as usize } else { 0 }];
+        if !pz.is_empty() { rd(f.read_exact(&mut pz), "short input-order names"); }
+
         // The metadata hash covers the header with h[15] zeroed, then every
         // stream, and the sidecar's bytes stand in for the names when they
         // are not in the file. A foreign sidecar is caught here.
@@ -226,6 +230,7 @@ impl Reader {
             mh = kst::fnv(mh, &iz);
             mh = kst::fnv(mh, &sz);
             mh = kst::fnv(mh, &itz);
+            mh = kst::fnv(mh, &pz);
             if mh != h[15] {
                 if was_side {
                     crate::bail("this names file does not belong to this track: give the file --names drop:FILE wrote, not a FASTA or a list");
@@ -318,8 +323,37 @@ impl Reader {
         if names.len() as u64 != h[0] {
             crate::bail("names stream does not match the track's sequence count");
         }
+        // --sort stores a rank per record; the input-order names sit beside
+        // them, or come from --names FILE when the blob is empty.
+        let perm_ext = was_perm && pz.is_empty();
+        if (was_perm && !pz.is_empty()) || perm_ext {
+            let resolve = if perm_ext {
+                match &o.names_file {
+                    Some(f) => Some(read_name_file(f, h[0])),
+                    None if o.raw || o.ordnames => None,
+                    None => crate::bail("--sort --no-names keeps the rank of every record and no name text: give the original FASTA/FASTQ in --names FILE, or --ordinal-names to see the ranks"),
+                }
+            } else if perm_tok {
+                Some(tok_d(&pz))
+            } else {
+                Some(zdec(&pz, "input-order names"))
+            };
+            if let Some(nat) = resolve {
+                let tab: Vec<Vec<u8>> = nat.split(|&c| c == b'\n')
+                    .filter(|l| !l.is_empty()).map(|l| l.to_vec()).collect();
+                if tab.len() as u64 != h[0] {
+                    crate::bail("input-order names do not match the track's sequence count");
+                }
+                names = names.iter().map(|n| {
+                    let v: u64 = std::str::from_utf8(n).ok().and_then(|t| t.parse().ok())
+                        .unwrap_or_else(|| crate::bail("a stored rank is not a record number"));
+                    if v >= h[0] { crate::bail("a stored rank is not a record number"); }
+                    tab[v as usize].clone()
+                }).collect();
+            }
+        }
 
-        let data0 = 8 + 128 + lzl as u64 + nml + h[2] + h[3] + h[11];
+        let data0 = 8 + 128 + lzl as u64 + nml + h[2] + h[3] + h[11] + pz.len() as u64;
         Reader {
             f, nreads: h[0], rows: h[4], lab, block: blk, b, data0,
             idcodec: h[9] as u32 as i32, lencodec: h[5] as u32 as i32,

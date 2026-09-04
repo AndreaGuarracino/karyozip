@@ -15,6 +15,8 @@ const TOKFLAG: u64 = 1 << 63;
 const INTFLAG: u64 = 1 << 62;
 const DROPPED: u64 = 1 << 60;
 const SIDEFLAG: u64 = 1 << 57;
+const PERMFLAG: u64 = 1 << 54;
+const PERMTOK: u64 = 1 << 53;
 const TAILFLAG: u64 = 1 << 55;
 const ICHUNK: u64 = 65536;
 const TAILSKIP: usize = 64;
@@ -29,6 +31,7 @@ pub struct Options {
     pub names_out: Option<String>,
     pub tail: Option<bool>,
     pub tok_chunk: Option<usize>,
+    pub sort: bool,
     pub id_codec: Option<i32>,
     pub len_codec: Option<i32>,
 }
@@ -37,7 +40,8 @@ impl Default for Options {
     fn default() -> Self {
         Options { block: 262144, level: 17, levelset: false, slow: false,
                   keep_names: false, drop_names: false, names_out: None,
-                  tail: None, tok_chunk: None, id_codec: None, len_codec: None }
+                  tail: None, tok_chunk: None, sort: false,
+                  id_codec: None, len_codec: None }
     }
 }
 
@@ -67,6 +71,12 @@ pub struct Writer {
     tailsamp: Vec<u64>,
     tailpred: u64,
     tailon: Option<bool>,
+    /// --sort holds every record until close: (name, runs as (len, label id)).
+    srec: Vec<(Vec<u8>, Vec<(u64, u32)>)>,
+    sortbp: u64,
+    natbuf: Vec<u8>,
+    perm_on: bool,
+    natord: bool,
     raw: std::fs::File,
     tmpdir: std::path::PathBuf,
     rawlen: u64,
@@ -85,11 +95,14 @@ fn tmpfile(dir: &std::path::Path) -> std::io::Result<std::fs::File> {
 
 impl Writer {
     pub fn new(opt: Options, tmpdir: &std::path::Path) -> std::io::Result<Self> {
+        let perm_on = opt.sort && opt.names_out.is_none();
         Ok(Writer {
+            perm_on,
             opt, lens: Vec::new(), ids: Vec::new(), names: Vec::new(), ibx: Vec::new(),
             nidx: 0, ordok: true, labtab: Vec::new(), labmap: HashMap::new(), lastid: None,
             cur: Vec::new(), currun: 0, curbp: 0, blkbp0: 0, pend: 0, nblk: 0, rows: 0,
             plen: 0, phas: false, tailsamp: Vec::new(), tailpred: 0, tailon: None,
+            srec: Vec::new(), sortbp: 0, natbuf: Vec::new(), natord: true,
             raw: tmpfile(tmpdir)?, tmpdir: tmpdir.to_path_buf(), rawlen: 0, bm: Vec::new(),
         })
     }
@@ -175,7 +188,71 @@ impl Writer {
         Ok(())
     }
 
+    /// --sort: hold the record; the order is decided at close.
+    fn sortpush(&mut self, name: &[u8], run_len: u64, label: &[u8], start: u64)
+        -> Result<(), String> {
+        let newrec = start == 0
+            || self.srec.last().is_none_or(|r| r.0 != name);
+        if newrec && start != 0 { return Err("a sequence does not start at 0".into()); }
+        if !newrec && start != self.sortbp {
+            return Err("gap or overlap: start is not the previous end".into());
+        }
+        self.sortbp = if newrec { run_len } else { self.sortbp + run_len };
+        if newrec {
+            if self.perm_on {
+                let want = self.srec.len().to_string();
+                if self.natord && want.as_bytes() != name { self.natord = false; }
+                self.natbuf.extend_from_slice(name);
+                self.natbuf.push(b'\n');
+            }
+            self.srec.push((name.to_vec(), Vec::new()));
+        }
+        let id = self.intern(label);
+        self.srec.last_mut().unwrap().1.push((run_len, id));
+        Ok(())
+    }
+
+    /// Order by label tuple, then run count, then lengths, then input rank.
+    fn sortflush(&mut self) -> Result<(), String> {
+        let lab = std::mem::take(&mut self.labtab);
+        let mut idx: Vec<usize> = (0..self.srec.len()).collect();
+        idx.sort_by(|&a, &b| {
+            let (p, q) = (&self.srec[a].1, &self.srec[b].1);
+            let n = p.len().min(q.len());
+            for i in 0..n {
+                if p[i].1 != q[i].1 { return p[i].1.cmp(&q[i].1); }
+            }
+            if p.len() != q.len() { return p.len().cmp(&q.len()); }
+            for i in 0..n {
+                if p[i].0 != q[i].0 { return p[i].0.cmp(&q[i].0); }
+            }
+            a.cmp(&b)
+        });
+        let recs = std::mem::take(&mut self.srec);
+        self.labtab = lab;
+        let n = recs.len();
+        for &i in &idx {
+            let (nm, runs) = &recs[i];
+            let rank = i.to_string();
+            let name: &[u8] = if self.perm_on { rank.as_bytes() } else { nm };
+            let mut pos = 0u64;
+            for &(len, id) in runs {
+                let l = self.labtab[id as usize].clone();
+                self.row_inner(name, len, &l, pos)?;
+                pos += len;
+            }
+        }
+        eprintln!("sorted {n} records by label tuple then lengths");
+        Ok(())
+    }
+
     pub fn row(&mut self, name: &[u8], run_len: u64, label: &[u8], start: u64)
+        -> Result<(), String> {
+        if self.opt.sort { return self.sortpush(name, run_len, label, start); }
+        self.row_inner(name, run_len, label, start)
+    }
+
+    fn row_inner(&mut self, name: &[u8], run_len: u64, label: &[u8], start: u64)
         -> Result<(), String> {
         if name.is_empty() { return Err("empty sequence name".into()); }
         if run_len == 0 {
@@ -216,6 +293,7 @@ impl Writer {
     }
 
     pub fn close(mut self, out: &mut impl Write) -> Result<Stats, String> {
+        if self.opt.sort && !self.srec.is_empty() { self.sortflush()?; }
         self.tail();
         self.pushread();
         self.flush().map_err(io)?;
@@ -266,25 +344,76 @@ impl Writer {
         let mut labs = Vec::new();
         for l in &self.labtab { labs.extend_from_slice(l); labs.push(b'\n'); }
 
+        // The C's decision, step for step: which of the names are stored,
+        // as text, as ordinals, in a sidecar, or as ranks plus a blob.
+        let mut perm_on = self.perm_on;
         let mut ordinal = self.ordok && self.nidx > 0;
         if self.opt.keep_names { ordinal = false; }
-        let dropnames = self.opt.drop_names;
-        if dropnames { ordinal = true; }
-        if self.nidx > 1 { check_unique(&self.names)?; }
+        if !self.opt.drop_names && self.nidx > 1 {
+            check_unique(if perm_on { &self.natbuf } else { &self.names })?;
+        }
+        let mut dropnames = self.opt.drop_names;
+        if dropnames && perm_on { dropnames = false; ordinal = false; }
+        else if dropnames { ordinal = true; }
         if !ordinal && self.ordok && self.names.is_empty() && self.nidx > 0 {
             for i in 0..self.nidx {
                 self.names.extend_from_slice(i.to_string().as_bytes());
                 self.names.push(b'\n');
             }
         }
+        if perm_on && !self.natord && ordinal && !self.opt.drop_names {
+            self.names = std::mem::take(&mut self.natbuf);
+            ordinal = false;
+            perm_on = false;
+        }
         if ordinal { self.names.clear(); }
 
-        let (nz, tokused, intused) = if ordinal {
+        let (mut nz, mut tokused, mut intused) = if ordinal {
             (Vec::new(), false, false)
         } else {
             let b = best_names(&self.names, self.nidx, level);
             (b.bytes, b.kind == 2, b.kind == 1)
         };
+        // --sort keeps identity by storing a rank per record. Storing the
+        // sorted names instead is sometimes smaller; the C compares and so
+        // does this.
+        let mut permblob: Vec<u8> = Vec::new();
+        let mut permtok = false;
+        if perm_on && self.opt.drop_names { self.natbuf.clear(); }
+        else if perm_on && !self.natord && !self.natbuf.is_empty() {
+            let nt: Vec<&[u8]> = self.natbuf.split(|&c| c == b'\n')
+                .filter(|l| !l.is_empty()).collect();
+            if nt.len() as u64 != self.nidx {
+                return Err("input-order names do not match the records".into());
+            }
+            let mut srt = Vec::new();
+            for line in self.names.split(|&c| c == b'\n') {
+                if line.is_empty() { continue; }
+                let v: u64 = std::str::from_utf8(line).ok()
+                    .and_then(|t| t.parse().ok())
+                    .ok_or("a stored rank is not a record number")?;
+                if v >= self.nidx { return Err("a stored rank is not a record number".into()); }
+                srt.extend_from_slice(nt[v as usize]);
+                srt.push(b'\n');
+            }
+            let b = best_names(&srt, self.nidx, level);
+            let p1 = ffi::zstd(&self.natbuf, level);
+            let p2 = tok_best(&self.natbuf);
+            let (pbest, ptok) = match p2 {
+                Some(t) if t.len() < p1.len() => (t, true),
+                _ => (p1, false),
+            };
+            if !b.bytes.is_empty() && b.bytes.len() <= nz.len() + pbest.len() {
+                nz = b.bytes;
+                tokused = b.kind == 2;
+                intused = b.kind == 1;
+                perm_on = false;
+            } else {
+                permblob = pbest;
+                permtok = ptok;
+            }
+        }
+        let npl = if perm_on { permblob.len() } else { 0 };
 
         // The index is chunked so a lookup decodes 65536 entries, not all.
         let meta = if level < 19 { level } else { 19 };
@@ -320,6 +449,8 @@ impl Writer {
              | if dropnames && !(self.ordok && self.nidx > 0) { DROPPED } else { 0 }
              | if self.opt.names_out.is_some() { SIDEFLAG } else { 0 }
              | if intused { INTFLAG } else { 0 }
+             | if npl > 0 || (perm_on && self.opt.drop_names) { PERMFLAG } else { 0 }
+             | if permtok { PERMTOK } else { 0 }
              | if self.tailon == Some(true) { TAILFLAG } else { 0 };
         h[2] = ichunks.len() as u64;
         h[3] = sz.len() as u64;
@@ -333,7 +464,7 @@ impl Writer {
         h[11] = itz.len() as u64;
         h[12] = self.tailpred;
         h[13] = TAILSKIP as u64;
-        h[14] = 0;
+        h[14] = npl as u64;
         let mut hb = Vec::with_capacity(128);
         for v in h { hb.extend_from_slice(&v.to_le_bytes()); }
         let mut mh = kst::fnv(FNV0, &hb);
@@ -342,6 +473,7 @@ impl Writer {
         mh = kst::fnv(mh, &ichunks);
         mh = kst::fnv(mh, &sz);
         mh = kst::fnv(mh, &itz);
+        mh = kst::fnv(mh, &permblob[..npl]);
         h[15] = mh;
         hb.truncate(120);
         hb.extend_from_slice(&h[15].to_le_bytes());
@@ -359,6 +491,7 @@ impl Writer {
         out.write_all(&ichunks).map_err(io)?;
         out.write_all(&sz).map_err(io)?;
         out.write_all(&itz).map_err(io)?;
+        out.write_all(&permblob[..npl]).map_err(io)?;
         body.seek(SeekFrom::Start(0)).map_err(io)?;
         std::io::copy(&mut body, out).map_err(io)?;
         out.flush().map_err(io)?;

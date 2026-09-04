@@ -72,6 +72,7 @@ fn main() {
                 } else { ro.names_file = Some(v); }
             }
             "--slow" => opt.slow = true,
+            "--sort" => opt.sort = true,
             "--raw" => ro.raw = true,
             "--max-gap" => maxgap = val().parse().unwrap_or_else(|_| die("--max-gap needs a number")),
             "--halo" => halo = val().parse().unwrap_or_else(|_| die("--halo needs a number")),
@@ -95,6 +96,10 @@ fn main() {
                 if !(1..=1024).contains(&v) { die("--threads is a number of 1 to 1024"); }
                 // Explicit, so RAYON_NUM_THREADS cannot reach it.
                 rayon::ThreadPoolBuilder::new().num_threads(v).build_global().ok();
+            }
+            _ if a.starts_with("--sort=") => {
+                opt.sort = true;
+                mem_arg(&a[7..]);
             }
             _ if a.starts_with('-') && a.len() > 1 => die(&format!("unknown flag {a}")),
             _ => { if cmd.is_none() { cmd = Some(a.to_string()); } else { pos.push(a.to_string()); } }
@@ -159,6 +164,35 @@ fn main() {
             std::process::exit(1);
         }
     }
+}
+
+/// --sort=MEM: digits and an optional K, M, G or T. The C spells the
+/// refusals this way, so these do too.
+fn mem_arg(p: &str) -> u64 {
+    if p.is_empty() { die("--sort=MEM must be positive"); }
+    let b = p.as_bytes();
+    let mut val: u64 = 0;
+    let mut i = 0;
+    while i < b.len() && b[i].is_ascii_digit() {
+        if val > (u64::MAX - (b[i] - b'0') as u64) / 10 {
+            die("--sort=MEM is larger than the address space");
+        }
+        val = val * 10 + (b[i] - b'0') as u64;
+        i += 1;
+    }
+    if i == 0 || val == 0 { die("--sort=MEM must be positive"); }
+    let mul: u64 = if i == b.len() { 1 } else {
+        if i + 1 != b.len() { die("--sort=MEM: nothing may follow the unit"); }
+        match b[i] {
+            b'k' | b'K' => 1 << 10, b'm' | b'M' => 1 << 20,
+            b'g' | b'G' => 1 << 30, b't' | b'T' => 1 << 40,
+            _ => die("--sort=MEM: use a plain number of bytes or a K, M, G or T suffix"),
+        }
+    };
+    if val > u64::MAX / mul { die("--sort=MEM is larger than the address space"); }
+    let m = val * mul;
+    if m < (1 << 20) { die("--sort=MEM must be at least 1M"); }
+    m
 }
 
 fn parse_codec(s: &str) -> i32 {

@@ -25,7 +25,9 @@ ok=0; bad=0
 for f in "$D"/*.bed; do
   for fl in "" "--block 4" "--block all" "--level 3" "--level 22" "--names keep" \
             "--slow" "--slow --block 4" "--tail 0" "--tail 1" "--names drop" \
-            "--tok-chunk 250000" "--slow --level 22"; do
+            "--tok-chunk 250000" "--slow --level 22" \
+            "--sort" "--sort --names keep" "--sort --names drop" "--sort=1M" \
+            "--sort --block 4"; do
     "$C" $fl encode < "$f" > "$W/c.kst" 2>/dev/null
     "$R" $fl encode < "$f" > "$W/r.kst" 2>/dev/null
     if cmp -s "$W/c.kst" "$W/r.kst"; then ok=$((ok+1))
@@ -83,6 +85,25 @@ else echo "index: TRAILERS DIFFER"; fail=1; fi
 "$C" region "$W/ri.kst" seq0005 > "$W/a" 2>/dev/null
 "$R" region "$W/ci.kst" seq0005 > "$W/b" 2>/dev/null
 cmp -s "$W/a" "$W/b" || { echo "index: cross-read DIFFERS"; fail=1; }
+
+# 6b. a sorted track: the Rust must resolve the ranks the same way.
+sdok=0; sdbad=0
+for f in ls.bed s.bed db.rall.bed ord.bed; do
+  for fl in "--sort" "--sort --names keep"; do
+    "$C" $fl encode < "$D/$f" > "$W/t.kst" 2>/dev/null
+    "$C" decode "$W/t.kst" > "$W/c.out" 2>/dev/null; c1=$?
+    "$R" decode "$W/t.kst" > "$W/r.out" 2>/dev/null; c2=$?
+    if cmp -s "$W/c.out" "$W/r.out" && [ $c1 = $c2 ]; then sdok=$((sdok+1))
+    else sdbad=$((sdbad+1)); echo "  sorted decode differs: $f [$fl]"; fi
+  done
+  "$C" --sort --names drop encode < "$D/$f" > "$W/t.kst" 2>/dev/null
+  "$C" --names ordinal decode "$W/t.kst" > "$W/c.out" 2>/dev/null; c1=$?
+  "$R" --names ordinal decode "$W/t.kst" > "$W/r.out" 2>/dev/null; c2=$?
+  if cmp -s "$W/c.out" "$W/r.out" && [ $c1 = $c2 ]; then sdok=$((sdok+1))
+  else sdbad=$((sdbad+1)); echo "  sorted+drop differs: $f"; fi
+done
+[ $sdbad = 0 ] && echo "sorted decode: $sdok forms identical" \
+  || { echo "sorted decode: $sdbad DIFFER"; fail=1; }
 
 # 7. the reader's flags: dropped names, a sidecar, --raw.
 fok=0; fbad=0

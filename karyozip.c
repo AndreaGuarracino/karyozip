@@ -7,7 +7,6 @@
 #include <limits.h>
 #include <stdint.h>
 #include <time.h>
-#define ZSTD_STATIC_LINKING_ONLY
 #include <zstd.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -523,7 +522,6 @@ typedef struct {
     uint64_t currun, curoff, curblk, curbp, blkbp0;
     buf rawblocks; size_t *rawoff, *rawlen, *rawlens, *rawrows, *rawbp, nraw, rawcap;
     buf lalt[2], rawalt[2]; size_t *rawaoff[2], *rawalen[2];   /* plain; plus-strand sentinels only */
-    uint64_t lastid;
     uint64_t plen, pval; int phas, prev;
 } ktw;
 
@@ -657,7 +655,6 @@ static void ktw_row(ktw *w, const char *name, size_t nlen,
               && refend_at(ALNNAME ? ALNNAME : w->cur, start) == start + run_len
               ? 0 : run_len;
     w->prev = LASTREV;
-    w->lastid = id;
     bvar(&w->ids, id);
     w->pend++; w->currun++; w->rows++; w->curbp += run_len;
 }
@@ -1710,7 +1707,6 @@ static void pickcodecs(buf *rawblocks, const size_t *rawoff, const size_t *rawle
         size_t z22i = 0, z22l = 0;
 
         ZSTD_CCtx *sc = ZSTD_createCCtx();
-        ZSTD_DCtx *sd = ZSTD_createDCtx();
         uint8_t *zo = xmalloc(ZSTD_compressBound(SCAP) + 1024);
         for (size_t j = 0; j < np; j++) {
             const uint8_t *src = rawblocks->d + rawoff[pick[j]];
@@ -1843,7 +1839,7 @@ static void pickcodecs(buf *rawblocks, const size_t *rawoff, const size_t *rawle
                     (size_t)NCAND + 2, nraw);
             free(ti); free(tl); free(live);
         }
-        free(zo); ZSTD_freeCCtx(sc); ZSTD_freeDCtx(sd);
+        free(zo); ZSTD_freeCCtx(sc);
         if (IDCODEC < 0) IDCODEC = wi;
         if (LENCODEC < 0) LENCODEC = wl;
         fprintf(stderr, "codec: len=0x%x id=0x%x from %zu sample blocks, %s\n",
@@ -2190,7 +2186,7 @@ static void ktw_close(ktw *w) {
 /* --------------------------------------------------------------- decoding */
 typedef struct {
     FILE *f; uint64_t nreads, rows, data0, block;
-    char **name; char **lab; uint64_t nlab; rec *idx;
+    char **name; char **lab; uint64_t nlab;
     uint64_t *boff; uint64_t *bsize, *bl, *braw, *blraw, *brows, *bbp, *bhash; uint64_t nblk;
     uint8_t *bnos; int lenfile;   /* per block: plain lengths; file: --aln lengths */
     const uint8_t *lp0, *ip0;
@@ -2201,8 +2197,8 @@ typedef struct {
     uint8_t *nz_keep; size_t nzl_keep; int names_ready, names_tok, names_int, dropped;
     uint8_t *ibuf; int idcodec, lencodec;
     const uint8_t *cp, *cpe;   /* cpe: end of the decoded index chunk */
-    uint64_t ci, cblk, cpend; int cvalid; rec crec;
-    off_t nz_off; char *npath; uint64_t mhash, feathash;
+    uint64_t ci, cpend; int cvalid; rec crec;
+    off_t nz_off; uint64_t mhash, feathash;
     uint8_t *pz; size_t pzl; int perm_tok, perm_ext;  /* names in input order */
     char *namebuf, *natbufp;
     int name_borrowed;         /* the table belongs to another reader */
@@ -2235,7 +2231,6 @@ static void loadichunk(R *r, uint64_t c) {
 }
 
 static rec getidx(R *r, uint64_t i) {
-    if (r->idx) return r->idx[i];
     if (r->cvalid && r->ci == i) return r->crec;
     uint64_t want = i / ICHUNK;
     if (!r->cvalid || i < r->ci || want != r->curchunk) {
@@ -2421,7 +2416,6 @@ static R *ropen(const char *path) {
     }
     r->data0 = 8 + 128 + lzl + h[1] + h[2] + h[3] + h[11] + r->pzl;
 
-    r->npath = xstrdup(path);
     r->nz_keep = sidebuf ? sidebuf : nz; r->nzl_keep = nzl_eff; r->names_ready = 0; r->names_tok = names_tok; r->names_int = names_int; r->dropped = dropped;
     r->name = NULL;                    /* 160 MB, allocated by ensurenames */
 
@@ -2463,8 +2457,7 @@ static R *ropen(const char *path) {
     r->lencodec = (int)(uint32_t)h[5]; r->idcodec = (int)(uint32_t)h[9];
     if (nosz(r->lencodec) || nosz(r->idcodec)) die("corrupt file: a NOSZ codec cannot be size-checked");
     if ((uint32_t)h[5] >> 31 || (uint32_t)h[9] >> 31) die("corrupt file: codec id out of range");
-    r->idx = NULL;
-    r->ci = 0; r->cblk = 0; r->cpend = 0; r->cvalid = 0;
+    r->ci = 0; r->cpend = 0; r->cvalid = 0;
 
     unsigned long long sb = ZSTD_getFrameContentSize(sz, h[3]);
     if (sb == ZSTD_CONTENTSIZE_UNKNOWN || sb == ZSTD_CONTENTSIZE_ERROR)
@@ -3318,12 +3311,11 @@ static void rclose(R *r) {
     if (r->d) ZSTD_freeDCtx(r->d);
     if (!r->name_borrowed) { free(r->namebuf); free(r->natbufp); free(r->name); }
     if (r->lab) { free(r->lab[0]); free(r->lab); }
-    free(r->blkbuf); free(r->idx); free(r->boff);
+    free(r->blkbuf); free(r->boff);
     free(r->bsize); free(r->bl); free(r->braw); free(r->blraw); free(r->bnos);
     free(r->brows); free(r->bbp); free(r->bhash);
     free(r->nz_keep); free(r->pz); free(r->ibuf); free(r->ichunk);
     free(r->coff); free(r->cpendv); free(r->htab);
-    free(r->npath);
     free(r->sst); free(r->sen); free(r->sfeat); free(r->snov);
     free(r);
 }
@@ -3733,11 +3725,11 @@ static void decode_db(const char *path, const char *dir) {
         free(o[j].b);
     }
     {
-        char **old = xcalloc(nfset, sizeof *old); size_t nmv = 0, nold = 0; int bad = 0;
+        char **old = xcalloc(nfset, sizeof *old); size_t nmv = 0; int bad = 0;
         for (size_t j = 0; j < nfset && !bad; j++) {
             snprintf(pb, sizeof pb, "%s/%s.bed", dir, fset[j]);
             char *o2; if (asprintf(&o2, "%s/%s.bed.old.%d", dir, fset[j], (int)getpid()) < 0) die("oom");
-            if (!rename(pb, o2)) { old[j] = o2; nold++; } else { free(o2); if (errno != ENOENT) bad = 1; }
+            if (!rename(pb, o2)) { old[j] = o2; } else { free(o2); if (errno != ENOENT) bad = 1; }
         }
         for (size_t j = 0; j < nfset && !bad; j++) {
             snprintf(pb, sizeof pb, "%s/%s.bed", dir, fset[j]);
@@ -3756,7 +3748,7 @@ static void decode_db(const char *path, const char *dir) {
             free(old); die("cannot rename a derived BED into place");
         }
         for (size_t j = 0; j < nfset; j++) if (old[j]) { remove(old[j]); free(old[j]); }
-        free(old); (void)nold;
+        free(old);
     }
     fprintf(stderr, "db: %llu rows into %zu tracks under %s\n",
             (unsigned long long)rows, nfset, dir);

@@ -21,9 +21,54 @@ const FLAGS: u64 = TOKFLAG | INTFLAG | DROPPED | ALNFLAG | DBFLAG | SIDEFLAG
 const IDXMAGIC: u64 = 0x3130_5844_4954_534b;   // "KSTIDX01"
 const ICHUNK: u64 = 65536;
 
+fn ordinals(n: u64) -> Vec<u8> {
+    let mut v = Vec::with_capacity(n as usize * 8);
+    for i in 0..n { v.extend_from_slice(i.to_string().as_bytes()); v.push(b'\n'); }
+    v
+}
+
+/// --names FILE: a FASTA, a FASTQ, or one name per line. Rank N is record N.
+fn read_name_file(path: &str, nreads: u64) -> Vec<u8> {
+    let data = rd(std::fs::read(path), "cannot open the file given to --names");
+    if data.len() > 1 && data[0] == 0x1f && data[1] == 0x8b {
+        crate::bail("the file given to --names is gzipped; decompress it first");
+    }
+    let lines: Vec<&[u8]> = data.split(|&c| c == b'\n').collect();
+    // 1 fastq, 0 fasta, 2 a plain list.
+    let fq = if lines.len() >= 3 && lines[0].first() == Some(&b'@') && lines[2].first() == Some(&b'+') { 1 }
+             else if lines.len() >= 2 && lines[0].first() == Some(&b'>') && lines[1].first() != Some(&b'>') { 0 }
+             else { 2 };
+    let mut out = Vec::new();
+    let mut got = 0u64;
+    for (i, ln) in lines.iter().enumerate() {
+        let mut q: &[u8] = ln;
+        if fq == 1 { if i % 4 != 0 { continue; } q = &q[1..]; }
+        else if fq == 0 { if q.first() != Some(&b'>') { continue; } q = &q[1..]; }
+        let stop: &[u8] = if fq == 2 { b"\r" } else { b" \t\r" };
+        let l = q.iter().position(|c| stop.contains(c)).unwrap_or(q.len());
+        if l == 0 { continue; }
+        if l >= 512 { crate::bail("--names: a name is longer than any the track could hold"); }
+        out.extend_from_slice(&q[..l]);
+        out.push(b'\n');
+        got += 1;
+    }
+    if got != nreads {
+        eprintln!("--names: the file has {got} records, the track has {nreads} sequences. Rank N is the Nth record only when every record produced rows, so this file cannot name it.");
+        crate::bail("name file does not match the track");
+    }
+    out
+}
+
 /// One block: where it is, both frame sizes, both decoded sizes, its rows,
 /// the bases before it, and its own hash.
 struct Blk { off: u64, size: u64, l: u64, raw: u64, lraw: u64, rows: u64, hash: u64 }
+
+#[derive(Default)]
+pub struct ReadOpts {
+    pub raw: bool,
+    pub ordnames: bool,
+    pub names_file: Option<String>,
+}
 
 pub struct Reader {
     f: std::fs::File,
@@ -49,7 +94,8 @@ fn rd<T>(r: Result<T, std::io::Error>, what: &str) -> T {
 }
 
 impl Reader {
-    pub fn open(path: &str) -> Reader {
+
+    pub fn open_with(path: &str, o: &ReadOpts) -> Reader {
         let mut f = rd(std::fs::File::open(path), "open");
         let mut m = [0u8; 8];
         rd(f.read_exact(&mut m), "not a KST file: shorter than the magic");
@@ -91,9 +137,20 @@ impl Reader {
             || 8 + 128 + nml + h[2] + h[3] + h[6] + h[11] + h[14] > fsz {
             crate::bail("corrupt header: the stream sizes do not fit the file");
         }
-        if h[1] & (ALNFLAG | DBFLAG | SIDEFLAG | LENFLAG | PERMFLAG) != 0 {
-            crate::bail("this build reads plain tracks only");
+        let was_side = h[1] & SIDEFLAG != 0;
+        let dropped = h[1] & DROPPED != 0;
+        if !o.raw {
+            if h[1] & ALNFLAG != 0 {
+                crate::bail("this track was written with --aln: decode it with --aln PAF --ref R, or --raw to see what is stored");
+            }
+            if h[1] & DBFLAG != 0 {
+                crate::bail("this track holds featureIDs: decode it with --db features.tsv --out DIR, or --raw to see what is stored");
+            }
+            if h[1] & LENFLAG != 0 {
+                crate::bail("this track leaves out every length the reference implies: decode it with --aln PAF --ref R");
+            }
         }
+        if h[1] & PERMFLAG != 0 { crate::bail("this build does not read sorted tracks"); }
         rd(f.seek(SeekFrom::Start(8 + 128)), "seek");
 
         let lzl = h[6] as usize;
@@ -135,9 +192,25 @@ impl Reader {
         let mut itz = vec![0u8; h[11] as usize];
         rd(f.read_exact(&mut itz), "short index table");
 
+        // A sidecar holds the names --names drop:FILE wrote.
+        let mut nz = nz;
+        let mut nzl = nzl;
+        if nzl == 0 && was_side {
+            let side = o.names_file.clone()
+                .unwrap_or_else(|| format!("{path}.names"));
+            match std::fs::read(&side) {
+                Ok(v) => { nzl = v.len(); nz = v; }
+                Err(_) if o.raw => {}
+                Err(_) => {
+                    eprintln!("cannot open the names sidecar {side}");
+                    crate::bail("this track keeps its names in a sidecar and it is missing");
+                }
+            }
+        }
         // The metadata hash covers the header with h[15] zeroed, then every
-        // stream. A foreign or damaged file is caught here, not at a block.
-        {
+        // stream, and the sidecar's bytes stand in for the names when they
+        // are not in the file. A foreign sidecar is caught here.
+        if !(was_side && nzl == 0 && o.raw) {
             let mut hz = h;
             hz[15] = 0;
             hz[1] = h1_raw;
@@ -149,7 +222,15 @@ impl Reader {
             mh = kst::fnv(mh, &iz);
             mh = kst::fnv(mh, &sz);
             mh = kst::fnv(mh, &itz);
-            if mh != h[15] { crate::bail("corrupt file: the metadata does not match its hash"); }
+            if mh != h[15] {
+                if was_side {
+                    crate::bail("this names file does not belong to this track: give the file --names drop:FILE wrote, not a FASTA or a list");
+                }
+                crate::bail("corrupt file: the metadata does not match its hash");
+            }
+        }
+        if was_side && nzl == 0 && o.raw {
+            eprintln!("sidecar missing: names are ordinals and the metadata hash is unchecked");
         }
         let _ = nz_off;
 
@@ -209,10 +290,18 @@ impl Reader {
         }
 
         // The names, by whichever codec stored them.
-        let namebuf = if nzl == 0 {
-            let mut v = Vec::with_capacity(h[0] as usize * 8);
-            for i in 0..h[0] { v.extend_from_slice(i.to_string().as_bytes()); v.push(b'\n'); }
-            v
+        let namebuf = if let (Some(f), false) = (&o.names_file, was_side) {
+            if !dropped && nzl > 0 {
+                crate::bail("this track stores its own names: --names FILE would replace them, so it is refused. Unset it to read the names in the file");
+            }
+            read_name_file(f, h[0])
+        } else if dropped && nzl == 0 {
+            if !o.raw && !o.ordnames {
+                crate::bail("the names of this track were dropped at encode time: give them back with --names FILE, or pass --names ordinal to accept the ordinals that are stored instead");
+            }
+            ordinals(h[0])
+        } else if nzl == 0 {
+            ordinals(h[0])
         } else if names_int {
             int_names_d(&nz, h[0])
         } else if names_tok {

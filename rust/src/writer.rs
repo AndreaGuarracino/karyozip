@@ -13,6 +13,8 @@ use std::io::{Seek, SeekFrom, Write};
 pub const MAGIC: &[u8; 8] = b"KST00001";
 const TOKFLAG: u64 = 1 << 63;
 const INTFLAG: u64 = 1 << 62;
+const DROPPED: u64 = 1 << 60;
+const SIDEFLAG: u64 = 1 << 57;
 const TAILFLAG: u64 = 1 << 55;
 const ICHUNK: u64 = 65536;
 const TAILSKIP: usize = 64;
@@ -20,15 +22,22 @@ const TAILSKIP: usize = 64;
 pub struct Options {
     pub block: u64,
     pub level: i32,
+    pub levelset: bool,
+    pub slow: bool,
     pub keep_names: bool,
+    pub drop_names: bool,
+    pub names_out: Option<String>,
+    pub tail: Option<bool>,
+    pub tok_chunk: Option<usize>,
     pub id_codec: Option<i32>,
     pub len_codec: Option<i32>,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { block: 262144, level: 17, keep_names: false,
-                  id_codec: None, len_codec: None }
+        Options { block: 262144, level: 17, levelset: false, slow: false,
+                  keep_names: false, drop_names: false, names_out: None,
+                  tail: None, tok_chunk: None, id_codec: None, len_codec: None }
     }
 }
 
@@ -113,7 +122,8 @@ impl Writer {
                 let dev: u64 = self.tailsamp.iter()
                     .map(|&v| if v > self.tailpred { v - self.tailpred } else { self.tailpred - v })
                     .sum();
-                self.tailon = Some(dev * 12 <= self.tailpred * TAILSKIP as u64);
+                self.tailon = Some(self.opt.tail
+                    .unwrap_or(dev * 12 <= self.tailpred * TAILSKIP as u64));
             }
             kst::put(&mut self.lens, self.plen);
             self.phas = false;
@@ -212,21 +222,14 @@ impl Writer {
         let level = self.opt.level;
 
         // The codec search samples the first, middle and last block, which is
-        // why it cannot run until every row has arrived.
-        let mut picks: Vec<usize> = Vec::new();
-        if !self.bm.is_empty() {
-            picks.push(0);
-            if self.bm.len() > 2 { picks.push(self.bm.len() / 2); }
-            if self.bm.len() > 1 { picks.push(self.bm.len() - 1); }
-        }
+        // why it cannot run until every row has arrived. --slow reads them all.
         let rawtot: usize = self.bm.iter().map(|b| b.len).sum();
-        let seekable = self.bm.len() > 1 || rawtot as u64 > self.opt.block;
-        let sampled: Vec<(Vec<u8>, Vec<u8>)> = picks.iter()
-            .map(|&i| self.read_block(i))
-            .collect::<std::io::Result<_>>().map_err(io)?;
-        let sref: Vec<(&[u8], &[u8])> = sampled.iter()
-            .map(|(l, i)| (l.as_slice(), i.as_slice())).collect();
-        let p = pick(&sref, seekable, level, self.opt.id_codec, self.opt.len_codec);
+        let get = |i: usize| self.read_block(i).expect("staged block");
+        let p = pick(&get, self.bm.len(), rawtot, self.opt.block, self.opt.slow,
+                     self.opt.levelset, level, self.opt.id_codec, self.opt.len_codec);
+        let level = p.level;
+        let (lvl_id, lvl_len) = (if p.lvl_id < 0 { level } else { p.lvl_id },
+                                 if p.lvl_len < 0 { level } else { p.lvl_len });
 
         // Compress apart, write in order, a batch at a time. Holding every
         // compressed block would cost the whole file in memory; the C stages
@@ -240,8 +243,8 @@ impl Writer {
                 .par_iter()
                 .map(|&i| {
                     let (lens, ids) = self.read_block(i).expect("staged block");
-                    let a = comp_lens(&lens, p.len, level).expect("lens frame");
-                    let b = comp_ids(&ids, p.id, level).expect("ids frame");
+                    let a = comp_lens(&lens, p.len, lvl_len).expect("lens frame");
+                    let b = comp_ids(&ids, p.id, lvl_id).expect("ids frame");
                     (a, b, lens.len(), ids.len(), self.bm[i].rows, self.bm[i].bp)
                 })
                 .collect();
@@ -265,6 +268,8 @@ impl Writer {
 
         let mut ordinal = self.ordok && self.nidx > 0;
         if self.opt.keep_names { ordinal = false; }
+        let dropnames = self.opt.drop_names;
+        if dropnames { ordinal = true; }
         if self.nidx > 1 { check_unique(&self.names)?; }
         if !ordinal && self.ordok && self.names.is_empty() && self.nidx > 0 {
             for i in 0..self.nidx {
@@ -310,8 +315,10 @@ impl Writer {
 
         let mut h = [0u64; 16];
         h[0] = self.nidx;
-        h[1] = nz.len() as u64
+        h[1] = if self.opt.names_out.is_some() { 0 } else { nz.len() as u64 }
              | if tokused { TOKFLAG } else { 0 }
+             | if dropnames && !(self.ordok && self.nidx > 0) { DROPPED } else { 0 }
+             | if self.opt.names_out.is_some() { SIDEFLAG } else { 0 }
              | if intused { INTFLAG } else { 0 }
              | if self.tailon == Some(true) { TAILFLAG } else { 0 };
         h[2] = ichunks.len() as u64;
@@ -342,7 +349,13 @@ impl Writer {
         out.write_all(MAGIC).map_err(io)?;
         out.write_all(&hb).map_err(io)?;
         out.write_all(&lz).map_err(io)?;
-        out.write_all(&nz).map_err(io)?;
+        match &self.opt.names_out {
+            Some(f) => {
+                let mut nf = std::fs::File::create(f).map_err(io)?;
+                nf.write_all(&nz).map_err(io)?;
+            }
+            None => out.write_all(&nz).map_err(io)?,
+        }
         out.write_all(&ichunks).map_err(io)?;
         out.write_all(&sz).map_err(io)?;
         out.write_all(&itz).map_err(io)?;
@@ -355,7 +368,6 @@ impl Writer {
             names: nz.len(), index: ichunks.len(), offs: sz.len(),
             lens: byt_lens, labs: byt_labs, raw: rawtot,
             tokused, intused, ordinal,
-            id_codec: p.id, len_codec: p.len, seekable,
         })
     }
 
@@ -374,7 +386,6 @@ pub struct Stats {
     pub names: usize, pub index: usize, pub offs: usize,
     pub lens: u64, pub labs: u64, pub raw: usize,
     pub tokused: bool, pub intused: bool, pub ordinal: bool,
-    pub id_codec: i32, pub len_codec: i32, pub seekable: bool,
 }
 
 fn vget(b: &[u8], mut i: usize) -> (u64, usize) {
@@ -400,61 +411,160 @@ pub const CAND_FAST: [i32; 8] = [
     ffi::CODEC_BZIP3 | 16, ffi::CODEC_BZIP3 | 64,
 ];
 
+/// --slow: rANS order 0/1 x {PACK,RLE,X32,STRIPE}, arith order 0/1 x
+/// {PACK,RLE}, bzip3 at six block sizes. A strict superset of the default.
+pub const CAND_SLOW: [i32; 46] = [
+    0x100, 0x80, 0x40, 0xc0, 0x8, 0x88, 0x48, 0xc8,
+    0x4, 0x84, 0x44, 0xc4, 0xc, 0x8c, 0x4c, 0xcc,
+    0x1, 0x81, 0x41, 0xc1, 0x9, 0x89, 0x49, 0xc9,
+    0x5, 0x85, 0x45, 0xc5, 0xd, 0x8d, 0x4d, 0xcd,
+    ffi::CODEC_ARITH, ffi::CODEC_ARITH | 0x80, ffi::CODEC_ARITH | 0x40, ffi::CODEC_ARITH | 0xc0,
+    ffi::CODEC_ARITH | 1, ffi::CODEC_ARITH | 0x81, ffi::CODEC_ARITH | 0x41, ffi::CODEC_ARITH | 0xc1,
+    ffi::CODEC_BZIP3 | 8, ffi::CODEC_BZIP3 | 16, ffi::CODEC_BZIP3 | 32,
+    ffi::CODEC_BZIP3 | 64, ffi::CODEC_BZIP3 | 128, ffi::CODEC_BZIP3 | 256,
+];
+
 /// bzip3 decodes at about 8 MB/s against zstd's ~1000, so it is the wrong
 /// pick for a file a query will seek into.
-fn fast_enough(codec: i32) -> bool {
-    codec & ffi::CODEC_BZIP3 == 0
-}
+fn fast_enough(codec: i32) -> bool { codec & ffi::CODEC_BZIP3 == 0 }
 
-pub struct Pick {
-    pub id: i32,
-    pub len: i32,
-}
+pub struct Pick { pub id: i32, pub len: i32, pub lvl_id: i32, pub lvl_len: i32, pub level: i32 }
 
-/// `samples` are whole blocks: (lens frame, ids frame).
-pub fn pick(samples: &[(&[u8], &[u8])], seekable: bool, level: i32,
+/// `blocks` yields every block as (lens, ids); the default search reads three
+/// of them, --slow reads them all, twice.
+pub fn pick(all: &dyn Fn(usize) -> (Vec<u8>, Vec<u8>), nraw: usize, rawtot: usize,
+            block: u64, slow: bool, levelset: bool, mut level: i32,
             forced_id: Option<i32>, forced_len: Option<i32>) -> Pick {
+    let cand: &[i32] = if slow { &CAND_SLOW } else { &CAND_FAST };
+    let nc = cand.len();
     if let (Some(i), Some(l)) = (forced_id, forced_len) {
-        return Pick { id: i, len: l };
+        return Pick { id: i, len: l, lvl_id: -1, lvl_len: -1, level };
     }
-    // 4 MB per block when seekable: a smaller sample cannot show what a BWT
-    // codec does to a 100 MB stream.
-    let scap = if seekable { 4 << 20 } else { 96 << 20 };
+    let seekable = nraw > 1 || rawtot as u64 > block;
+    let mut picks: Vec<usize> = Vec::new();
+    if nraw > 0 {
+        picks.push(0);
+        if nraw > 2 { picks.push(nraw / 2); }
+        if nraw > 1 { picks.push(nraw - 1); }
+    }
+    // 4 MB per block when seekable; --slow uses whole blocks, since a 4 MB
+    // sample cannot show what a BWT codec does to a 100 MB stream.
+    let mut scap = if seekable { 4usize << 20 } else { 96 << 20 };
+    if slow {
+        let mut want = 0usize;
+        for i in 0..nraw { let (l, d) = all(i); want = want.max(l.len()).max(d.len()); }
+        scap = want.min(2048 << 20).max(4 << 20);
+    }
     let mut maxstream = 0usize;
-    for (l, i) in samples {
-        maxstream = maxstream.max(l.len()).max(i.len());
-    }
+    for i in 0..nraw { let (l, d) = all(i); maxstream = maxstream.max(l.len()).max(d.len()); }
     let big = maxstream >= 0x7fff_ffff;
 
-    let mut zi = 0usize;
-    let mut zl = 0usize;
-    let mut ci = [0usize; CAND_FAST.len()];
-    let mut cl = [0usize; CAND_FAST.len()];
+    let (mut zi, mut zl, mut z22i, mut z22l) = (0usize, 0usize, 0usize, 0usize);
+    let mut ci = vec![0usize; nc];
+    let mut cl = vec![0usize; nc];
     const BAD: usize = usize::MAX / 2;
-
-    for (lens, ids) in samples {
+    for &j in &picks {
+        let (lens, ids) = all(j);
         let nl = lens.len().min(scap);
         let ni = ids.len().min(scap);
-        if ni > 0 { zi += ffi::zstd(&ids[..ni], level).len(); }
-        if nl > 0 { zl += ffi::zstd(&lens[..nl], level).len(); }
-        for (k, &c) in CAND_FAST.iter().enumerate() {
-            // Size alone does not qualify a codec: it must decode back.
-            ci[k] = accumulate(ci[k], &ids[..ni], c, BAD);
-            cl[k] = accumulate(cl[k], &lens[..nl], c, BAD);
+        if ni > 0 {
+            zi += ffi::zstd(&ids[..ni], level).len();
+            if slow && !levelset { z22i += ffi::zstd(&ids[..ni], 22).len(); }
+        }
+        if nl > 0 {
+            zl += ffi::zstd(&lens[..nl], level).len();
+            if slow && !levelset { z22l += ffi::zstd(&lens[..nl], 22).len(); }
+        }
+        let step: Vec<(usize, usize)> = (0..nc).into_par_iter()
+            .map(|k| (accumulate(0, &ids[..ni], cand[k], BAD),
+                      accumulate(0, &lens[..nl], cand[k], BAD))).collect();
+        for k in 0..nc {
+            ci[k] = if ci[k] >= BAD || step[k].0 >= BAD { BAD } else { ci[k] + step[k].0 };
+            cl[k] = if cl[k] >= BAD || step[k].1 >= BAD { BAD } else { cl[k] + step[k].1 };
         }
     }
 
     let (mut wi, mut wl) = (0i32, 0i32);
     let (mut bi, mut bl) = (zi, zl);
-    // The 0.5% margin, in the C's exact arithmetic.
-    let need_i = (0.995_f64 * zi as f64) as usize;
-    let need_l = (0.995_f64 * zl as f64) as usize;
-    for (k, &c) in CAND_FAST.iter().enumerate() {
-        let ok = (!seekable || fast_enough(c)) && (!big || c & ffi::CODEC_BZIP3 != 0);
-        if zi > 0 && ci[k] < bi && ci[k] < need_i && ok { bi = ci[k]; wi = c; }
-        if zl > 0 && cl[k] < bl && cl[k] < need_l && ok { bl = cl[k]; wl = c; }
+    if slow && !levelset && z22i < bi { bi = z22i; }
+    if slow && !levelset && z22l < bl { bl = z22l; }
+    let lvl_i = if slow && !levelset && z22i < zi { 22 } else { level };
+    let lvl_l = if slow && !levelset && z22l < zl { 22 } else { level };
+    for (k, &c) in cand.iter().enumerate() {
+        let ok = (slow || !seekable || fast_enough(c)) && (!big || c & ffi::CODEC_BZIP3 != 0);
+        let need_i = if slow { bi } else { (0.995_f64 * zi as f64) as usize };
+        let need_l = if slow { bl } else { (0.995_f64 * zl as f64) as usize };
+        let m = usize::from(slow);
+        if zi > 0 && ci[k] < bi && ci[k] < need_i + m && ok { bi = ci[k]; wi = c; }
+        if zl > 0 && cl[k] < bl && cl[k] < need_l + m && ok { bl = cl[k]; wl = c; }
     }
-    Pick { id: forced_id.unwrap_or(wi), len: forced_len.unwrap_or(wl) }
+    if slow && !levelset && wi == 0 && wl == 0 {
+        level = if lvl_i == 22 || lvl_l == 22 { 22 } else { level };
+    } else if slow && !levelset && (wi == 0 || wl == 0) {
+        level = if wi == 0 { lvl_i } else { lvl_l };
+    }
+
+    let (mut lvl_id, mut lvl_len) = (-1i32, -1i32);
+    if slow {
+        // Decide on the whole file, and drop any candidate that fails to
+        // decode a block back.
+        let mut ti = vec![0usize; nc + 2];
+        let mut tl = vec![0usize; nc + 2];
+        let mut live: Vec<bool> = (0..nc + 2).map(|k| if k < nc {
+            (ci[k] < usize::MAX / 4 || cl[k] < usize::MAX / 4)
+                && (!big || cand[k] & ffi::CODEC_BZIP3 != 0)
+        } else { k == nc || !levelset }).collect();
+        for b in 0..nraw {
+            let (lens, ids) = all(b);
+            let step: Vec<(usize, usize)> = (0..nc + 2).into_par_iter().map(|k| {
+                if !live[k] { return (0, 0); }
+                if k < nc {
+                    (sz(ffi::paycomp(&ids, cand[k])), sz(ffi::paycomp(&lens, cand[k])))
+                } else {
+                    let lv = if k == nc { level } else { 22 };
+                    (ffi::zstd(&ids, lv).len(), ffi::zstd(&lens, lv).len())
+                }
+            }).collect();
+            for k in 0..nc + 2 { ti[k] += step[k].0; tl[k] += step[k].1; }
+        }
+        let (mut qi, mut ql);
+        loop {
+            qi = nc; ql = nc;
+            for k in 0..nc + 2 {
+                if !live[k] { continue; }
+                if ti[k] < ti[qi] { qi = k; }
+                if tl[k] < tl[ql] { ql = k; }
+            }
+            let (mut bad_i, mut bad_l) = (false, false);
+            for b in 0..nraw {
+                if bad_i && bad_l { break; }
+                let (lens, ids) = all(b);
+                if qi < nc && !ids.is_empty() && !bad_i && !verifies(&ids, cand[qi]) { bad_i = true; }
+                if ql < nc && !lens.is_empty() && !bad_l && !verifies(&lens, cand[ql]) { bad_l = true; }
+            }
+            if !bad_i && !bad_l { break; }
+            if bad_i { live[qi] = false; }
+            if bad_l { live[ql] = false; }
+        }
+        wi = if qi < nc { cand[qi] } else { 0 };
+        wl = if ql < nc { cand[ql] } else { 0 };
+        if wi == 0 { lvl_id = if qi == nc + 1 { 22 } else { level }; }
+        if wl == 0 { lvl_len = if ql == nc + 1 { 22 } else { level }; }
+        eprintln!("codec: --slow ran {} live candidates over {nraw} blocks whole", nc + 2);
+    }
+    eprintln!("codec: len=0x{:x} id=0x{:x} from {} sample blocks, {}",
+              forced_len.unwrap_or(wl), forced_id.unwrap_or(wi), picks.len(),
+              if seekable { "seekable" } else { "one block" });
+    Pick { id: forced_id.unwrap_or(wi), len: forced_len.unwrap_or(wl), lvl_id, lvl_len, level }
+}
+
+fn sz(v: Option<Vec<u8>>) -> usize { v.map_or(usize::MAX / 4, |x| x.len()) }
+
+fn verifies(src: &[u8], codec: i32) -> bool {
+    match ffi::paycomp(src, codec) {
+        Some(t) => ffi::paydecomp(&t, codec, src.len()).as_deref() == Some(src),
+        None => false,
+    }
 }
 
 fn accumulate(acc: usize, src: &[u8], codec: i32, bad: usize) -> usize {

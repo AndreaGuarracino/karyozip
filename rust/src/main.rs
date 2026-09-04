@@ -11,8 +11,20 @@ fn die(msg: &str) -> ! {
 }
 pub fn bail(msg: &str) -> ! { die(msg) }
 
+const USAGE: &str = "usage:
+  karyozip encode [--block N|all] [--level N] [--slow: smaller, slower]
+                  [--names keep|drop|drop:FILE]
+  karyozip decode F   --names F|ordinal   --raw
+  karyozip region F SEQ | SEQ POS | SEQ START END [HALO]
+  karyozip index  F                     appends an index to the track itself
+  any command: --threads N, -t N  --tmp-dir DIR  --help, -h  --version";
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        println!("{USAGE}");
+        return;
+    }
     if args.iter().any(|a| a == "--version") {
         println!("karyozip {} (rust), format KST00001", env!("CARGO_PKG_VERSION"));
         println!("  zstd       {}", ffi::zstd_version());
@@ -24,7 +36,9 @@ fn main() {
 
     let mut opt = writer::Options::default();
     let mut tmpdir = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".into());
+    let mut ro = reader::ReadOpts::default();
     let mut cmd = None;
+    let mut pos: Vec<String> = Vec::new();
     let mut i = 1;
     while i < args.len() {
         let a = args[i].as_str();
@@ -43,8 +57,31 @@ fn main() {
                 let v = val();
                 opt.level = v.parse().unwrap_or_else(|_| die("--level is a zstd level, 1 to 22"));
                 if !(1..=22).contains(&opt.level) { die("--level is a zstd level, 1 to 22"); }
+                opt.levelset = true;
             }
-            "--names" => { if val() == "keep" { opt.keep_names = true; } }
+            "--names" => {
+                let v = val();
+                if v == "keep" { opt.keep_names = true; }
+                else if v == "ordinal" { ro.ordnames = true; }
+                else if v == "drop" { opt.drop_names = true; }
+                else if let Some(f) = v.strip_prefix("drop:") {
+                    if f.is_empty() { die("--names drop:FILE needs a file"); }
+                    opt.names_out = Some(f.to_string());
+                } else { ro.names_file = Some(v); }
+            }
+            "--slow" => opt.slow = true,
+            "--raw" => ro.raw = true,
+            "--tail" => {
+                let v = val();
+                opt.tail = Some(match v.as_str() { "0" => false, "1" => true,
+                                                   _ => die("--tail is 0 or 1") });
+            }
+            "--tok-chunk" => {
+                let v: usize = val().parse().unwrap_or_else(|_| die("--tok-chunk needs a number"));
+                if v == 0 { die("--tok-chunk needs a number"); }
+                opt.tok_chunk = Some(v.min(9_000_000));
+            }
+            "--profile" => {}
             "--tmp-dir" => tmpdir = val(),
             "--id-codec" => { opt.id_codec = Some(parse_codec(&val())); }
             "--len-codec" => { opt.len_codec = Some(parse_codec(&val())); }
@@ -55,44 +92,41 @@ fn main() {
                 rayon::ThreadPoolBuilder::new().num_threads(v).build_global().ok();
             }
             _ if a.starts_with('-') && a.len() > 1 => die(&format!("unknown flag {a}")),
-            _ => { if cmd.is_none() { cmd = Some(a.to_string()); } }
+            _ => { if cmd.is_none() { cmd = Some(a.to_string()); } else { pos.push(a.to_string()); } }
         }
         i += 1;
     }
     match cmd.as_deref() {
         Some("encode") => encode(opt, std::path::Path::new(&tmpdir)),
         Some("index") => {
-            let f = args.iter().skip(1).find(|a| !a.starts_with('-') && *a != "index")
-                        .unwrap_or_else(|| die("index needs a track"));
-            reader::Reader::open(f).build_index(f);
+            let f = pos.first().unwrap_or_else(|| die("index needs a track"));
+            reader::Reader::open_with(f, &ro).build_index(f);
         }
         Some("region") => {
-            let pos: Vec<&String> = args.iter().skip(1)
-                .filter(|a| !a.starts_with('-') && *a != "region").collect();
             if pos.len() < 2 { die("bad command or missing arguments"); }
             let n = |s: &str, w: &str| -> u64 {
                 s.parse().unwrap_or_else(|_| die(w)) };
             let (lo, hi, halo) = match pos.len() {
                 2 => (0, 0, 0),
-                3 => { let p = n(pos[2], "region: start is not a number"); (p, p + 1, 0) }
+                3 => { let p = n(&pos[2], "region: start is not a number"); (p, p + 1, 0) }
                 4 | 5 => {
-                    let a = n(pos[2], "region: start is not a number");
-                    let b = n(pos[3], "region: end is not a number");
+                    let a = n(&pos[2], "region: start is not a number");
+                    let b = n(&pos[3], "region: end is not a number");
                     if a >= b { die("region: give START END with END past START"); }
-                    (a, b, if pos.len() == 5 { n(pos[4], "region: halo is not a number") } else { 0 })
+                    (a, b, if pos.len() == 5 { n(&pos[4], "region: halo is not a number") } else { 0 })
                 }
                 _ => die("bad command or missing arguments"),
             };
-            let mut r = reader::Reader::open(pos[0]);
+            let mut r = reader::Reader::open_with(&pos[0], &ro);
             let stdout = std::io::stdout();
             let mut o = BufWriter::new(stdout.lock());
             r.region(pos[1].as_bytes(), lo, hi, halo, &mut o);
             o.flush().unwrap_or_else(|e| die(&e.to_string()));
         }
         Some("decode") => {
-            let f = args.iter().skip(1).find(|a| !a.starts_with('-') && *a != "decode")
-                        .unwrap_or_else(|| die("decode needs a track"));
-            let mut r = reader::Reader::open(f);
+            if pos.len() > 1 { die("decode takes one track"); }
+            let f = pos.first().unwrap_or_else(|| die("decode needs a track"));
+            let mut r = reader::Reader::open_with(f, &ro);
             let stdout = std::io::stdout();
             let mut o = BufWriter::new(stdout.lock());
             r.decode(&mut o);
@@ -155,10 +189,6 @@ fn encode(opt: writer::Options, tmpdir: &std::path::Path) {
     let mut out = BufWriter::new(stdout.lock());
     let st = w.close(&mut out).unwrap_or_else(|m| die(&m));
     out.flush().unwrap_or_else(|e| die(&e.to_string()));
-    eprintln!("codec: len=0x{:x} id=0x{:x} from {} sample blocks, {}",
-              st.len_codec, st.id_codec,
-              if st.blocks == 0 { 0 } else if st.blocks > 2 { 3 } else if st.blocks > 1 { 2 } else { 1 },
-              if st.seekable { "seekable" } else { "one block" });
     eprintln!("encoded rows={} reads={} blocks={} names={}B{} index={}B offs={}B lens={}B labs={}B raw={}B",
               st.rows, st.reads, st.blocks, st.names,
               if st.ordinal { " (ordinal, not stored)" }

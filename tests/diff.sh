@@ -23,7 +23,9 @@ echo "codecs: every candidate round-trips"
 # 2. encode must be byte-identical, over every fixture and flag.
 ok=0; bad=0
 for f in "$D"/*.bed; do
-  for fl in "" "--block 4" "--block all" "--level 3" "--level 22" "--names keep"; do
+  for fl in "" "--block 4" "--block all" "--level 3" "--level 22" "--names keep" \
+            "--slow" "--slow --block 4" "--tail 0" "--tail 1" "--names drop" \
+            "--tok-chunk 250000" "--slow --level 22"; do
     "$C" $fl encode < "$f" > "$W/c.kst" 2>/dev/null
     "$R" $fl encode < "$f" > "$W/r.kst" 2>/dev/null
     if cmp -s "$W/c.kst" "$W/r.kst"; then ok=$((ok+1))
@@ -82,7 +84,31 @@ else echo "index: TRAILERS DIFFER"; fail=1; fi
 "$R" region "$W/ci.kst" seq0005 > "$W/b" 2>/dev/null
 cmp -s "$W/a" "$W/b" || { echo "index: cross-read DIFFERS"; fail=1; }
 
-# 7. the same refusals, with the same words.
+# 7. the reader's flags: dropped names, a sidecar, --raw.
+fok=0; fbad=0
+for f in ls.bed s.bed db.rall.bed ord.bed; do
+  "$C" encode --names drop < "$D/$f" > "$W/d.kst" 2>/dev/null
+  for dfl in "--names ordinal" "--raw"; do
+    "$C" $dfl decode "$W/d.kst" > "$W/c.out" 2>/dev/null; c1=$?
+    "$R" $dfl decode "$W/d.kst" > "$W/r.out" 2>/dev/null; c2=$?
+    if cmp -s "$W/c.out" "$W/r.out" && [ $c1 = $c2 ]; then fok=$((fok+1))
+    else fbad=$((fbad+1)); echo "  decode $dfl differs on $f"; fi
+  done
+  "$C" encode --names "drop:$W/side" < "$D/$f" > "$W/s.kst" 2>/dev/null
+  "$C" --names "$W/side" decode "$W/s.kst" > "$W/c.out" 2>/dev/null; c1=$?
+  "$R" --names "$W/side" decode "$W/s.kst" > "$W/r.out" 2>/dev/null; c2=$?
+  if cmp -s "$W/c.out" "$W/r.out" && [ $c1 = $c2 ]; then fok=$((fok+1))
+  else fbad=$((fbad+1)); echo "  sidecar differs on $f"; fi
+  "$C" encode < "$D/$f" > "$W/p.kst" 2>/dev/null
+  "$C" --raw decode "$W/p.kst" > "$W/c.out" 2>/dev/null
+  "$R" --raw decode "$W/p.kst" > "$W/r.out" 2>/dev/null
+  cmp -s "$W/c.out" "$W/r.out" && fok=$((fok+1)) \
+    || { fbad=$((fbad+1)); echo "  --raw differs on $f"; }
+done
+[ $fbad = 0 ] && echo "reader flags: $fok forms identical" \
+  || { echo "reader flags: $fbad DIFFER"; fail=1; }
+
+# 8. the same refusals, with the same words.
 for bad_in in 'r1\t0\t10' 'r1\t5\t10\tA' 'r1\t0\t0\tA' '\t0\t10\tA' 'r1\tx\t10\tA'; do
   cm=$(printf "$bad_in\n" | "$C" encode 2>&1 >/dev/null | tail -1)
   rm2=$(printf "$bad_in\n" | "$R" encode 2>&1 >/dev/null | tail -1)

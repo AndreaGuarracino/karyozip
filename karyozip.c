@@ -1660,29 +1660,20 @@ static void pickcodecs(buf *rawblocks, const blkmeta *bm, size_t nraw) {
         static const int CAND_FAST[] = { 0x100, 1, 65, 521, CODEC_ARITH, CODEC_ARITH | 1,
                                          CODEC_BZIP3 | 16, CODEC_BZIP3 | 64 };
 
-        static int CAND_SLOW[128]; static size_t NSLOW = 0;
-        if (!NSLOW) {
-
-            static const int BIT[] = { 0x80, 0x40, 0x08, 0x04 };
-            for (size_t o = 0; o < 2; o++)
-                for (unsigned m = 0; m < 16; m++) {
-                    int f = (int)o;
-                    for (int k = 0; k < 4; k++) if (m & (1u << k)) f |= BIT[k];
-                    if (!f) f = 0x100;
-                    CAND_SLOW[NSLOW++] = f;
-                }
-            for (size_t o = 0; o < 2; o++)
-                for (unsigned m = 0; m < 4; m++)
-                    CAND_SLOW[NSLOW++] = CODEC_ARITH | (int)o
-                                         | (m & 1 ? 0x80 : 0) | (m & 2 ? 0x40 : 0);
-            static const int BZ[] = { 8, 16, 32, 64, 128, 256 };
-            for (size_t bi = 0; bi < sizeof BZ / sizeof *BZ; bi++)
-                CAND_SLOW[NSLOW++] = CODEC_BZIP3 | BZ[bi];
-            if (NSLOW > sizeof CAND_SLOW / sizeof *CAND_SLOW
-                || NSLOW > 128) die("candidate list outgrew its arrays");
-        }
+        /* rANS order 0/1 x {PACK,RLE,X32,STRIPE}, arith order 0/1 x {PACK,RLE},
+           bzip3 at six block sizes. Was built by three loops at every call. */
+        static const int CAND_SLOW[] = {
+            0x100, 0x80, 0x40, 0xc0, 0x8, 0x88, 0x48, 0xc8,
+            0x4, 0x84, 0x44, 0xc4, 0xc, 0x8c, 0x4c, 0xcc,
+            0x1, 0x81, 0x41, 0xc1, 0x9, 0x89, 0x49, 0xc9,
+            0x5, 0x85, 0x45, 0xc5, 0xd, 0x8d, 0x4d, 0xcd,
+            CODEC_ARITH, CODEC_ARITH | 0x80, CODEC_ARITH | 0x40, CODEC_ARITH | 0xc0,
+            CODEC_ARITH | 1, CODEC_ARITH | 0x81, CODEC_ARITH | 0x41, CODEC_ARITH | 0xc1,
+            CODEC_BZIP3 | 8, CODEC_BZIP3 | 16, CODEC_BZIP3 | 32,
+            CODEC_BZIP3 | 64, CODEC_BZIP3 | 128, CODEC_BZIP3 | 256,
+        };
         const int *CAND = FASTMODE ? CAND_FAST : CAND_SLOW;
-        const size_t NCAND = FASTMODE ? sizeof CAND_FAST / sizeof *CAND_FAST : NSLOW;
+        const size_t NCAND = (FASTMODE ? sizeof CAND_FAST : sizeof CAND_SLOW) / sizeof *CAND;
 
         size_t rawtot = 0, maxstream = 0;
         for (size_t i2 = 0; i2 < nraw; i2++) { rawtot += bm[i2].len;

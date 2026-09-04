@@ -520,6 +520,12 @@ static __thread int TAILDEC = 0;          /* the file being read uses it */
 static __thread uint64_t TAILPRED_R = 0;  /* its predictor, from the header */
 static __thread uint64_t TAILSKIP_R = 0;  /* sequences before this store a plain length */
 
+/* one pending block, while the raw payload waits in rawblocks */
+typedef struct {
+    size_t off, len, lens, rows, bp;   /* into rawblocks, then its two frames */
+    size_t aoff[2], alen[2];           /* the same for the two --aln spellings */
+} blkmeta;
+
 typedef struct {
     buf names, lens, ids, sizes;
     buf ibx; size_t nidx; int ordok;
@@ -527,8 +533,8 @@ typedef struct {
     FILE *tmp;
     char cur[512]; size_t curlen;
     uint64_t currun, curoff, curblk, curbp, blkbp0;
-    buf rawblocks; size_t *rawoff, *rawlen, *rawlens, *rawrows, *rawbp, nraw, rawcap;
-    buf lalt[2], rawalt[2]; size_t *rawaoff[2], *rawalen[2];   /* plain; plus-strand sentinels only */
+    buf rawblocks; blkmeta *bm; size_t nraw, rawcap;
+    buf lalt[2], rawalt[2];       /* plain; plus-strand sentinels only */
     uint64_t plen, pval; int phas, prev;
 } ktw;
 
@@ -536,23 +542,16 @@ static void ktw_flush(ktw *w) {
     if (!w->pend) return;
     if (w->nraw == w->rawcap) {
         w->rawcap = w->rawcap ? w->rawcap * 2 : 1 << 16;
-        w->rawoff = xrealloc(w->rawoff, w->rawcap * sizeof(size_t));
-        w->rawlen = xrealloc(w->rawlen, w->rawcap * sizeof(size_t));
-        w->rawlens = xrealloc(w->rawlens, w->rawcap * sizeof(size_t));
-        w->rawrows = xrealloc(w->rawrows, w->rawcap * sizeof(size_t));
-        w->rawbp = xrealloc(w->rawbp, w->rawcap * sizeof(size_t));
-        for (int v = 0; v < 2; v++) {
-            w->rawaoff[v] = xrealloc(w->rawaoff[v], w->rawcap * sizeof(size_t));
-            w->rawalen[v] = xrealloc(w->rawalen[v], w->rawcap * sizeof(size_t));
-        }
+        w->bm = xrealloc(w->bm, mul(w->rawcap, sizeof *w->bm));
     }
+    blkmeta *m = w->bm + w->nraw;
     for (int v = 0; v < 2; v++) {
-        w->rawaoff[v][w->nraw] = w->rawalt[v].n; w->rawalen[v][w->nraw] = w->lalt[v].n;
+        m->aoff[v] = w->rawalt[v].n; m->alen[v] = w->lalt[v].n;
         bput(&w->rawalt[v], w->lalt[v].d, w->lalt[v].n); w->lalt[v].n = 0;
     }
-    w->rawoff[w->nraw] = w->rawblocks.n; w->rawlen[w->nraw] = w->lens.n + w->ids.n;
-    w->rawlens[w->nraw] = w->lens.n; w->rawrows[w->nraw] = w->pend;
-    w->rawbp[w->nraw] = w->blkbp0; w->blkbp0 = 0; w->nraw++;
+    m->off = w->rawblocks.n; m->len = w->lens.n + w->ids.n;
+    m->lens = w->lens.n; m->rows = w->pend;
+    m->bp = w->blkbp0; w->blkbp0 = 0; w->nraw++;
     bput(&w->rawblocks, w->lens.d, w->lens.n); bput(&w->rawblocks, w->ids.d, w->ids.n);
     w->nblk++;
     w->lens.n = 0; w->ids.n = 0; w->pend = 0;
@@ -1654,8 +1653,7 @@ static int fastenough(int codec) {
     return (codec & CODEC_BZIP3) == 0;
 }
 
-static void pickcodecs(buf *rawblocks, const size_t *rawoff, const size_t *rawlen,
-                       const size_t *rawlens, size_t nraw) {
+static void pickcodecs(buf *rawblocks, const blkmeta *bm, size_t nraw) {
 
     if (IDCODEC >= 0 && LENCODEC >= 0) return;
 
@@ -1687,9 +1685,9 @@ static void pickcodecs(buf *rawblocks, const size_t *rawoff, const size_t *rawle
         const size_t NCAND = FASTMODE ? sizeof CAND_FAST / sizeof *CAND_FAST : NSLOW;
 
         size_t rawtot = 0, maxstream = 0;
-        for (size_t i2 = 0; i2 < nraw; i2++) { rawtot += rawlen[i2];
-            if (rawlens[i2] > maxstream) maxstream = rawlens[i2];
-            if (rawlen[i2] - rawlens[i2] > maxstream) maxstream = rawlen[i2] - rawlens[i2]; }
+        for (size_t i2 = 0; i2 < nraw; i2++) { rawtot += bm[i2].len;
+            if (bm[i2].lens > maxstream) maxstream = bm[i2].lens;
+            if (bm[i2].len - bm[i2].lens > maxstream) maxstream = bm[i2].len - bm[i2].lens; }
         int big = maxstream >= 0x7fffffffu;   /* rANS and arith decode below INT_MAX */
         int seekable = nraw > 1 || (uint64_t)rawtot > BLOCK;
         size_t SCAP = seekable ? (4u << 20) : (96u << 20);
@@ -1697,7 +1695,7 @@ static void pickcodecs(buf *rawblocks, const size_t *rawoff, const size_t *rawle
         if (SLOW) {
             size_t want = 0;
             for (size_t i2 = 0; i2 < nraw; i2++) {
-                size_t nl2 = rawlens[i2], ni2 = rawlen[i2] - nl2;
+                size_t nl2 = bm[i2].lens, ni2 = bm[i2].len - nl2;
                 if (nl2 > want) want = nl2;
                 if (ni2 > want) want = ni2;
             }
@@ -1716,8 +1714,8 @@ static void pickcodecs(buf *rawblocks, const size_t *rawoff, const size_t *rawle
         ZSTD_CCtx *sc = ZSTD_createCCtx();
         uint8_t *zo = xmalloc(ZSTD_compressBound(SCAP) + 1024);
         for (size_t j = 0; j < np; j++) {
-            const uint8_t *src = rawblocks->d + rawoff[pick[j]];
-            size_t nl = rawlens[pick[j]], ni = rawlen[pick[j]] - nl;
+            const uint8_t *src = rawblocks->d + bm[pick[j]].off;
+            size_t nl = bm[pick[j]].lens, ni = bm[pick[j]].len - nl;
             const uint8_t *ids = src + nl;
             if (nl > SCAP) nl = SCAP;
             if (ni > SCAP) ni = SCAP;
@@ -1789,8 +1787,8 @@ static void pickcodecs(buf *rawblocks, const size_t *rawoff, const size_t *rawle
                 live[k] = ((ci[k] < (size_t)-1 / 4) || (cl[k] < (size_t)-1 / 4)) && (!big || (CAND[k] & CODEC_BZIP3));
             live[NCAND] = 1; live[NCAND + 1] = !LEVELSET;
             for (size_t b2 = 0; b2 < nraw; b2++) {
-                const uint8_t *src = rawblocks->d + rawoff[b2];
-                size_t nl = rawlens[b2], ni = rawlen[b2] - nl;
+                const uint8_t *src = rawblocks->d + bm[b2].off;
+                size_t nl = bm[b2].lens, ni = bm[b2].len - nl;
 #ifdef _OPENMP
 #pragma omp parallel for schedule(dynamic, 1) num_threads(nthreads())
 #endif
@@ -1822,8 +1820,8 @@ static void pickcodecs(buf *rawblocks, const size_t *rawoff, const size_t *rawle
                 }
                 int bad_i = 0, bad_l = 0;
                 for (size_t b2 = 0; b2 < nraw && !(bad_i && bad_l); b2++) {
-                    const uint8_t *src = rawblocks->d + rawoff[b2];
-                    size_t nl = rawlens[b2], ni = rawlen[b2] - nl;
+                    const uint8_t *src = rawblocks->d + bm[b2].off;
+                    size_t nl = bm[b2].lens, ni = bm[b2].len - nl;
                     uint8_t *t = NULL, *v = NULL; size_t g;
                     if (qi < NCAND && ni && !bad_i) {
                         g = paycomp(src + nl, ni, CAND[qi], &t); v = g ? malloc(ni) : NULL;
@@ -1900,16 +1898,15 @@ static void ktw_close(ktw *w) {
     uint64_t nblk = w->nblk, rows = w->rows;
     FILE *tmp = w->tmp;
     buf rawblocks = w->rawblocks;
-    size_t *rawoff = w->rawoff, *rawlen = w->rawlen, *rawlens = w->rawlens,
-           *rawrows = w->rawrows, *rawbp = w->rawbp, nraw = w->nraw;
+    const blkmeta *bm = w->bm; size_t nraw = w->nraw;
 
-    pickcodecs(&rawblocks, rawoff, rawlen, rawlens, nraw);
+    pickcodecs(&rawblocks, bm, nraw);
 
     size_t maxraw = 0;
     for (size_t i = 0; i < nraw; i++) {
-        if (rawlen[i] > maxraw) maxraw = rawlen[i];
+        if (bm[i].len > maxraw) maxraw = bm[i].len;
         for (int v = 0; ALNPAF && v < 2; v++)
-            if (w->rawalen[v][i] + (rawlen[i] - rawlens[i]) > maxraw) maxraw = w->rawalen[v][i] + (rawlen[i] - rawlens[i]);
+            if (bm[i].alen[v] + (bm[i].len - bm[i].lens) > maxraw) maxraw = bm[i].alen[v] + (bm[i].len - bm[i].lens);
     }
     size_t obound = ZSTD_compressBound(maxraw ? maxraw : 1);
 
@@ -1931,15 +1928,15 @@ static void ktw_close(ktw *w) {
                 if (failed) continue;
                 uint8_t *o = malloc(2 * obound + 64);
                 if (!o) { failed = 1; continue; }   /* out of memory, not a codec fault */
-                const uint8_t *src = rawblocks.d + rawoff[i];
-                size_t nl = rawlens[i], ni = rawlen[i] - nl;
+                const uint8_t *src = rawblocks.d + bm[i].off;
+                size_t nl = bm[i].lens, ni = bm[i].len - nl;
                 const uint8_t *idsrc = src + nl;   /* fixed: nl may change below */
                 size_t a = 0, b2; uint64_t nosent = 0;
                 uint8_t *fa = NULL, *fb = NULL;
 
                 const uint8_t *vs[3] = { src, NULL, NULL }; size_t vn[3] = { nl, 0, 0 };
                 for (int v = 0; ALNPAF && v < 2; v++) {
-                    size_t an = w->rawalen[v][i]; const uint8_t *alt = w->rawalt[v].d + w->rawaoff[v][i];
+                    size_t an = bm[i].alen[v]; const uint8_t *alt = w->rawalt[v].d + bm[i].aoff[v];
                     if (!an || (an == nl && !memcmp(alt, src, an))) continue;   /* same bytes as every-sentinel */
                     if (v == 1 && vs[1] && an == vn[1] && !memcmp(alt, vs[1], an)) continue;   /* plus equals plain */
                     vs[v + 1] = alt; vn[v + 1] = an;
@@ -1983,7 +1980,7 @@ static void ktw_close(ktw *w) {
                     if (fwrite(fa, 1, a, tmp) != a || fwrite(ids, 1, b2, tmp) != b2) wfail = 1;
                     bvar(&sizes, a); bvar(&sizes, b2);
                     bvar(&sizes, ni); bvar(&sizes, ALNPAF ? nl << 2 | nosent : nl);
-                    bvar(&sizes, rawrows[i]); bvar(&sizes, rawbp[i]);
+                    bvar(&sizes, bm[i].rows); bvar(&sizes, bm[i].bp);
                     bvar(&sizes, fnvbuf(fnvbuf(FNV0, fa, a), ids, b2));
                 }
                 free(o); free(fa); free(fb);
@@ -2179,8 +2176,8 @@ static void ktw_close(ktw *w) {
     free(itab.d); free(ichunks.d);
     free(lz); free(nz); free(sz); free(itz); free(npz);
     free(names.d); free(sizes.d); free(labs.d);
-    free(rawoff); free(rawlen); free(rawlens); free(rawrows); free(rawbp);
-    for (int v = 0; v < 2; v++) { free(w->rawaoff[v]); free(w->rawalen[v]); free(w->rawalt[v].d); free(w->lalt[v].d); }
+    free(w->bm);
+    for (int v = 0; v < 2; v++) { free(w->rawalt[v].d); free(w->lalt[v].d); }
     free(w->lens.d); free(w->ids.d); free(w->ibx.d);
     free(w);
 }

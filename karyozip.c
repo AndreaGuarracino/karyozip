@@ -93,7 +93,7 @@ static uint64_t fnvbuf(uint64_t h, const void *p, size_t n) {
     return h;
 }
 #define FNV0 0xcbf29ce484222325ULL
-static uint64_t blkhash(const uint8_t *p, size_t n) { return fnvbuf(FNV0, p, n); }
+static uint64_t fnvstr(const char *s) { return fnvbuf(FNV0, s, strlen(s)); }
 
 static long int_arg(const char *p, long lo, long hi, const char *what) {   /* a whole signed number in range */
     char *e = NULL; errno = 0;
@@ -193,12 +193,6 @@ static int nlabtab = 0, labcap = 0;
 static int32_t labhash[LABHASH];
 static int labhash_init = 0;
 
-static uint64_t strhash(const char *s, size_t n) {
-    uint64_t h = 1469598103934665603ULL;
-    for (size_t i = 0; i < n; i++) { h ^= (uint8_t)s[i]; h *= 1099511628211ULL; }
-    return h;
-}
-
 static size_t *labnlen;
 static int lastid = -1;
 
@@ -206,7 +200,7 @@ static int intern(const char *s, size_t n) {
     if (lastid >= 0 && labnlen[lastid] == n && !memcmp(labtab[lastid], s, n))
         return lastid;
     if (!labhash_init) { memset(labhash, 0xff, sizeof labhash); labhash_init = 1; }
-    uint64_t k = strhash(s, n) & (LABHASH - 1);
+    uint64_t k = fnvbuf(FNV0, s, n) & (LABHASH - 1);
     uint64_t probes = 0;
     while (labhash[k] >= 0) {
         if (++probes >= LABHASH) die("more than LABHASH distinct labels");
@@ -674,27 +668,22 @@ typedef struct { char *name; uint64_t *st, end; uint32_t *lab; size_t n, cap; } 
 static qseg *QS; static size_t nqs, cqs;
 static rcon *RC; static size_t nrc, crc;
 
-static size_t shash(const char *s) {
-    size_t h = 1469598103934665603ULL;
-    for (; *s; s++) { h ^= (unsigned char)*s; h *= 1099511628211ULL; }
-    return h;
-}
 static uint64_t ALNHASH;
 static rcon *rcon_get(const char *nm, int make) {
     static size_t *idx; static size_t im;           /* open addressed by hash */
     if (!idx) { im = 1 << 16; idx = xcalloc(im, sizeof *idx); }
-    size_t j = shash(nm) & (im - 1);
+    size_t j = fnvstr(nm) & (im - 1);
     while (idx[j]) { if (!strcmp(RC[idx[j] - 1].name, nm)) return RC + idx[j] - 1;
                      j = (j + 1) & (im - 1); }
     if (!make) return NULL;
     if (nrc * 2 + 2 > im) {                          /* grow and rehash, then place */
         free(idx); im *= 4; idx = xcalloc(im, sizeof *idx);
         for (size_t k = 0; k < nrc; k++) {
-            size_t h = shash(RC[k].name) & (im - 1);
+            size_t h = fnvstr(RC[k].name) & (im - 1);
             while (idx[h]) h = (h + 1) & (im - 1);
             idx[h] = k + 1;
         }
-        j = shash(nm) & (im - 1); while (idx[j]) j = (j + 1) & (im - 1);
+        j = fnvstr(nm) & (im - 1); while (idx[j]) j = (j + 1) & (im - 1);
     }
     idx[j] = nrc + 1;
     if (nrc == crc) { crc = crc ? crc * 2 : 64; RC = xrealloc(RC, crc * sizeof *RC); }
@@ -704,7 +693,7 @@ static rcon *rcon_get(const char *nm, int make) {
 static qseg *qseg_get(const char *nm, int make) {
     static size_t *idx; static size_t im;           /* open addressed by hash */
     if (!idx) { im = 1 << 20; idx = xcalloc(im, sizeof *idx); }
-    size_t j = shash(nm) & (im - 1);
+    size_t j = fnvstr(nm) & (im - 1);
     while (idx[j]) { if (!strcmp(QS[idx[j] - 1].name, nm)) return QS + idx[j] - 1;
                      j = (j + 1) & (im - 1); }
     if (!make) return NULL;
@@ -714,7 +703,7 @@ static qseg *qseg_get(const char *nm, int make) {
     if (nqs * 2 > im) {                              /* grow and rehash */
         free(idx); im *= 4; idx = xcalloc(im, sizeof *idx);
         for (size_t k = 0; k < nqs; k++) {
-            size_t h = shash(QS[k].name) & (im - 1);
+            size_t h = fnvstr(QS[k].name) & (im - 1);
             while (idx[h]) h = (h + 1) & (im - 1);
             idx[h] = k + 1;
         }
@@ -2246,12 +2235,6 @@ typedef struct {
     const uint8_t *curlp, *curip;
 } R;
 
-static uint64_t fnv(const char *s) {
-    uint64_t h = 1469598103934665603ULL;
-    while (*s) { h ^= (uint8_t)*s++; h *= 1099511628211ULL; }
-    return h;
-}
-
 static void loadichunk(R *r, uint64_t c) {
     if (c >= r->nichunk) die("index chunk out of range");
     size_t cl = (size_t)(r->coff[c + 1] - r->coff[c]);
@@ -2570,7 +2553,7 @@ static void buildhash(R *r) {
     r->htab = xmalloc(mul(cap, 4));
     memset(r->htab, 0xff, cap * 4);
     for (uint64_t i = 0; i < r->nreads; i++) {
-        uint64_t s = fnv(r->name[i]) & r->hmask;
+        uint64_t s = fnvstr(r->name[i]) & r->hmask;
         while (r->htab[s] != 0xffffffffu) {
             if (!strcmp(r->name[r->htab[s]], r->name[i])) die("a sequence name repeats: the names are not usable");
             s = (s + 1) & r->hmask;
@@ -2752,12 +2735,6 @@ static uint64_t namesrc(void) {
     struct stat st; if (stat(NAMEFILE, &st)) die("cannot stat the file given to --names");
     return stathash(&st);
 }
-static uint64_t h64(const char *s) {
-    uint64_t h = 1469598103934665603ULL;
-    while (*s) { h ^= (unsigned char)*s++; h *= 1099511628211ULL; }
-    return h;
-}
-
 static int kcmp(const void *a, const void *b) {
     uint64_t x = ((const uint64_t *)a)[0], y = ((const uint64_t *)b)[0];
     return x < y ? -1 : x > y ? 1 : 0;
@@ -2778,7 +2755,7 @@ static void buildindex(const char *path) {
     uint32_t *ord = xmalloc(mul(n, 4));
     uint64_t *pair = xmalloc(mul(n, 16));          /* sort key and ordinal together */
     for (uint64_t i = 0; i < r->nreads; i++) {
-        pair[2 * i] = h64(r->name[i]);
+        pair[2 * i] = fnvstr(r->name[i]);
         pair[2 * i + 1] = i;
     }
     qsort(pair, r->nreads, 16, kcmp);
@@ -2824,7 +2801,7 @@ static int64_t idxlookup(R *r, const char *path, const char *nm) {
     const uint64_t *key = (const uint64_t *)((const char *)m + 32);
     const uint64_t *key2 = (const uint64_t *)((const char *)m + 32 + n * 8);
     const uint32_t *ord = (const uint32_t *)((const char *)m + 32 + n * 16);
-    uint64_t want = h64(nm), want2 = h64b(nm);
+    uint64_t want = fnvstr(nm), want2 = h64b(nm);
     int64_t out = -1;
     uint64_t lo = 0, hi = n;
     while (lo < hi) {
@@ -2853,7 +2830,7 @@ static int64_t idxlookup(R *r, const char *path, const char *nm) {
 
 static int64_t rfind(R *r, const char *nm) {
     buildhash(r);
-    uint64_t s = fnv(nm) & r->hmask;
+    uint64_t s = fnvstr(nm) & r->hmask;
     while (r->htab[s] != 0xffffffffu) {
         if (!strcmp(r->name[r->htab[s]], nm)) return r->htab[s];
         s = (s + 1) & r->hmask;
@@ -2870,7 +2847,7 @@ static void loadblk(R *r, uint64_t b) {
     if (fseeko(r->f, (off_t)(r->data0 + r->boff[b]), SEEK_SET)) die("seek");
     if (fread(cb, 1, r->bsize[b], r->f) != r->bsize[b])
         die("file is truncated: a block is missing or short");
-    if (blkhash(cb, r->bsize[b]) != r->bhash[b])
+    if (fnvbuf(FNV0, cb, r->bsize[b]) != r->bhash[b])
         die("corrupt block: its bytes do not match the stored hash");
     LENDEC = r->lenfile && r->bnos[b] != 1;
     uint64_t la = r->bl[b], lb = r->bsize[b] - la;

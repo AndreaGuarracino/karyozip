@@ -1858,6 +1858,13 @@ static void pickcodecs(int rawfd, const blkmeta *bm, size_t nraw) {
 #pragma omp parallel for schedule(dynamic, 1) num_threads(cthr)
 #endif
             for (unsigned k = 0; k < NCAND; k++) {
+                /* A candidate the selection below cannot take is not worth
+                   compressing. On a seekable track that is both bzip3
+                   entries, whose bz3_new alone asks for its 16 or 64 MB. */
+                if (!((SLOW || !seekable || !FASTMODE || fastenough(CAND[k]))
+                      && (!big || (CAND[k] & CODEC_BZIP3)))) {
+                    ci[k] = cl[k] = (size_t)-1 / 2; continue;
+                }
                 /* Size alone does not qualify a codec: */
                 uint8_t *t = NULL; size_t g;
                 if (ni && (g = paycomp(ids, ni, CAND[k], &t))) {

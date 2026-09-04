@@ -378,7 +378,8 @@ impl Writer {
         let rawtot: usize = self.bm.iter().map(|b| b.len).sum();
         let get = |i: usize| self.read_block(i).expect("staged block");
         let _s = crate::prof::span(8);
-        let p = pick(&get, self.bm.len(), rawtot, level, &self.opt);
+        let maxstream = self.bm.iter().map(|m| m.lens.max(m.len - m.lens)).max().unwrap_or(0);
+        let p = pick(&get, self.bm.len(), rawtot, maxstream, level, &self.opt);
         drop(_s);
         let level = p.level;
         let (lvl_id, lvl_len) = (if p.lvl_id < 0 { level } else { p.lvl_id },
@@ -681,7 +682,7 @@ pub struct Pick { pub id: i32, pub len: i32, pub lvl_id: i32, pub lvl_len: i32, 
 /// `blocks` yields every block as (lens, ids); the default search reads three
 /// of them, --slow reads them all, twice.
 pub fn pick(all: &dyn Fn(usize) -> (Vec<u8>, Vec<u8>), nraw: usize, rawtot: usize,
-            mut level: i32, o: &Options) -> Pick {
+            maxstream: usize, mut level: i32, o: &Options) -> Pick {
     let (block, slow, levelset) = (o.block, o.slow, o.levelset);
     let (forced_id, forced_len) = (o.id_codec, o.len_codec);
     let cand: &[i32] = if slow { &CAND_SLOW } else { &CAND_FAST };
@@ -699,15 +700,14 @@ pub fn pick(all: &dyn Fn(usize) -> (Vec<u8>, Vec<u8>), nraw: usize, rawtot: usiz
     // 4 MB per block when seekable; --slow uses whole blocks, since a 4 MB
     // sample cannot show what a BWT codec does to a 100 MB stream.
     let mut scap = if seekable { 4usize << 20 } else { 96 << 20 };
-    if slow {
-        let mut want = 0usize;
-        for i in 0..nraw { let (l, d) = all(i); want = want.max(l.len()).max(d.len()); }
-        scap = want.clamp(4 << 20, 2048 << 20);
-    }
-    let mut maxstream = 0usize;
-    for i in 0..nraw { let (l, d) = all(i); maxstream = maxstream.max(l.len()).max(d.len()); }
+    if slow { scap = maxstream.clamp(4 << 20, 2048 << 20); }
     let big = maxstream >= 0x7fff_ffff;
 
+    // A candidate the selection cannot take is not worth compressing. On a
+    // seekable track that is both bzip3 entries, whose bz3_new alone asks
+    // for its 16 MB or 64 MB block.
+    let usable = |c: i32| (slow || !seekable || fast_enough(c))
+                       && (!big || c & ffi::CODEC_BZIP3 != 0);
     let (mut zi, mut zl, mut z22i, mut z22l) = (0usize, 0usize, 0usize, 0usize);
     let mut ci = vec![0usize; nc];
     let mut cl = vec![0usize; nc];
@@ -716,17 +716,21 @@ pub fn pick(all: &dyn Fn(usize) -> (Vec<u8>, Vec<u8>), nraw: usize, rawtot: usiz
         let (lens, ids) = all(j);
         let nl = lens.len().min(scap);
         let ni = ids.len().min(scap);
-        if ni > 0 {
-            zi += ffi::zstd(&ids[..ni], level).len();
-            if slow && !levelset { z22i += ffi::zstd(&ids[..ni], 22).len(); }
-        }
-        if nl > 0 {
-            zl += ffi::zstd(&lens[..nl], level).len();
-            if slow && !levelset { z22l += ffi::zstd(&lens[..nl], 22).len(); }
-        }
-        let step: Vec<(usize, usize)> = (0..nc).into_par_iter()
-            .map(|k| (accumulate(0, &ids[..ni], cand[k], BAD),
-                      accumulate(0, &lens[..nl], cand[k], BAD))).collect();
+        let z22 = slow && !levelset;
+        let step: Vec<(usize, usize)> = (0..nc + 2).into_par_iter()
+            .map(|k| match k {
+                _ if k < nc => if usable(cand[k]) {
+                        (accumulate(0, &ids[..ni], cand[k], BAD),
+                         accumulate(0, &lens[..nl], cand[k], BAD))
+                    } else { (BAD, BAD) },
+                _ if k == nc => (if ni > 0 { ffi::zstd(&ids[..ni], level).len() } else { 0 },
+                                 if nl > 0 { ffi::zstd(&lens[..nl], level).len() } else { 0 }),
+                _ if z22 => (if ni > 0 { ffi::zstd(&ids[..ni], 22).len() } else { 0 },
+                             if nl > 0 { ffi::zstd(&lens[..nl], 22).len() } else { 0 }),
+                _ => (0, 0),
+            }).collect();
+        zi += step[nc].0; zl += step[nc].1;
+        z22i += step[nc + 1].0; z22l += step[nc + 1].1;
         for k in 0..nc {
             ci[k] = if ci[k] >= BAD || step[k].0 >= BAD { BAD } else { ci[k] + step[k].0 };
             cl[k] = if cl[k] >= BAD || step[k].1 >= BAD { BAD } else { cl[k] + step[k].1 };

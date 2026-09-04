@@ -467,11 +467,30 @@ static size_t tokbest(buf *in, uint8_t **out) {
 /* smallest of zstd, integer deltas, tokeniser; losers freed; kind 0/1/2 */
 static size_t bestnames(buf *b, uint64_t n, uint8_t **out, int *kind) {
     uint8_t *a1 = NULL, *a2 = NULL, *a3 = NULL;
-    double _t1 = nowsec(); size_t s1 = zc(b, &a1);
-    double _t2 = nowsec(); size_t s2 = intnames(b, n, &a2);
-    double _t3 = nowsec(); size_t s3 = tokbest(b, &a3);
-    if (PROF) fprintf(stderr, "  names %zu B: zstd %.3f s, int %.3f s, tok %.3f s\n",
-                      b->n, _t2 - _t1, _t3 - _t2, nowsec() - _t3);
+    size_t s1 = 0, s2 = 0, s3 = 0;
+    double _t0 = nowsec();
+    /* zstd and the tokeniser are independent and neither gains from threads
+       on a buffer this size, so run them side by side. tok3 overwrites every
+       separator with NUL and puts it back, so it cannot share the buffer with
+       a concurrent reader: it gets a copy. b is at most the 200,000-name
+       sample here, one tokeniser chunk, so nothing is lost by not nesting. */
+    buf tb = { xmalloc(b->n ? b->n : 1), b->n, b->n };
+    memcpy(tb.d, b->d, b->n);
+#ifdef _OPENMP
+#pragma omp parallel sections num_threads(2)
+#endif
+    {
+#ifdef _OPENMP
+#pragma omp section
+#endif
+        { s1 = zc(b, &a1); s2 = intnames(b, n, &a2); }
+#ifdef _OPENMP
+#pragma omp section
+#endif
+        { s3 = tokbest(&tb, &a3); }
+    }
+    free(tb.d);
+    if (PROF) fprintf(stderr, "  names %zu B: candidates %.3f s\n", b->n, nowsec() - _t0);
     size_t best = s1; *kind = 0; *out = a1;
     if (s2 && s2 < best) { best = s2; *kind = 1; *out = a2; }
     if (s3 && s3 < best) { best = s3; *kind = 2; *out = a3; }

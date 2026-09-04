@@ -1,12 +1,11 @@
-# One target, one binary. The tokeniser and the BWT codec are not optional:
-# karyozip.c calls paydecomp unconditionally, so a build without -DKARYOZIP_TOK
-# does not link. Everything vendored lives beside this file.
+# One target, one binary. The tokeniser and the BWT codec are not optional
+# and no longer sit behind a define. Everything vendored lives beside this file.
 CC      ?= gcc
 CFLAGS  ?= -O3 -std=gnu11 -Wall -Wextra -fopenmp
 # VERSION is bzip3's, which libbz3.c needs; the KST format version is in
 # the magic. They are not the same number and never were.
 BZIP3_VERSION ?= 1.5.1
-CFLAGS  += -DKARYOZIP_TOK -DVERSION='"$(BZIP3_VERSION)"' -I.
+CFLAGS  += -DVERSION='"$(BZIP3_VERSION)"' -I.
 ZSTD_CFLAGS := $(shell pkg-config --cflags libzstd 2>/dev/null)
 ZSTD_LIBS   := $(shell pkg-config --libs libzstd 2>/dev/null || echo -lzstd)
 ifneq ($(CONDA_PREFIX),)

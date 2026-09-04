@@ -323,7 +323,6 @@ static uint32_t TOKCHUNK = 3000000;     /* --tok-chunk overrides */
 static int TOKSET = 0, V1 = 0;
 static const char *TMPD = NULL;         /* --tmp-dir, else TMPDIR, else /tmp */
 
-#ifdef KARYOZIP_TOK
 #include "htscodecs/tokenise_name3.h"
 #include "htscodecs/rANS_static4x16.h"
 #include "htscodecs/arith_dynamic.h"
@@ -418,15 +417,6 @@ static char *tokd(const uint8_t *b, size_t n, size_t *outn) {
     free(woff); free(coff);
     o[raw] = 0; *outn = raw; return o;
 }
-#else
-static size_t tokc(buf *in, uint8_t **out, uint32_t chunk) {
-    (void)in; (void)chunk; *out = NULL; return 0; }
-static char *tokd(const uint8_t *b, size_t n, size_t *outn) {
-    (void)b; (void)n; (void)outn;
-    die("this track has tokenised names; rebuild karyozip with -DKARYOZIP_TOK");
-    return NULL;
-}
-#endif
 
 static const uint32_t TCAND[] = { 250000, 1000000, 3000000, TOKMAX };
 static size_t tokbest(buf *in, uint8_t **out) {
@@ -455,7 +445,6 @@ static size_t bestnames(buf *b, uint64_t n, uint8_t **out, int *kind) {
     return best;
 }
 
-#ifdef KARYOZIP_TOK
 
 static int nosz(int c) { unsigned u = (unsigned)c; return u && !(u & CODEC_BZIP3) && (u & 0x10); }
 static int badcodec(int c) {   /* bits no codec defines, or a bzip3 block size out of range */
@@ -511,7 +500,6 @@ static size_t paydecomp(const uint8_t *src, size_t n, int codec, uint8_t *dst, s
     if (!q || ul != raw) return 0;
     return ul;
 }
-#endif
 
 static const char *NAMES_OUT = NULL;
 
@@ -910,12 +898,10 @@ static void alnpack(const char *inpaf, const char *out) {
     for (int k = 0; k < 5; k++) {
         uint8_t *best = NULL; size_t bn = 0; int bc = -1;
         if (st[k]->n) {
-#ifdef KARYOZIP_TOK
             if (k == 0) {
                 uint8_t *t = NULL; size_t g = tokbest(st[k], &t);
                 if (g) { best = t; bn = g; bc = ALNTOK; }
             }
-#endif
             if (!best) {
             ZSTD_CCtx *zc = ZSTD_createCCtx();
             size_t zb = ZSTD_compressBound(st[k]->n);
@@ -924,7 +910,6 @@ static void alnpack(const char *inpaf, const char *out) {
             if (ZSTD_isError(bn)) die("packing the alignment failed");
             best = zo; bc = 0;
             ZSTD_freeCCtx(zc);
-#ifdef KARYOZIP_TOK
             static const int C[] = { 0x100, 1, 65, 521, CODEC_ARITH, CODEC_ARITH | 1,
                                      CODEC_BZIP3 | 16, CODEC_BZIP3 | 64 };
             for (unsigned c = 0; c < sizeof C / sizeof *C; c++) {
@@ -932,7 +917,6 @@ static void alnpack(const char *inpaf, const char *out) {
                 if (g && g < bn) { free(best); best = t; bn = g; bc = C[c]; }
                 else free(t);
             }
-#endif
             }
         }
         fprintf(stderr, "  aln %-9s raw %10zu  coded %10zu  codec 0x%x\n",
@@ -1661,16 +1645,13 @@ static void encode(void) {
     ktw_close(w);
 }
 
-#ifdef KARYOZIP_TOK
 
 static int fastenough(int codec) {
     return (codec & CODEC_BZIP3) == 0;
 }
-#endif
 
 static void pickcodecs(buf *rawblocks, const size_t *rawoff, const size_t *rawlen,
                        const size_t *rawlens, size_t nraw) {
-#ifdef KARYOZIP_TOK
 
     if (IDCODEC >= 0 && LENCODEC >= 0) return;
 
@@ -1867,17 +1848,12 @@ static void pickcodecs(buf *rawblocks, const size_t *rawoff, const size_t *rawle
         if (LENCODEC < 0) LENCODEC = wl;
         fprintf(stderr, "codec: len=0x%x id=0x%x from %zu sample blocks, %s\n",
                 LENCODEC, IDCODEC, np, seekable ? "seekable" : "one block");
-#else
-    (void)rawblocks; (void)rawoff; (void)rawlen; (void)rawlens; (void)nraw;
-#endif
     if (IDCODEC < 0) IDCODEC = 0;
     if (LENCODEC < 0) LENCODEC = 0;
 }
 
 static size_t complens(ZSTD_CCtx *tc, const uint8_t *src, size_t n, uint8_t **out, size_t bound) {
-#ifdef KARYOZIP_TOK
     if (LENCODEC) return paycomp(src, n, LENCODEC, out);
-#endif
     *out = malloc(bound + 64);
     if (!*out) return 0;
     size_t a = ZSTD_compressCCtx(tc, *out, bound + 64, src, n, LEVEL_L < 0 ? LEVEL : LEVEL_L);
@@ -1988,11 +1964,9 @@ static void ktw_close(ktw *w) {
                 if (!failed && FASTMODE && ALNPAF) { best = complens(tc, vs[bv], vn[bv], &fa, ZSTD_compressBound(vn[bv])); if (!best) failed = 1; }
                 if (failed) { free(o); free(fa); continue; }
                 a = best; nl = vn[bv]; nosent = (uint64_t)bv;
-#ifdef KARYOZIP_TOK
                 if (IDCODEC) { b2 = paycomp(idsrc, ni, IDCODEC, &fb);
                                if (!b2) { failed = 1; free(fa); free(o); continue; } }
                 else
-#endif
                 { b2 = ZSTD_compressCCtx(tc, o, obound, idsrc, ni, LEVEL_I < 0 ? LEVEL : LEVEL_I);
                   if (ZSTD_isError(b2)) { failed = 1; free(fa); free(o); continue; } }
 #ifdef _OPENMP
@@ -2854,19 +2828,15 @@ static void loadblk(R *r, uint64_t b) {
     LENDEC = r->lenfile && r->bnos[b] != 1;
     uint64_t la = r->bl[b], lb = r->bsize[b] - la;
     size_t g, h2;
-#ifdef KARYOZIP_TOK
     PAYEND = NULL;                    /* not valid until this block decodes */
     if (r->lencodec) { g = paydecomp(cb, la, r->lencodec, r->blkbuf, r->blraw[b]);
                        if (!g && r->blraw[b]) die("frame decode failed"); }
     else
-#endif
     { g = ZSTD_decompressDCtx(r->d, r->blkbuf, r->blkcap, cb, la);
       if (ZSTD_isError(g)) die(ZSTD_getErrorName(g)); }
-#ifdef KARYOZIP_TOK
     if (r->idcodec) { h2 = paydecomp(cb + la, lb, r->idcodec, r->blkbuf + g, r->braw[b]);
                       if (!h2 && r->braw[b]) die("frame decode failed"); }
     else
-#endif
     { h2 = ZSTD_decompressDCtx(r->d, r->blkbuf + g, r->blkcap - g, cb + la, lb);
       if (ZSTD_isError(h2)) die(ZSTD_getErrorName(h2)); }
     free(cb);

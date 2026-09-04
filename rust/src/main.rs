@@ -285,6 +285,7 @@ fn encode(opt: writer::Options, tmpdir: &std::path::Path, a: Option<aln::Aln>) {
     const SLAB: usize = 1 << 24;
     let mut slab = vec![0u8; SLAB];
     let mut have = 0usize;
+    let nthr = rayon::current_num_threads().min(32);
     let mut stdin = std::io::stdin().lock();
     let mut eof = false;
     loop {
@@ -303,9 +304,13 @@ fn encode(opt: writer::Options, tmpdir: &std::path::Path, a: Option<aln::Aln>) {
                 break;
             }
         };
-        for line in slab[..end].split(|&c| c == b'\n') {
-            if line.is_empty() { continue; }
-            row(&mut w, line);
+        // Split the lines on threads, append in order. The append is
+        // serial because the streams come out in row order.
+        let rows = parse_slab(&slab[..end], nthr);
+        for r in &rows {
+            w.row(&slab[r.nm.0..r.nm.1], r.en - r.st,
+                  &slab[r.lab.0..r.lab.1], r.st)
+                .unwrap_or_else(|m| die(&m));
         }
         slab.copy_within(end..have, 0);
         have -= end;
@@ -335,20 +340,68 @@ fn report(st: &writer::Stats) {
               st.index, st.offs, st.lens, st.labs, st.raw);
 }
 
-fn row(w: &mut writer::Writer, line: &[u8]) {
-    if line.contains(&0) { die("a NUL byte inside a row"); }
-    let mut it = line.splitn(4, |&c| c == b'\t');
-    let (name, s, e, label) = match (it.next(), it.next(), it.next(), it.next()) {
-        (Some(a), Some(b), Some(c), Some(d)) => (a, b, c, d),
-        _ => die("bad line"),
-    };
-    if s.is_empty() || e.is_empty() { die("empty start or end column"); }
-    let st = bedcoord(s, "start is not a number");
-    let en = bedcoord(e, "end is not a number");
-    if en < st { die("end is before start"); }
-    if en == st { die("end equals start: a run must cover at least one base"); }
-    if name.is_empty() { die("empty sequence name"); }
-    w.row(name, en - st, label, st).unwrap_or_else(|m| die(&m));
+/// One parsed row: byte ranges into the slab, and the coordinates.
+struct Row { nm: (usize, usize), lab: (usize, usize), st: u64, en: u64 }
+
+/// Splits `s` at line boundaries into `t` chunks, parses each on its own
+/// thread, and returns the rows in order. A worker records the first thing
+/// it refuses; main reports the earliest chunk's.
+fn parse_slab(s: &[u8], t: usize) -> Vec<Row> {
+    use rayon::prelude::*;
+    let mut cut = vec![0usize];
+    for k in 1..t {
+        let mut g = s.len() * k / t;
+        while g < s.len() && s[g] != b'\n' { g += 1; }
+        cut.push(if g < s.len() { g + 1 } else { s.len() });
+    }
+    cut.push(s.len());
+    for k in 1..cut.len() { if cut[k] < cut[k - 1] { cut[k] = cut[k - 1]; } }
+    let parts: Vec<Result<Vec<Row>, &'static str>> = (0..cut.len() - 1)
+        .into_par_iter()
+        .map(|k| parse_chunk(s, cut[k], cut[k + 1]))
+        .collect();
+    let mut out = Vec::new();
+    for p in parts {
+        match p { Ok(mut v) => out.append(&mut v), Err(m) => die(m) }
+    }
+    out
+}
+
+fn parse_chunk(s: &[u8], from: usize, to: usize) -> Result<Vec<Row>, &'static str> {
+    let mut out = Vec::new();
+    let mut p = from;
+    while p < to {
+        let nl = match s[p..to].iter().position(|&c| c == b'\n') {
+            Some(i) => p + i,
+            None => break,
+        };
+        let line = &s[p..nl];
+        if line.contains(&0) { return Err("a NUL byte inside a row"); }
+        let t1 = line.iter().position(|&c| c == b'\t').ok_or("bad line")?;
+        let t2 = line[t1 + 1..].iter().position(|&c| c == b'\t').ok_or("bad line")? + t1 + 1;
+        let t3 = line[t2 + 1..].iter().position(|&c| c == b'\t').ok_or("bad line")? + t2 + 1;
+        if t1 + 1 == t2 || t2 + 1 == t3 { return Err("empty start or end column"); }
+        let st = bedcoord_r(&line[t1 + 1..t2], "start is not a number")?;
+        let en = bedcoord_r(&line[t2 + 1..t3], "end is not a number")?;
+        if en < st { return Err("end is before start"); }
+        if en == st { return Err("end equals start: a run must cover at least one base"); }
+        if t1 == 0 { return Err("empty sequence name"); }
+        out.push(Row { nm: (p, p + t1), lab: (p + t3 + 1, nl), st, en });
+        p = nl + 1;
+    }
+    Ok(out)
+}
+
+fn bedcoord_r(b: &[u8], what: &'static str) -> Result<u64, &'static str> {
+    let mut v: u64 = 0;
+    for &c in b {
+        if !c.is_ascii_digit() { return Err(what); }
+        if v > (u64::MAX - (c - b'0') as u64) / 10 {
+            return Err("a coordinate does not fit in 64 bits");
+        }
+        v = v * 10 + (c - b'0') as u64;
+    }
+    Ok(v)
 }
 
 pub fn bedcoord(b: &[u8], what: &str) -> u64 {

@@ -146,10 +146,17 @@ static uint64_t fnvbuf(uint64_t h, const void *p, size_t n) {
 #define FNV0 0xcbf29ce484222325ULL
 static uint64_t fnvstr(const char *s) { return fnvbuf(FNV0, s, strlen(s)); }
 
-static long int_arg(const char *p, long lo, long hi, const char *what) {   /* a whole signed number in range */
-    char *e = NULL; errno = 0;
-    long v = (p && *p) ? strtol(p, &e, 0) : 0;
-    if (!p || !*p || *e || errno || v < lo || v > hi) die(what);
+static long int_arg(const char *p, long lo, long hi, const char *what) {   /* digits only, in range */
+    if (!p || !*p || strspn(p, "0123456789") != strlen(p) || strlen(p) > 18) die(what);
+    long v = strtol(p, NULL, 10);
+    if (v < lo || v > hi) die(what);
+    return v;
+}
+static long codec_arg(const char *p, const char *what) {   /* a codec id: digits, or 0x and hex digits */
+    int hex = p && p[0] == '0' && (p[1] == 'x' || p[1] == 'X'); if (hex) p += 2;
+    if (!p || !*p || strlen(p) > 8 || strspn(p, hex ? "0123456789abcdefABCDEF" : "0123456789") != strlen(p)) die(what);
+    long v = strtol(p, NULL, hex ? 16 : 10);
+    if (v > 0x7fffffff) die(what);
     return v;
 }
 
@@ -4086,9 +4093,9 @@ int main(int argc, char **argv) {
             TOKSET = 1; take = 2; }
         else if (!strcmp(a, "--tail")) { ok = enc; TAILFORCE = (int)int_arg(v, 0, 1, "--tail is 0 or 1"); take = 2; }
         else if (!strcmp(a, "--id-codec")) { ok = enc;
-            IDCODEC = (int)int_arg(v, 0, 0x7fffffff, "--id-codec needs a codec id"); take = 2; }
+            IDCODEC = (int)codec_arg(v, "--id-codec needs a codec id"); take = 2; }
         else if (!strcmp(a, "--len-codec")) { ok = enc;
-            LENCODEC = (int)int_arg(v, 0, 0x7fffffff, "--len-codec needs a codec id"); take = 2; }
+            LENCODEC = (int)codec_arg(v, "--len-codec needs a codec id"); take = 2; }
         else if (!strcmp(a, "--max-gap")) { ok = sm; MAXGAP = num_arg(v, UINT64_MAX, "--max-gap needs a number"); take = 2; }
         else if (!strcmp(a, "--v1")) { ok = sm; V1 = 1; take = 1; }
         else if (!strcmp(a, "--aln-names")) {   /* the alignment's own table: ordinal N is line N+1 */

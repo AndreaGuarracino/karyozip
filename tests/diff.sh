@@ -218,7 +218,8 @@ cli aln-pack --names foo a b c; cli encode --db; cli --version encode
 cli index f x; cli decode f x; cli smooth f h fs a b c d; cli aln-pack a b c d
 cli smooth f h fs a b; cli smooth f h fs a b c; cli region f s 1
 cli encode --tok-chunk 0; cli encode --id-codec zz; cli smooth --max-gap x f h fs
-cli decode --out D; cli region --halo 3 f s; cli encode --tail 2
+cli decode --out D; cli region --halo 3 f s; cli encode --tail 2; cli region f s +1
+cli encode --tail 01; cli encode --id-codec +5; cli encode --id-codec 0X100; cli encode --block +5
 cli encode --id-codec 0x10; cli encode --id-codec 999999; cli encode --len-codec 0x10004
 cli encode --id-codec 0x10 --len-codec 999999; cli encode --aln p; cli encode --ref r
 cli decode --aln-names f; cli index --names ordinal; cli encode --sort --sort=1M

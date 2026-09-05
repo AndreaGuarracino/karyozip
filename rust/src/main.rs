@@ -9,7 +9,7 @@ use std::io::{BufWriter, Read, Write};
 /// The C's wording for a number that is not one.
 fn num(v: &Option<String>, lo: u64, hi: u64, what: &'static str) -> Option<u64> {
     let s = v.as_ref()?;
-    let n: u64 = s.parse().unwrap_or_else(|_| die(what));
+    let n = karyozip::bedcoord(s.as_bytes(), what);   // digits only, as the C
     if n < lo || n > hi { die(what); }
     Some(n)
 }
@@ -53,7 +53,7 @@ fn main() {
     let mut opt = writer::Options::default();
     if let Some(b) = &c.block {
         opt.block = if b == "all" { u64::MAX } else {
-            b.parse().unwrap_or_else(|_| die("--block is a number of runs, 1 or more, or \"all\""))
+            karyozip::bedcoord(b.as_bytes(), "--block is a number of runs, 1 or more, or \"all\"")
         };
         if opt.block == 0 { die("--block is a number of runs, 1 or more, or \"all\""); }
     }
@@ -69,9 +69,7 @@ fn main() {
         if m.is_empty() && std::env::args().any(|a| a == "--sort=") { mem_arg(""); }
         if !m.is_empty() { opt.sortmem = mem_arg(m); }
     }
-    if let Some(t) = &c.tail {
-        opt.tail = Some(match t.as_str() { "0" => false, "1" => true, _ => die("--tail is 0 or 1") });
-    }
+    opt.tail = num(&c.tail, 0, 1, "--tail is 0 or 1").map(|t| t == 1);
     if let Some(k) = num(&c.tok_chunk, 1, 0x7fff_ffff, "--tok-chunk needs a number") {
         opt.tok_chunk = Some((k as usize).min(9_000_000));
     }
@@ -169,7 +167,7 @@ fn main() {
         Cmd::Region { track, seq, a, b, hl, rest: _ } => {
             let (track, seq) = (need(track), need(seq));
             let p = |v: &Option<String>, w: &'static str| -> u64 {
-                v.as_ref().unwrap().parse().unwrap_or_else(|_| die(w))
+                karyozip::bedcoord(v.as_ref().unwrap().as_bytes(), w)
             };
             let (lo, hi, hlo) = match (a, b) {
                 (None, _) => (0, 0, 0),
@@ -195,8 +193,8 @@ fn main() {
             let maxgap = num(&c.max_gap, 0, u64::MAX, "--max-gap needs a number").unwrap_or(1000);
             let (lo, hi) = match (start, end) {
                 (Some(a), Some(b)) => (
-                    a.parse().unwrap_or_else(|_| die("smooth: start is not a number")),
-                    b.parse().unwrap_or_else(|_| die("smooth: end is not a number"))),
+                    karyozip::bedcoord(a.as_bytes(), "smooth: start is not a number"),
+                    karyozip::bedcoord(b.as_bytes(), "smooth: end is not a number")),
                 (None, None) => (0, 0),
                 _ => die("smooth: give SEQ, or SEQ START END"),
             };
@@ -273,11 +271,12 @@ fn mem_arg(p: &str) -> u64 {
 }
 
 fn parse_codec(s: &str, flag: &str) -> i32 {
-    let v = if let Some(h) = s.strip_prefix("0x") {
-        i64::from_str_radix(h, 16)
-    } else { s.parse::<i64>() };
-    match v {
-        Ok(v) if (0..=0x7fff_ffff).contains(&v) => v as i32,
+    // digits, or 0x and hex digits, as the C reads it
+    let (h, radix) = match s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        Some(h) => (h, 16), None => (s, 10) };
+    let ok = !h.is_empty() && h.len() <= 8 && h.chars().all(|c| c.is_digit(radix));
+    match i64::from_str_radix(h, radix) {
+        Ok(v) if ok && v <= 0x7fff_ffff => v as i32,
         _ => die(&format!("{flag} needs a codec id")),
     }
 }

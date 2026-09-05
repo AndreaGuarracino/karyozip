@@ -754,6 +754,7 @@ static ktw *ktw_open(FILE *out) {
 
 static __thread int LENDEC = 0;      /* the file being read leaves lengths out */
 static uint64_t refend_at(const char *nm, uint64_t pos);
+static uint32_t refrow_at(const char *nm, uint64_t st, uint64_t len);
 static __thread int LASTREV;   /* strand of the last refend answer */
 static const char *ALNNAME = NULL;    /* --sort writes ranks; the PAF wants names */
 
@@ -776,6 +777,12 @@ static void ktw_row(ktw *w, const char *name, size_t nlen,
 
     if (start != w->curbp) die("gap or overlap: start is not the previous end");
     uint64_t id = (uint64_t)intern(label, llen);   /* once, not once per check */
+    /* A label the reference already gives is stored as "=". Done here, on
+       the row as written, so a --sort track orders on the input's own labels
+       and its order is the same with or without --aln. */
+    if (ALNPAF && refrow_at(ALNNAME ? ALNNAME : w->cur, start, run_len) == (uint32_t)id) {
+        id = (uint64_t)intern("=", 1); ALNHIT++;
+    }
 
     if (w->phas) { lensput(w, w->pval); w->phas = 0; }
     if (w->pend >= BLOCK) ktw_flush(w);            /* mid-sequence is fine */
@@ -1263,6 +1270,11 @@ static uint32_t refrow(const qseg *Q, uint64_t st, uint64_t len) {
     uint32_t a = reflabel(Q, st + len / 4), b = reflabel(Q, st + len / 2);
     if (a == b) return a;
     return a == reflabel(Q, st + 3 * len / 4) ? a : b;
+}
+static uint32_t refrow_at(const char *nm, uint64_t st, uint64_t len) {
+    static __thread const qseg *cq = NULL; static __thread char cn[512];
+    if (strcmp(nm, cn)) { cq = qlookup(nm); snprintf(cn, sizeof cn, "%s", nm); }
+    return refrow(cq, st, len);
 }
 
 typedef struct { char *key; uint32_t id; } fent;
@@ -1761,17 +1773,7 @@ static void encode(void) {
             for (size_t k = 0; k < prn[t]; k++) {
                 prow *q = &pr[t][k];
                 const char *lab = q->lab; size_t llen = q->llen;
-                if (ALNPAF) {
-                    char *nmm = (char *)q->nm; char save = nmm[q->nlen];
-                    nmm[q->nlen] = 0;
-                    const qseg *Q = qlookup(nmm);
-                    nmm[q->nlen] = save;
-                    if (llen == 1 && *lab == '=') die("a label \"=\" is reserved under --aln");
-                    uint32_t rl = refrow(Q, q->st, q->len);
-                    if (rl != UINT32_MAX && rl == (uint32_t)intern(lab, llen)) {
-                        lab = "="; llen = 1; ALNHIT++;
-                    }
-                }
+                if (ALNPAF && llen == 1 && *lab == '=') die("a label \"=\" is reserved under --aln");
                 if (SORT) sortpush(q->nm, q->nlen, q->st, q->len, lab, llen);
                 else ktw_row(w, q->nm, q->nlen, q->len, lab, llen, q->st, q->same);
             }
@@ -3740,7 +3742,6 @@ static void encode_db(int nfiles, char **files) {
     size_t seqlen = 0;
     uint32_t prevfid = UINT32_MAX; uint64_t lastend = 0;
     char lastseq[512] = ""; int haveseq = 0;
-    const qseg *QCUR = NULL;
     while (!b[0].eof) {
         for (int i = 1; i < nfiles; i++)
             if (b[i].eof || strcmp(b[i].seq, b[0].seq))
@@ -3755,7 +3756,6 @@ static void encode_db(int nfiles, char **files) {
             haveseq = 1; snprintf(lastseq, sizeof lastseq, "%s", b[0].seq);
             seqlen = strlen(lastseq);
             prevfid = UINT32_MAX;               /* a new sequence starts fresh */
-            QCUR = ALNPAF ? qlookup(lastseq) : NULL;
         }
         uint32_t id = UINT32_MAX;
         if (DBIDS) {                       /* the label column IS the id */
@@ -3793,13 +3793,7 @@ static void encode_db(int nfiles, char **files) {
         char *e2 = putu64(idbuf, id);              /* snprintf per row is slow */
         const char *lab = idbuf; size_t llen = (size_t)(e2 - idbuf);
 
-        if (ALNPAF) {
-            if (llen == 1 && *lab == '=') die("a label \"=\" is reserved under --aln");
-            uint32_t rl = refrow(QCUR, lo, hi - lo);
-            if (rl != UINT32_MAX && rl == (uint32_t)intern(lab, llen)) {
-                lab = "="; llen = 1; ALNHIT++;
-            }
-        }
+        if (ALNPAF && llen == 1 && *lab == '=') die("a label \"=\" is reserved under --aln");
         if (SORT) sortpush(b[0].seq, seqlen, lo, hi - lo, lab, llen);
         else ktw_row(w, b[0].seq, seqlen, hi - lo, lab, llen, lo, 0);
         rows++;

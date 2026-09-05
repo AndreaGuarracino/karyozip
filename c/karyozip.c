@@ -3123,12 +3123,14 @@ static inline char *putu64(char *o, uint64_t v) {
     return o;
 }
 
+static void setcols(void);
 /* --db and --aln companions, for every reader */
 static void loadinformed(const char *who) {
     if (ALNPAF && !ALNREF) { fprintf(stderr, "karyozip: %s--aln needs --ref\n", who); exit(1); }
     if (ALNREF && !ALNPAF) die("--ref does nothing without --aln");
     if (ALNNAMES && !ALNPAF) die("--aln-names does nothing without --aln");
-    if (DBFEATS) loadfeatures(DBFEATS);
+    if (SETNAME && !DBFEATS) die("--set needs --db");
+    if (DBFEATS) { loadfeatures(DBFEATS); setcols(); }
     if (ALNPAF) { if (ALNNAMES) loadordinals(ALNNAMES); loadref(ALNREF); loadaln(ALNPAF); }
 }
 static R *ropen_informed(const char *path) {
@@ -3137,10 +3139,20 @@ static R *ropen_informed(const char *path) {
         die("this features.tsv is not the one the track was encoded with");
     return r;
 }
-static size_t setidx(void) {   /* --set, as a column of features.tsv */
-    if (!DBFEATS) die("--set needs --db");
-    for (size_t k = 0; k < nfset; k++) if (!strcmp(fset[k], SETNAME)) return k;
-    die("--set: not a set in features.tsv"); return 0;
+static size_t *SETK, NSETK;   /* --set as columns of features.tsv, default all */
+static void setcols(void) {
+    SETK = xmalloc((nfset ? nfset : 1) * sizeof *SETK); NSETK = 0;
+    if (!SETNAME || !strcmp(SETNAME, "all")) { for (size_t k = 0; k < nfset; k++) SETK[NSETK++] = k; return; }
+    char *cp = xstrdup(SETNAME);
+    for (char *t = strtok(cp, ","); t; t = strtok(NULL, ",")) {
+        if (!strcmp(t, "all")) die("--set all takes no other set");
+        size_t k = 0; while (k < nfset && strcmp(fset[k], t)) k++;
+        if (k == nfset) { fprintf(stderr, "karyozip: --set: %s is not a set in features.tsv\n", t); exit(1); }
+        for (size_t j = 0; j < NSETK; j++) if (SETK[j] == k) die("--set names a set twice");
+        SETK[NSETK++] = k;
+    }
+    free(cp);
+    if (!NSETK) die("--set needs at least one set");
 }
 static uint32_t featid(const char *L) {   /* a --db label, checked */
     uint32_t id = (uint32_t)num_arg(L, (1u << 26) - 1, "corrupt --db track: a label is not a featureID");
@@ -3159,10 +3171,9 @@ static char *putlab(char *o, const R *r, uint64_t f, const char *seq, uint64_t s
     }
     if (!DBFEATS) { size_t n = strlen(L); memcpy(o, L, n); return o + n; }
     uint32_t id = featid(L);
-    size_t j0 = SETNAME ? setidx() : 0, j1 = SETNAME ? j0 + 1 : nfset;
-    for (size_t j = j0; j < j1; j++) {
-        const char *Lb = id ? fid2lab[id][j] : "novel"; size_t n = strlen(Lb);
-        if (j > j0) *o++ = '\t';
+    for (size_t j = 0; j < NSETK; j++) {
+        const char *Lb = id ? fid2lab[id][SETK[j]] : "novel"; size_t n = strlen(Lb);
+        if (j) *o++ = '\t';
         memcpy(o, Lb, n); o += n;
     }
     return o;
@@ -3170,9 +3181,9 @@ static char *putlab(char *o, const R *r, uint64_t f, const char *seq, uint64_t s
 static size_t maxlablen(const R *r) {   /* the longest label putlab writes */
     size_t m = 20;
     if (!DBFEATS) { if (r->lab) for (uint64_t j = 0; j < r->nlab; j++) { size_t L = strlen(r->lab[j]); if (L > m) m = L; } return m; }
-    if (6 * nfset > m) m = 6 * nfset;   /* the novel tuple */
+    if (6 * NSETK > m) m = 6 * NSETK;   /* the novel tuple */
     for (uint32_t id = 0; id < nfid; id++) if (fid2lab[id]) {
-        size_t L = 0; for (size_t j = 0; j < nfset; j++) L += strlen(fid2lab[id][j]) + 1;
+        size_t L = 0; for (size_t j = 0; j < NSETK; j++) L += strlen(fid2lab[id][SETK[j]]) + 1;
         if (L > m) m = L; }
     return m;
 }
@@ -3254,8 +3265,8 @@ static char *putrow(char *o, const char *seq, size_t nlen, uint64_t st, uint64_t
     o = putu64(o, en); *o++ = '\t'; memcpy(o, lab, ln); o += ln; *o++ = '\n';
     return o;
 }
-/* --set: the sequence's rows for one set, touching equal labels merged, so
-   the answer is what the set's own track gives; needs the whole sequence */
+/* --db: the sequence's rows over the selected sets, touching equal tuples
+   merged, so one set gives what its own track gives; needs the whole sequence */
 static void region_set(R *r, int64_t ri, const char *seq, uint64_t lo, uint64_t hi, uint64_t halo) {
     rec q = getidx(r, ri);
     loadblk(r, q.blk);
@@ -3299,7 +3310,7 @@ static void region(const char *path, const char *seq, uint64_t lo, uint64_t hi,
     int64_t ri = idxlookup(r, path, seq);
     if (ri < 0) ri = rfind(r, seq);
     if (ri < 0) die("sequence not found");
-    if (SETNAME) { region_set(r, ri, seq, lo, hi, halo); return; }
+    if (DBFEATS) { region_set(r, ri, seq, lo, hi, halo); return; }
     rec q = getidx(r, ri);
     loadblk(r, q.blk);
     const uint8_t *lp = r->lp0, *ip = r->ip0;
@@ -3940,34 +3951,43 @@ static void dbtmpclean(void) { for (size_t i = 0; i < ndbtmp; i++) if (DBTMP[i])
 static void dbtmpsig(int s) { dbtmpclean(); (void)s; _exit(1); }   /* atexit does not run on a signal */
 
 static void decode_db(const char *path, const char *dir) {
-    ow *o = xcalloc(nfset, sizeof *o);
-    uint64_t *c0 = xcalloc(nfset, sizeof *c0), *c1 = xcalloc(nfset, sizeof *c1);
-    const char **cl = xcalloc(nfset, sizeof *cl);
-    size_t *cll = xcalloc(nfset, sizeof *cll);
+    /* --out DIR: one BED per selected set, staged then swapped in together.
+       No --out: the selected columns, tab-joined, merged where they all
+       agree, on stdout; one set gives that set's own track. */
+    int tostd = !dir;
+    size_t nout = tostd ? 1 : NSETK;
+    ow *o = xcalloc(nout, sizeof *o);
+    uint64_t *c0 = xcalloc(nout, sizeof *c0), *c1 = xcalloc(nout, sizeof *c1);
+    const char **cl = xcalloc(nout, sizeof *cl);
+    size_t *cll = xcalloc(nout, sizeof *cll);
     const char *cseq = NULL; size_t cseqn = 0;
     R *r = ropen_informed(path);
     ensurenames(r);
     char pb[4096];
-    size_t j0 = SETNAME ? setidx() : 0, j1 = SETNAME ? j0 + 1 : nfset;   /* --set: one set, to stdout */
-    if (SETNAME) { o[j0].f = stdout; o[j0].cap = 1 << 20; o[j0].b = xmalloc(o[j0].cap); }
+    if (tostd) { o[0].f = stdout; o[0].cap = 1 << 20; o[0].b = xmalloc(o[0].cap); }
     else {
-    for (size_t i = 0; i < nfset; i++) {
-        struct stat ts; int pn = snprintf(pb, sizeof pb, "%s/%s.bed", dir, fset[i]);
-        if (pn < 0 || (size_t)pn >= sizeof pb - 16) die("--out: the output path is too long");
-        if (!lstat(pb, &ts) && !S_ISREG(ts.st_mode)) die("--out: a set's BED exists and is not a regular file");
+        for (char *q = strchr(pb, 0), *d = xstrdup(dir); ; q++) {   /* mkdir -p, as the Rust does */
+            if (q == pb) { q = d; }
+            if (*q == '/' || !*q) { char c = *q; *q = 0; if (*d && mkdir(d, 0777) && errno != EEXIST) die("cannot create the output directory"); *q = c; if (!c) { free(d); break; } }
+        }
+        for (size_t i = 0; i < NSETK; i++) {
+            struct stat ts; int pn = snprintf(pb, sizeof pb, "%s/%s.bed", dir, fset[SETK[i]]);
+            if (pn < 0 || (size_t)pn >= sizeof pb - 16) die("--out: the output path is too long");
+            if (!lstat(pb, &ts) && !S_ISREG(ts.st_mode)) die("--out: a set's BED exists and is not a regular file");
+        }
+        DBTMP = xcalloc(NSETK, sizeof *DBTMP); ndbtmp = NSETK; atexit(dbtmpclean);
+        signal(SIGINT, dbtmpsig); signal(SIGTERM, dbtmpsig); signal(SIGHUP, dbtmpsig);
+        for (size_t i = 0; i < NSETK; i++) {
+            int pn = snprintf(pb, sizeof pb, "%s/%s.bed.tmp.%d", dir, fset[SETK[i]], (int)getpid());
+            if (pn < 0 || (size_t)pn >= sizeof pb - 16) die("--out: the output path is too long");
+            DBTMP[i] = xstrdup(pb);
+            o[i].f = fopen(pb, "w");
+            if (!o[i].f) die("cannot write a derived BED");
+            o[i].cap = 1 << 20;
+            o[i].b = xmalloc(o[i].cap);
+        }
     }
-    DBTMP = xcalloc(nfset, sizeof *DBTMP); ndbtmp = nfset; atexit(dbtmpclean);
-    signal(SIGINT, dbtmpsig); signal(SIGTERM, dbtmpsig); signal(SIGHUP, dbtmpsig);
-    for (size_t i = 0; i < nfset; i++) {
-        int pn = snprintf(pb, sizeof pb, "%s/%s.bed.tmp.%d", dir, fset[i], (int)getpid());
-        if (pn < 0 || (size_t)pn >= sizeof pb - 16) die("--out: the output path is too long");
-        DBTMP[i] = xstrdup(pb);
-        o[i].f = fopen(pb, "w");
-        if (!o[i].f) die("cannot write a derived BED");
-        o[i].cap = 1 << 20;
-        o[i].b = xmalloc(o[i].cap);
-    }
-    }
+    char *jb[2] = { NULL, NULL }; size_t jcap[2] = { 0, 0 }; int jw = 0;   /* joined labels, pending and current */
     cur_t c = { UINT64_MAX, 0, NULL, NULL };
     uint64_t rows = 0;
     for (uint64_t i = 0; i < r->nreads; i++) {
@@ -3978,7 +3998,7 @@ static void decode_db(const char *path, const char *dir) {
         const qseg *Q = ALNPAF ? qlookup(nm) : NULL;
 
         if (cseq)
-            for (size_t j = j0; j < j1; j++)
+            for (size_t j = 0; j < nout; j++)
                 owput(&o[j], cseq, cseqn, c0[j], c1[j], cl[j], cll[j]);
         cseq = NULL;
         uint64_t s = 0, nr = getidx(r, i).nruns;
@@ -3997,14 +4017,25 @@ static void decode_db(const char *path, const char *dir) {
             }
             /* the label text IS the featureID: parse it as strictly as encode did */
             uint32_t id = idtxt ? featid(idtxt) : (uint32_t)f;
-            for (size_t j = j0; j < j1; j++) {
-                const char *Lb = id ? fid2lab[id][j] : "novel";
-                size_t Lbn = strlen(Lb);
+            for (size_t j = 0; j < nout; j++) {
+                const char *Lb; size_t Lbn;
+                if (tostd) {                        /* the selected columns, one tuple */
+                    size_t need = 1; for (size_t t = 0; t < NSETK; t++) need += strlen(id ? fid2lab[id][SETK[t]] : "novel") + 1;
+                    if (need > jcap[jw]) { jcap[jw] = need * 2; jb[jw] = xrealloc(jb[jw], jcap[jw]); }
+                    char *q = jb[jw];
+                    for (size_t t = 0; t < NSETK; t++) {
+                        const char *L = id ? fid2lab[id][SETK[t]] : "novel"; size_t L2 = strlen(L);
+                        if (t) *q++ = '\t';
+                        memcpy(q, L, L2); q += L2;
+                    }
+                    *q = 0; Lb = jb[jw]; Lbn = (size_t)(q - jb[jw]);
+                } else { Lb = id ? fid2lab[id][SETK[j]] : "novel"; Lbn = strlen(Lb); }
                 if (cseq && c1[j] == s && cll[j] == Lbn && !memcmp(cl[j], Lb, Lbn)) {
                     c1[j] = s + len;                       /* extend the run */
                 } else {
                     if (cseq) owput(&o[j], cseq, cseqn, c0[j], c1[j], cl[j], cll[j]);
                     c0[j] = s; c1[j] = s + len; cl[j] = Lb; cll[j] = Lbn;
+                    if (tostd) jw ^= 1;                    /* the pending label lives on */
                 }
             }
             cseq = nm; cseqn = nml;
@@ -4013,41 +4044,41 @@ static void decode_db(const char *path, const char *dir) {
         seqdone(r, i, &c, lp, ip, &sp);
     }
     if (cseq)
-        for (size_t j = j0; j < j1; j++)
+        for (size_t j = 0; j < nout; j++)
             owput(&o[j], cseq, cseqn, c0[j], c1[j], cl[j], cll[j]);
-    for (size_t j = j0; j < j1; j++) {
-        if ((o[j].n && fwrite(o[j].b, 1, o[j].n, o[j].f) != o[j].n) || (SETNAME ? fflush(o[j].f) : fclose(o[j].f))) die("write failed");
+    for (size_t j = 0; j < nout; j++) {
+        if ((o[j].n && fwrite(o[j].b, 1, o[j].n, o[j].f) != o[j].n) || (tostd ? fflush(o[j].f) : fclose(o[j].f))) die("write failed");
         free(o[j].b);
     }
-    if (SETNAME) fprintf(stderr, "db: %llu rows, set %s\n", (unsigned long long)rows, SETNAME);
+    free(jb[0]); free(jb[1]);
+    if (tostd) fprintf(stderr, "db: %llu rows, %zu sets on stdout\n", (unsigned long long)rows, NSETK);
     else {
-        char **old = xcalloc(nfset, sizeof *old); size_t nmv = 0; int bad = 0;
-        for (size_t j = 0; j < nfset && !bad; j++) {
-            snprintf(pb, sizeof pb, "%s/%s.bed", dir, fset[j]);
-            char *o2; if (asprintf(&o2, "%s/%s.bed.old.%d", dir, fset[j], (int)getpid()) < 0) die("oom");
+        char **old = xcalloc(NSETK, sizeof *old); size_t nmv = 0; int bad = 0;
+        for (size_t j = 0; j < NSETK && !bad; j++) {
+            snprintf(pb, sizeof pb, "%s/%s.bed", dir, fset[SETK[j]]);
+            char *o2; if (asprintf(&o2, "%s/%s.bed.old.%d", dir, fset[SETK[j]], (int)getpid()) < 0) die("oom");
             if (!rename(pb, o2)) { old[j] = o2; } else { free(o2); if (errno != ENOENT) bad = 1; }
         }
-        for (size_t j = 0; j < nfset && !bad; j++) {
-            snprintf(pb, sizeof pb, "%s/%s.bed", dir, fset[j]);
+        for (size_t j = 0; j < NSETK && !bad; j++) {
+            snprintf(pb, sizeof pb, "%s/%s.bed", dir, fset[SETK[j]]);
             if (rename(DBTMP[j], pb)) bad = 1; else { free(DBTMP[j]); DBTMP[j] = NULL; nmv++; }
         }
         if (bad) {
             for (size_t j = 0; j < nmv; j++) {   /* take the new ones back out */
-                snprintf(pb, sizeof pb, "%s/%s.bed", dir, fset[j]);
-                if (asprintf(&DBTMP[j], "%s/%s.bed.tmp.%d", dir, fset[j], (int)getpid()) >= 0)
+                snprintf(pb, sizeof pb, "%s/%s.bed", dir, fset[SETK[j]]);
+                if (asprintf(&DBTMP[j], "%s/%s.bed.tmp.%d", dir, fset[SETK[j]], (int)getpid()) >= 0)
                     (void)!rename(pb, DBTMP[j]);
             }
-            for (size_t j = 0; j < nfset; j++) if (old[j]) {
-                snprintf(pb, sizeof pb, "%s/%s.bed", dir, fset[j]);
+            for (size_t j = 0; j < NSETK; j++) if (old[j]) {
+                snprintf(pb, sizeof pb, "%s/%s.bed", dir, fset[SETK[j]]);
                 (void)!rename(old[j], pb); free(old[j]);
             }
             free(old); die("cannot rename a derived BED into place");
         }
-        for (size_t j = 0; j < nfset; j++) if (old[j]) { remove(old[j]); free(old[j]); }
+        for (size_t j = 0; j < NSETK; j++) if (old[j]) { remove(old[j]); free(old[j]); }
         free(old);
+        fprintf(stderr, "db: %llu rows into %zu tracks under %s\n", (unsigned long long)rows, NSETK, dir);
     }
-    if (!SETNAME) fprintf(stderr, "db: %llu rows into %zu tracks under %s\n",
-                          (unsigned long long)rows, nfset, dir);
     free(o); free(c0); free(c1); free(cl); free(cll); rclose(r);
 }
 
@@ -4062,7 +4093,7 @@ int main(int argc, char **argv) {
             "                  [--names keep|drop|drop:FILE]\n"
             "                  [--sort | --sort=MEM]\n"
             "                  [--db features.tsv] [--aln P.paf --ref R [--aln-names F]]\n"
-            "  karyozip decode F | --db features.tsv --out DIR|--set NAME F | --aln P.paf --ref R F\n"
+            "  karyozip decode F | --db features.tsv [--out DIR] [--set A,B] F | --aln P.paf --ref R F\n"
             "                  --names F reads the names, from drop:FILE or a FASTA, FASTQ or list\n"
             "                  --names ordinal accepts a track whose names were dropped\n"
             "                  --raw shows what is stored, reversing no transform\n"
@@ -4079,8 +4110,8 @@ int main(int argc, char **argv) {
             "               --tail 0|1  --tok-chunk N  --id-codec N  --len-codec N\n"
             "  decode:      --raw  --out DIR\n"
             "  readers:     --names FILE|ordinal  --db F  --aln P --ref R, as encode was given;\n"
-            "               under --db, --set NAME gives one set (decode, region), else region\n"
-            "               prints one label per set\n"
+            "               --db: --set A,B picks feature sets, default all; decode without --out and\n"
+            "               region print the picked labels as columns, merged where they all agree\n"
             "  with --aln:  --aln-names FILE, on encode and decode, when the track\n"
             "               names rows by ordinal\n"
             "  smooth:      --max-gap N  --v1\n"
@@ -4238,8 +4269,6 @@ int main(int argc, char **argv) {
             f = argv[i];
         }
         if (!f) die("decode needs a track");
-        if (SETNAME && !DBFEATS) die("--set needs --db");
-        if (DBFEATS && !OUTDIR && !SETNAME) die("decode --db needs --out DIR for the per-set BEDs, or --set NAME for one on stdout");
         loadinformed("decode ");
         if (DBFEATS) decode_db(f, OUTDIR); else dump(f);
     }
@@ -4251,7 +4280,6 @@ int main(int argc, char **argv) {
         uint64_t rhi = argc > 5 ? num_arg(argv[5], UINT64_MAX, "region: end is not a number") : 0;
         if (argc == 5) rhi = rlo + 1;                  /* one position */
         if (argc > 5 && rlo >= rhi) die("region: give START END with END past START");
-        if (SETNAME && !DBFEATS) die("--set needs --db");
         loadinformed("region ");
         region(argv[2], argv[3], rlo, rhi, argc > 6 ? num_arg(argv[6], UINT64_MAX, "region: halo is not a number") : 0);
     }

@@ -67,19 +67,28 @@ impl Feats {
         id
     }
 
-    /// One label per set, tab-joined: what region prints under --db.
-    pub fn tuple(&self, lab: &[u8], out: &mut Vec<u8>) {
-        let id = self.featid(lab);
-        for j in 0..self.sets.len() {
-            if j > 0 { out.push(b'\t'); }
-            out.extend_from_slice(if id == 0 { b"novel" } else { &self.id2lab[&id][j] });
+    /// --set A,B as columns of features.tsv; None or "all" is every set.
+    pub fn setcols(&self, spec: Option<&str>) -> Vec<usize> {
+        let Some(spec) = spec.filter(|s| *s != "all") else { return (0..self.sets.len()).collect() };
+        let mut cols = Vec::new();
+        for t in spec.split(',').filter(|t| !t.is_empty()) {
+            if t == "all" { crate::bail("--set all takes no other set"); }
+            let k = self.sets.iter().position(|s| s == t.as_bytes())
+                .unwrap_or_else(|| crate::bail(&format!("--set: {t} is not a set in features.tsv")));
+            if cols.contains(&k) { crate::bail("--set names a set twice"); }
+            cols.push(k);
         }
+        if cols.is_empty() { crate::bail("--set needs at least one set"); }
+        cols
     }
 
-    /// --set NAME as a column of features.tsv.
-    pub fn setidx(&self, name: &str) -> usize {
-        self.sets.iter().position(|s| s == name.as_bytes())
-            .unwrap_or_else(|| crate::bail("--set: not a set in features.tsv"))
+    /// The labels of the picked sets for one featureID, tab-joined.
+    pub fn joined(&self, id: u32, cols: &[usize], out: &mut Vec<u8>) {
+        out.clear();
+        for (i, &k) in cols.iter().enumerate() {
+            if i > 0 { out.push(b'\t'); }
+            out.extend_from_slice(if id == 0 { b"novel" } else { &self.id2lab[&id][k] });
+        }
     }
 
     pub fn check_hash(&self, r: &crate::reader::Reader) {
@@ -238,16 +247,18 @@ pub fn drop_tmp() {
     }
 }
 
-/// decode --db: every set into DIR, or with `only` one set to stdout.
-pub fn decode(r: &mut crate::reader::Reader, feats: &Feats, dir: Option<&str>, only: Option<usize>) {
+/// decode --db. With DIR: one BED per picked set, staged then swapped in
+/// together. Without: the picked columns, tab-joined, merged where they all
+/// agree, on stdout; one set gives that set's own track.
+pub fn decode(r: &mut crate::reader::Reader, feats: &Feats, dir: Option<&str>, cols: &[usize]) {
     let name = |s: &[u8]| String::from_utf8_lossy(s).into_owned();
     let pid = std::process::id();
-    let (j0, j1) = only.map_or((0, feats.sets.len()), |k| (k, k + 1));
+    let sets: Vec<&[u8]> = cols.iter().map(|&k| feats.sets[k].as_slice()).collect();
     let mut tmps: Vec<String> = Vec::new();
     let mut out: Vec<Box<dyn Write>> = Vec::new();
-    if let (Some(dir), None) = (dir, only) {
+    if let Some(dir) = dir {
         std::fs::create_dir_all(dir).unwrap_or_else(|_| crate::bail("cannot create the output directory"));
-        for s in &feats.sets {
+        for s in &sets {
             let p = format!("{dir}/{}.bed", name(s));
             if p.len() + 16 >= 4096 { crate::bail("--out: the output path is too long"); }
             if let Ok(m) = std::fs::symlink_metadata(&p) {
@@ -255,23 +266,23 @@ pub fn decode(r: &mut crate::reader::Reader, feats: &Feats, dir: Option<&str>, o
             }
         }
         // Write beside the old BEDs, then swap them in together.
-        tmps = feats.sets.iter().map(|s| format!("{dir}/{}.bed.tmp.{pid}", name(s))).collect();
+        tmps = sets.iter().map(|s| format!("{dir}/{}.bed.tmp.{pid}", name(s))).collect();
         *TMP.lock().unwrap() = tmps.clone();
         out = tmps.iter().map(|p| Box::new(std::io::BufWriter::new(std::fs::File::create(p)
                 .unwrap_or_else(|_| crate::bail("cannot write a derived BED")))) as Box<dyn Write>).collect();
     } else {
-        for _ in 0..j0 { out.push(Box::new(std::io::sink())); }
         out.push(Box::new(std::io::BufWriter::new(std::io::stdout())));
     }
-    // One open run per set, extended while its label does not change.
-    let n = j1;
+    // One open run per output, extended while its label does not change.
+    let n = out.len();
+    let mut joined = Vec::new();
     let mut cur: Vec<Option<(u64, u64, Vec<u8>)>> = vec![None; n];
     let mut cseq: Vec<u8> = Vec::new();
     let mut rows = 0u64;
     let novel = b"novel".to_vec();
     r.for_each_row(&mut |seq: &[u8], st: u64, en: u64, lab: &[u8]| {
         if seq != cseq {
-            for j in j0..n {
+            for j in 0..n {
                 if let Some((a, b2, l)) = cur[j].take() {
                     wr(&mut out[j], &cseq, a, b2, &l);
                 }
@@ -279,8 +290,9 @@ pub fn decode(r: &mut crate::reader::Reader, feats: &Feats, dir: Option<&str>, o
             cseq = seq.to_vec();
         }
         let id = feats.featid(lab);
-        for j in j0..n {
-            let l: &[u8] = if id == 0 { &novel } else { &feats.id2lab[&id][j] };
+        if dir.is_none() { feats.joined(id, cols, &mut joined); }
+        for j in 0..n {
+            let l: &[u8] = if dir.is_none() { &joined } else if id == 0 { &novel } else { &feats.id2lab[&id][cols[j]] };
             match &mut cur[j] {
                 Some((_, e, cl)) if *e == st && cl == l => *e = en,
                 slot => {
@@ -291,19 +303,19 @@ pub fn decode(r: &mut crate::reader::Reader, feats: &Feats, dir: Option<&str>, o
         }
         rows += 1;
     });
-    for j in j0..n {
+    for j in 0..n {
         if let Some((a, b2, l)) = cur[j].take() { wr(&mut out[j], &cseq, a, b2, &l); }
         out[j].flush().unwrap_or_else(|_| crate::bail("write failed"));
     }
     drop(out);
-    match (dir, only) {
-        (_, Some(k)) => eprintln!("db: {rows} rows, set {}", name(&feats.sets[k])),
-        (Some(dir), None) => {
-            swap_in(dir, &feats.sets, &tmps);
+    match dir {
+        None => eprintln!("db: {rows} rows, {} sets on stdout", cols.len()),
+        Some(dir) => {
+            let owned: Vec<Vec<u8>> = sets.iter().map(|s| s.to_vec()).collect();
+            swap_in(dir, &owned, &tmps);
             TMP.lock().unwrap().clear();
             eprintln!("db: {rows} rows into {n} tracks under {dir}");
         }
-        (None, None) => unreachable!(),
     }
 }
 

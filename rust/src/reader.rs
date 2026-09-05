@@ -773,10 +773,10 @@ impl Reader {
     }
 
     /// region F SEQ | SEQ POS | SEQ START END [HALO].
-    /// --set: one set of a --db track, touching equal labels merged, so the
-    /// answer is what the set's own track gives. Needs the whole sequence.
+    /// --db: the sequence's rows over the picked sets, touching equal tuples
+    /// merged, so one set gives what its own track gives. Needs the whole sequence.
     fn region_set(&mut self, ri: u64, seq: &[u8], lo: u64, hi: u64, halo: u64,
-                  fe: &crate::db::Feats, k: usize, out: &mut impl std::io::Write) {
+                  fe: &crate::db::Feats, cols: &[usize], out: &mut impl std::io::Write) {
         let (blk, off, nruns) = self.locate(ri);
         let tskip = self.tailskip;
         let mut c = self.at(blk, off);
@@ -785,8 +785,7 @@ impl Reader {
         for i in 0..nruns {
             let (len, f) = self.step(&mut c, s, i + 1 == nruns && ri >= tskip);
             l.clear(); self.label(f, &mut l, s, len);
-            let id = fe.featid(&l);
-            t.clear(); t.extend_from_slice(if id == 0 { b"novel" } else { &fe.id2lab[&id][k] });
+            fe.joined(fe.featid(&l), cols, &mut t);
             if en.last() == Some(&s) && lab.last() == Some(&t) { *en.last_mut().unwrap() = s + len; }
             else { st.push(s); en.push(s + len); lab.push(t.clone()); }
             s += len;
@@ -812,12 +811,12 @@ impl Reader {
     }
 
     pub fn region(&mut self, seq: &[u8], lo: u64, hi: u64, halo: u64,
-                  feats: Option<&crate::db::Feats>, set: Option<usize>, out: &mut impl std::io::Write) {
+                  feats: Option<&crate::db::Feats>, cols: &[usize], out: &mut impl std::io::Write) {
         let ri = self.find(seq);
         if ri < 0 { crate::bail("sequence not found"); }
         let ri = ri as u64;
         self.alnq = self.aln.as_ref().and_then(|a| a.find(seq));
-        if let (Some(fe), Some(k)) = (feats, set) { return self.region_set(ri, seq, lo, hi, halo, fe, k, out); }
+        if let Some(fe) = feats { return self.region_set(ri, seq, lo, hi, halo, fe, cols, out); }
         let (blk, off, nruns) = self.locate(ri);
         let tskip = self.tailskip;
         let last_of = |k: u64| k + 1 == nruns && ri >= tskip;
@@ -857,14 +856,7 @@ impl Reader {
                 buf.push(b'\t');
                 kst::putu64(&mut buf, en);
                 buf.push(b'\t');
-                match feats {
-                    Some(fe) if !self.lab.is_empty() => {
-                        let mut l = Vec::new();
-                        self.label(f, &mut l, st, len);
-                        fe.tuple(&l, &mut buf);
-                    }
-                    _ => self.label(f, &mut buf, st, len),
-                }
+                self.label(f, &mut buf, st, len);
                 buf.push(b'\n');
                 if buf.len() > (1 << 20) - 4096 {
                     rd(out.write_all(&buf), "write failed");

@@ -149,16 +149,11 @@ fn main() {
         Cmd::Decode { track, rest } => {
             if !rest.is_empty() { die("decode takes one track"); }
             let track = need(track);
-            // The C refuses the flag pair before it loads anything.
-            if c.set.is_some() && c.db.is_none() { die("--set needs --db"); }
-            if c.db.is_some() && c.out.is_none() && c.set.is_none() {
-                die("decode --db needs --out DIR for the per-set BEDs, or --set NAME for one on stdout");
-            }
             let feats = informed(&c, &mut ro, "decode ");
             let mut r = reader::Reader::open_with(track, &ro);
             if let Some(f) = &feats { f.check_hash(&r); }
             match &feats {
-                Some(f) => db::decode(&mut r, f, c.out.as_deref(), c.set.as_deref().map(|n| f.setidx(n))),
+                Some(f) => db::decode(&mut r, f, c.out.as_deref(), &f.setcols(c.set.as_deref())),
                 None => {
                     let so = std::io::stdout();
                     let mut o = BufWriter::new(so.lock());
@@ -182,14 +177,13 @@ fn main() {
                     (x, y, hl.as_ref().map_or(0, |_| p(hl, "region: halo is not a number")))
                 }
             };
-            if c.set.is_some() && c.db.is_none() { die("--set needs --db"); }
             let feats = informed(&c, &mut ro, "region ");
             let mut r = reader::Reader::open_with(track, &ro);
             if let Some(f) = &feats { f.check_hash(&r); }
-            let set = c.set.as_deref().map(|n| feats.as_ref().unwrap().setidx(n));
+            let cols = feats.as_ref().map_or(Vec::new(), |f| f.setcols(c.set.as_deref()));
             let so = std::io::stdout();
             let mut o = BufWriter::new(so.lock());
-            r.region(seq.as_bytes(), lo, hi, hlo, feats.as_ref(), set, &mut o);
+            r.region(seq.as_bytes(), lo, hi, hlo, feats.as_ref(), &cols, &mut o);
             o.flush().unwrap_or_else(|e| die(&e.to_string()));
         }
         Cmd::Smooth { track, hier, fs, seq, start, end, rest } => {
@@ -289,6 +283,7 @@ fn parse_codec(s: &str, flag: &str) -> i32 {
 /// --aln needs --ref, and the two are read once, before any row.
 /// --db and --aln companions for a reader, in the C's order: features first.
 fn informed(c: &cli::Cli, ro: &mut reader::ReadOpts, who: &str) -> Option<db::Feats> {
+    if c.set.is_some() && c.db.is_none() { die("--set needs --db"); }
     let feats = c.db.as_deref().map(|fp| {
         let f = db::Feats::load(fp);
         eprintln!("features: {} ids, {} sets", f.id2lab.len(), f.sets.len());

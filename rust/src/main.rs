@@ -144,6 +144,8 @@ fn main() {
             if !rest.is_empty() { die("decode takes one track"); }
             let track = need(track);
             ro.aln = load_aln(&c.aln, &c.refbed, &c.aln_names, "decode ");
+            // The C refuses the flag pair before it opens the track.
+            if c.db.is_some() && c.out.is_none() { die("decode --db needs --out DIR for the per-set BEDs"); }
             let mut r = reader::Reader::open_with(track, &ro);
             match (&c.db, &c.out) {
                 (Some(fp), Some(d)) => {

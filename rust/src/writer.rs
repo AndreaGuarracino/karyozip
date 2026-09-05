@@ -580,6 +580,10 @@ impl Writer {
                 self.names.push(b'\n');
             }
         }
+        if ordinal && self.opt.names_out.is_some() && !self.opt.drop_names {
+            return Err("--names drop:FILE: the names are already the record ordinals, so a \
+                        file beside the track would be redundant; use --names keep to store them".into());
+        }
         if perm_on && !self.natord && ordinal && !self.opt.drop_names {
             self.names = std::mem::take(&mut self.natbuf);
             ordinal = false;

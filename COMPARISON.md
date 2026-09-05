@@ -73,8 +73,11 @@ the three names codecs over all 164 MB of read names where the C ranks them
 on a 200,000-name sample, and it compressed the tokeniser chunks serially.
 Both fixed, its names phase is now the faster one (92 s against 107 s) and
 its parser too (42 s against 55 s); `parse:append`, the serial row path, is
-where it still loses (14.0 s against 8.2 s). Decode is 38% slower and is
-the open item.
+where it still loses (14.0 s against 8.2 s). The decode number above
+predates two fixes found afterwards, the tokeniser chunks decoded serially
+and one `Vec` per sequence name; on a 5M-name track those took the Rust
+decode from 3.12 s to 1.76 s against the C's 1.52 s. The big track is to be
+re-measured.
 
 Compression: 17.17 GB of BED to 0.552 GB of `.kst`, 31.1x over the plain
 BED and 3.98x over gzip, 1.880 bytes per row. Sequence names are 30% of

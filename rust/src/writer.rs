@@ -587,11 +587,34 @@ impl Writer {
         }
         if ordinal { self.names.clear(); }
 
+        // Rank the three names codecs on a 200,000-name sample, then run the
+        // winner over the whole buffer. Running all three over every name is
+        // three times the work: a level 17 zstd of 9.4M ONT read names is
+        // 130 s on its own.
         let (mut nz, mut tokused, mut intused) = if ordinal {
             (Vec::new(), false, false)
         } else {
-            let b = best_names(&self.names, self.nidx, level, self.opt.slow);
-            (b.bytes, b.kind == 2, b.kind == 1)
+            let (mut q, mut smpn) = (0usize, 0u64);
+            while q < self.names.len() && smpn < 200_000 {
+                match memchr::memchr(b'\n', &self.names[q..]) {
+                    Some(k) => { q += k + 1; smpn += 1; }
+                    None => break,
+                }
+            }
+            let b = best_names(&self.names[..q], smpn, level, self.opt.slow);
+            if q == self.names.len() {
+                (b.bytes, b.kind == 2, b.kind == 1)      // the sample was all of it
+            } else {
+                let whole = match b.kind {
+                    1 => int_names(&self.names, self.nidx).map(|v| ffi::zstd(&v, level)),
+                    2 => tok_best(&self.names, self.opt.slow),
+                    _ => None,
+                };
+                match whole {
+                    Some(v) if !v.is_empty() => (v, b.kind == 2, b.kind == 1),
+                    _ => (ffi::zstd(&self.names, level), false, false),   // refused
+                }
+            }
         };
         // --sort keeps identity by storing a rank per record. Storing the
         // sorted names instead is sometimes smaller; the C compares and so
@@ -1034,10 +1057,11 @@ fn tok_chunked(names: &[u8], chunk: usize) -> Option<Vec<u8>> {
         p = e;
     }
     let nchunk = offs.len() - 1;
-    let mut blobs = Vec::with_capacity(nchunk);
-    for i in 0..nchunk {
-        blobs.push(ffi::tok_encode(&names[offs[i]..offs[i + 1]])?);
-    }
+    // One chunk per thread: 9.4M ONT read names is 38 chunks, and doing them
+    // in turn was the whole of the Rust's names phase. The C threads it too.
+    let blobs: Vec<Vec<u8>> = (0..nchunk).into_par_iter()
+        .map(|i| ffi::tok_encode(&names[offs[i]..offs[i + 1]]))
+        .collect::<Option<Vec<_>>>()?;
     // chunk size, chunk count, then the raw length of each chunk and the
     // coded length of each, then the blobs. c/karyozip.c tokc().
     let mut out = Vec::new();

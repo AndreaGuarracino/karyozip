@@ -16,7 +16,7 @@ ordinal=0; zcat "$(ls "$D"/*.bed.gz | head -1)" | head -1 | cut -f1 | grep -qE '
 alnnames=""; [ $ordinal = 1 ] && [ -s "$D/names.txt" ] && alnnames="--aln-names $D/names.txt"
 sets=$(head -1 "$FEAT" | cut -f2- | tr '\t' ' ')
 
-printf 'class\tdb\tbackend\tset\ttype\tinformed\tseekable\tmode\timpl\trows\tseqs\tbed_gz_B\tbed_plain_B\tkst_B\tindex_B\tcompanion_B\ttotal_B\tratio_gz\tratio_plain\tB_per_row\tencode_s\tencode_MB\tdecode_s\tdecode_MB\troundtrip\tquery_mean_ms\tquery_sd_ms\tquery_p50_ms\tquery_p99_ms\tthreads\n'
+printf 'class\tdb\tbackend\tset\ttype\tinformed\tseekable\tmode\timpl\trows\tseqs\tbed_gz_B\tbed_plain_B\tkst_B\tindex_B\tcompanion_B\ttotal_B\tratio_gz\tratio_plain\tB_per_row\tencode_s\tencode_MB\tdecode_s\tdecode_MB\tsmooth_s\tsmooth_MB\troundtrip\tquery_mean_ms\tquery_sd_ms\tquery_p50_ms\tquery_p99_ms\tthreads\n'
 
 best() { sort -n | head -1; }
 timed() {  # timed OUTFILE IN cmd... : fastest wall, largest RSS, or "refused refused"
@@ -49,7 +49,7 @@ row() {  # row SET KIND INFORMED SEEK MODE IMPL BIN INPUT(s) ENCFLAGS DECFLAGS C
   fi
   local es=$1 em=$2
   if [ "$es" = refused ]; then
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\tNA\tNA\t%s\tNA\tNA\tNA\tNA\trefused\tNA\tNA\tNA\trefused\tNA\tNA\tNA\tNA\t%s\n' \
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\tNA\tNA\t%s\tNA\tNA\tNA\tNA\trefused\tNA\tNA\tNA\tNA\tNA\trefused\tNA\tNA\tNA\tNA\t%s\n' \
       "$class" "$dbv" "$backend" "$set" "$kind" "$inf" "$seek" "$mode" "$impl" "$rows" "$seqs" "$gz" "$plain" "$comp" "$T"
     return
   fi
@@ -61,16 +61,21 @@ row() {  # row SET KIND INFORMED SEEK MODE IMPL BIN INPUT(s) ENCFLAGS DECFLAGS C
   else set -- $(timed "$W/back.bed" /dev/null "$bin" -t $T $df decode "$W/k.kst"); ds=$1; dm=$2
     cmp -s "$W/plain.bed" "$W/back.bed" && rt=exact || rt=DIFFERS
   fi
+  # an unsmoothed track is also smoothed, timed: what the tool replaces
+  local sm="NA NA"
+  if [ "$kind" = presmoothed ] && [ "$set" != ALL ] && [ -s "$HIER" ]; then
+    set -- $(timed /dev/null /dev/null "$bin" -t $T $df smooth "$W/k.kst" "$HIER" "$set"); sm="$1 $2"
+  fi
   local ix=0 q="NA NA NA NA"
   if [ "$seek" = seekable ] && [ "$set" != ALL ]; then
     cp "$W/k.kst" "$W/ki.kst"; "$bin" index "$W/ki.kst" >/dev/null 2>&1; ix=$(( $(stat -c%s "$W/ki.kst") - kst ))
     cut -f1 "$W/plain.bed" | uniq > "$W/names"; q=$(queries "$bin" "$W/ki.kst" "$W/names")
   fi
   local tot=$((kst + comp))
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
     "$class" "$dbv" "$backend" "$set" "$kind" "$inf" "$seek" "$mode" "$impl" "$rows" "$seqs" "$gz" "$plain" "$kst" "$ix" "$comp" "$tot" \
     "$(ratio $gz $tot)" "$(ratio $plain $tot)" "$(awk -v a=$kst -v b=$rows 'BEGIN{ if (b>0) printf "%.3f", a/b; else print "NA" }')" \
-    "$es" "$em" "$ds" "$dm" "$rt" $q "$T"
+    "$es" "$em" "$ds" "$dm" $sm "$rt" $q "$T"
 }
 
 pafB=$(stat -c%s "$PAF")

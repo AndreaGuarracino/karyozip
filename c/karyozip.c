@@ -1215,6 +1215,7 @@ static const seg *segat(const qseg *Q, uint64_t pos) {   /* last seg with q <= p
     return pos < g->q + g->n ? g : NULL;
 }
 static size_t runat(const rcon *rc, uint64_t tpos) {   /* count of starts <= tpos */
+    if (tpos >= rc->end) return 0;      /* past the last run: no answer, not the last run's */
     size_t a;
     if (rc == CR) {
         a = CRI;

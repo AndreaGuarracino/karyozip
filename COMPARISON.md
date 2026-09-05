@@ -8,18 +8,20 @@ the same words. Run it with `make diff`.
 ```
 codec versions: zstd=1.5.7 libbz3=1.5.3
 codecs: every candidate round-trips
-encode: 342 forms byte-identical
+encode: 342 forms identical
 decode: 95 forms give the input back
 cross-decode: the C reads the Rust's files
-region: 110 queries identical
+region: 110 forms identical
 index: byte-identical trailer
 sorted decode: 12 forms identical
 reader flags: 16 forms identical
 smooth: 27 forms identical
---db encode / decode: identical, restores all six inputs
+--db encode: identical / --db decode: identical, restores all six inputs
 --aln and aln-pack: 11 forms identical
 refusals: same message from both
+gzip input: 10 forms match the plain track
 cli: 69 forms give the same words and code
+DIFF_PASS
 ```
 
 ## Size

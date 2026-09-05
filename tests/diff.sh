@@ -13,6 +13,18 @@ rv=$("$R" --version | awk '/zstd|libbz3/{print $1"="$2}' | tr '\n' ' ')
 if [ "$cv" = "$rv" ]; then echo "codec versions: $cv"
 else echo "codec versions DIFFER: c=[$cv] rust=[$rv]"; fail=1; fi
 
+# Run both on the same input and arguments: stdout bytes and exit code must
+# match. IN names the stdin file. Every section below tallies with these.
+ok=0; bad=0
+both() {  # both LABEL args...
+  local l=$1; shift
+  "$C" "$@" < "${IN:-/dev/null}" > "$W/c.out" 2>/dev/null; local a=$?
+  "$R" "$@" < "${IN:-/dev/null}" > "$W/r.out" 2>/dev/null; local b=$?
+  if cmp -s "$W/c.out" "$W/r.out" && [ $a = $b ]; then ok=$((ok+1))
+  else bad=$((bad+1)); echo "  differs: $l"; fi
+}
+tally() { [ $bad = 0 ] && echo "$1: $ok forms identical" || { echo "$1: $bad of $((ok+bad)) DIFFER"; fail=1; }; ok=0; bad=0; }
+
 # 1. every codec gives the same bytes from both, and round-trips.
 for f in db.rall.bed db.chromosome.bed ls.bed; do
   "$R" codecs "$D/$f" 2>/dev/null | grep -q 'roundtrip=false' \
@@ -21,21 +33,16 @@ done
 echo "codecs: every candidate round-trips"
 
 # 2. encode must be byte-identical, over every fixture and flag.
-ok=0; bad=0
 for f in "$D"/*.bed; do
   for fl in "" "--block 4" "--block all" "--level 3" "--level 22" "--names keep" \
             "--slow" "--slow --block 4" "--tail 0" "--tail 1" "--names drop" \
             "--tok-chunk 250000" "--slow --level 22" \
             "--sort" "--sort --names keep" "--sort --names drop" "--sort=1M" \
             "--sort --block 4"; do
-    "$C" $fl encode < "$f" > "$W/c.kst" 2>/dev/null
-    "$R" $fl encode < "$f" > "$W/r.kst" 2>/dev/null
-    if cmp -s "$W/c.kst" "$W/r.kst"; then ok=$((ok+1))
-    else bad=$((bad+1)); echo "  encode differs: $(basename "$f") [$fl]"; fi
+    IN=$f both "encode $(basename "$f") [$fl]" $fl encode
   done
 done
-[ $bad = 0 ] && echo "encode: $ok forms byte-identical" \
-  || { echo "encode: $bad of $((ok+bad)) DIFFER"; fail=1; }
+tally encode
 
 # 3. decode: the Rust must give back exactly what was encoded.
 dok=0; dbad=0
@@ -58,22 +65,17 @@ done
 echo "cross-decode: the C reads the Rust's files"
 
 # 5. region: the same rows for every shape of query.
-rok=0; rbad=0
 for f in ls.bed s.bed db.rall.bed ord.bed; do
   for bl in "" "--block 4"; do
     "$C" $bl encode < "$D/$f" > "$W/t.kst" 2>/dev/null
     for seq in $(awk -F'\t' '{print $1}' "$D/$f" | uniq | head -3); do
       for q in "$seq" "$seq 50" "$seq 0 100" "$seq 0 100 2" "$seq 999999"; do
-        "$C" region "$W/t.kst" $q > "$W/c.out" 2>/dev/null; c1=$?
-        "$R" region "$W/t.kst" $q > "$W/r.out" 2>/dev/null; c2=$?
-        if cmp -s "$W/c.out" "$W/r.out" && [ $c1 = $c2 ]; then rok=$((rok+1))
-        else rbad=$((rbad+1)); echo "  region differs: $f [$bl] [$q]"; fi
+        both "region $f [$bl] [$q]" region "$W/t.kst" $q
       done
     done
   done
 done
-[ $rbad = 0 ] && echo "region: $rok queries identical" \
-  || { echo "region: $rbad of $((rok+rbad)) DIFFER"; fail=1; }
+tally region
 
 # 6. index: the same trailer, and each reads the other's.
 "$C" encode < "$D/db.rall.bed" > "$W/ci.kst" 2>/dev/null
@@ -82,75 +84,40 @@ cp "$W/ci.kst" "$W/ri.kst"
 "$R" index "$W/ri.kst" >/dev/null 2>&1
 if cmp -s "$W/ci.kst" "$W/ri.kst"; then echo "index: byte-identical trailer"
 else echo "index: TRAILERS DIFFER"; fail=1; fi
-"$C" region "$W/ri.kst" seq0005 > "$W/a" 2>/dev/null
-"$R" region "$W/ci.kst" seq0005 > "$W/b" 2>/dev/null
-cmp -s "$W/a" "$W/b" || { echo "index: cross-read DIFFERS"; fail=1; }
+both "index cross-read" region "$W/ci.kst" seq0005; tally "index cross-read"
 
 # 6b. a sorted track: the Rust must resolve the ranks the same way.
-sdok=0; sdbad=0
 for f in ls.bed s.bed db.rall.bed ord.bed; do
   for fl in "--sort" "--sort --names keep"; do
     "$C" $fl encode < "$D/$f" > "$W/t.kst" 2>/dev/null
-    "$C" decode "$W/t.kst" > "$W/c.out" 2>/dev/null; c1=$?
-    "$R" decode "$W/t.kst" > "$W/r.out" 2>/dev/null; c2=$?
-    if cmp -s "$W/c.out" "$W/r.out" && [ $c1 = $c2 ]; then sdok=$((sdok+1))
-    else sdbad=$((sdbad+1)); echo "  sorted decode differs: $f [$fl]"; fi
+    both "sorted decode $f [$fl]" decode "$W/t.kst"
   done
   "$C" --sort --names drop encode < "$D/$f" > "$W/t.kst" 2>/dev/null
-  "$C" --names ordinal decode "$W/t.kst" > "$W/c.out" 2>/dev/null; c1=$?
-  "$R" --names ordinal decode "$W/t.kst" > "$W/r.out" 2>/dev/null; c2=$?
-  if cmp -s "$W/c.out" "$W/r.out" && [ $c1 = $c2 ]; then sdok=$((sdok+1))
-  else sdbad=$((sdbad+1)); echo "  sorted+drop differs: $f"; fi
+  both "sorted+drop $f" --names ordinal decode "$W/t.kst"
 done
-[ $sdbad = 0 ] && echo "sorted decode: $sdok forms identical" \
-  || { echo "sorted decode: $sdbad DIFFER"; fail=1; }
+tally "sorted decode"
 
 # 7. the reader's flags: dropped names, a sidecar, --raw.
-fok=0; fbad=0
 for f in ls.bed s.bed db.rall.bed ord.bed; do
   "$C" encode --names drop < "$D/$f" > "$W/d.kst" 2>/dev/null
-  for dfl in "--names ordinal" "--raw"; do
-    "$C" $dfl decode "$W/d.kst" > "$W/c.out" 2>/dev/null; c1=$?
-    "$R" $dfl decode "$W/d.kst" > "$W/r.out" 2>/dev/null; c2=$?
-    if cmp -s "$W/c.out" "$W/r.out" && [ $c1 = $c2 ]; then fok=$((fok+1))
-    else fbad=$((fbad+1)); echo "  decode $dfl differs on $f"; fi
-  done
+  for dfl in "--names ordinal" "--raw"; do both "decode $dfl on $f" $dfl decode "$W/d.kst"; done
   "$C" encode --names "drop:$W/side" < "$D/$f" > "$W/s.kst" 2>/dev/null
-  "$C" --names "$W/side" decode "$W/s.kst" > "$W/c.out" 2>/dev/null; c1=$?
-  "$R" --names "$W/side" decode "$W/s.kst" > "$W/r.out" 2>/dev/null; c2=$?
-  if cmp -s "$W/c.out" "$W/r.out" && [ $c1 = $c2 ]; then fok=$((fok+1))
-  else fbad=$((fbad+1)); echo "  sidecar differs on $f"; fi
+  both "sidecar $f" --names "$W/side" decode "$W/s.kst"
   "$C" encode < "$D/$f" > "$W/p.kst" 2>/dev/null
-  "$C" --raw decode "$W/p.kst" > "$W/c.out" 2>/dev/null
-  "$R" --raw decode "$W/p.kst" > "$W/r.out" 2>/dev/null
-  cmp -s "$W/c.out" "$W/r.out" && fok=$((fok+1)) \
-    || { fbad=$((fbad+1)); echo "  --raw differs on $f"; }
+  both "--raw $f" --raw decode "$W/p.kst"
 done
-[ $fbad = 0 ] && echo "reader flags: $fok forms identical" \
-  || { echo "reader flags: $fbad DIFFER"; fail=1; }
+tally "reader flags"
 
 # 8. smooth: the same rows, over a real hierarchy shape.
 printf 'feature_set\tchild\tparent\nfs\tA\tcategorized\nfs\tB\tcategorized\nfs\tC\tcategorized\nfs\tD\tcategorized\n' > "$W/h.tsv"
-sok=0; sbad=0
 for f in ls.bed s.bed db.rall.bed; do
   "$C" encode < "$D/$f" > "$W/t.kst" 2>/dev/null
-  for q in "" "--v1" "--max-gap 5" "--max-gap 100000" "--halo 1"; do
-    "$C" $q smooth "$W/t.kst" "$W/h.tsv" fs > "$W/c.out" 2>/dev/null; c1=$?
-    "$R" $q smooth "$W/t.kst" "$W/h.tsv" fs > "$W/r.out" 2>/dev/null; c2=$?
-    if cmp -s "$W/c.out" "$W/r.out" && [ $c1 = $c2 ]; then sok=$((sok+1))
-    else sbad=$((sbad+1)); echo "  smooth differs: $f [$q]"; fi
-  done
+  for q in "" "--v1" "--max-gap 5" "--max-gap 100000" "--halo 1"; do both "smooth $f [$q]" $q smooth "$W/t.kst" "$W/h.tsv" fs; done
   for seq in $(awk -F'\t' '{print $1}' "$D/$f" | uniq | head -2); do
-    for q in "$seq" "$seq 0 100"; do
-      "$C" smooth "$W/t.kst" "$W/h.tsv" fs $q > "$W/c.out" 2>/dev/null; c1=$?
-      "$R" smooth "$W/t.kst" "$W/h.tsv" fs $q > "$W/r.out" 2>/dev/null; c2=$?
-      if cmp -s "$W/c.out" "$W/r.out" && [ $c1 = $c2 ]; then sok=$((sok+1))
-      else sbad=$((sbad+1)); echo "  smooth differs: $f [$q]"; fi
-    done
+    for q in "$seq" "$seq 0 100"; do both "smooth $f [$q]" smooth "$W/t.kst" "$W/h.tsv" fs $q; done
   done
 done
-[ $sbad = 0 ] && echo "smooth: $sok forms identical" \
-  || { echo "smooth: $sbad DIFFER"; fail=1; }
+tally smooth
 
 # 9. --db, both directions.
 DB="$D/db.acrocentric.bed $D/db.chromosome.bed $D/db.gene.bed $D/db.region.bed $D/db.repeat.bed $D/db.subtelomeric.bed"

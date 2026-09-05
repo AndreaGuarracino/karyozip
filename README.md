@@ -11,8 +11,16 @@ Two implementations, `c/` and `rust/`, which produce the same bytes.
 ```
 make            # both binaries
 make test       # the C suite: ~256 checks, LeakSanitizer, five fuzz stages
-make diff       # the C and the Rust must agree
+make diff       # the C and the Rust must agree on the small fixtures
+make matrix     # and on two real HPRC assembly cells, every set, strategy, flag and reader
+make rust-test  # the C's own suite and fuzzer, run against the Rust
 ```
+
+`tests/bench.sh CELLDIR PAF FEATURES HIER REFDIR` prints the benchmark
+table, one TSV row per set, smoothing, strategy, seekability and
+implementation: sizes, ratios, round trip, encode/decode/smooth time and
+memory, and query latency. `tests/mkfix.py` cuts a real cell down to a
+fixture on the cluster.
 
 ## Commands
 

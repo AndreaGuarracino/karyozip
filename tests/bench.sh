@@ -9,6 +9,7 @@ set -u
 D=$1; PAF=$2; FEAT=$3; HIER=$4; REFD=$5
 C=${6:-$(dirname "$0")/../c/build/karyozip}; R=${7:-$(dirname "$0")/../rust/target/release/karyozip}
 T=${THREADS:-8}; NQ=${NQ:-1000}; REPS=${REPS:-3}
+NQ_ALN=${NQ_ALN:-100}   # an aln-informed query parses the whole reference track, seconds each
 W=$(mktemp -d); trap 'rm -rf "$W"' EXIT; export TMPDIR=$W
 cell=$(basename "$D"); smp=${cell%%.*}; dbv=$(echo "$cell" | cut -d. -f2); backend=$(echo "$cell" | cut -d. -f3 | tr a-z A-Z)
 case $smp in asm_*) class=assembly;; ont_*) class=long_ONT;; hifi_*) class=long_HiFi;; short_*) class=short;; *) class=$smp;; esac
@@ -71,7 +72,7 @@ row() {  # row SET KIND INFORMED SEEK MODE IMPL BIN INPUT(s) ENCFLAGS DECFLAGS C
   local ix=0 q="NA NA NA NA"
   if [ "$seek" = seekable ] && [ "$set" != ALL ]; then
     cp "$W/k.kst" "$W/ki.kst"; "$bin" index "$W/ki.kst" >/dev/null 2>&1; ix=$(( $(stat -c%s "$W/ki.kst") - kst ))
-    cut -f1 "$W/plain.bed" | uniq > "$W/names"; q=$(queries "$bin" "$df" "$W/ki.kst" "$W/names")
+    cut -f1 "$W/plain.bed" | uniq > "$W/names"; q=$(NQ=$([ "$inf" = not-informed ] || [ "$inf" = db-informed ] && echo $NQ || echo $NQ_ALN) queries "$bin" "$df" "$W/ki.kst" "$W/names")
   fi
   local tot=$((kst + comp))
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \

@@ -71,7 +71,7 @@ pub type RowFn<'a> = dyn FnMut(&[u8], u64, u64, &[u8]) + 'a;
 pub struct ReadOpts {
     pub raw: bool,
     pub db: bool,
-    pub aln: Option<crate::aln::Aln>,
+    pub aln: Option<std::rc::Rc<crate::aln::Aln>>,
     pub ordnames: bool,
     pub names_file: Option<String>,
 }
@@ -111,7 +111,7 @@ pub struct Reader {
     cur_pend: u64,
     cached: Option<(usize, std::rc::Rc<Vec<u8>>, usize, u64)>,
     feathash: u64,
-    aln: Option<crate::aln::Aln>,
+    aln: Option<std::rc::Rc<crate::aln::Aln>>,
     lenfile: bool,
     /// --raw shows what is stored, so a zero length is the answer, not a fault.
     raw: bool,

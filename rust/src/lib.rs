@@ -58,6 +58,26 @@ pub fn unzip(r: impl std::io::Read + 'static) -> Box<dyn std::io::Read> {
     if gz { Box::new(flate2::read::MultiGzDecoder::new(b)) } else { Box::new(b) }
 }
 
+/// A text input one line at a time, plain or gzipped, without holding the
+/// file: a reference track is a gigabyte of text for 24 million runs.
+pub struct Lines { r: std::io::BufReader<Box<dyn std::io::Read>>, buf: Vec<u8> }
+impl Lines {
+    pub fn open(path: &str, what: &'static str) -> Lines {
+        let f = std::fs::File::open(path).unwrap_or_else(|_| bail(what));
+        Lines { r: std::io::BufReader::with_capacity(1 << 20, unzip(f)), buf: Vec::new() }
+    }
+    /// The next line without its newline, or None at the end.
+    pub fn next_line(&mut self) -> Option<&[u8]> {
+        use std::io::BufRead;
+        self.buf.clear();
+        match self.r.read_until(b'\n', &mut self.buf) {
+            Ok(0) => None,
+            Ok(_) => { if self.buf.last() == Some(&b'\n') { self.buf.pop(); } Some(&self.buf) }
+            Err(_) => bail("read error"),
+        }
+    }
+}
+
 fn inflate(d: &[u8], what: &'static str) -> Vec<u8> {
     use std::io::Read;
     let mut v = Vec::new();

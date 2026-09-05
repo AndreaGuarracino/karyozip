@@ -39,10 +39,10 @@ impl Aln {
 
     /// The reference track: one contig's rows together, sorted, gapless.
     pub fn load_ref(&mut self, path: &str) {
-        let data = crate::slurp(path, "cannot open the reference track");
+        let mut lines = crate::Lines::open(path, "cannot open the reference track");
         let mut rh = FNV0;
         let (mut badln, mut cur) = (0u64, usize::MAX);
-        for raw in data.split(|&c| c == b'\n') {
+        while let Some(raw) = lines.next_line() {
             let mut line = raw;
             if line.last() == Some(&b'\r') { line = &line[..line.len() - 1]; }
             let c: Vec<&[u8]> = line.splitn(4, |&x| x == b'\t').collect();
@@ -77,9 +77,9 @@ impl Aln {
 
     /// The PAF, read for its cg:Z: CIGARs. Everything else is dead weight.
     pub fn load_paf(&mut self, path: &str) {
-        let data = crate::slurp(path, "cannot open the PAF");
+        let mut lines = crate::Lines::open(path, "cannot open the PAF");
         let (mut nblk, mut badpaf, mut nocg, mut noref) = (0usize, 0u64, 0u64, 0u64);
-        for raw in data.split(|&c| c == b'\n') {
+        while let Some(raw) = lines.next_line() {
             let mut line = raw;
             if line.last() == Some(&b'\r') { line = &line[..line.len() - 1]; }
             if line.is_empty() { continue; }

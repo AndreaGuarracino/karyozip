@@ -3328,7 +3328,6 @@ static uint8_t *ANC = NULL;
 static int16_t *LCA = NULL;
 static int ROOTID = -1;
 static uint64_t MAXGAP = 1000;
-static uint64_t HALO = UINT64_MAX;   /* --halo: runs of context, default the whole sequence */
 /* runs of context around a requested region */
 
 static int nodeid(const char *nm, size_t n) {
@@ -3627,18 +3626,9 @@ static void smooth_mt(const char *path, R *r0, int64_t first, int64_t last,
             for (int64_t ri = a; ri < b; ri++) {
                 uint64_t *st, *en; int *feat; uint8_t *novel;
                 uint64_t n = loadseq(rr, ri, &st, &en, &feat, &novel, labmap);
-                uint64_t p = 0, q = n;
-                if (hi) {
-                    uint64_t f = n, l = 0;
-                    for (uint64_t k = 0; k < n; k++)
-                        if (en[k] > lo && st[k] < hi) { if (k < f) f = k; l = k; }
-                    if (f > l) continue;
-                    p = f > HALO ? f - HALO : 0;
-                    q = n - l - 1 <= HALO ? n : l + HALO + 1;
-                }
-                smooth_one(st + p, en + p, feat + p, q - p);
-                emit_buf(&ob, &cap, &len, rr->name[ri], st + p, en + p, feat + p,
-                         novel + p, q - p, lo, hi, v1);
+                if (hi && (!n || lo >= en[n - 1])) continue;   /* the range misses it */
+                smooth_one(st, en, feat, n);   /* the whole sequence: a range only cuts the output */
+                emit_buf(&ob, &cap, &len, rr->name[ri], st, en, feat, novel, n, lo, hi, v1);
             }
 #ifdef _OPENMP
 #pragma omp ordered
@@ -3686,20 +3676,12 @@ static void smoothcmd(const char *path, const char *hier, const char *fs,
         uint64_t n = loadseq(r, ri, &st, &en, &feat, &novel, labmap);
         PH_ADD(6, _t);
 
-        uint64_t a = 0, b = n;
-        if (hi) {
-            uint64_t f = n, l = 0;
-            for (uint64_t k = 0; k < n; k++)
-                if (en[k] > lo && st[k] < hi) { if (k < f) f = k; l = k; }
-            if (f > l) continue;
-            a = f > HALO ? f - HALO : 0;
-            b = n - l - 1 <= HALO ? n : l + HALO + 1;
-        }
+        if (hi && (!n || lo >= en[n - 1])) continue;
         _t = nowsec();
-        smooth_one(st + a, en + a, feat + a, b - a);
+        smooth_one(st, en, feat, n);
         PH_ADD(4, _t);
         _t = nowsec();
-        emit(r->name[ri], st + a, en + a, feat + a, novel + a, b - a, lo, hi, v1);
+        emit(r->name[ri], st, en, feat, novel, n, lo, hi, v1);
         PH_ADD(5, _t);
     }
     free(labmap); rclose(r);
@@ -4037,7 +4019,7 @@ int main(int argc, char **argv) {
             "               region prints one label per set under --db\n"
             "  with --aln:  --aln-names FILE, on encode and decode, when the track\n"
             "               names rows by ordinal\n"
-            "  smooth:      --max-gap N  --halo N  --v1\n"
+            "  smooth:      --max-gap N  --v1\n"
             "  Two variables are read, and neither changes the stored bytes:\n"
             "    TMPDIR         where temp files go, when --tmp-dir is not given\n"
             "    OMP_NUM_THREADS  the thread count, when --threads is not given";
@@ -4056,7 +4038,7 @@ int main(int argc, char **argv) {
     static const struct { const char *f; int nv; } FLAGS[] = {
         {"--version",0},{"--threads",1},{"-t",1},{"--profile",0},{"--tmp-dir",1},{"--names",1},
         {"--tok-chunk",1},{"--tail",1},{"--id-codec",1},{"--len-codec",1},
-        {"--max-gap",1},{"--halo",1},{"--v1",0},{"--aln-names",1},{"--sort",0},
+        {"--max-gap",1},{"--v1",0},{"--aln-names",1},{"--sort",0},
         {"--slow",0},
         {"--block",1},{"--level",1},{"--db",1},{"--aln",1},
         {"--ref",1},{"--out",1},{"--raw",0},
@@ -4108,7 +4090,6 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--len-codec")) { ok = enc;
             LENCODEC = (int)int_arg(v, 0, 0x7fffffff, "--len-codec needs a codec id"); take = 2; }
         else if (!strcmp(a, "--max-gap")) { ok = sm; MAXGAP = num_arg(v, UINT64_MAX, "--max-gap needs a number"); take = 2; }
-        else if (!strcmp(a, "--halo")) { ok = sm; HALO = num_arg(v, UINT64_MAX, "--halo needs a number"); take = 2; }
         else if (!strcmp(a, "--v1")) { ok = sm; V1 = 1; take = 1; }
         else if (!strcmp(a, "--aln-names")) {   /* the alignment's own table: ordinal N is line N+1 */
             ok = inf; ALNNAMES = v; take = 2; }
@@ -4131,6 +4112,8 @@ int main(int argc, char **argv) {
         if (take) { for (int j = i; j + take <= argc; j++) argv[j] = argv[j + take]; argc -= take; i--; }
     }
     if (!*cmd) die(USAGE);   /* flags but no command: argv[1] is now past the end */
+    for (int i = 2; i < argc; i++)   /* what the loop left is positional; "-" alone is stdin */
+        if (argv[i][0] == '-' && argv[i][1]) { fprintf(stderr, "karyozip: unknown flag %s\n", argv[i]); exit(1); }
     if ((IDCODEC >= 0 && badcodec(IDCODEC)) || (LENCODEC >= 0 && badcodec(LENCODEC))) die("--id-codec and --len-codec take a codec id, not any number");
     if (nosz(IDCODEC) || nosz(LENCODEC)) die("a NOSZ codec (0x10) stores no size and is not accepted");
     if (noext(IDCODEC) || noext(LENCODEC)) die("arith X_EXT (0x04) needs libbz2 and is not accepted");
@@ -4154,7 +4137,6 @@ int main(int argc, char **argv) {
 
         char *freearg[64]; int nfree = 0;
         for (int i = 2; i < argc; i++) {
-            if (argv[i][0] == '-' && argv[i][1]) die("unknown encode flag");  /* "-" alone is stdin */
             if (nfree == 64) die("too many input files");
             freearg[nfree++] = argv[i];
         }
@@ -4187,7 +4169,6 @@ int main(int argc, char **argv) {
     else if (!strcmp(argv[1], "decode") && argc > 2) {
         const char *f = NULL;
         for (int i = 2; i < argc; i++) {
-            if (argv[i][0] == '-') die("unknown decode flag");
             if (f) die("decode takes one track");
             f = argv[i];
         }

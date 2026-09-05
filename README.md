@@ -53,7 +53,7 @@ karyozip aln-pack P.paf REF.bed OUT     packs a PAF to only what --aln reads
 | `--aln-names F` | ordinal N is line N+1 of `F` |
 | `--names F`, `--names ordinal` | on the readers |
 | `--raw`, `--out DIR` | on decode |
-| `--max-gap N`, `--halo N`, `--v1` | on smooth; `--halo` is the runs of context around SEQ START END, default the whole sequence, which is exact |
+| `--max-gap N`, `--v1` | on smooth; `SEQ START END` smooths the whole sequence and prints the overlap, so it equals the full smooth |
 | `--threads N`, `-t N` | 1 to 1024. Default `OMP_NUM_THREADS`, else cores capped at 8 |
 | `--tmp-dir DIR`, `--profile`, `--help`, `--version` | any command |
 

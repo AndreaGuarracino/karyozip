@@ -69,9 +69,6 @@ pub struct Cli {
     /// smooth: the largest gap two runs may span
     #[arg(long = "max-gap", global = true, value_name = "N")]
     pub max_gap: Option<String>,
-    /// smooth: runs of context around a requested region
-    #[arg(long, global = true, value_name = "N")]
-    pub halo: Option<String>,
     /// smooth: v1 label names, dropping the _specific suffix
     #[arg(long, global = true)]
     pub v1: bool,
@@ -174,7 +171,6 @@ impl Cli {
         if self.refbed.is_some() && !inf { bad("--ref")?; }
         if self.aln_names.is_some() && !inf { bad("--aln-names")?; }
         if self.max_gap.is_some() && !sm { bad("--max-gap")?; }
-        if self.halo.is_some() && !sm { bad("--halo")?; }
         if self.v1 && !sm { bad("--v1")?; }
         for n in &self.names {
             let enc_form = n == "keep" || n == "drop" || n.starts_with("drop:");

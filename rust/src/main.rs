@@ -193,7 +193,6 @@ fn main() {
             let (track, hier, fs) = (need(track), need(hier), need(fs));
             if !rest.is_empty() { die("smooth: give SEQ, or SEQ START END"); }
             let maxgap = num(&c.max_gap, 0, u64::MAX, "--max-gap needs a number").unwrap_or(1000);
-            let halo = num(&c.halo, 0, u64::MAX, "--halo needs a number").unwrap_or(u64::MAX);
             let (lo, hi) = match (start, end) {
                 (Some(a), Some(b)) => (
                     a.parse().unwrap_or_else(|_| die("smooth: start is not a number")),
@@ -206,7 +205,7 @@ fn main() {
             let so = std::io::stdout();
             let mut o = BufWriter::new(so.lock());
             smooth::run(track, hier, fs.as_bytes(), seq.as_ref().map(|s| s.as_bytes()),
-                        lo, hi, c.v1, maxgap, halo, &ro, feats.as_ref(), &mut o);
+                        lo, hi, c.v1, maxgap, &ro, feats.as_ref(), &mut o);
             o.flush().unwrap_or_else(|e| die(&e.to_string()));
         }
         Cmd::Index { track, rest: _ } => {

@@ -187,7 +187,7 @@ fn emit(h: &Hier, out: &mut Vec<u8>, seq: &[u8], st: &[u64], en: &[u64],
 
 #[allow(clippy::too_many_arguments)]
 pub fn run(path: &str, hier: &str, fs: &[u8], seq: Option<&[u8]>,
-           lo: u64, hi: u64, v1: bool, maxgap: u64, halo: u64,
+           lo: u64, hi: u64, v1: bool, maxgap: u64,
            ro: &crate::reader::ReadOpts, feats: Option<&crate::db::Feats>, out: &mut impl Write) {
     let mut h = Hier::load(hier, fs);
     h.build();
@@ -221,21 +221,14 @@ pub fn run(path: &str, hier: &str, fs: &[u8], seq: Option<&[u8]>,
         let _s = crate::prof::span(6);
         let (st, en, mut feat, novel) = r.seq_rows(ri, &labmap, &novelid, h.root);
         drop(_s);
-        let n = feat.len();
-        let (mut a, mut b) = (0usize, n);
-        if hi > 0 {
-            let (mut f, mut l) = (n, 0usize);
-            for k in 0..n { if en[k] > lo && st[k] < hi { if k < f { f = k; } l = k; } }
-            if f > l { continue; }
-            a = f.saturating_sub(halo as usize);
-            b = if n - l - 1 <= halo as usize { n } else { l + halo as usize + 1 };
-        }
+        // The whole sequence is smoothed; a range only cuts the output.
+        if hi > 0 && en.last().is_none_or(|&e| lo >= e) { continue; }
         let _s = crate::prof::span(4);
-        smooth_one(&h, &st[a..b], &en[a..b], &mut feat[a..b], maxgap);
+        smooth_one(&h, &st, &en, &mut feat, maxgap);
         drop(_s);
         let name = r.name_at(ri).to_vec();
         let _s = crate::prof::span(5);
-        emit(&h, &mut buf, &name, &st[a..b], &en[a..b], &feat[a..b], &novel[a..b], lo, hi, v1);
+        emit(&h, &mut buf, &name, &st, &en, &feat, &novel, lo, hi, v1);
         drop(_s);
         if buf.len() > (1 << 20) - 4096 {
             out.write_all(&buf).unwrap_or_else(|_| crate::bail("write failed"));

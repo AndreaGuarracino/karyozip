@@ -27,12 +27,14 @@ timed() {  # timed OUTFILE IN cmd... : fastest wall, largest RSS, or "refused re
   echo "$(cut -d' ' -f1 "$W/t" | best) $(( $(cut -d' ' -f2 "$W/t" | sort -n | tail -1) / 1024 ))"
 }
 ratio() { awk -v a=$1 -v b=$2 'BEGIN{ if (b > 0) printf "%.2f", a/b; else print "NA" }'; }
-queries() {  # queries BIN KST NAMEFILE : NQ random point queries, ms stats
-  local b=$1 k=$2 nf=$3; : > "$W/q"
+queries() {  # queries BIN "FLAGS" KST NAMEFILE : NQ random point queries, ms stats; NA unless every one answered
+  local b=$1 fl=$2 k=$3 nf=$4; : > "$W/q"; : > "$W/qbad"
   shuf -n $NQ --random-source=<(yes) "$nf" | while read -r nm; do
-    s=$(date +%s%N); "$b" region "$k" "$nm" 100 > /dev/null 2>&1; e=$(date +%s%N)
+    s=$(date +%s%N); "$b" $fl region "$k" "$nm" 100 > "$W/qo" 2>/dev/null || echo x >> "$W/qbad"; e=$(date +%s%N)
+    [ -s "$W/qo" ] || echo x >> "$W/qbad"
     echo $(( (e - s) / 1000 )) >> "$W/q"
   done
+  if [ -s "$W/qbad" ]; then echo "queries: $(wc -l < "$W/qbad") of $NQ refused or empty for $b $fl $k" >&2; echo "NA NA NA NA"; return; fi
   awk '{x[NR]=$1/1000; s+=x[NR]; ss+=x[NR]*x[NR]} END{n=NR; m=s/n; sd=sqrt(ss/n-m*m); asort(x); printf "%.3f %.3f %.3f %.3f", m, sd, x[int(n*0.5)+1], x[int(n*0.99)]}' "$W/q"
 }
 
@@ -69,7 +71,7 @@ row() {  # row SET KIND INFORMED SEEK MODE IMPL BIN INPUT(s) ENCFLAGS DECFLAGS C
   local ix=0 q="NA NA NA NA"
   if [ "$seek" = seekable ] && [ "$set" != ALL ]; then
     cp "$W/k.kst" "$W/ki.kst"; "$bin" index "$W/ki.kst" >/dev/null 2>&1; ix=$(( $(stat -c%s "$W/ki.kst") - kst ))
-    cut -f1 "$W/plain.bed" | uniq > "$W/names"; q=$(queries "$bin" "$W/ki.kst" "$W/names")
+    cut -f1 "$W/plain.bed" | uniq > "$W/names"; q=$(queries "$bin" "$df" "$W/ki.kst" "$W/names")
   fi
   local tot=$((kst + comp))
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \

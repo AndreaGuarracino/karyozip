@@ -89,9 +89,17 @@ pub struct Reader {
     taildec: bool,
     tailpred: u64,
     tailskip: u64,
-    /// every name, newline-free, back to back; noff[i]..noff[i+1] is name i
-    pub names: Vec<u8>,
-    noff: Vec<u32>,
+    /// every name, newline-free, back to back, and noff[i]..noff[i+1] is
+    /// name i: decoded from nz/pz on first use
+    names: std::cell::OnceCell<(Vec<u8>, Vec<u32>)>,
+    nz: Vec<u8>,
+    pz: Vec<u8>,
+    names_file: Option<String>,
+    ordnames: bool,
+    /// side, perm_ext, dropped, int, tok, perm, perm_tok
+    nf: u8,
+    /// the appended index: offset of its key table, and its trailer's binding word
+    idx: Option<(u64, u64)>,
     /// name -> rank, built on the first lookup, which is also where the C
     /// notices that two sequences share a name.
     nameix: std::cell::OnceCell<HashMap<Vec<u8>, u64>>,
@@ -144,6 +152,7 @@ impl Reader {
         let h1_raw = h[1];
         let mut fsz = rd(f.seek(SeekFrom::End(0)), "seek");
         let mut hasidx = false;
+        let mut idx = None;
         // An index trailer sits past the data: take it off, so every size
         // check below still bounds the data alone.
         if fsz >= 32 + 8 + 128 {
@@ -153,7 +162,9 @@ impl Reader {
             let w: Vec<u64> = (0..4)
                 .map(|i| u64::from_le_bytes(t[i * 8..i * 8 + 8].try_into().unwrap())).collect();
             if w[3] == IDXMAGIC && w[0] == h[0] && w[0] <= (fsz - 32) / 20
-                && fsz - 32 - w[0] * 20 >= 8 + 128 { fsz -= 32 + w[0] * 20; hasidx = true; }
+                && fsz - 32 - w[0] * 20 >= 8 + 128 {
+                fsz -= 32 + w[0] * 20; hasidx = true; idx = Some((fsz, w[2]));
+            }
         }
         let nml = h[1] & !FLAGS;
         if nml > fsz || h[2] > fsz || h[3] > fsz || h[6] > fsz || h[11] > fsz
@@ -357,67 +368,12 @@ impl Reader {
         // so --names FILE is the source there, not a replacement.
         let perm_ext = was_perm && pz.is_empty();
 
-        // The names, by whichever codec stored them.
-        let namebuf = if let (Some(f), false) = (&o.names_file, was_side || perm_ext) {
-            if !dropped && nzl > 0 {
-                crate::bail("this track stores its own names: --names FILE would replace them, so it is refused. Unset it to read the names in the file");
-            }
-            read_name_file(f, h[0])
-        } else if dropped && nzl == 0 {
-            if !o.raw && !o.ordnames {
-                crate::bail("the names of this track were dropped at encode time: give them back with --names FILE, or pass --names ordinal to accept the ordinals that are stored instead");
-            }
-            ordinals(h[0])
-        } else if nzl == 0 {
-            ordinals(h[0])
-        } else if names_int {
-            int_names_d(&nz, h[0])
-        } else if names_tok {
-            tok_d(&nz)
-        } else {
-            zdec(&nz, "names")
-        };
-        let mut names = namebuf;
-        if names.last() == Some(&b'\n') { names.pop(); }
-        let mut noff: Vec<u32> = vec![0];
-        if !names.is_empty() {
-            for (i, &c) in names.iter().enumerate() { if c == b'\n' { noff.push(i as u32 + 1); } }
-            noff.push(names.len() as u32 + 1);
+        // The names are decoded on first use: a query through the index
+        // never needs them, and a short-read track has 20 million.
+        let mut nf = 0u8;
+        for (bit, on) in [(1, was_side), (2, perm_ext), (4, dropped), (8, names_int), (16, names_tok), (32, was_perm), (64, perm_tok)] {
+            if on { nf |= bit; }
         }
-        if noff.len() as u64 - 1 != h[0] {
-            crate::bail("names stream does not match the track's sequence count");
-        }
-        // --sort stores a rank per record; the input-order names sit beside
-        // them, or come from --names FILE when the blob is empty.
-        if (was_perm && !pz.is_empty()) || perm_ext {
-            let resolve = if perm_ext {
-                match &o.names_file {
-                    Some(f) => Some(read_name_file(f, h[0])),
-                    None if o.raw || o.ordnames => None,
-                    None => crate::bail("--sort --no-names keeps the rank of every record and no name text: give the original FASTA/FASTQ in --names FILE, or --ordinal-names to see the ranks"),
-                }
-            } else if perm_tok {
-                Some(tok_d(&pz))
-            } else {
-                Some(zdec(&pz, "input-order names"))
-            };
-            if let Some(nat) = resolve {
-                let tab: Vec<&[u8]> = nat.split(|&c| c == b'\n').filter(|l| !l.is_empty()).collect();
-                if tab.len() as u64 != h[0] {
-                    crate::bail("input-order names do not match the track's sequence count");
-                }
-                let (mut nn, mut no) = (Vec::new(), vec![0u32]);
-                for i in 0..noff.len() - 1 {
-                    let n = &names[noff[i] as usize..noff[i + 1] as usize - 1];
-                    let v: u64 = std::str::from_utf8(n).ok().and_then(|t| t.parse().ok())
-                        .unwrap_or_else(|| crate::bail("a stored rank is not a record number"));
-                    if v >= h[0] { crate::bail("a stored rank is not a record number"); }
-                    nn.extend_from_slice(tab[v as usize]); nn.push(b'\n'); no.push(nn.len() as u32);
-                }
-                names = nn; noff = no;
-            }
-        }
-
         let (lenc, idc) = (h[5] as u32 as i32, h[9] as u32 as i32);
         if crate::ffi::nosz(lenc) || crate::ffi::nosz(idc) {
             crate::bail("corrupt file: a NOSZ codec cannot be size-checked");
@@ -430,7 +386,9 @@ impl Reader {
             f, nreads: h[0], rows: h[4], lab, block: blk, b, data0,
             nameix: std::cell::OnceCell::new(),
             idcodec: idc, lencodec: lenc,
-            taildec, tailpred: h[12], tailskip: h[13] & 0xff, names, noff, ibx,
+            taildec, tailpred: h[12], tailskip: h[13] & 0xff, ibx,
+            names: std::cell::OnceCell::new(), nz, pz, names_file: o.names_file.clone(),
+            ordnames: o.ordnames, nf, idx,
             hasidx, mhash: h[15], cur_ri: 0, cur_q: 0, cur_pend: 0, cached: None,
             feathash: (h[5] >> 32) | ((h[9] >> 32) << 32),
             aln: o.aln.clone(), lenfile: h[1] & LENFLAG != 0 && !o.raw, raw: o.raw,
@@ -683,7 +641,125 @@ impl Reader {
         out.extend_from_slice(l);
     }
 
+    /// What the C's ensurenames does: the names, by whichever codec stored
+    /// them, or from --names FILE, or the ordinals.
+    fn decode_names(&self) -> (Vec<u8>, Vec<u32>) {
+        let (side, perm_ext, dropped) = (self.nf & 1 != 0, self.nf & 2 != 0, self.nf & 4 != 0);
+        let (names_int, names_tok, was_perm, perm_tok) = (self.nf & 8 != 0, self.nf & 16 != 0, self.nf & 32 != 0, self.nf & 64 != 0);
+        let (nz, pz, n) = (&self.nz, &self.pz, self.nreads);
+        let mut names = if let (Some(f), false) = (&self.names_file, side || perm_ext) {
+            if !dropped && !nz.is_empty() {
+                crate::bail("this track stores its own names: --names FILE would replace them, so it is refused. Unset it to read the names in the file");
+            }
+            read_name_file(f, n)
+        } else if dropped && nz.is_empty() {
+            if !self.raw && !self.ordnames {
+                crate::bail("the names of this track were dropped at encode time: give them back with --names FILE, or pass --names ordinal to accept the ordinals that are stored instead");
+            }
+            ordinals(n)
+        } else if nz.is_empty() {
+            ordinals(n)
+        } else if names_int {
+            int_names_d(nz, n)
+        } else if names_tok {
+            tok_d(nz)
+        } else {
+            zdec(nz, "names")
+        };
+        if names.last() == Some(&b'\n') { names.pop(); }
+        let mut noff: Vec<u32> = vec![0];
+        if !names.is_empty() {
+            for (i, &c) in names.iter().enumerate() { if c == b'\n' { noff.push(i as u32 + 1); } }
+            noff.push(names.len() as u32 + 1);
+        }
+        if noff.len() as u64 - 1 != n {
+            crate::bail("names stream does not match the track's sequence count");
+        }
+        // --sort stores a rank per record; the input-order names sit beside
+        // them, or come from --names FILE when the blob is empty.
+        if (was_perm && !pz.is_empty()) || perm_ext {
+            let resolve = if perm_ext {
+                match &self.names_file {
+                    Some(f) => Some(read_name_file(f, n)),
+                    None if self.raw || self.ordnames => None,
+                    None => crate::bail("--sort --no-names keeps the rank of every record and no name text: give the original FASTA/FASTQ in --names FILE, or --ordinal-names to see the ranks"),
+                }
+            } else if perm_tok {
+                Some(tok_d(pz))
+            } else {
+                Some(zdec(pz, "input-order names"))
+            };
+            if let Some(nat) = resolve {
+                let tab: Vec<&[u8]> = nat.split(|&c| c == b'\n').filter(|l| !l.is_empty()).collect();
+                if tab.len() as u64 != n {
+                    crate::bail("input-order names do not match the track's sequence count");
+                }
+                let (mut nn, mut no) = (Vec::new(), vec![0u32]);
+                for i in 0..noff.len() - 1 {
+                    let nm = &names[noff[i] as usize..noff[i + 1] as usize - 1];
+                    let v: u64 = std::str::from_utf8(nm).ok().and_then(|t| t.parse().ok())
+                        .unwrap_or_else(|| crate::bail("a stored rank is not a record number"));
+                    if v >= n { crate::bail("a stored rank is not a record number"); }
+                    nn.extend_from_slice(tab[v as usize]); nn.push(b'\n'); no.push(nn.len() as u32);
+                }
+                names = nn; noff = no;
+            }
+        }
+        (names, noff)
+    }
+
+    /// The C's namesrc: an index is bound to the --names FILE it was built
+    /// under, by path and stat; a pipe binds nothing.
+    fn namesrc(&self) -> u64 {
+        use std::os::linux::fs::MetadataExt;
+        let Some(f) = self.names_file.as_ref().filter(|_| self.nf & 1 == 0) else { return 0 };
+        let m = rd(std::fs::metadata(f), "cannot stat the file given to --names");
+        if !m.is_file() { return 0; }
+        let mut h = kst::fnv(FNV0, f.as_bytes());
+        for v in [m.st_size() as u64, m.st_ino(), m.st_dev(), m.st_mtime() as u64, m.st_mtime_nsec() as u64,
+                  m.st_ctime() as u64, m.st_ctime_nsec() as u64] {
+            h = kst::fnv(h, &v.to_le_bytes());
+        }
+        h
+    }
+
+    /// The appended index, as the C reads it: a binary search over the
+    /// sorted hash column, then the second hash and the ordinal confirm.
+    fn idxlookup(&self, nm: &[u8]) -> i64 {
+        use std::os::unix::fs::FileExt;
+        let Some((base, bind)) = self.idx else { return -1 };
+        if bind != self.mhash ^ self.namesrc() { return -1; }
+        let n = self.nreads;
+        let word = |off: u64| -> u64 { let mut b = [0u8; 8]; rd(self.f.read_exact_at(&mut b, off), "index read"); u64::from_le_bytes(b) };
+        let ord = |i: u64| -> u64 { let mut b = [0u8; 4]; rd(self.f.read_exact_at(&mut b, base + n * 16 + i * 4), "index read"); u32::from_le_bytes(b) as u64 };
+        let (want, want2) = (kst::fnv(FNV0, nm), h64b(nm));
+        let (mut lo, mut hi) = (0u64, n);
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let k = word(base + mid * 8);
+            if k == want {
+                let (mut a2, mut b2) = (mid, mid + 1);
+                while a2 > 0 && word(base + (a2 - 1) * 8) == want { a2 -= 1; }
+                while b2 < n && word(base + b2 * 8) == want { b2 += 1; }
+                let fits = |j: u64| { let o = ord(j); o < n && word(base + n * 8 + j * 8) == want2 ^ o.wrapping_mul(H64B_K) };
+                if b2 - a2 == 1 {
+                    let o = ord(a2);
+                    let named = self.names.get().is_some_and(|_| self.name_at(o) != nm);
+                    return if fits(a2) && !named { o as i64 } else { -1 };
+                }
+                for j in a2..b2 {
+                    if fits(j) && self.name_at(ord(j)) == nm { return ord(j) as i64; }
+                }
+                return -1;
+            }
+            if k < want { lo = mid + 1; } else { hi = mid; }
+        }
+        -1
+    }
+
     fn find(&self, seq: &[u8]) -> i64 {
+        let hit = self.idxlookup(seq);
+        if hit >= 0 { return hit; }
         let ix = self.nameix.get_or_init(|| {
             let mut m = HashMap::with_capacity(self.nreads as usize);
             for i in 0..self.nreads {
@@ -803,7 +879,7 @@ impl Reader {
                                   ^ (*o as u64).wrapping_mul(H64B_K)).to_le_bytes());
         }
         for (_, o) in &pair { t.extend_from_slice(&o.to_le_bytes()); }
-        for v in [self.nreads, dup, self.mhash, IDXMAGIC] {
+        for v in [self.nreads, dup, self.mhash ^ self.namesrc(), IDXMAGIC] {
             t.extend_from_slice(&v.to_le_bytes());
         }
         use std::io::Write;
@@ -821,7 +897,8 @@ impl Reader {
     pub fn has_aln(&self) -> bool { self.aln.is_some() }
     pub fn label_at(&self, i: usize) -> &[u8] { &self.lab[i] }
     pub fn name_at(&self, i: u64) -> &[u8] {
-        let i = i as usize; &self.names[self.noff[i] as usize..self.noff[i + 1] as usize - 1]
+        let (names, noff) = self.names.get_or_init(|| self.decode_names());
+        let i = i as usize; &names[noff[i] as usize..noff[i + 1] as usize - 1]
     }
     pub fn find_seq(&self, s: &[u8]) -> i64 { self.find(s) }
 

@@ -1784,7 +1784,7 @@ static void encode(void) {
         if (!eof && have == SLAB) die("a BED line is longer than the read buffer");
     }
     for (int t = 0; t < T; t++) free(pr[t]);
-    free(pr); free(prn); free(prc); free(slab);
+    free(pr); free(prn); free(prc); free(slab); fclose(IN);
     sortfinish(w);
     PH_ADD(0, _tp);
     ktw_tail(w);

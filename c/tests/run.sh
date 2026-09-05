@@ -748,6 +748,8 @@ rc=0; (ulimit -f 1; $KT encode < "$W/pbig.bed" > "$W/lim.kt" 2> "$W/lim.err") ||
 $KT --len-codec 0 --id-codec 0 encode --level 1 --block all < "$W/pbig.bed" > "$W/l5.kt" 2>/dev/null
 $KT --len-codec 0 --id-codec 0 encode --level 1 --block all --slow < "$W/pbig.bed" > "$W/l5s.kt" 2>/dev/null
 [ "$(stat -c%s "$W/l5.kt")" = "$(stat -c%s "$W/l5s.kt")" ] && echo "--slow keeps --level: same size" || { echo "--slow keeps --level: WRONG"; fail=1; }
+$KT encode < "$D/db.rall.bed" > "$W/sd.kt" 2>/dev/null; $KT --slow encode < "$D/db.rall.bed" > "$W/ss.kt" 2>/dev/null
+[ "$(stat -c%s "$W/ss.kt")" -le "$(stat -c%s "$W/sd.kt")" ] && echo "--slow never larger: $(stat -c%s "$W/ss.kt") <= $(stat -c%s "$W/sd.kt") B" || { echo "--slow LARGER than the default"; fail=1; }
 must_fail "--tmp-dir that does not exist" $KT --tmp-dir /nonexistent/dir encode < "$D/s.bed"
 $KT --tmp-dir "$W" encode < "$D/s.bed" 2>/dev/null | cmp -s - "$W/p.kt" && echo "--tmp-dir honoured: same bytes" || { echo "--tmp-dir honoured: WRONG"; fail=1; }
 

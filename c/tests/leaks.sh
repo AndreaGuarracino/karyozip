@@ -10,12 +10,12 @@ SAN=${1:-${KARYOZIP_SAN:-}}
 if [ -z "$SAN" ]; then
   command -v gcc >/dev/null || { echo "leaks: skipped, no gcc"; exit 0; }
   SAN=$(mktemp -u /tmp/kz-lsan.XXXXXX)
-  gcc -O1 -g -fsanitize=address -std=gnu11 -fopenmp -DVERSION='"1.5.3"' \
+  gcc -O1 -g -fsanitize=address -std=gnu11 -fopenmp -D_GNU_SOURCE -DVERSION='"1.5.3"' \
       -o "$SAN" "$SRC"/karyozip.c "$SRC"/htscodecs/tokenise_name3.c \
       "$SRC"/htscodecs/rANS_static4x16pr.c "$SRC"/htscodecs/rANS_static32x16pr.c \
       "$SRC"/htscodecs/arith_dynamic.c "$SRC"/htscodecs/rle.c "$SRC"/htscodecs/pack.c \
-      "$SRC"/htscodecs/utils.c "$SRC"/bzip3/libbz3.c -I"$SRC" -lzstd -lm -lpthread \
-      >/dev/null 2>&1 || { echo "leaks: skipped, sanitizer build failed"; exit 0; }
+      "$SRC"/htscodecs/utils.c "$SRC"/bzip3/libbz3.c -I"$SRC" -lzstd -lz -lm -lpthread \
+      >/dev/null 2>&1 || { echo "leaks: sanitizer build FAILED"; exit 1; }
   trap 'rm -f "$SAN"' EXIT
 fi
 W=$(mktemp -d); trap 'rm -rf "$W" "${SAN:-}"' EXIT

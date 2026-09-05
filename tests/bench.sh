@@ -1,0 +1,102 @@
+#!/bin/bash
+# The benchmark table: one TSV row per cell, feature set, smoothing, strategy,
+# seekability and implementation, on full-size real tracks. Runs on the
+# cluster; prints numbers only, never a row or a sequence name.
+#   tests/bench.sh CELLDIR PAF FEATURES HIER REFDIR [C] [RUST] > table.tsv
+# CELLDIR holds <sample>.<db>.<set>.<kind>.bed.gz; REFDIR the reference
+# tracks named *.<set>.<kind>.bed.gz; PAF may be a packed alignment.
+set -u
+D=$1; PAF=$2; FEAT=$3; HIER=$4; REFD=$5
+C=${6:-$(dirname "$0")/../c/build/karyozip}; R=${7:-$(dirname "$0")/../rust/target/release/karyozip}
+T=${THREADS:-8}; NQ=${NQ:-1000}; REPS=${REPS:-3}
+W=$(mktemp -d); trap 'rm -rf "$W"' EXIT; export TMPDIR=$W
+cell=$(basename "$D"); smp=${cell%%.*}; dbv=$(echo "$cell" | cut -d. -f2); backend=$(echo "$cell" | cut -d. -f3 | tr a-z A-Z)
+case $smp in asm_*) class=assembly;; ont_*) class=long_ONT;; hifi_*) class=long_HiFi;; short_*) class=short;; *) class=$smp;; esac
+ordinal=0; zcat "$(ls "$D"/*.bed.gz | head -1)" | head -1 | cut -f1 | grep -qE '^[0-9]+$' && ordinal=1
+alnnames=""; [ $ordinal = 1 ] && [ -s "$D/names.txt" ] && alnnames="--aln-names $D/names.txt"
+sets=$(head -1 "$FEAT" | cut -f2- | tr '\t' ' ')
+
+printf 'class\tdb\tbackend\tset\ttype\tinformed\tseekable\tmode\timpl\trows\tseqs\tbed_gz_B\tbed_plain_B\tkst_B\tindex_B\tcompanion_B\ttotal_B\tratio_gz\tratio_plain\tB_per_row\tencode_s\tencode_MB\tdecode_s\tdecode_MB\troundtrip\tquery_mean_ms\tquery_sd_ms\tquery_p50_ms\tquery_p99_ms\tthreads\n'
+
+best() { sort -n | head -1; }
+timed() {  # timed OUTFILE IN cmd... : fastest wall, largest RSS, or "refused refused"
+  local out=$1 in=$2; shift 2; : > "$W/t"
+  for i in $(seq $REPS); do
+    /usr/bin/time -f '%e %M' -a -o "$W/t" "$@" < "$in" > "$out" 2>/dev/null || { echo "refused refused"; return 1; }
+  done
+  echo "$(cut -d' ' -f1 "$W/t" | best) $(( $(cut -d' ' -f2 "$W/t" | sort -n | tail -1) / 1024 ))"
+}
+ratio() { awk -v a=$1 -v b=$2 'BEGIN{ if (b > 0) printf "%.2f", a/b; else print "NA" }'; }
+queries() {  # queries BIN KST NAMEFILE : NQ random point queries, ms stats
+  local b=$1 k=$2 nf=$3; : > "$W/q"
+  shuf -n $NQ --random-source=<(yes) "$nf" | while read -r nm; do
+    s=$(date +%s%N); "$b" region "$k" "$nm" 100 > /dev/null 2>&1; e=$(date +%s%N)
+    echo $(( (e - s) / 1000 )) >> "$W/q"
+  done
+  awk '{x[NR]=$1/1000; s+=x[NR]; ss+=x[NR]*x[NR]} END{n=NR; m=s/n; sd=sqrt(ss/n-m*m); asort(x); printf "%.3f %.3f %.3f %.3f", m, sd, x[int(n*0.5)+1], x[int(n*0.99)]}' "$W/q"
+}
+
+row() {  # row SET KIND INFORMED SEEK MODE IMPL BIN INPUT(s) ENCFLAGS DECFLAGS COMPANION_B
+  local set=$1 kind=$2 inf=$3 seek=$4 mode=$5 impl=$6 bin=$7 in=$8 ef=$9 df=${10} comp=${11}
+  local gz plain rows seqs
+  if [ "$set" = ALL ]; then gz=0; plain=0; for f in $in; do gz=$((gz + $(stat -c%s $f))); done
+    zcat $in > "$W/plain.bed"; plain=$(stat -c%s "$W/plain.bed"); rows=$(wc -l < "$W/plain.bed")
+    seqs=$(cut -f1 "$W/plain.bed" | uniq | wc -l)
+    set -- $(timed "$W/k.kst" /dev/null "$bin" -t $T $ef encode $in)
+  else gz=$(stat -c%s "$in"); zcat "$in" > "$W/plain.bed"; plain=$(stat -c%s "$W/plain.bed")
+    rows=$(wc -l < "$W/plain.bed"); seqs=$(cut -f1 "$W/plain.bed" | uniq | wc -l)
+    set -- $(timed "$W/k.kst" "$in" "$bin" -t $T $ef encode)
+  fi
+  local es=$1 em=$2
+  if [ "$es" = refused ]; then
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\tNA\tNA\t%s\tNA\tNA\tNA\tNA\trefused\tNA\tNA\tNA\trefused\tNA\tNA\tNA\tNA\t%s\n' \
+      "$class" "$dbv" "$backend" "$set" "$kind" "$inf" "$seek" "$mode" "$impl" "$rows" "$seqs" "$gz" "$plain" "$comp" "$T"
+    return
+  fi
+  local kst=$(stat -c%s "$W/k.kst")
+  local ds dm rt
+  if [ "$set" = ALL ]; then mkdir -p "$W/o"; rm -f "$W/o"/*
+    set -- $(timed /dev/null /dev/null "$bin" -t $T $df --out "$W/o" decode "$W/k.kst"); ds=$1; dm=$2
+    rt=exact; for f in $in; do s2=$(basename "$f" | sed -E 's/.*\.([a-z_]+)\.(pre)?smoothed\.bed\.gz/\1/'); zcat "$f" | cmp -s - "$W/o/$s2.bed" || rt=DIFFERS; done
+  else set -- $(timed "$W/back.bed" /dev/null "$bin" -t $T $df decode "$W/k.kst"); ds=$1; dm=$2
+    cmp -s "$W/plain.bed" "$W/back.bed" && rt=exact || rt=DIFFERS
+  fi
+  local ix=0 q="NA NA NA NA"
+  if [ "$seek" = seekable ] && [ "$set" != ALL ]; then
+    cp "$W/k.kst" "$W/ki.kst"; "$bin" index "$W/ki.kst" >/dev/null 2>&1; ix=$(( $(stat -c%s "$W/ki.kst") - kst ))
+    cut -f1 "$W/plain.bed" | uniq > "$W/names"; q=$(queries "$bin" "$W/ki.kst" "$W/names")
+  fi
+  local tot=$((kst + comp))
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$class" "$dbv" "$backend" "$set" "$kind" "$inf" "$seek" "$mode" "$impl" "$rows" "$seqs" "$gz" "$plain" "$kst" "$ix" "$comp" "$tot" \
+    "$(ratio $gz $tot)" "$(ratio $plain $tot)" "$(awk -v a=$kst -v b=$rows 'BEGIN{ if (b>0) printf "%.3f", a/b; else print "NA" }')" \
+    "$es" "$em" "$ds" "$dm" "$rt" $q "$T"
+}
+
+pafB=$(stat -c%s "$PAF")
+for kind in presmoothed smoothed; do
+  for set in $sets; do
+    q=$(ls "$D"/*."$set"."$kind".bed.gz 2>/dev/null | head -1); [ -n "$q" ] || continue
+    ref=$(ls "$REFD"/*."$set"."$kind".bed.gz 2>/dev/null | head -1)
+    for seek in seekable non-seekable; do bf=""; [ $seek = non-seekable ] && bf="--block all"
+      for mode in default slow; do mf=""; [ $mode = slow ] && mf="--slow"
+        for impl in C Rust; do bin=$C; [ $impl = Rust ] && bin=$R
+          row "$set" "$kind" not-informed "$seek" "$mode" "$impl" "$bin" "$q" "$bf $mf" "" 0
+          [ -s "$ref" ] && row "$set" "$kind" aln-informed "$seek" "$mode" "$impl" "$bin" "$q" "$bf $mf --aln $PAF --ref $ref $alnnames" "--aln $PAF --ref $ref $alnnames" "$pafB"
+        done
+      done
+    done
+  done
+  # --db takes every set at once: one row per kind, set = ALL
+  ins=""; for set in $sets; do f=$(ls "$D"/*."$set"."$kind".bed.gz 2>/dev/null | head -1); [ -n "$f" ] && ins="$ins $f"; done
+  [ $(echo $ins | wc -w) = $(echo $sets | wc -w) ] || continue
+  ref=$(ls "$REFD"/*.chromosome."$kind".bed.gz 2>/dev/null | head -1)
+  for seek in seekable non-seekable; do bf=""; [ $seek = non-seekable ] && bf="--block all"
+    for mode in default slow; do mf=""; [ $mode = slow ] && mf="--slow"
+      for impl in C Rust; do bin=$C; [ $impl = Rust ] && bin=$R
+        row ALL "$kind" db-informed "$seek" "$mode" "$impl" "$bin" "$ins" "--db $FEAT $bf $mf" "--db $FEAT" 0
+        [ -s "$ref" ] && row ALL "$kind" db+aln-informed "$seek" "$mode" "$impl" "$bin" "$ins" "--db $FEAT $bf $mf --aln $PAF --ref $ref $alnnames" "--db $FEAT --aln $PAF --ref $ref $alnnames" "$pafB"
+      done
+    done
+  done
+done

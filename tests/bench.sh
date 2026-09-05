@@ -11,6 +11,7 @@ C=${6:-$(dirname "$0")/../c/build/karyozip}; R=${7:-$(dirname "$0")/../rust/targ
 T=${THREADS:-8}; NQ=${NQ:-1000}; REPS=${REPS:-3}
 NQ_ALN=${NQ_ALN:-100}   # an aln-informed query parses the whole reference track, seconds each
 W=$(mktemp -d); trap 'rm -rf "$W"' EXIT; export TMPDIR=$W
+LASTIN=""; gz=0; plain=0; rows=0; seqs=0
 cell=$(basename "$D"); smp=${cell%%.*}; dbv=$(echo "$cell" | cut -d. -f2); backend=$(echo "$cell" | cut -d. -f3 | tr a-z A-Z)
 case $smp in asm_*) class=assembly;; ont_*) class=long_ONT;; hifi_*) class=long_HiFi;; short_*) class=short;; *) class=$smp;; esac
 ordinal=0; zcat "$(ls "$D"/*.bed.gz | head -1)" | head -1 | cut -f1 | grep -qE '^[0-9]+$' && ordinal=1
@@ -41,15 +42,15 @@ queries() {  # queries BIN "FLAGS" KST NAMEFILE : NQ random point queries, ms st
 
 row() {  # row SET KIND INFORMED SEEK MODE IMPL BIN INPUT(s) ENCFLAGS DECFLAGS COMPANION_B
   local set=$1 kind=$2 inf=$3 seek=$4 mode=$5 impl=$6 bin=$7 in=$8 ef=$9 df=${10} comp=${11}
-  local gz plain rows seqs
-  if [ "$set" = ALL ]; then gz=0; plain=0; for f in $in; do gz=$((gz + $(stat -c%s $f))); done
+  # the input's plain text, row and sequence counts and name list: once per
+  # input, not per row, since 16 rows share each one and Illumina is 3.3 GB
+  if [ "$in" != "$LASTIN" ]; then LASTIN=$in
+    gz=0; for f in $in; do gz=$((gz + $(stat -c%s $f))); done
     zcat $in > "$W/plain.bed"; plain=$(stat -c%s "$W/plain.bed"); rows=$(wc -l < "$W/plain.bed")
-    seqs=$(cut -f1 "$W/plain.bed" | uniq | wc -l)
-    set -- $(timed "$W/k.kst" /dev/null "$bin" -t $T $ef encode $in)
-  else gz=$(stat -c%s "$in"); zcat "$in" > "$W/plain.bed"; plain=$(stat -c%s "$W/plain.bed")
-    rows=$(wc -l < "$W/plain.bed"); seqs=$(cut -f1 "$W/plain.bed" | uniq | wc -l)
-    set -- $(timed "$W/k.kst" "$in" "$bin" -t $T $ef encode)
+    cut -f1 "$W/plain.bed" | uniq > "$W/names"; seqs=$(wc -l < "$W/names")
   fi
+  if [ "$set" = ALL ]; then set -- $(timed "$W/k.kst" /dev/null "$bin" -t $T $ef encode $in)
+  else set -- $(timed "$W/k.kst" "$in" "$bin" -t $T $ef encode); fi
   local es=$1 em=$2
   if [ "$es" = refused ]; then
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\tNA\tNA\t%s\tNA\tNA\tNA\tNA\trefused\tNA\tNA\tNA\tNA\tNA\trefused\tNA\tNA\tNA\tNA\t%s\n' \
@@ -72,7 +73,7 @@ row() {  # row SET KIND INFORMED SEEK MODE IMPL BIN INPUT(s) ENCFLAGS DECFLAGS C
   local ix=0 q="NA NA NA NA"
   if [ "$seek" = seekable ] && [ "$set" != ALL ]; then
     cp "$W/k.kst" "$W/ki.kst"; "$bin" index "$W/ki.kst" >/dev/null 2>&1; ix=$(( $(stat -c%s "$W/ki.kst") - kst ))
-    cut -f1 "$W/plain.bed" | uniq > "$W/names"; q=$(NQ=$([ "$inf" = not-informed ] || [ "$inf" = db-informed ] && echo $NQ || echo $NQ_ALN) queries "$bin" "$df" "$W/ki.kst" "$W/names")
+    q=$(NQ=$([ "$inf" = not-informed ] || [ "$inf" = db-informed ] && echo $NQ || echo $NQ_ALN) queries "$bin" "$df" "$W/ki.kst" "$W/names")
   fi
   local tot=$((kst + comp))
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \

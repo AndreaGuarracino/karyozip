@@ -51,10 +51,40 @@ vendored C codecs. Nothing else in the crate is unsafe.
 
 ## Speed
 
+### A real track: ONT long reads, 2.20 GB of `.bed.gz`
+
+The KaryoScope `chromosome` track of an ONT_frag sample against CHM13 v2:
+293,614,022 rows, 9,387,314 reads, 1,121 blocks, 17.17 GB of BED, read
+straight from gzip. All 13 encode forms byte-identical between C and Rust
+(default, `--block 4096`, `--block all`, `--level 3`, `--level 22`, `--names
+keep`, `--names drop`, `--tail 0`, `--tail 1`, `--tok-chunk 250000`,
+`--sort`, `--sort=256M`, `--slow`), round trip exact, identical at 1, 4 and
+16 threads, `index`, `region` and `decode --raw` identical.
+
+Fastest of 3 interleaved, 8 threads, on the cluster login node:
+
+|        | C | Rust |
+|--------|--:|-----:|
+| encode | 151.6 s, 16.3 GB | 157.9 s, 17.1 GB |
+| decode |  20.4 s, 1.54 GB |  28.2 s, 1.24 GB |
+
+The Rust encode was 2.3x slower before this track was measured: it ranked
+the three names codecs over all 164 MB of read names where the C ranks them
+on a 200,000-name sample, and it compressed the tokeniser chunks serially.
+Both fixed, its names phase is now the faster one (92 s against 107 s) and
+its parser too (42 s against 55 s); `parse:append`, the serial row path, is
+where it still loses (14.0 s against 8.2 s). Decode is 38% slower and is
+the open item.
+
+Compression: 17.17 GB of BED to 0.552 GB of `.kst`, 31.1x over the plain
+BED and 3.98x over gzip, 1.880 bytes per row. Sequence names are 30% of
+the file (`--names drop` gives 0.387 GB).
+
+### Small files
+
 Fastest of 9 to 11 interleaved runs. The small case is 4,000,000 rows,
 99,354,996 B of BED in; the large one 40,000,000 rows over 658 sequences,
-1,390,855,987 B in, 27,940,756 B of `.kst` out. Byte-identical from both at
-every flag combination and every thread count.
+1,390,855,987 B in, 27,940,756 B of `.kst` out.
 
 |          | C, 4M | Rust, 4M | C, 40M | Rust, 40M |
 |----------|------:|---------:|-------:|----------:|
@@ -62,19 +92,6 @@ every flag combination and every thread count.
 | decode   | 0.39 s, 9 MB | 0.40 s, 12 MB | 1.33 s, 8 MB | 1.26 s, 10 MB |
 | `--slow` | | | 32.8 s, 103 MB | 36.7 s, 120 MB |
 | build from clean | 14.2 s | 30.4 s | | |
-
-Decode is a tie, and the Rust wins it at 40M rows. Encode is 13% apart at
-both sizes, and the phase breakdown says where. At 4M rows the codec search
-dominates and is now a tie; at 40M the parser is half of encode and is the
-Rust's alone to lose, with parse:lines at 0.300 s against 0.272 s and
-parse:append at 1.026 s against 0.812 s.
-
-Both were much slower before profiling. The search compressed two bzip3
-candidates that the seekable-track rule then refused, and both ran their
-zstd baselines serially ahead of the parallel sweep; fixing those took the
-C from 0.63 s to 0.31 s and the Rust from 0.77 s to 0.35 s, with no change
-to a single stored byte. On the Rust side the parser also built its row
-array twice, and the label table hashed one-byte keys with SipHash.
 
 The memory difference is glibc, not the program. Rust peak scales with
 threads (43 MB at `-t 1`, below the C's 53 MB; 69 MB at `-t 8`) because

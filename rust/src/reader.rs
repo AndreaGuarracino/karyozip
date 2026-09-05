@@ -71,7 +71,7 @@ pub type RowFn<'a> = dyn FnMut(&[u8], u64, u64, &[u8]) + 'a;
 pub struct ReadOpts {
     pub raw: bool,
     pub db: bool,
-    pub aln: Option<std::rc::Rc<crate::aln::Aln>>,
+    pub aln: Option<std::sync::Arc<crate::aln::Aln>>,
     pub ordnames: bool,
     pub names_file: Option<String>,
 }
@@ -110,8 +110,11 @@ pub struct Reader {
     cur_q: usize,
     cur_pend: u64,
     cached: Option<(usize, std::rc::Rc<Vec<u8>>, usize, u64)>,
+    /// where the last seq_rows stopped: (block, rows into it, cursor), so a
+    /// walk in order continues instead of re-skipping the block's rows
+    sc: Option<(usize, u64, Cursor)>,
     feathash: u64,
-    aln: Option<std::rc::Rc<crate::aln::Aln>>,
+    aln: Option<std::sync::Arc<crate::aln::Aln>>,
     lenfile: bool,
     /// --raw shows what is stored, so a zero length is the answer, not a fault.
     raw: bool,
@@ -389,7 +392,7 @@ impl Reader {
             taildec, tailpred: h[12], tailskip: h[13] & 0xff, ibx,
             names: std::cell::OnceCell::new(), nz, pz, names_file: o.names_file.clone(),
             ordnames: o.ordnames, nf, idx,
-            hasidx, mhash: h[15], cur_ri: 0, cur_q: 0, cur_pend: 0, cached: None,
+            hasidx, mhash: h[15], cur_ri: 0, cur_q: 0, cur_pend: 0, cached: None, sc: None,
             feathash: (h[5] >> 32) | ((h[9] >> 32) << 32),
             aln: o.aln.clone(), lenfile: h[1] & LENFLAG != 0 && !o.raw, raw: o.raw,
             alnq: None, blk_nos,
@@ -939,7 +942,13 @@ impl Reader {
         -> (Vec<u64>, Vec<u64>, Vec<i32>, Vec<u8>) {
         let (blk, off, nruns) = self.locate(ri);
         self.alnq = self.aln.as_ref().and_then(|a| a.find(self.name_at(ri)));
-        let mut c = self.at(blk, off);
+        let mut c = match self.sc.take() {
+            Some((b, o, mut c)) if b == blk && o <= off => {
+                for _ in o..off { c.lp = skip(&c.data, c.lp); c.ip = skip(&c.data, c.ip); }
+                c.left -= off - o; c
+            }
+            _ => self.at(blk, off),
+        };
         let n = nruns as usize;
         let (mut st, mut en) = (Vec::with_capacity(n), Vec::with_capacity(n));
         let (mut feat, mut nov) = (Vec::with_capacity(n), Vec::with_capacity(n));
@@ -966,6 +975,8 @@ impl Reader {
             feat.push(if isnov != 0 { root } else { m });
             s += len;
         }
+        let rows = self.b[c.blk].rows;
+        self.sc = Some((c.blk, rows - c.left, c));
         (st, en, feat, nov)
     }
 }

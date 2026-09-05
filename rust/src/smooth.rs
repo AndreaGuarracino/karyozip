@@ -216,24 +216,47 @@ pub fn run(path: &str, hier: &str, fs: &[u8], seq: Option<&[u8]>,
                      (i as u64, i as u64 + 1) }
         None => (0, r.nreads),
     };
-    let mut buf = Vec::with_capacity(1 << 20);
-    for ri in first..last {
+    // One sequence: smoothed whole, printed where it overlaps the range.
+    let one = |r: &mut Reader, ri: u64, buf: &mut Vec<u8>| {
         let _s = crate::prof::span(6);
         let (st, en, mut feat, novel) = r.seq_rows(ri, &labmap, &novelid, h.root);
         drop(_s);
-        // The whole sequence is smoothed; a range only cuts the output.
-        if hi > 0 && en.last().is_none_or(|&e| lo >= e) { continue; }
+        if hi > 0 && en.last().is_none_or(|&e| lo >= e) { return; }
         let _s = crate::prof::span(4);
         smooth_one(&h, &st, &en, &mut feat, maxgap);
         drop(_s);
         let name = r.name_at(ri).to_vec();
         let _s = crate::prof::span(5);
-        emit(&h, &mut buf, &name, &st, &en, &feat, &novel, lo, hi, v1);
-        drop(_s);
-        if buf.len() > (1 << 20) - 4096 {
-            out.write_all(&buf).unwrap_or_else(|_| crate::bail("write failed"));
-            buf.clear();
+        emit(&h, buf, &name, &st, &en, &feat, &novel, lo, hi, v1);
+    };
+    let wr = |out: &mut dyn Write, b: &[u8]| out.write_all(b).unwrap_or_else(|_| crate::bail("write failed"));
+    let (nthr, chunk) = (rayon::current_num_threads() as u64, 4096u64);
+    if nthr > 1 && last - first >= 64 {
+        // As the C's smooth_mt: chunks of sequences on worker threads, each
+        // with its own reader, written in order, a bounded window at a time.
+        use rayon::prelude::*;
+        thread_local! { static RD: std::cell::RefCell<Option<Reader>> = const { std::cell::RefCell::new(None) }; }
+        let nchunk = (last - first).div_ceil(chunk);
+        let mut c0 = 0;
+        while c0 < nchunk {
+            let c1 = (c0 + nthr * 2).min(nchunk);
+            let parts: Vec<Vec<u8>> = (c0..c1).into_par_iter().map(|c| RD.with(|cell| {
+                let mut g = cell.borrow_mut();
+                let r = g.get_or_insert_with(|| Reader::open_with(path, ro));
+                let (a, b) = (first + c * chunk, (first + (c + 1) * chunk).min(last));
+                let mut buf = Vec::new();
+                for ri in a..b { one(r, ri, &mut buf); }
+                buf
+            })).collect();
+            for p in &parts { wr(out, p); }
+            c0 = c1;
         }
+        return;
     }
-    out.write_all(&buf).unwrap_or_else(|_| crate::bail("write failed"));
+    let mut buf = Vec::with_capacity(1 << 20);
+    for ri in first..last {
+        one(&mut r, ri, &mut buf);
+        if buf.len() > (1 << 20) - 4096 { wr(out, &buf); buf.clear(); }
+    }
+    wr(out, &buf);
 }

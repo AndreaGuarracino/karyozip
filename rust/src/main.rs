@@ -290,7 +290,7 @@ fn informed(c: &cli::Cli, ro: &mut reader::ReadOpts, who: &str) -> Option<db::Fe
         if f.sets.len() <= 32 { eprintln!("features: integer-tuple index on"); }
         f
     });
-    ro.aln = load_aln(&c.aln, &c.refbed, &c.aln_names, who).map(std::rc::Rc::new);
+    ro.aln = load_aln(&c.aln, &c.refbed, &c.aln_names, who).map(std::sync::Arc::new);
     feats
 }
 

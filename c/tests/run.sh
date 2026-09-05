@@ -131,6 +131,15 @@ $KT --db "$D/db.features.tsv" region "$W/f.kt" "$sq" 0 100000 2>/dev/null > "$W/
 awk -F'\t' 'NR>1 && $1==p && $2==e && $4==l {e=$3; next} NR>1 {print p"\t"s"\t"e"\t"l} {p=$1; s=$2; e=$3; l=$4} END{print p"\t"s"\t"e"\t"l}' <(cut -f1-4 "$W/inf.got") | cmp -s - "$W/inf.want" && echo "region --db: acrocentric column, merged, same as plain" || { echo "region --db: DIFFERS"; fail=1; }
 $KT --db "$D/db.features.tsv" --aln "$D/db.self.paf" --ref "$D/db.rall.bed" region "$W/da.kt" "$sq" 0 100000 2>/dev/null | cmp -s - "$W/inf.got" && echo "region --db --aln: same as --db" || { echo "region --db --aln: DIFFERS"; fail=1; }
 $KT --aln "$D/p.paf" --ref "$D/ref.bed" region "$W/d.kt" q1 2>/dev/null | cmp -s <($KT region "$W/p.kt" q1 2>/dev/null) && echo "region --aln: same as plain" || { echo "region --aln: DIFFERS"; fail=1; }
+# --set: one set of a --db track, on stdout, equal to the set's own track
+n=0; for f in $sets; do $KT --db "$D/db.features.tsv" --set $f decode "$W/f.kt" 2>/dev/null | cmp -s - "$D/db.$f.bed" && n=$((n+1)); done
+[ "$n" = 6 ] && echo "decode --set: 6/6 equal to the set's track" || { echo "decode --set: only $n/6"; fail=1; }
+$KT --db "$D/db.features.tsv" --aln "$D/db.self.paf" --ref "$D/db.rall.bed" --set gene decode "$W/da.kt" 2>/dev/null | cmp -s - "$D/db.gene.bed" && echo "decode --set on db+aln: same" || { echo "decode --set on db+aln: DIFFERS"; fail=1; }
+n=0; for r in "$sq" "$sq 100" "$sq 0 100000" "$sq 50 400 2"; do $KT --db "$D/db.features.tsv" --set acrocentric region "$W/f.kt" $r 2>/dev/null | cmp -s - <($KT region "$W/pa.kt" $r 2>/dev/null) && n=$((n+1)); done
+[ "$n" = 4 ] && echo "region --set: 4/4 forms equal the set's track" || { echo "region --set: only $n/4"; fail=1; }
+must_fail "--set without --db" $KT --set gene decode "$W/pa.kt"
+must_fail "--set not in features.tsv" $KT --db "$D/db.features.tsv" --set nosuch decode "$W/f.kt"
+must_fail "--set on smooth" $KT --db "$D/db.features.tsv" --set gene smooth "$W/f.kt" "$W/inf.tsv" acrocentric
 must_fail "smooth an --aln track without --aln" $KT smooth "$W/d.kt" "$W/inf.tsv" acrocentric
 must_fail "smooth a --db track without --db" $KT smooth "$W/f.kt" "$W/inf.tsv" acrocentric
 must_fail "smooth --db a set not in features.tsv" $KT --db "$D/db.features.tsv" smooth "$W/f.kt" "$W/sm.tsv" nosuch

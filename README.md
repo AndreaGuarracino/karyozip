@@ -31,7 +31,7 @@ and the hierarchy. A bgzipped file works too, being many gzip members.
 ```
 karyozip encode [flags] < in.bed        > out.kst
 karyozip encode [flags] < in.bed.gz     > out.kst
-karyozip decode F
+karyozip decode F | --db F.tsv --out DIR F | --db F.tsv --set NAME F
 karyozip region F SEQ | SEQ POS | SEQ START END [HALO]
 karyozip smooth F HIER FS [SEQ [START END]]
 karyozip index  F                       appends an index to the track
@@ -53,6 +53,7 @@ karyozip aln-pack P.paf REF.bed OUT     packs a PAF to only what --aln reads
 | `--aln-names F` | ordinal N is line N+1 of `F` |
 | `--names F`, `--names ordinal` | on the readers |
 | `--raw`, `--out DIR` | on decode |
+| `--set NAME` | decode and region under `--db`: one set, as its own track would give it, on stdout |
 | `--max-gap N`, `--v1` | on smooth; `SEQ START END` smooths the whole sequence and prints the overlap, so it equals the full smooth |
 | `--threads N`, `-t N` | 1 to 1024. Default `OMP_NUM_THREADS`, else cores capped at 8 |
 | `--tmp-dir DIR`, `--profile`, `--help`, `--version` | any command |

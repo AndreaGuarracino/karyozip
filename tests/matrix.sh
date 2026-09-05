@@ -133,7 +133,11 @@ for kind in presmoothed smoothed; do
       [ -z "$fl" ] && { seq=$(zcat $(echo $ins | cut -d' ' -f1) | head -1 | cut -f1); rd=${dec% --out}
         same "$lbl region" -- $rd region "$W/t.kst" "$seq" && { j=0; for fs in $sets; do j=$((j+1))
           mergecol $((j+3)) < "$W/c.out" | cmp -s - <(mergecol 4 < "$W/plain.$fs.$kind.region") || fail "$lbl region column $fs differs from the plain track's"; done; }
-        for fs in $sets; do same "$lbl smooth $fs" -- $rd smooth "$W/t.kst" "$hier" "$fs" && { cmp -s "$W/c.out" "$W/plain.$fs.$kind.smooth" || fail "$lbl smooth $fs differs from the plain track's"; }; done; }
+        for fs in $sets; do
+          same "$lbl smooth $fs" -- $rd smooth "$W/t.kst" "$hier" "$fs" && { cmp -s "$W/c.out" "$W/plain.$fs.$kind.smooth" || fail "$lbl smooth $fs differs from the plain track's"; }
+          same "$lbl decode --set $fs" -- $rd --set "$fs" decode "$W/t.kst" && { zcat "$(ls "$D"/*."$fs"."$kind".bed.gz | grep -v '/ref\.' | head -1)" | cmp -s - "$W/c.out" || fail "$lbl decode --set $fs differs from the set's track"; }
+          same "$lbl region --set $fs" -- $rd --set "$fs" region "$W/t.kst" "$seq" && { cmp -s "$W/c.out" "$W/plain.$fs.$kind.region" || fail "$lbl region --set $fs differs from the plain track's"; }
+        done; }
     done
   done
 done

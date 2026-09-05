@@ -773,12 +773,51 @@ impl Reader {
     }
 
     /// region F SEQ | SEQ POS | SEQ START END [HALO].
+    /// --set: one set of a --db track, touching equal labels merged, so the
+    /// answer is what the set's own track gives. Needs the whole sequence.
+    fn region_set(&mut self, ri: u64, seq: &[u8], lo: u64, hi: u64, halo: u64,
+                  fe: &crate::db::Feats, k: usize, out: &mut impl std::io::Write) {
+        let (blk, off, nruns) = self.locate(ri);
+        let tskip = self.tailskip;
+        let mut c = self.at(blk, off);
+        let (mut st, mut en, mut lab): (Vec<u64>, Vec<u64>, Vec<Vec<u8>>) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut s, mut l, mut t) = (0u64, Vec::new(), Vec::new());
+        for i in 0..nruns {
+            let (len, f) = self.step(&mut c, s, i + 1 == nruns && ri >= tskip);
+            l.clear(); self.label(f, &mut l, s, len);
+            let id = fe.featid(&l);
+            t.clear(); t.extend_from_slice(if id == 0 { b"novel" } else { &fe.id2lab[&id][k] });
+            if en.last() == Some(&s) && lab.last() == Some(&t) { *en.last_mut().unwrap() = s + len; }
+            else { st.push(s); en.push(s + len); lab.push(t.clone()); }
+            s += len;
+        }
+        let n = st.len();
+        let (mut a, mut b) = (0, n);
+        if hi > 0 {
+            let (mut f, mut l) = (n, 0usize);
+            for i in 0..n { if en[i] > lo && st[i] < hi { if i < f { f = i; } l = i; } }
+            if f > l { return; }
+            a = f.saturating_sub(halo as usize);
+            b = if n - l - 1 <= halo as usize { n } else { l + halo as usize + 1 };
+        }
+        let mut buf = Vec::with_capacity(1 << 20);
+        for i in a..b {
+            buf.extend_from_slice(seq); buf.push(b'\t');
+            kst::putu64(&mut buf, st[i]); buf.push(b'\t');
+            kst::putu64(&mut buf, en[i]); buf.push(b'\t');
+            buf.extend_from_slice(&lab[i]); buf.push(b'\n');
+            if buf.len() > (1 << 20) - 4096 { rd(out.write_all(&buf), "write failed"); buf.clear(); }
+        }
+        rd(out.write_all(&buf), "write failed");
+    }
+
     pub fn region(&mut self, seq: &[u8], lo: u64, hi: u64, halo: u64,
-                  feats: Option<&crate::db::Feats>, out: &mut impl std::io::Write) {
+                  feats: Option<&crate::db::Feats>, set: Option<usize>, out: &mut impl std::io::Write) {
         let ri = self.find(seq);
         if ri < 0 { crate::bail("sequence not found"); }
         let ri = ri as u64;
         self.alnq = self.aln.as_ref().and_then(|a| a.find(seq));
+        if let (Some(fe), Some(k)) = (feats, set) { return self.region_set(ri, seq, lo, hi, halo, fe, k, out); }
         let (blk, off, nruns) = self.locate(ri);
         let tskip = self.tailskip;
         let last_of = |k: u64| k + 1 == nruns && ri >= tskip;

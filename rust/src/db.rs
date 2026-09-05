@@ -76,6 +76,12 @@ impl Feats {
         }
     }
 
+    /// --set NAME as a column of features.tsv.
+    pub fn setidx(&self, name: &str) -> usize {
+        self.sets.iter().position(|s| s == name.as_bytes())
+            .unwrap_or_else(|| crate::bail("--set: not a set in features.tsv"))
+    }
+
     pub fn check_hash(&self, r: &crate::reader::Reader) {
         if r.feathash() != self.hash { crate::bail("this features.tsv is not the one the track was encoded with"); }
     }
@@ -232,34 +238,40 @@ pub fn drop_tmp() {
     }
 }
 
-pub fn decode(r: &mut crate::reader::Reader, feats: &Feats, dir: &str) {
-    let n = feats.sets.len();
-    std::fs::create_dir_all(dir).unwrap_or_else(|_| crate::bail("cannot create the output directory"));
+/// decode --db: every set into DIR, or with `only` one set to stdout.
+pub fn decode(r: &mut crate::reader::Reader, feats: &Feats, dir: Option<&str>, only: Option<usize>) {
     let name = |s: &[u8]| String::from_utf8_lossy(s).into_owned();
     let pid = std::process::id();
-    for s in &feats.sets {
-        let p = format!("{dir}/{}.bed", name(s));
-        if p.len() + 16 >= 4096 { crate::bail("--out: the output path is too long"); }
-        if let Ok(m) = std::fs::symlink_metadata(&p) {
-            if !m.is_file() { crate::bail("--out: a set's BED exists and is not a regular file"); }
+    let (j0, j1) = only.map_or((0, feats.sets.len()), |k| (k, k + 1));
+    let mut tmps: Vec<String> = Vec::new();
+    let mut out: Vec<Box<dyn Write>> = Vec::new();
+    if let (Some(dir), None) = (dir, only) {
+        std::fs::create_dir_all(dir).unwrap_or_else(|_| crate::bail("cannot create the output directory"));
+        for s in &feats.sets {
+            let p = format!("{dir}/{}.bed", name(s));
+            if p.len() + 16 >= 4096 { crate::bail("--out: the output path is too long"); }
+            if let Ok(m) = std::fs::symlink_metadata(&p) {
+                if !m.is_file() { crate::bail("--out: a set's BED exists and is not a regular file"); }
+            }
         }
+        // Write beside the old BEDs, then swap them in together.
+        tmps = feats.sets.iter().map(|s| format!("{dir}/{}.bed.tmp.{pid}", name(s))).collect();
+        *TMP.lock().unwrap() = tmps.clone();
+        out = tmps.iter().map(|p| Box::new(std::io::BufWriter::new(std::fs::File::create(p)
+                .unwrap_or_else(|_| crate::bail("cannot write a derived BED")))) as Box<dyn Write>).collect();
+    } else {
+        for _ in 0..j0 { out.push(Box::new(std::io::sink())); }
+        out.push(Box::new(std::io::BufWriter::new(std::io::stdout())));
     }
-    // Write beside the old BEDs, then swap them in together.
-    let tmps: Vec<String> = feats.sets.iter()
-        .map(|s| format!("{dir}/{}.bed.tmp.{pid}", name(s))).collect();
-    *TMP.lock().unwrap() = tmps.clone();
-    let mut out: Vec<std::io::BufWriter<std::fs::File>> = tmps.iter()
-        .map(|p| std::io::BufWriter::new(std::fs::File::create(p)
-                .unwrap_or_else(|_| crate::bail("cannot write a derived BED"))))
-        .collect();
     // One open run per set, extended while its label does not change.
+    let n = j1;
     let mut cur: Vec<Option<(u64, u64, Vec<u8>)>> = vec![None; n];
     let mut cseq: Vec<u8> = Vec::new();
     let mut rows = 0u64;
     let novel = b"novel".to_vec();
     r.for_each_row(&mut |seq: &[u8], st: u64, en: u64, lab: &[u8]| {
         if seq != cseq {
-            for j in 0..n {
+            for j in j0..n {
                 if let Some((a, b2, l)) = cur[j].take() {
                     wr(&mut out[j], &cseq, a, b2, &l);
                 }
@@ -267,7 +279,7 @@ pub fn decode(r: &mut crate::reader::Reader, feats: &Feats, dir: &str) {
             cseq = seq.to_vec();
         }
         let id = feats.featid(lab);
-        for j in 0..n {
+        for j in j0..n {
             let l: &[u8] = if id == 0 { &novel } else { &feats.id2lab[&id][j] };
             match &mut cur[j] {
                 Some((_, e, cl)) if *e == st && cl == l => *e = en,
@@ -279,14 +291,20 @@ pub fn decode(r: &mut crate::reader::Reader, feats: &Feats, dir: &str) {
         }
         rows += 1;
     });
-    for j in 0..n {
+    for j in j0..n {
         if let Some((a, b2, l)) = cur[j].take() { wr(&mut out[j], &cseq, a, b2, &l); }
         out[j].flush().unwrap_or_else(|_| crate::bail("write failed"));
     }
     drop(out);
-    swap_in(dir, &feats.sets, &tmps);
-    TMP.lock().unwrap().clear();
-    eprintln!("db: {rows} rows into {n} tracks under {dir}");
+    match (dir, only) {
+        (_, Some(k)) => eprintln!("db: {rows} rows, set {}", name(&feats.sets[k])),
+        (Some(dir), None) => {
+            swap_in(dir, &feats.sets, &tmps);
+            TMP.lock().unwrap().clear();
+            eprintln!("db: {rows} rows into {n} tracks under {dir}");
+        }
+        (None, None) => unreachable!(),
+    }
 }
 
 fn wr(f: &mut impl Write, seq: &[u8], st: u64, en: u64, lab: &[u8]) {

@@ -44,6 +44,9 @@ pub struct Cli {
     /// per-set BEDs go here
     #[arg(long, global = true, value_name = "DIR")]
     pub out: Option<String>,
+    /// decode, region: one set of a --db track
+    #[arg(long, global = true, value_name = "NAME")]
+    pub set: Option<String>,
     /// do not store what the reference already gives
     #[arg(long, global = true, value_name = "P.paf")]
     pub aln: Option<String>,
@@ -164,6 +167,7 @@ impl Cli {
         if self.id_codec.is_some() && !enc { bad("--id-codec")?; }
         if self.len_codec.is_some() && !enc { bad("--len-codec")?; }
         if self.out.is_some() && !dec { bad("--out")?; }
+        if self.set.is_some() && !(dec || c == "region") { bad("--set")?; }
         if self.raw && !dec { bad("--raw")?; }
         let inf = enc || dec || sm || c == "region";
         if self.db.is_some() && !inf { bad("--db")?; }

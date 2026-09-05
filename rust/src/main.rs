@@ -150,13 +150,16 @@ fn main() {
             if !rest.is_empty() { die("decode takes one track"); }
             let track = need(track);
             // The C refuses the flag pair before it loads anything.
-            if c.db.is_some() && c.out.is_none() { die("decode --db needs --out DIR for the per-set BEDs"); }
+            if c.set.is_some() && c.db.is_none() { die("--set needs --db"); }
+            if c.db.is_some() && c.out.is_none() && c.set.is_none() {
+                die("decode --db needs --out DIR for the per-set BEDs, or --set NAME for one on stdout");
+            }
             let feats = informed(&c, &mut ro, "decode ");
             let mut r = reader::Reader::open_with(track, &ro);
             if let Some(f) = &feats { f.check_hash(&r); }
-            match (&feats, &c.out) {
-                (Some(f), Some(d)) => db::decode(&mut r, f, d),
-                _ => {
+            match &feats {
+                Some(f) => db::decode(&mut r, f, c.out.as_deref(), c.set.as_deref().map(|n| f.setidx(n))),
+                None => {
                     let so = std::io::stdout();
                     let mut o = BufWriter::new(so.lock());
                     r.decode(&mut o);
@@ -179,12 +182,14 @@ fn main() {
                     (x, y, hl.as_ref().map_or(0, |_| p(hl, "region: halo is not a number")))
                 }
             };
+            if c.set.is_some() && c.db.is_none() { die("--set needs --db"); }
             let feats = informed(&c, &mut ro, "region ");
             let mut r = reader::Reader::open_with(track, &ro);
             if let Some(f) = &feats { f.check_hash(&r); }
+            let set = c.set.as_deref().map(|n| feats.as_ref().unwrap().setidx(n));
             let so = std::io::stdout();
             let mut o = BufWriter::new(so.lock());
-            r.region(seq.as_bytes(), lo, hi, hlo, feats.as_ref(), &mut o);
+            r.region(seq.as_bytes(), lo, hi, hlo, feats.as_ref(), set, &mut o);
             o.flush().unwrap_or_else(|e| die(&e.to_string()));
         }
         Cmd::Smooth { track, hier, fs, seq, start, end, rest } => {

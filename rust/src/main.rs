@@ -125,6 +125,7 @@ fn main() {
                 Some(fp) => {
                     let feats = db::Feats::load(fp);
                     eprintln!("features: {} ids, {} sets", feats.id2lab.len(), feats.sets.len());
+                    if feats.sets.len() <= 32 { eprintln!("features: integer-tuple index on"); }
                     let mut w = writer::Writer::new(opt, std::path::Path::new(&tmpdir))
                         .unwrap_or_else(|e| die(&e.to_string()));
                     w.set_feathash(feats.hash);
@@ -151,6 +152,7 @@ fn main() {
                 (Some(fp), Some(d)) => {
                     let feats = db::Feats::load(fp);
                     eprintln!("features: {} ids, {} sets", feats.id2lab.len(), feats.sets.len());
+                    if feats.sets.len() <= 32 { eprintln!("features: integer-tuple index on"); }
                     if r.feathash() != feats.hash {
                         die("this features.tsv is not the one the track was encoded with");
                     }

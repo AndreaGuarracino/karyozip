@@ -522,14 +522,22 @@ impl Writer {
                     }
                     const ORDER: [usize; 3] = [1, 2, 0];
                     let (mut best, mut bv, mut fa) = (0usize, usize::MAX, Vec::new());
+                    // Fast mode ranks the spellings by a level 1 zstd, then
+                    // compresses only the winner; --slow ranks by the real
+                    // frame. Two rulers, and they disagree on real data.
                     for &v in &ORDER {
                         let Some(src) = vs[v] else { continue };
-                        let f2 = comp_lens(src, p.len, lvl_len).expect("lens frame");
-                        let a2 = f2.len();
+                        let (a2, f2) = if fast_aln {
+                            (ffi::zstd(src, 1).len(), Vec::new())
+                        } else {
+                            let f = comp_lens(src, p.len, lvl_len).expect("lens frame");
+                            (f.len(), f)
+                        };
                         if bv == usize::MAX || a2 + if fast_aln { a2 / 100 } else { 0 } < best {
                             best = a2; bv = v; fa = f2;
                         }
                     }
+                    if fast_aln { fa = comp_lens(vs[bv].unwrap(), p.len, lvl_len).expect("lens frame"); }
                     let nl = vs[bv].unwrap().len();
                     let b = comp_ids(&ids, p.id, lvl_id).expect("ids frame");
                     (fa, b, nl, ids.len(), m.rows, m.bp, bv as u64)

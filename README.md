@@ -48,12 +48,12 @@ karyozip aln-pack P.paf REF.bed OUT     packs a PAF to only what --aln reads
 | `--sort`, `--sort=MEM` | order by label tuple, then lengths; spill past `MEM` |
 | `--names keep` | store names even when they are 0,1,2,... |
 | `--names drop`, `--names drop:F` | store none, or write them beside the track |
-| `--db features.tsv` | one BED per feature set, or one merged featureID track |
-| `--aln P.paf --ref R` | do not store what the reference already gives |
+| `--db features.tsv` | one BED per feature set, or one merged featureID track; every reader takes it, and region then prints one label per set |
+| `--aln P.paf --ref R` | do not store what the reference already gives; every reader takes the same pair |
 | `--aln-names F` | ordinal N is line N+1 of `F` |
 | `--names F`, `--names ordinal` | on the readers |
 | `--raw`, `--out DIR` | on decode |
-| `--max-gap N`, `--halo N`, `--v1` | on smooth |
+| `--max-gap N`, `--halo N`, `--v1` | on smooth; `--halo` is the runs of context around SEQ START END, default the whole sequence, which is exact |
 | `--threads N`, `-t N` | 1 to 1024. Default `OMP_NUM_THREADS`, else cores capped at 8 |
 | `--tmp-dir DIR`, `--profile`, `--help`, `--version` | any command |
 

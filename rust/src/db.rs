@@ -57,6 +57,28 @@ impl Feats {
         if f.sets.is_empty() { crate::bail("features table has no header"); }
         f
     }
+
+    /// A track label as a featureID, checked as decode checks it.
+    pub fn featid(&self, lab: &[u8]) -> u32 {
+        let id = num(lab, (1u32 << 26) - 1, "corrupt --db track: a label is not a featureID");
+        if id != 0 && !self.id2lab.contains_key(&id) {
+            crate::bail("a featureID in the track is not in the features table");
+        }
+        id
+    }
+
+    /// One label per set, tab-joined: what region prints under --db.
+    pub fn tuple(&self, lab: &[u8], out: &mut Vec<u8>) {
+        let id = self.featid(lab);
+        for j in 0..self.sets.len() {
+            if j > 0 { out.push(b'\t'); }
+            out.extend_from_slice(if id == 0 { b"novel" } else { &self.id2lab[&id][j] });
+        }
+    }
+
+    pub fn check_hash(&self, r: &crate::reader::Reader) {
+        if r.feathash() != self.hash { crate::bail("this features.tsv is not the one the track was encoded with"); }
+    }
 }
 
 fn num(b: &[u8], max: u32, what: &str) -> u32 {
@@ -244,10 +266,7 @@ pub fn decode(r: &mut crate::reader::Reader, feats: &Feats, dir: &str) {
             }
             cseq = seq.to_vec();
         }
-        let id = num(lab, (1u32 << 26) - 1, "corrupt --db track: a label is not a featureID");
-        if id != 0 && !feats.id2lab.contains_key(&id) {
-            crate::bail("a featureID in the track is not in the features table");
-        }
+        let id = feats.featid(lab);
         for j in 0..n {
             let l: &[u8] = if id == 0 { &novel } else { &feats.id2lab[&id][j] };
             match &mut cur[j] {

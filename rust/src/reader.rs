@@ -470,7 +470,7 @@ impl Reader {
     pub fn decode(&mut self, out: &mut impl std::io::Write) {
         let mut buf: Vec<u8> = Vec::with_capacity(1 << 22);
         let mut c = Cursor { blk: usize::MAX, data: std::rc::Rc::new(Vec::new()), lp: 0, ip: 0, left: 0 };
-        let (mut ipos, mut emitted) = (0usize, 0u64);
+        let (mut ipos, mut emitted, mut restored) = (0usize, 0u64, 0u64);
         let tskip = self.tailskip;
         let mut name = Vec::new();
         for i in 0..self.nreads {
@@ -488,6 +488,7 @@ impl Reader {
                 buf.push(b'\t');
                 kst::putu64(&mut buf, en);
                 buf.push(b'\t');
+                if self.aln.is_some() && self.lab.get(f as usize).is_some_and(|l| l == b"=") { restored += 1; }
                 self.label(f, &mut buf, st, len);
                 buf.push(b'\n');
                 if buf.len() > (1 << 22) - 4096 {
@@ -499,6 +500,7 @@ impl Reader {
             }
         }
         rd(out.write_all(&buf), "write failed");
+        if self.aln.is_some() { eprintln!("aln: {restored} rows restored from the reference"); }
         if emitted != self.rows {
             eprintln!("karyozip: emitted {emitted} rows, the header says {}", self.rows);
             crate::bail("file is truncated");
@@ -696,7 +698,7 @@ impl Reader {
 
     /// region F SEQ | SEQ POS | SEQ START END [HALO].
     pub fn region(&mut self, seq: &[u8], lo: u64, hi: u64, halo: u64,
-                  out: &mut impl std::io::Write) {
+                  feats: Option<&crate::db::Feats>, out: &mut impl std::io::Write) {
         let ri = self.find(seq);
         if ri < 0 { crate::bail("sequence not found"); }
         let ri = ri as u64;
@@ -740,7 +742,14 @@ impl Reader {
                 buf.push(b'\t');
                 kst::putu64(&mut buf, en);
                 buf.push(b'\t');
-                self.label(f, &mut buf, st, len);
+                match feats {
+                    Some(fe) if !self.lab.is_empty() => {
+                        let mut l = Vec::new();
+                        self.label(f, &mut l, st, len);
+                        fe.tuple(&l, &mut buf);
+                    }
+                    _ => self.label(f, &mut buf, st, len),
+                }
                 buf.push(b'\n');
                 if buf.len() > (1 << 20) - 4096 {
                     rd(out.write_all(&buf), "write failed");
@@ -809,6 +818,7 @@ impl Reader {
 
 impl Reader {
     pub fn nlabels(&self) -> usize { self.lab.len() }
+    pub fn has_aln(&self) -> bool { self.aln.is_some() }
     pub fn label_at(&self, i: usize) -> &[u8] { &self.lab[i] }
     pub fn name_at(&self, i: u64) -> &[u8] {
         let i = i as usize; &self.names[self.noff[i] as usize..self.noff[i + 1] as usize - 1]
@@ -829,14 +839,23 @@ impl Reader {
         let mut s = 0u64;
         for k in 0..nruns {
             let (len, f) = self.step(&mut c, s, k + 1 == nruns && ri >= tskip);
-            if f as usize >= self.lab.len() && !self.lab.is_empty() {
+            let mut f = f as usize;
+            if f >= self.lab.len() && !self.lab.is_empty() {
                 crate::bail("corrupt block: a label id past the table");
             }
-            let isnov = isnovel.get(f as usize).copied().unwrap_or(0);
+            let mut m = labmap.get(f).copied().unwrap_or(root);
+            if m == i32::MIN {              // stored as =: the reference row's label
+                let miss = || crate::bail("a delta row has no reference answer: wrong PAF or reference track");
+                let rl = self.aln.as_ref().unwrap().row(self.alnq.unwrap_or_else(miss), s, len);
+                if rl == u32::MAX || rl as usize >= self.lab.len() { miss(); }
+                f = rl as usize; m = labmap[f];
+            }
+            if m == i32::MIN + 1 { crate::bail("corrupt --db track: a label is not a featureID"); }
+            let isnov = isnovel.get(f).copied().unwrap_or(0);
             st.push(s);
             en.push(s + len);
             nov.push(isnov);
-            feat.push(if isnov != 0 { root } else { *labmap.get(f as usize).unwrap_or(&root) });
+            feat.push(if isnov != 0 { root } else { m });
             s += len;
         }
         (st, en, feat, nov)

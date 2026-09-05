@@ -188,15 +188,27 @@ fn emit(h: &Hier, out: &mut Vec<u8>, seq: &[u8], st: &[u64], en: &[u64],
 #[allow(clippy::too_many_arguments)]
 pub fn run(path: &str, hier: &str, fs: &[u8], seq: Option<&[u8]>,
            lo: u64, hi: u64, v1: bool, maxgap: u64, halo: u64,
-           ro: &crate::reader::ReadOpts, out: &mut impl Write) {
+           ro: &crate::reader::ReadOpts, feats: Option<&crate::db::Feats>, out: &mut impl Write) {
     let mut h = Hier::load(hier, fs);
     h.build();
     let mut r = Reader::open_with(path, ro);
+    if let Some(f) = feats { f.check_hash(&r); }
+    let setk = feats.map(|f| f.sets.iter().position(|s| s == fs)
+        .unwrap_or_else(|| crate::bail("smooth: the set is not in features.tsv")));
     // The track's own labels join the hierarchy, so the tables are rebuilt.
-    let labmap: Vec<i32> = (0..r.nlabels())
-        .map(|i| { let l = r.label_at(i).to_vec(); h.id(&l) }).collect();
-    let novelid: Vec<u8> = (0..r.nlabels())
-        .map(|i| u8::from(r.label_at(i) == b"novel")).collect();
+    // Under --aln "=" and under --db a non-featureID are resolved per row.
+    let (mut labmap, mut novelid) = (Vec::new(), Vec::new());
+    for i in 0..r.nlabels() {
+        let mut l = r.label_at(i).to_vec();
+        if r.has_aln() && l == b"=" { labmap.push(i32::MIN); novelid.push(0); continue; }
+        if let Some(f) = feats {
+            if l.is_empty() || !l.iter().all(u8::is_ascii_digit) { labmap.push(i32::MIN + 1); novelid.push(0); continue; }
+            let id = f.featid(&l);
+            l = if id == 0 { b"novel".to_vec() } else { f.id2lab[&id][setk.unwrap()].clone() };
+        }
+        novelid.push(u8::from(l == b"novel"));
+        labmap.push(h.id(&l));
+    }
     h.build();
 
     let (first, last) = match seq {

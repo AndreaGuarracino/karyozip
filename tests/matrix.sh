@@ -39,21 +39,28 @@ echo "cell $(basename "$D"): sets [$sets], ordinal-named=$ordinal"
 FLAGS=("" "--block all" "--block 4096" "--level 3" "--level 22" "--names keep" \
        "--names drop" "--sort" "--sort=1M" "--slow" "--tail 0" "--tail 1")
 
-readers() {  # readers KST SEQ FS HIER
-  local k=$1 seq=$2 fs=$3 h=$4
-  same "decode" -- decode "$k"
+readers() {  # readers KST SEQ FS HIER "DECODE FLAGS"
+  local k=$1 seq=$2 fs=$3 h=$4 dec=$5
+  same "decode" -- $dec decode "$k"
   same "decode --raw" -- --raw decode "$k"
-  same "region seq" -- region "$k" "$seq"
-  same "region pos" -- region "$k" "$seq" 100
-  same "region range" -- region "$k" "$seq" 0 5000
-  same "region halo" -- region "$k" "$seq" 0 5000 3
+  same "region seq" -- $dec region "$k" "$seq" && cp "$W/c.out" "$W/region.out"
+  same "region pos" -- $dec region "$k" "$seq" 100
+  same "region range" -- $dec region "$k" "$seq" 0 5000
+  same "region halo" -- $dec region "$k" "$seq" 0 5000 3
   cp "$k" "$W/ixc.kst"; cp "$k" "$W/ixr.kst"
   "$C" index "$W/ixc.kst" > /dev/null 2> "$W/c.err"; "$R" index "$W/ixr.kst" > /dev/null 2> "$W/r.err"
   if cmp -s "$W/ixc.kst" "$W/ixr.kst" && [ "$(tail -1 "$W/c.err")" = "$(tail -1 "$W/r.err")" ]; then ok=$((ok+1)); else fail "index: $(stat -c%s "$W/ixc.kst")/$(stat -c%s "$W/ixr.kst") B"; fi
-  same "region after index" -- region "$W/ixc.kst" "$seq" 0 5000
-  same "smooth" -- smooth "$k" "$h" "$fs"
-  same "smooth seq" -- smooth "$k" "$h" "$fs" "$seq"
-  same "smooth range" -- smooth "$k" "$h" "$fs" "$seq" 0 5000
+  same "region after index" -- $dec region "$W/ixc.kst" "$seq" 0 5000
+  same "smooth" -- $dec smooth "$k" "$h" "$fs" && cp "$W/c.out" "$W/smooth.out"
+  same "smooth seq" -- $dec smooth "$k" "$h" "$fs" "$seq"
+  same "smooth range" -- $dec smooth "$k" "$h" "$fs" "$seq" 0 5000
+}
+# the plain track's smooth and region are what every informed form must give
+plainref() {  # plainref FS KIND
+  cp "$W/smooth.out" "$W/plain.$1.$2.smooth"; cp "$W/region.out" "$W/plain.$1.$2.region"; cp "$W/c.out" "$W/plain.$1.$2.smrange"
+}
+mergecol() {  # mergecol COL: one label column of a --db region, runs merged
+  cut -f1-3,"$1" | awk -F'\t' 'NR>1 && $1==p && $2==e && $4==l {e=$3; next} NR>1 {print p"\t"s"\t"e"\t"l} {p=$1; s=$2; e=$3; l=$4} END{if (NR) print p"\t"s"\t"e"\t"l}'
 }
 
 for kind in presmoothed smoothed; do
@@ -76,7 +83,13 @@ for kind in presmoothed smoothed; do
         case "$fl" in *"--names drop"*) cut -f2- "$W/want.bed" > "$W/w2"; cut -f2- "$W/got.bed" > "$W/g2"; mv "$W/w2" "$W/want.bed"; mv "$W/g2" "$W/got.bed";; esac
         cmp -s "$W/want.bed" "$W/got.bed" || fail "$lbl round trip"
         # every reader, on the default form only: the bytes are the same file
-        [ -z "$fl" ] && readers "$W/t.kst" "$seq" "$fs" "$hier"
+        if [ -z "$fl" ]; then
+          readers "$W/t.kst" "$seq" "$fs" "$hier" "$dec"
+          if [ $strat = plain ]; then plainref "$fs" "$kind"
+          else cmp -s "$W/smooth.out" "$W/plain.$fs.$kind.smooth" || fail "$lbl smooth differs from the plain track's"
+               cmp -s "$W/region.out" "$W/plain.$fs.$kind.region" || fail "$lbl region differs from the plain track's"
+               cmp -s "$W/c.out" "$W/plain.$fs.$kind.smrange" || fail "$lbl smooth range differs from the plain track's"; fi
+        fi
         # the oracle: smoothing the presmoothed track must give KaryoScope's
         # own smoothed track, from both. A shared miss is the smoother's
         # difference, not ours, and is reported as such.
@@ -115,7 +128,12 @@ for kind in presmoothed smoothed; do
       [ -z "$fl" ] && for fs in $sets; do
         zcat "$(ls "$D"/*."$fs"."$kind".bed.gz | grep -v '/ref\.' | head -1)" | cmp -s - "$W/oc/$fs.bed" || fail "$lbl restores $fs"
       done
-      [ -z "$fl" ] && { seq=$(zcat $(echo $ins | cut -d' ' -f1) | head -1 | cut -f1); same "$lbl region" -- --db $feat region "$W/t.kst" "$seq" 0 5000 2>/dev/null; }
+      # --db readers: the smooth of every set and one label column of region,
+      # merged, must equal the plain track's
+      [ -z "$fl" ] && { seq=$(zcat $(echo $ins | cut -d' ' -f1) | head -1 | cut -f1); rd=${dec% --out}
+        same "$lbl region" -- $rd region "$W/t.kst" "$seq" && { j=0; for fs in $sets; do j=$((j+1))
+          mergecol $((j+3)) < "$W/c.out" | cmp -s - <(mergecol 4 < "$W/plain.$fs.$kind.region") || fail "$lbl region column $fs differs from the plain track's"; done; }
+        for fs in $sets; do same "$lbl smooth $fs" -- $rd smooth "$W/t.kst" "$hier" "$fs" && { cmp -s "$W/c.out" "$W/plain.$fs.$kind.smooth" || fail "$lbl smooth $fs differs from the plain track's"; }; done; }
     done
   done
 done

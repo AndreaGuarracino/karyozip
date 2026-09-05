@@ -168,10 +168,11 @@ impl Cli {
         if self.len_codec.is_some() && !enc { bad("--len-codec")?; }
         if self.out.is_some() && !dec { bad("--out")?; }
         if self.raw && !dec { bad("--raw")?; }
-        if self.db.is_some() && !(enc || dec) { bad("--db")?; }
-        if self.aln.is_some() && !(enc || dec) { bad("--aln")?; }
-        if self.refbed.is_some() && !(enc || dec) { bad("--ref")?; }
-        if self.aln_names.is_some() && !(enc || dec) { bad("--aln-names")?; }
+        let inf = enc || dec || sm || c == "region";
+        if self.db.is_some() && !inf { bad("--db")?; }
+        if self.aln.is_some() && !inf { bad("--aln")?; }
+        if self.refbed.is_some() && !inf { bad("--ref")?; }
+        if self.aln_names.is_some() && !inf { bad("--aln-names")?; }
         if self.max_gap.is_some() && !sm { bad("--max-gap")?; }
         if self.halo.is_some() && !sm { bad("--halo")?; }
         if self.v1 && !sm { bad("--v1")?; }

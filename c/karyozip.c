@@ -3115,8 +3115,54 @@ static inline char *putu64(char *o, uint64_t v) {
     return o;
 }
 
-/* Measured: */
-/* Measured: */
+/* --db and --aln companions, for every reader */
+static void loadinformed(const char *who) {
+    if (ALNPAF && !ALNREF) { fprintf(stderr, "karyozip: %s--aln needs --ref\n", who); exit(1); }
+    if (ALNREF && !ALNPAF) die("--ref does nothing without --aln");
+    if (ALNNAMES && !ALNPAF) die("--aln-names does nothing without --aln");
+    if (DBFEATS) loadfeatures(DBFEATS);
+    if (ALNPAF) { if (ALNNAMES) loadordinals(ALNNAMES); loadref(ALNREF); loadaln(ALNPAF); }
+}
+static R *ropen_informed(const char *path) {
+    R *r = ropen(path);
+    if (DBFEATS && (!r->feathash || r->feathash != FEATHASH))
+        die("this features.tsv is not the one the track was encoded with");
+    return r;
+}
+static uint32_t featid(const char *L) {   /* a --db label, checked */
+    uint32_t id = (uint32_t)num_arg(L, (1u << 26) - 1, "corrupt --db track: a label is not a featureID");
+    if (id && (id >= nfid || !fid2lab[id])) die("a featureID in the track is not in the features table");
+    return id;
+}
+/* the label a reader prints: restored under --aln, a set tuple under --db */
+static char *putlab(char *o, const R *r, uint64_t f, const char *seq, uint64_t st, uint64_t len) {
+    if (r->lab && f >= r->nlab) die("corrupt block: a label id past the table");
+    if (!r->lab) return putu64(o, f);
+    const char *L = r->lab[f];
+    if (ALNPAF && L[0] == '=' && !L[1]) {
+        uint32_t rl = refrow_at(seq, st, len);
+        if (rl == UINT32_MAX || rl >= r->nlab) die("a delta row has no reference answer: wrong PAF or reference track");
+        L = r->lab[rl];
+    }
+    if (!DBFEATS) { size_t n = strlen(L); memcpy(o, L, n); return o + n; }
+    uint32_t id = featid(L);
+    for (size_t j = 0; j < nfset; j++) {
+        const char *Lb = id ? fid2lab[id][j] : "novel"; size_t n = strlen(Lb);
+        if (j) *o++ = '\t';
+        memcpy(o, Lb, n); o += n;
+    }
+    return o;
+}
+static size_t maxlablen(const R *r) {   /* the longest label putlab writes */
+    size_t m = 20;
+    if (!DBFEATS) { if (r->lab) for (uint64_t j = 0; j < r->nlab; j++) { size_t L = strlen(r->lab[j]); if (L > m) m = L; } return m; }
+    if (6 * nfset > m) m = 6 * nfset;   /* the novel tuple */
+    for (uint32_t id = 0; id < nfid; id++) if (fid2lab[id]) {
+        size_t L = 0; for (size_t j = 0; j < nfset; j++) L += strlen(fid2lab[id][j]) + 1;
+        if (L > m) m = L; }
+    return m;
+}
+
 static void dump(const char *path) {
     R *r = ropen(path);
     ensurenames(r);
@@ -3191,7 +3237,7 @@ static void dump(const char *path) {
 
 static void region(const char *path, const char *seq, uint64_t lo, uint64_t hi,
                    uint64_t halo) {
-    R *r = ropen(path);
+    R *r = ropen_informed(path);
 
     int64_t ri = idxlookup(r, path, seq);
     if (ri < 0) ri = rfind(r, seq);
@@ -3246,9 +3292,7 @@ static void region(const char *path, const char *seq, uint64_t lo, uint64_t hi,
         st = jump != q.blk ? r->b[jump].bp : 0;
     }
 
-    size_t nlen = strlen(seq), maxlab = 20;
-    if (r->lab) for (uint64_t j = 0; j < r->nlab; j++) {
-        size_t L = strlen(r->lab[j]); if (L > maxlab) maxlab = L; }
+    size_t nlen = strlen(seq), maxlab = maxlablen(r);
     size_t OCAP = 1 << 20;
     if (nlen + maxlab + 48 > OCAP) OCAP = nlen + maxlab + 48;
     char *ob = xmalloc(OCAP), *o = ob;
@@ -3264,10 +3308,7 @@ static void region(const char *path, const char *seq, uint64_t lo, uint64_t hi,
             memcpy(o, seq, nlen); o += nlen; *o++ = '\t';
             o = putu64(o, st); *o++ = '\t';
             o = putu64(o, en); *o++ = '\t';
-            if (r->lab && f >= r->nlab) die("corrupt block: a label id past the table");
-            if (r->lab && f < r->nlab) {
-                size_t L = strlen(r->lab[f]); memcpy(o, r->lab[f], L); o += L;
-            } else o = putu64(o, f);
+            o = putlab(o, r, f, seq, st, en - st);
             *o++ = '\n';
         }
         st = en;
@@ -3287,7 +3328,7 @@ static uint8_t *ANC = NULL;
 static int16_t *LCA = NULL;
 static int ROOTID = -1;
 static uint64_t MAXGAP = 1000;
-static uint64_t HALO = 200;
+static uint64_t HALO = UINT64_MAX;   /* --halo: runs of context, default the whole sequence */
 /* runs of context around a requested region */
 
 static int nodeid(const char *nm, size_t n) {
@@ -3414,11 +3455,23 @@ static void smooth_one(uint64_t *st, uint64_t *en, int *feat, uint64_t n) {
 }
 
 static uint8_t *isnovel = NULL;
-static void buildnovel(R *r) {
-    if (isnovel || !r->lab) return;
-    isnovel = xmalloc(r->nlab ? r->nlab : 1);
-    for (uint64_t i = 0; i < r->nlab; i++)
-        isnovel[i] = (uint8_t)(strcmp(r->lab[i], "novel") == 0);
+static int *labnodes(R *r, const char *fs) {   /* label id to hierarchy node */
+    size_t k = 0;
+    if (DBFEATS) { while (k < nfset && strcmp(fset[k], fs)) k++;
+                   if (k == nfset) die("smooth: the set is not in features.tsv"); }
+    uint64_t n = r->nlab ? r->nlab : 1;
+    isnovel = xmalloc(n); int *m = xmalloc(mul(n, sizeof(int)));
+    for (uint64_t i = 0; i < r->nlab; i++) {
+        const char *L = r->lab[i];
+        if (ALNPAF && L[0] == '=' && !L[1]) { m[i] = INT_MIN; isnovel[i] = 0; continue; }
+        if (DBFEATS) {                      /* a reference label need not be a featureID */
+            size_t n = strspn(L, "0123456789");
+            if (!n || L[n]) { m[i] = INT_MIN + 1; isnovel[i] = 0; continue; }
+            uint32_t id = featid(L); L = id ? fid2lab[id][k] : "novel"; }
+        isnovel[i] = (uint8_t)(strcmp(L, "novel") == 0);
+        m[i] = nodeid(L, strlen(L));
+    }
+    return m;
 }
 
 static uint64_t loadseq(R *r, int64_t ri, uint64_t **st, uint64_t **en, int **feat,
@@ -3449,10 +3502,16 @@ static uint64_t loadseq(R *r, int64_t ri, uint64_t **st, uint64_t **en, int **fe
         spannext(r, &sp, &lp, &ip); sp.left--;
         uint64_t e = s + rlen(&lp, r->name[ri], s, k + 1 == n && (uint64_t)ri >= TAILSKIP_R), f = vget(&ip);
         (*st)[k] = s; (*en)[k] = e;
-        int isnov = (isnovel && f < r->nlab) ? isnovel[f] : 0;
-        (*novel)[k] = (uint8_t)isnov;
         if (f >= r->nlab) die("corrupt block: a label id past the table");
-        (*feat)[k] = isnov ? ROOTID : labmap[f];
+        int m = labmap[f];
+        if (m == INT_MIN) {                 /* stored as =: the reference row's label */
+            uint32_t rl = refrow_at(r->name[ri], s, e - s);
+            if (rl == UINT32_MAX || rl >= r->nlab) die("a delta row has no reference answer: wrong PAF or reference track");
+            f = rl; m = labmap[f];
+        }
+        if (m == INT_MIN + 1) die("corrupt --db track: a label is not a featureID");
+        (*novel)[k] = isnovel[f];
+        (*feat)[k] = isnovel[f] ? ROOTID : m;
         s = e;
     }
     r->curblk = q.blk; r->curoff = q.off + n;
@@ -3600,13 +3659,9 @@ static void smoothcmd(const char *path, const char *hier, const char *fs,
                       const char *seq, uint64_t lo, uint64_t hi, int v1) {
     loadhier(hier, fs);
     buildanc();
-    R *r = ropen(path);
+    R *r = ropen_informed(path);
     ensurenames(r);   /* emit prints names */
-
-    buildnovel(r);
-    int *labmap = xmalloc(mul(r->nlab ? r->nlab : 1, sizeof(int)));
-    for (uint64_t i = 0; i < r->nlab; i++)
-        labmap[i] = r->lab ? nodeid(r->lab[i], strlen(r->lab[i])) : ROOTID;
+    int *labmap = labnodes(r, fs);
     if (ANC) { free(ANC); free(LCA); buildanc(); }   /* unknown labels added above */
 
     int64_t first = 0, last = (int64_t)r->nreads;
@@ -3845,19 +3900,12 @@ static void dbtmpclean(void) { for (size_t i = 0; i < ndbtmp; i++) if (DBTMP[i])
 static void dbtmpsig(int s) { dbtmpclean(); (void)s; _exit(1); }   /* atexit does not run on a signal */
 
 static void decode_db(const char *path, const char *dir) {
-    loadfeatures(DBFEATS);
-    if (ALNPAF) {
-        if (ALNNAMES) loadordinals(ALNNAMES);
-        loadref(ALNREF); loadaln(ALNPAF);
-    }
     ow *o = xcalloc(nfset, sizeof *o);
     uint64_t *c0 = xcalloc(nfset, sizeof *c0), *c1 = xcalloc(nfset, sizeof *c1);
     const char **cl = xcalloc(nfset, sizeof *cl);
     size_t *cll = xcalloc(nfset, sizeof *cll);
     const char *cseq = NULL; size_t cseqn = 0;
-    R *r = ropen(path);
-    if (!r->feathash || r->feathash != FEATHASH)
-        die("this features.tsv is not the one the track was encoded with");
+    R *r = ropen_informed(path);
     ensurenames(r);
     char pb[4096];
     for (size_t i = 0; i < nfset; i++) {
@@ -3904,11 +3952,7 @@ static void decode_db(const char *path, const char *dir) {
                 idtxt = labtab[rl];
             }
             /* the label text IS the featureID: parse it as strictly as encode did */
-            uint32_t id = idtxt ? (uint32_t)num_arg(idtxt, (1u << 26) - 1,
-                              "corrupt --db track: a label is not a featureID")
-                                : (uint32_t)f;
-            if (id && (id >= nfid || !fid2lab[id]))
-                die("a featureID in the track is not in the features table");
+            uint32_t id = idtxt ? featid(idtxt) : (uint32_t)f;
             for (size_t j = 0; j < nfset; j++) {
                 const char *Lb = id ? fid2lab[id][j] : "novel";
                 size_t Lbn = strlen(Lb);
@@ -3962,12 +4006,6 @@ static void decode_db(const char *path, const char *dir) {
     free(o); free(c0); free(c1); free(cl); free(cll); rclose(r);
 }
 
-static void decode_aln(const char *path) {
-    if (ALNNAMES) loadordinals(ALNNAMES);
-    loadref(ALNREF); loadaln(ALNPAF);
-    dump(path);
-}
-
 #ifndef KARYOZIP_LIB
 int main(int argc, char **argv) {
     signal(SIGXFSZ, SIG_IGN);
@@ -3994,8 +4032,9 @@ int main(int argc, char **argv) {
             "  encode:      --block N|all  --level N  --slow  --sort[=MEM]\n"
             "               --names keep|drop|drop:FILE  --db F  --aln P --ref R\n"
             "               --tail 0|1  --tok-chunk N  --id-codec N  --len-codec N\n"
-            "  decode:      --raw  --out DIR  --db F  --aln P --ref R\n"
-            "  readers:     --names FILE|ordinal\n"
+            "  decode:      --raw  --out DIR\n"
+            "  readers:     --names FILE|ordinal  --db F  --aln P --ref R, as encode was given;\n"
+            "               region prints one label per set under --db\n"
             "  with --aln:  --aln-names FILE, on encode and decode, when the track\n"
             "               names rows by ordinal\n"
             "  smooth:      --max-gap N  --halo N  --v1\n"
@@ -4037,6 +4076,8 @@ int main(int argc, char **argv) {
     int sm = !strcmp(cmd, "smooth");
     int dec = !strcmp(cmd, "decode");
     int rd = sm || dec || !strcmp(cmd, "region") || !strcmp(cmd, "index");
+    int inf = enc || rd;                   /* --db and --aln: every reader but index */
+    if (!strcmp(cmd, "index")) inf = 0;
     for (int i = 1; i < argc; i++) {
         int take = 0, ok = 1; const char *a = argv[i], *v = i + 1 < argc ? argv[i + 1] : NULL;
         for (size_t k = 0; k < sizeof FLAGS / sizeof *FLAGS; k++)   /* a value is required */
@@ -4070,7 +4111,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--halo")) { ok = sm; HALO = num_arg(v, UINT64_MAX, "--halo needs a number"); take = 2; }
         else if (!strcmp(a, "--v1")) { ok = sm; V1 = 1; take = 1; }
         else if (!strcmp(a, "--aln-names")) {   /* the alignment's own table: ordinal N is line N+1 */
-            ok = enc || dec; ALNNAMES = v; take = 2; }
+            ok = inf; ALNNAMES = v; take = 2; }
         else if (!strcmp(a, "--sort")) { ok = enc; SORT = 1; take = 1; }
         else if (!strncmp(a, "--sort=", 7)) { ok = enc; SORT = 1; SORTMEM = mem_arg(a + 7); take = 1; }
         else if (!strcmp(a, "--slow")) { ok = enc; SLOW = 1; FASTMODE = 0; take = 1; }
@@ -4081,9 +4122,9 @@ int main(int argc, char **argv) {
             BLOCKSET = 1; take = 2; }
         else if (!strcmp(a, "--level")) { ok = enc;
             LEVEL = (int)int_arg(v, 1, 22, "--level is a zstd level, 1 to 22"); LEVELSET = 1; take = 2; }
-        else if (!strcmp(a, "--db")) { ok = enc || dec; DBFEATS = v; take = 2; }
-        else if (!strcmp(a, "--aln")) { ok = enc || dec; ALNPAF = v; take = 2; }
-        else if (!strcmp(a, "--ref")) { ok = enc || dec; ALNREF = v; take = 2; }
+        else if (!strcmp(a, "--db")) { ok = inf; DBFEATS = v; take = 2; }
+        else if (!strcmp(a, "--aln")) { ok = inf; ALNPAF = v; take = 2; }
+        else if (!strcmp(a, "--ref")) { ok = inf; ALNREF = v; take = 2; }
         else if (!strcmp(a, "--out")) { ok = dec; OUTDIR = v; take = 2; }
         else if (!strcmp(a, "--raw")) { ok = dec; RAW = 1; take = 1; }
         if (take && !ok) { fprintf(stderr, "karyozip: %s does not apply to %s\n", a, cmd); exit(1); }
@@ -4151,13 +4192,9 @@ int main(int argc, char **argv) {
             f = argv[i];
         }
         if (!f) die("decode needs a track");
-        if (ALNPAF && !ALNREF) die("decode --aln needs --ref");
-        if (DBFEATS) {
-            /* decode_db loads the alignment itself */
-            if (!OUTDIR) die("decode --db needs --out DIR for the per-set BEDs");
-            decode_db(f, OUTDIR);
-        } else if (ALNPAF) decode_aln(f);
-        else dump(f);
+        if (DBFEATS && !OUTDIR) die("decode --db needs --out DIR for the per-set BEDs");
+        loadinformed("decode ");
+        if (DBFEATS) decode_db(f, OUTDIR); else dump(f);
     }
 
     /* one reader: SEQ alone is the whole sequence, SEQ POS the run covering
@@ -4167,6 +4204,7 @@ int main(int argc, char **argv) {
         uint64_t rhi = argc > 5 ? num_arg(argv[5], UINT64_MAX, "region: end is not a number") : 0;
         if (argc == 5) rhi = rlo + 1;                  /* one position */
         if (argc > 5 && rlo >= rhi) die("region: give START END with END past START");
+        loadinformed("region ");
         region(argv[2], argv[3], rlo, rhi, argc > 6 ? num_arg(argv[6], UINT64_MAX, "region: halo is not a number") : 0);
     }
     else if (!strcmp(argv[1], "index") && argc > 2) buildindex(argv[2]);
@@ -4175,6 +4213,7 @@ int main(int argc, char **argv) {
         uint64_t slo = argc > 6 ? num_arg(argv[6], UINT64_MAX, "smooth: start is not a number") : 0;
         uint64_t shi = argc > 7 ? num_arg(argv[7], UINT64_MAX, "smooth: end is not a number") : 0;
         if (argc > 7 && slo >= shi) die("smooth: end must be past start");
+        loadinformed("smooth ");
         smoothcmd(argv[2], argv[3], argv[4], argc > 5 ? argv[5] : NULL, slo, shi, V1);
     }
     else die("bad command or missing arguments");

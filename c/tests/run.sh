@@ -114,6 +114,29 @@ $KT decode --db "$D/db.features.tsv" --aln "$D/db.self.paf" --ref "$D/db.rall.be
   --out "$W/dao" "$W/da.kt" 2>/dev/null
 n=0; for f in $sets; do cmp -s "$W/dao/$f.bed" "$D/db.$f.bed" && n=$((n+1)); done
 [ "$n" = 6 ] && echo "db+aln: 6/6 identical" || { echo "db+aln: only $n/6"; fail=1; }
+# smooth and region read every informed form, given what encode was given,
+# and give the same rows as the plain track. Under --db region prints the
+# whole label tuple, one column per set.
+{ printf 'feature_set\tchild\tparent\n'; for l in $(cut -f4 "$D/db.acrocentric.bed" "$D/s.bed" | sort -u); do printf 'acrocentric\t%s\tcategorized\n' "$l"; done; } > "$W/inf.tsv"
+$KT encode < "$D/db.acrocentric.bed" > "$W/pa.kt" 2>/dev/null
+$KT smooth "$W/pa.kt" "$W/inf.tsv" acrocentric > "$W/inf.want" 2>/dev/null
+$KT smooth "$W/p.kt" "$W/inf.tsv" acrocentric > "$W/inf.wants" 2>/dev/null
+$KT --db "$D/db.features.tsv" smooth "$W/f.kt" "$W/inf.tsv" acrocentric 2>/dev/null | cmp -s - "$W/inf.want" && echo "smooth --db: same as plain" || { echo "smooth --db: DIFFERS"; fail=1; }
+$KT --db "$D/db.features.tsv" --aln "$D/db.self.paf" --ref "$D/db.rall.bed" -t 4 smooth "$W/da.kt" "$W/inf.tsv" acrocentric 2>/dev/null | cmp -s - "$W/inf.want" && echo "smooth --db --aln, 4 threads: same as plain" || { echo "smooth --db --aln: DIFFERS"; fail=1; }
+$KT --aln "$D/p.paf" --ref "$D/ref.bed" smooth "$W/d.kt" "$W/inf.tsv" acrocentric 2>/dev/null | cmp -s - "$W/inf.wants" && echo "smooth --aln: same as plain" || { echo "smooth --aln: DIFFERS"; fail=1; }
+sq=$(head -1 "$D/db.acrocentric.bed" | cut -f1)
+$KT region "$W/pa.kt" "$sq" 0 100000 > "$W/inf.want" 2>/dev/null
+$KT --db "$D/db.features.tsv" region "$W/f.kt" "$sq" 0 100000 2>/dev/null > "$W/inf.got"
+[ "$(awk -F'\t' '{print NF}' "$W/inf.got" | sort -u)" = 9 ] && echo "region --db: 6 label columns" || { echo "region --db: wrong column count"; fail=1; }
+awk -F'\t' 'NR>1 && $1==p && $2==e && $4==l {e=$3; next} NR>1 {print p"\t"s"\t"e"\t"l} {p=$1; s=$2; e=$3; l=$4} END{print p"\t"s"\t"e"\t"l}' <(cut -f1-4 "$W/inf.got") | cmp -s - "$W/inf.want" && echo "region --db: acrocentric column, merged, same as plain" || { echo "region --db: DIFFERS"; fail=1; }
+$KT --db "$D/db.features.tsv" --aln "$D/db.self.paf" --ref "$D/db.rall.bed" region "$W/da.kt" "$sq" 0 100000 2>/dev/null | cmp -s - "$W/inf.got" && echo "region --db --aln: same as --db" || { echo "region --db --aln: DIFFERS"; fail=1; }
+$KT --aln "$D/p.paf" --ref "$D/ref.bed" region "$W/d.kt" q1 2>/dev/null | cmp -s <($KT region "$W/p.kt" q1 2>/dev/null) && echo "region --aln: same as plain" || { echo "region --aln: DIFFERS"; fail=1; }
+must_fail "smooth an --aln track without --aln" $KT smooth "$W/d.kt" "$W/inf.tsv" acrocentric
+must_fail "smooth a --db track without --db" $KT smooth "$W/f.kt" "$W/inf.tsv" acrocentric
+must_fail "smooth --db a set not in features.tsv" $KT --db "$D/db.features.tsv" smooth "$W/f.kt" "$W/sm.tsv" nosuch
+must_fail "region --db on a plain track" $KT --db "$D/db.features.tsv" region "$W/p.kt" q1
+must_fail "smooth --aln without --ref" $KT --aln "$D/p.paf" smooth "$W/d.kt" "$W/inf.tsv" acrocentric
+must_fail "index --aln" $KT --aln "$D/p.paf" --ref "$D/ref.bed" index "$W/d.kt"
 
 # HKS tracks name sequences by ordinal, so --aln reaches the PAF only through
 # --names FILE. Dropping the names is legal here and must still round-trip.

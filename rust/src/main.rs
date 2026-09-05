@@ -21,8 +21,15 @@ fn need(v: &Option<String>) -> &str {
 
 fn main() {
     ffi::ignore_sigxfsz();
+    // The runtime reopens a closed standard fd on /dev/null, read-write; a
+    // shell redirection to /dev/null is write-only or read-only. The C
+    // refuses a closed fd outright, and so must this.
     for fd in 0..3 {
-        if std::fs::read_link(format!("/proc/self/fd/{fd}")).is_err() {
+        let dst = std::fs::read_link(format!("/proc/self/fd/{fd}")).ok();
+        let info = std::fs::read_to_string(format!("/proc/self/fdinfo/{fd}")).unwrap_or_default();
+        let flags = info.lines().find_map(|l| l.strip_prefix("flags:\t"))
+            .and_then(|f| u32::from_str_radix(f.trim(), 8).ok()).unwrap_or(0);
+        if dst.is_none() || (dst.as_deref() == Some(std::path::Path::new("/dev/null")) && flags & 3 == 2) {
             die("stdin, stdout or stderr is closed");
         }
     }
@@ -144,21 +151,13 @@ fn main() {
         Cmd::Decode { track, rest } => {
             if !rest.is_empty() { die("decode takes one track"); }
             let track = need(track);
-            ro.aln = load_aln(&c.aln, &c.refbed, &c.aln_names, "decode ");
-            // The C refuses the flag pair before it opens the track.
+            // The C refuses the flag pair before it loads anything.
             if c.db.is_some() && c.out.is_none() { die("decode --db needs --out DIR for the per-set BEDs"); }
+            let feats = informed(&c, &mut ro, "decode ");
             let mut r = reader::Reader::open_with(track, &ro);
-            match (&c.db, &c.out) {
-                (Some(fp), Some(d)) => {
-                    let feats = db::Feats::load(fp);
-                    eprintln!("features: {} ids, {} sets", feats.id2lab.len(), feats.sets.len());
-                    if feats.sets.len() <= 32 { eprintln!("features: integer-tuple index on"); }
-                    if r.feathash() != feats.hash {
-                        die("this features.tsv is not the one the track was encoded with");
-                    }
-                    db::decode(&mut r, &feats, d);
-                }
-                (Some(_), None) => die("decode --db needs --out DIR for the per-set BEDs"),
+            if let Some(f) = &feats { f.check_hash(&r); }
+            match (&feats, &c.out) {
+                (Some(f), Some(d)) => db::decode(&mut r, f, d),
                 _ => {
                     let so = std::io::stdout();
                     let mut o = BufWriter::new(so.lock());
@@ -182,18 +181,19 @@ fn main() {
                     (x, y, hl.as_ref().map_or(0, |_| p(hl, "region: halo is not a number")))
                 }
             };
-            ro.aln = load_aln(&c.aln, &c.refbed, &c.aln_names, "");
+            let feats = informed(&c, &mut ro, "region ");
             let mut r = reader::Reader::open_with(track, &ro);
+            if let Some(f) = &feats { f.check_hash(&r); }
             let so = std::io::stdout();
             let mut o = BufWriter::new(so.lock());
-            r.region(seq.as_bytes(), lo, hi, hlo, &mut o);
+            r.region(seq.as_bytes(), lo, hi, hlo, feats.as_ref(), &mut o);
             o.flush().unwrap_or_else(|e| die(&e.to_string()));
         }
         Cmd::Smooth { track, hier, fs, seq, start, end, rest } => {
             let (track, hier, fs) = (need(track), need(hier), need(fs));
             if !rest.is_empty() { die("smooth: give SEQ, or SEQ START END"); }
             let maxgap = num(&c.max_gap, 0, u64::MAX, "--max-gap needs a number").unwrap_or(1000);
-            let halo = num(&c.halo, 0, u64::MAX, "--halo needs a number").unwrap_or(200);
+            let halo = num(&c.halo, 0, u64::MAX, "--halo needs a number").unwrap_or(u64::MAX);
             let (lo, hi) = match (start, end) {
                 (Some(a), Some(b)) => (
                     a.parse().unwrap_or_else(|_| die("smooth: start is not a number")),
@@ -202,10 +202,11 @@ fn main() {
                 _ => die("smooth: give SEQ, or SEQ START END"),
             };
             if start.is_some() && lo >= hi { die("smooth: end must be past start"); }
+            let feats = informed(&c, &mut ro, "smooth ");
             let so = std::io::stdout();
             let mut o = BufWriter::new(so.lock());
             smooth::run(track, hier, fs.as_bytes(), seq.as_ref().map(|s| s.as_bytes()),
-                        lo, hi, c.v1, maxgap, halo, &ro, &mut o);
+                        lo, hi, c.v1, maxgap, halo, &ro, feats.as_ref(), &mut o);
             o.flush().unwrap_or_else(|e| die(&e.to_string()));
         }
         Cmd::Index { track, rest: _ } => {
@@ -283,13 +284,25 @@ fn parse_codec(s: &str, flag: &str) -> i32 {
 }
 
 /// --aln needs --ref, and the two are read once, before any row.
+/// --db and --aln companions for a reader, in the C's order: features first.
+fn informed(c: &cli::Cli, ro: &mut reader::ReadOpts, who: &str) -> Option<db::Feats> {
+    let feats = c.db.as_deref().map(|fp| {
+        let f = db::Feats::load(fp);
+        eprintln!("features: {} ids, {} sets", f.id2lab.len(), f.sets.len());
+        if f.sets.len() <= 32 { eprintln!("features: integer-tuple index on"); }
+        f
+    });
+    ro.aln = load_aln(&c.aln, &c.refbed, &c.aln_names, who);
+    feats
+}
+
 fn load_aln(paf: &Option<String>, refbed: &Option<String>,
             ordfile: &Option<String>, who: &str) -> Option<aln::Aln> {
-    if paf.is_none() && ordfile.is_some() { die("--aln-names does nothing without --aln"); }
     match (paf, refbed) {
-        (None, None) => None,
         (Some(_), None) => die(&format!("{who}--aln needs --ref")),
         (None, Some(_)) => die("--ref does nothing without --aln"),
+        (None, None) if ordfile.is_some() => die("--aln-names does nothing without --aln"),
+        (None, None) => None,
         (Some(p), Some(r)) => {
             // The C loads the ordinal map first, and the diagnostics are
             // compared line for line.

@@ -20,8 +20,13 @@ rust-test: all rust
 diff: all rust
 	bash tests/diff.sh
 
+# The wide check: every real fixture cell under tests/fixtures, every set,
+# smoothing, strategy, flag and reader, through both binaries.
+matrix: all rust
+	@for d in tests/fixtures/*/; do bash tests/matrix.sh "$$d" || exit 1; done
+
 clean:
 	$(MAKE) -C c clean
 	cd rust && cargo clean 2>/dev/null || true
 
-.PHONY: all test rust rust-test diff clean
+.PHONY: all test rust rust-test diff matrix clean

@@ -47,8 +47,10 @@ readers() {  # readers KST SEQ FS HIER
   same "region pos" -- region "$k" "$seq" 100
   same "region range" -- region "$k" "$seq" 0 5000
   same "region halo" -- region "$k" "$seq" 0 5000 3
-  cp "$k" "$W/ix.kst"; same "index" -- index "$W/ix.kst"
-  same "region after index" -- region "$W/ix.kst" "$seq" 0 5000
+  cp "$k" "$W/ixc.kst"; cp "$k" "$W/ixr.kst"
+  "$C" index "$W/ixc.kst" > /dev/null 2> "$W/c.err"; "$R" index "$W/ixr.kst" > /dev/null 2> "$W/r.err"
+  if cmp -s "$W/ixc.kst" "$W/ixr.kst" && [ "$(tail -1 "$W/c.err")" = "$(tail -1 "$W/r.err")" ]; then ok=$((ok+1)); else fail "index: $(stat -c%s "$W/ixc.kst")/$(stat -c%s "$W/ixr.kst") B"; fi
+  same "region after index" -- region "$W/ixc.kst" "$seq" 0 5000
   same "smooth" -- smooth "$k" "$h" "$fs"
   same "smooth seq" -- smooth "$k" "$h" "$fs" "$seq"
   same "smooth range" -- smooth "$k" "$h" "$fs" "$seq" 0 5000

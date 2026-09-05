@@ -356,7 +356,8 @@ fn encode(opt: writer::Options, tmpdir: &std::path::Path, a: Option<aln::Aln>) {
 fn report(st: &writer::Stats) {
     eprintln!("encoded rows={} reads={} blocks={} names={}B{} index={}B offs={}B lens={}B labs={}B raw={}B",
               st.rows, st.reads, st.blocks, st.names,
-              if st.ordinal { " (ordinal, not stored)" }
+              if st.dropped { " (dropped, needs --names FILE)" }
+              else if st.ordinal { " (ordinal, not stored)" }
               else if st.tokused { " (tokenised)" }
               else if st.intused { " (int deltas)" } else { "" },
               st.index, st.offs, st.lens, st.labs, st.raw);

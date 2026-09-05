@@ -70,7 +70,7 @@ for kind in presmoothed smoothed; do
         cp "$W/c.out" "$W/t.kst"
         # the round trip, with the decoder given what the encoder was given
         dec=""; [ $strat = aln ] && dec="--aln $paf --ref $ref $alnnames"
-        case "$fl" in *"--names drop"*) [ $ordinal = 1 ] || dec="$dec --names ordinal";; esac
+        case "$fl" in *"--names drop"*) dec="$dec --names ordinal";; esac   # harmless when names were kept
         case "$fl" in *--sort*) sort "$W/in.bed" > "$W/want.bed"; "$C" $dec decode "$W/t.kst" 2>/dev/null | sort > "$W/got.bed";;
                       *) cp "$W/in.bed" "$W/want.bed"; "$C" $dec decode "$W/t.kst" > "$W/got.bed" 2>/dev/null;; esac
         case "$fl" in *"--names drop"*) cut -f2- "$W/want.bed" > "$W/w2"; cut -f2- "$W/got.bed" > "$W/g2"; mv "$W/w2" "$W/want.bed"; mv "$W/g2" "$W/got.bed";; esac
@@ -109,7 +109,7 @@ for kind in presmoothed smoothed; do
       cp "$W/c.out" "$W/t.kst"
       mkdir -p "$W/oc" "$W/or"; rm -f "$W/oc"/* "$W/or"/*
       dec="--db $feat --out"; [ $strat = dbaln ] && dec="--aln $paf --ref $ref $alnnames $dec"
-      case "$fl" in *"--names drop"*) [ $ordinal = 1 ] || dec="--names ordinal $dec";; esac
+      case "$fl" in *"--names drop"*) dec="--names ordinal $dec";; esac
       "$C" $dec "$W/oc" decode "$W/t.kst" >/dev/null 2>&1; "$R" $dec "$W/or" decode "$W/t.kst" >/dev/null 2>&1
       for f in "$W/oc"/*.bed; do cmp -s "$f" "$W/or/$(basename "$f")" || fail "$lbl decode --db $(basename "$f")"; done
       [ -z "$fl" ] && for fs in $sets; do

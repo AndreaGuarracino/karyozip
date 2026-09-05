@@ -89,7 +89,9 @@ pub struct Reader {
     taildec: bool,
     tailpred: u64,
     tailskip: u64,
-    pub names: Vec<Vec<u8>>,
+    /// every name, newline-free, back to back; noff[i]..noff[i+1] is name i
+    pub names: Vec<u8>,
+    noff: Vec<u32>,
     /// name -> rank, built on the first lookup, which is also where the C
     /// notices that two sequences share a name.
     nameix: std::cell::OnceCell<HashMap<Vec<u8>, u64>>,
@@ -375,9 +377,14 @@ impl Reader {
         } else {
             zdec(&nz, "names")
         };
-        let mut names: Vec<Vec<u8>> = namebuf.split(|&c| c == b'\n').map(|s| s.to_vec()).collect();
-        if names.last().map(|x| x.is_empty()) == Some(true) { names.pop(); }
-        if names.len() as u64 != h[0] {
+        let mut names = namebuf;
+        if names.last() == Some(&b'\n') { names.pop(); }
+        let mut noff: Vec<u32> = vec![0];
+        if !names.is_empty() {
+            for (i, &c) in names.iter().enumerate() { if c == b'\n' { noff.push(i as u32 + 1); } }
+            noff.push(names.len() as u32 + 1);
+        }
+        if noff.len() as u64 - 1 != h[0] {
             crate::bail("names stream does not match the track's sequence count");
         }
         // --sort stores a rank per record; the input-order names sit beside
@@ -395,17 +402,19 @@ impl Reader {
                 Some(zdec(&pz, "input-order names"))
             };
             if let Some(nat) = resolve {
-                let tab: Vec<Vec<u8>> = nat.split(|&c| c == b'\n')
-                    .filter(|l| !l.is_empty()).map(|l| l.to_vec()).collect();
+                let tab: Vec<&[u8]> = nat.split(|&c| c == b'\n').filter(|l| !l.is_empty()).collect();
                 if tab.len() as u64 != h[0] {
                     crate::bail("input-order names do not match the track's sequence count");
                 }
-                names = names.iter().map(|n| {
+                let (mut nn, mut no) = (Vec::new(), vec![0u32]);
+                for i in 0..noff.len() - 1 {
+                    let n = &names[noff[i] as usize..noff[i + 1] as usize - 1];
                     let v: u64 = std::str::from_utf8(n).ok().and_then(|t| t.parse().ok())
                         .unwrap_or_else(|| crate::bail("a stored rank is not a record number"));
                     if v >= h[0] { crate::bail("a stored rank is not a record number"); }
-                    tab[v as usize].clone()
-                }).collect();
+                    nn.extend_from_slice(tab[v as usize]); nn.push(b'\n'); no.push(nn.len() as u32);
+                }
+                names = nn; noff = no;
             }
         }
 
@@ -421,7 +430,7 @@ impl Reader {
             f, nreads: h[0], rows: h[4], lab, block: blk, b, data0,
             nameix: std::cell::OnceCell::new(),
             idcodec: idc, lencodec: lenc,
-            taildec, tailpred: h[12], tailskip: h[13] & 0xff, names, ibx,
+            taildec, tailpred: h[12], tailskip: h[13] & 0xff, names, noff, ibx,
             hasidx, mhash: h[15], cur_ri: 0, cur_q: 0, cur_pend: 0, cached: None,
             feathash: (h[5] >> 32) | ((h[9] >> 32) << 32),
             aln: o.aln.clone(), lenfile: h[1] & LENFLAG != 0 && !o.raw, raw: o.raw,
@@ -435,21 +444,21 @@ impl Reader {
                              lp: 0, ip: 0, left: 0 };
         let (mut ipos, mut emitted) = (0usize, 0u64);
         let tskip = self.tailskip;
+        let (mut name, mut lab) = (Vec::new(), Vec::new());
         for i in 0..self.nreads {
             let (nruns, next) = vget(&self.ibx, ipos);
             ipos = next;
-            let name = std::mem::take(&mut self.names[i as usize]);
+            name.clear(); name.extend_from_slice(self.name_at(i));
             self.alnq = self.aln.as_ref().and_then(|a| a.find(&name));
             let mut st = 0u64;
             for k in 0..nruns {
                 let (len, id) = self.step(&mut c, st, k + 1 == nruns && i >= tskip);
-                let mut lab = Vec::new();
+                lab.clear();
                 self.label(id, &mut lab, st, len);
                 f(&name, st, st + len, &lab);
                 st += len;
                 emitted += 1;
             }
-            self.names[i as usize] = name;
         }
         if emitted != self.rows {
             eprintln!("karyozip: emitted {emitted} rows, the header says {}", self.rows);
@@ -463,10 +472,11 @@ impl Reader {
         let mut c = Cursor { blk: usize::MAX, data: std::rc::Rc::new(Vec::new()), lp: 0, ip: 0, left: 0 };
         let (mut ipos, mut emitted) = (0usize, 0u64);
         let tskip = self.tailskip;
+        let mut name = Vec::new();
         for i in 0..self.nreads {
             let (nruns, next) = vget(&self.ibx, ipos);
             ipos = next;
-            let name = std::mem::take(&mut self.names[i as usize]);
+            name.clear(); name.extend_from_slice(self.name_at(i));
             self.alnq = self.aln.as_ref().and_then(|a| a.find(&name));
             let mut st = 0u64;
             for k in 0..nruns {
@@ -487,7 +497,6 @@ impl Reader {
                 st = en;
                 emitted += 1;
             }
-            self.names[i as usize] = name;
         }
         rd(out.write_all(&buf), "write failed");
         if emitted != self.rows {
@@ -576,16 +585,16 @@ pub fn tok_d(b: &[u8]) -> Vec<u8> {
     if coff[nchunk] > b.len() - hdr {
         crate::bail("corrupt tokenised names: chunks overrun the stream");
     }
-    let mut o = Vec::new();
-    for i in 0..nchunk {
-        let s = &b[hdr + coff[i]..hdr + coff[i + 1]];
-        let mut d = ffi::tok_decode(s)
+    // One chunk per thread, as the C's tokd does. The tokeniser separates
+    // with NUL; the format stores newlines.
+    use rayon::prelude::*;
+    let parts: Vec<Vec<u8>> = (0..nchunk).into_par_iter().map(|i| {
+        let mut d = ffi::tok_decode(&b[hdr + coff[i]..hdr + coff[i + 1]])
             .unwrap_or_else(|| crate::bail("name tokeniser decode failed"));
-        // The tokeniser separates with NUL; the format stores newlines.
         for c in d.iter_mut() { if *c == 0 { *c = b'\n'; } }
-        o.append(&mut d);
-    }
-    o
+        d
+    }).collect();
+    parts.concat()
 }
 
 pub use crate::kst::{unzz, vget};
@@ -674,9 +683,9 @@ impl Reader {
 
     fn find(&self, seq: &[u8]) -> i64 {
         let ix = self.nameix.get_or_init(|| {
-            let mut m = HashMap::with_capacity(self.names.len());
-            for (i, n) in self.names.iter().enumerate() {
-                if m.insert(n.clone(), i as u64).is_some() {
+            let mut m = HashMap::with_capacity(self.nreads as usize);
+            for i in 0..self.nreads {
+                if m.insert(self.name_at(i).to_vec(), i).is_some() {
                     crate::bail("a sequence name repeats: the names are not usable");
                 }
             }
@@ -775,13 +784,13 @@ impl Reader {
         }
         let n = self.nreads as usize;
         let mut pair: Vec<(u64, u32)> = (0..n)
-            .map(|i| (kst::fnv(FNV0, &self.names[i]), i as u32)).collect();
+            .map(|i| (kst::fnv(FNV0, self.name_at(i as u64)), i as u32)).collect();
         pair.sort_unstable();
         let dup = pair.windows(2).filter(|w| w[0].0 == w[1].0).count() as u64;
         let mut t = Vec::with_capacity(crate::ckalloc(n * 20 + 32));
         for (k, _) in &pair { t.extend_from_slice(&k.to_le_bytes()); }
         for (_, o) in &pair {
-            t.extend_from_slice(&(h64b(&self.names[*o as usize])
+            t.extend_from_slice(&(h64b(self.name_at(*o as u64))
                                   ^ (*o as u64).wrapping_mul(H64B_K)).to_le_bytes());
         }
         for (_, o) in &pair { t.extend_from_slice(&o.to_le_bytes()); }
@@ -801,7 +810,9 @@ impl Reader {
 impl Reader {
     pub fn nlabels(&self) -> usize { self.lab.len() }
     pub fn label_at(&self, i: usize) -> &[u8] { &self.lab[i] }
-    pub fn name_at(&self, i: u64) -> &[u8] { &self.names[i as usize] }
+    pub fn name_at(&self, i: u64) -> &[u8] {
+        let i = i as usize; &self.names[self.noff[i] as usize..self.noff[i + 1] as usize - 1]
+    }
     pub fn find_seq(&self, s: &[u8]) -> i64 { self.find(s) }
 
     /// One sequence as arrays: starts, ends, hierarchy node per run, and
@@ -809,8 +820,7 @@ impl Reader {
     pub fn seq_rows(&mut self, ri: u64, labmap: &[i32], isnovel: &[u8], root: i32)
         -> (Vec<u64>, Vec<u64>, Vec<i32>, Vec<u8>) {
         let (blk, off, nruns) = self.locate(ri);
-        self.alnq = { let nm = self.names[ri as usize].clone();
-                      self.aln.as_ref().and_then(|a| a.find(&nm)) };
+        self.alnq = self.aln.as_ref().and_then(|a| a.find(self.name_at(ri)));
         let mut c = self.at(blk, off);
         let n = nruns as usize;
         let (mut st, mut en) = (Vec::with_capacity(n), Vec::with_capacity(n));

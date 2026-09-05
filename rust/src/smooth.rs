@@ -236,13 +236,14 @@ pub fn run(path: &str, hier: &str, fs: &[u8], seq: Option<&[u8]>,
         // with its own reader, written in order, a bounded window at a time.
         use rayon::prelude::*;
         thread_local! { static RD: std::cell::RefCell<Option<Reader>> = const { std::cell::RefCell::new(None) }; }
+        let names = r.names_shared();
         let nchunk = (last - first).div_ceil(chunk);
         let mut c0 = 0;
         while c0 < nchunk {
             let c1 = (c0 + nthr * 2).min(nchunk);
             let parts: Vec<Vec<u8>> = (c0..c1).into_par_iter().map(|c| RD.with(|cell| {
                 let mut g = cell.borrow_mut();
-                let r = g.get_or_insert_with(|| Reader::open_with(path, ro));
+                let r = g.get_or_insert_with(|| { let mut r = Reader::open_with(path, ro); r.adopt_names(names.clone()); r });
                 let (a, b) = (first + c * chunk, (first + (c + 1) * chunk).min(last));
                 let mut buf = Vec::new();
                 for ri in a..b { one(r, ri, &mut buf); }

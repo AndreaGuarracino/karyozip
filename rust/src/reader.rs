@@ -91,7 +91,7 @@ pub struct Reader {
     tailskip: u64,
     /// every name, newline-free, back to back, and noff[i]..noff[i+1] is
     /// name i: decoded from nz/pz on first use
-    names: std::cell::OnceCell<(Vec<u8>, Vec<u32>)>,
+    names: std::cell::OnceCell<std::sync::Arc<(Vec<u8>, Vec<u32>)>>,
     nz: Vec<u8>,
     pz: Vec<u8>,
     names_file: Option<String>,
@@ -931,9 +931,15 @@ impl Reader {
     pub fn has_aln(&self) -> bool { self.aln.is_some() }
     pub fn label_at(&self, i: usize) -> &[u8] { &self.lab[i] }
     pub fn name_at(&self, i: u64) -> &[u8] {
-        let (names, noff) = self.names.get_or_init(|| self.decode_names());
+        let (names, noff) = &**self.names.get_or_init(|| std::sync::Arc::new(self.decode_names()));
         let i = i as usize; &names[noff[i] as usize..noff[i + 1] as usize - 1]
     }
+    /// The decoded names, to hand to a worker's reader of the same track so
+    /// the table is decoded once, as the C's smooth_mt borrows it.
+    pub fn names_shared(&self) -> std::sync::Arc<(Vec<u8>, Vec<u32>)> {
+        self.names.get_or_init(|| std::sync::Arc::new(self.decode_names())).clone()
+    }
+    pub fn adopt_names(&mut self, n: std::sync::Arc<(Vec<u8>, Vec<u32>)>) { let _ = self.names.set(n); }
     pub fn find_seq(&self, s: &[u8]) -> i64 { self.find(s) }
 
     /// One sequence as arrays: starts, ends, hierarchy node per run, and

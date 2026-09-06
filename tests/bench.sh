@@ -21,6 +21,9 @@ sets=$(head -1 "$FEAT" | cut -f2- | tr '\t' ' ')
 printf 'class\tdb\tbackend\tset\ttype\tinformed\tseekable\tmode\timpl\trows\tseqs\tbed_gz_B\tbed_plain_B\tkst_B\tindex_B\tcompanion_B\ttotal_B\tratio_gz\tratio_plain\tB_per_row\tencode_s\tencode_MB\tdecode_s\tdecode_MB\tsmooth_s\tsmooth_MB\troundtrip\tquery_mean_ms\tquery_sd_ms\tquery_p50_ms\tquery_p99_ms\tthreads\n'
 
 best() { sort -n | head -1; }
+refof() {  # refof SET KIND: a cut cell keeps its reference beside its tracks, named ref.*
+  { ls "$REFD"/ref.*."$1"."$2".bed.gz; ls "$REFD"/*."$1"."$2".bed.gz; } 2>/dev/null | head -1
+}
 timed() {  # timed OUTFILE IN cmd... : fastest wall, largest RSS, or "refused refused"
   local out=$1 in=$2; shift 2; : > "$W/t"
   for i in $(seq $REPS); do
@@ -86,7 +89,7 @@ pafB=$(stat -c%s "$PAF")
 for kind in presmoothed smoothed; do
   for set in $sets; do
     q=$(ls "$D"/*."$set"."$kind".bed.gz 2>/dev/null | head -1); [ -n "$q" ] || continue
-    ref=$(ls "$REFD"/ref.*."$set"."$kind".bed.gz "$REFD"/*."$set"."$kind".bed.gz 2>/dev/null | head -1)   # a cut cell keeps its reference beside its tracks
+    ref=$(refof "$set" "$kind")
     for seek in seekable non-seekable; do bf=""; [ $seek = non-seekable ] && bf="--block all"
       for mode in default slow; do mf=""; [ $mode = slow ] && mf="--slow"
         for impl in C Rust; do bin=$C; [ $impl = Rust ] && bin=$R
@@ -99,7 +102,7 @@ for kind in presmoothed smoothed; do
   # --db takes every set at once: one row per kind, set = ALL
   ins=""; for set in $sets; do f=$(ls "$D"/*."$set"."$kind".bed.gz 2>/dev/null | head -1); [ -n "$f" ] && ins="$ins $f"; done
   [ $(echo $ins | wc -w) = $(echo $sets | wc -w) ] || continue
-  ref=$(ls "$REFD"/ref.*.chromosome."$kind".bed.gz "$REFD"/*.chromosome."$kind".bed.gz 2>/dev/null | head -1)
+  ref=$(refof chromosome "$kind")
   for seek in seekable non-seekable; do bf=""; [ $seek = non-seekable ] && bf="--block all"
     for mode in default slow; do mf=""; [ $mode = slow ] && mf="--slow"
       for impl in C Rust; do bin=$C; [ $impl = Rust ] && bin=$R

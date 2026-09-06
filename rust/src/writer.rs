@@ -450,16 +450,14 @@ impl Writer {
         // even when the reference answers for it.
         let mut id = self.intern(label);
         self.rowhash = kst::rowmix(self.rowhash, self.curnh, start, start + run_len, self.labh[id as usize]);
-        if let Some(a) = self.aln.take() {
+        if self.aln.is_some() {
             if label == b"=" { return Err("a label \"=\" is reserved under --aln".into()); }
-            if let Some(q) = self.alnq {
-                let rl = a.row(q, start, run_len);
-                if rl != u32::MAX && rl == id {
-                    id = self.intern(b"=");
-                    self.alnhit += 1;
-                }
-            }
-            self.aln = Some(a);
+            // borrowed, not taken: taking moved the whole Aln out and back per row
+            let hit = self.alnq.is_some_and(|q| {
+                let rl = self.aln.as_ref().unwrap().row(q, start, run_len);
+                rl != u32::MAX && rl == id
+            });
+            if hit { id = self.intern(b"="); self.alnhit += 1; }
         }
         let id = id as u64;
         if self.phas { self.lensput(self.pval); self.phas = false; }

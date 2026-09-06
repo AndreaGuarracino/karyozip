@@ -160,6 +160,13 @@ for pair in "s.bed p.paf ref.bed" "ls.bed lp.paf lref.bed"; do
   "$R" decode --aln "$D/$2" --ref "$D/$3" "$W/a.kst" > "$W/r.out" 2>/dev/null; c2=$?
   if cmp -s "$W/c.out" "$W/r.out" && [ $c1 = $c2 ] && cmp -s "$W/r.out" "$D/$1"; then aok=$((aok+1))
   else abad=$((abad+1)); echo "  --aln decode differs: $1"; fi
+  # the reference as a track, from either binary: the same bytes and rows as the text gives
+  "$C" encode < "$D/$3" > "$W/c.ref.kst" 2>/dev/null; "$R" encode < "$D/$3" > "$W/r.ref.kst" 2>/dev/null
+  "$C" encode --aln "$D/$2" --ref "$W/r.ref.kst" < "$D/$1" > "$W/c.kst" 2>/dev/null; c1=$?
+  "$R" encode --aln "$D/$2" --ref "$W/c.ref.kst" < "$D/$1" > "$W/r.kst" 2>/dev/null; c2=$?
+  "$R" decode --aln "$D/$2" --ref "$W/c.ref.kst" "$W/a.kst" > "$W/r.out" 2>/dev/null; c3=$?
+  if cmp -s "$W/c.ref.kst" "$W/r.ref.kst" && cmp -s "$W/c.kst" "$W/a.kst" && cmp -s "$W/r.kst" "$W/a.kst" && [ $c1 = 0 ] && [ $c2 = 0 ] && [ $c3 = 0 ] && cmp -s "$W/r.out" "$D/$1"; then aok=$((aok+1))
+  else abad=$((abad+1)); echo "  .kst reference differs: $1"; fi
 done
 for pair in "p.paf ref.bed" "lp.paf lref.bed" "db.self.paf db.rall.bed"; do
   set -- $pair

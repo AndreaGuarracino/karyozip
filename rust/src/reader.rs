@@ -114,7 +114,11 @@ pub struct Reader {
     cur_ri: u64,
     cur_q: usize,
     cur_pend: u64,
-    cached: Option<(usize, std::rc::Rc<Vec<u8>>, usize, u64)>,
+    cached: Option<(usize, std::sync::Arc<Vec<u8>>, usize, u64)>,
+    /// the rows as text, what binds this track when it serves as --ref
+    pub rowhash: u64,
+    /// not --aln, --db, --sort, --names drop, names in the file: fit for --ref
+    pub plainref: bool,
     /// where the last seq_rows stopped: (block, rows into it, cursor), so a
     /// walk in order continues instead of re-skipping the block's rows
     sc: Option<(usize, u64, Cursor)>,
@@ -384,6 +388,8 @@ impl Reader {
             names: std::cell::OnceCell::new(), nz, pz, names_file: o.names_file.clone(),
             ordnames: o.ordnames, nf, idx,
             hasidx, mhash: h[15], cur_ri: 0, cur_q: 0, cur_pend: 0, cached: None, sc: None,
+            rowhash: if h1_raw & ALNFLAG != 0 { 0 } else { h[13] >> 8 },
+            plainref: h1_raw & (ALNFLAG | DBFLAG | SIDEFLAG | DROPPED | PERMFLAG) == 0,
             feathash: (h[5] >> 32) | ((h[9] >> 32) << 32),
             cart: h[1] & CARTFLAG != 0,
             aln: o.aln.clone(), lenfile: h[1] & LENFLAG != 0 && !o.raw, raw: o.raw,
@@ -393,7 +399,7 @@ impl Reader {
 
     /// Every row, in order, to a callback. decode and --db share it.
     pub fn for_each_row(&mut self, f: &mut RowFn) {
-        let mut c = Cursor { blk: usize::MAX, data: std::rc::Rc::new(Vec::new()),
+        let mut c = Cursor { blk: usize::MAX, data: std::sync::Arc::new(Vec::new()),
                              lp: 0, ip: 0, left: 0 };
         let mut emitted = 0u64;
         let tskip = self.tailskip;
@@ -421,7 +427,7 @@ impl Reader {
     /// Every sequence, in order. One forward pass over the blocks.
     pub fn decode(&mut self, out: &mut impl std::io::Write) {
         let mut buf: Vec<u8> = Vec::with_capacity(1 << 22);
-        let mut c = Cursor { blk: usize::MAX, data: std::rc::Rc::new(Vec::new()), lp: 0, ip: 0, left: 0 };
+        let mut c = Cursor { blk: usize::MAX, data: std::sync::Arc::new(Vec::new()), lp: 0, ip: 0, left: 0 };
         let (mut emitted, mut restored) = (0u64, 0u64);
         let tskip = self.tailskip;
         let mut name = Vec::new();
@@ -461,12 +467,12 @@ impl Reader {
     /// One block's two frames back to back, the split, its rows. The last
     /// block stays decoded: without that, a track whose sequences share a
     /// block is decompressed once per sequence.
-    fn load(&mut self, b: usize) -> (std::rc::Rc<Vec<u8>>, usize, u64) {
+    fn load(&mut self, b: usize) -> (std::sync::Arc<Vec<u8>>, usize, u64) {
         if let Some((cb, d, sp, r)) = &self.cached {
             if *cb == b { return (d.clone(), *sp, *r); }
         }
         let (d, sp, r) = self.load_raw(b);
-        let d = std::rc::Rc::new(d);
+        let d = std::sync::Arc::new(d);
         self.cached = Some((b, d.clone(), sp, r));
         (d, sp, r)
     }
@@ -566,7 +572,7 @@ pub use crate::kst::{unzz, vget};
 
 /// A position in the row stream: the block, its bytes, a cursor per frame,
 /// and how many of its rows are left.
-struct Cursor { blk: usize, data: std::rc::Rc<Vec<u8>>, lp: usize, ip: usize, left: u64 }
+struct Cursor { blk: usize, data: std::sync::Arc<Vec<u8>>, lp: usize, ip: usize, left: u64 }
 
 impl Reader {
     /// (block, offset in it, run count) for sequence `ri`. A forward cursor,
@@ -962,6 +968,26 @@ impl Reader {
     }
     pub fn adopt_names(&mut self, n: std::sync::Arc<(Vec<u8>, Vec<u32>)>) { let _ = self.names.set(n); }
     pub fn find_seq(&self, s: &[u8]) -> i64 { self.find(s) }
+    pub fn labels(&self) -> &[Vec<u8>] { &self.lab }
+    /// run count of sequence `ri`, from the index alone
+    pub fn nruns_of(&mut self, ri: u64) -> u64 { self.locate(ri).2 }
+
+    /// One sequence of a plain track as run starts, label ids and its end:
+    /// what a --ref contig is, decoded when first asked.
+    pub fn seq_runs(&mut self, ri: u64) -> (Vec<u64>, Vec<u32>, u64) {
+        let (blk, off, nruns) = self.locate(ri);
+        let mut c = self.at(blk, off);
+        let (mut st, mut lab) = (Vec::with_capacity(nruns as usize), Vec::with_capacity(nruns as usize));
+        let mut s = 0u64;
+        for k in 0..nruns {
+            let (len, f) = self.step(&mut c, s, k + 1 == nruns && ri >= self.tailskip);
+            if f as usize >= self.lab.len() { crate::bail("corrupt block: a label id past the table"); }
+            if len == 0 { crate::bail("reference track: a run of no length"); }
+            st.push(s); lab.push(f as u32); s += len;
+        }
+        self.sc = None;
+        (st, lab, s)
+    }
 
     /// One sequence as arrays: starts, ends, hierarchy node per run, and
     /// whether the label was "novel". What smoothing works on.

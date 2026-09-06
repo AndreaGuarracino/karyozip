@@ -69,6 +69,7 @@ for kind in presmoothed smoothed; do
   for fs in $sets; do
     q=$(ls "$D"/*."$fs"."$kind".bed.gz 2>/dev/null | grep -v '/ref\.' | head -1); [ -n "$q" ] || { fail "$fs $kind: no track in the cell"; continue; }
     ref=$(ls "$D"/ref.*."$fs"."$kind".bed.gz 2>/dev/null | head -1)
+    [ -s "$ref" ] && { zcat "$ref" | "$C" encode > "$W/ref.kst" 2>/dev/null || fail "$fs $kind: the reference does not encode"; }
     zcat "$q" > "$W/in.bed"; seq=$(head -1 "$W/in.bed" | cut -f1)
     for strat in plain aln; do
       [ $strat = aln ] && { [ -s "$ref" ] && [ -s "$paf" ] || { fail "$fs $kind: no reference track or PAF in the cell"; continue; }; }
@@ -79,8 +80,10 @@ for kind in presmoothed smoothed; do
         case "$strat:$fl:$alnnames" in aln:*"--names drop"*:) ALLOW=1;; esac
         same "$lbl encode" "$q" -- $a $fl encode; rc=$?; ALLOW=0; [ $rc = 0 ] || continue
         cp "$W/c.out" "$W/t.kst"
+        # the reference as a track gives the same bytes, from both
+        [ $strat = aln ] && { a2="--aln $paf --ref $W/ref.kst $alnnames"; same "$lbl encode, .kst reference" "$q" -- $a2 $fl encode && { cmp -s "$W/c.out" "$W/t.kst" || fail "$lbl .kst reference gives other bytes"; }; }
         # the round trip, with the decoder given what the encoder was given
-        dec=""; [ $strat = aln ] && dec="--aln $paf --ref $ref $alnnames"
+        dec=""; [ $strat = aln ] && { dec="--aln $paf --ref $ref $alnnames"; [ -z "$fl" ] && dec="--aln $paf --ref $W/ref.kst $alnnames"; }   # the readers on the plain form take the .kst reference
         case "$fl" in *"--names drop"*) dec="$dec --names ordinal";; esac   # harmless when names were kept
         case "$fl" in *--sort*) sort "$W/in.bed" > "$W/want.bed"; "$C" $dec decode "$W/t.kst" 2>/dev/null | sort > "$W/got.bed";;
                       *) cp "$W/in.bed" "$W/want.bed"; "$C" $dec decode "$W/t.kst" > "$W/got.bed" 2>/dev/null;; esac

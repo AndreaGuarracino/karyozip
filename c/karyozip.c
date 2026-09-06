@@ -147,6 +147,11 @@ static uint64_t fnvbuf(uint64_t h, const void *p, size_t n) {
     return h;
 }
 #define FNV0 0xcbf29ce484222325ULL
+/* one row into the row hash: name hash, start, end, label hash, as words */
+static inline uint64_t rowmix(uint64_t h, uint64_t nh, uint64_t st, uint64_t en, uint64_t lh) {
+    h = (h ^ nh) * 0x100000001b3ULL; h = (h ^ st) * 0x100000001b3ULL;
+    h = (h ^ en) * 0x100000001b3ULL; return (h ^ lh) * 0x100000001b3ULL;
+}
 static uint64_t fnvstr(const char *s) { return fnvbuf(FNV0, s, strlen(s)); }
 static uint64_t ld64(const void *p) { uint64_t v; memcpy(&v, p, 8); return v; }
 static uint32_t ld32(const void *p) { uint32_t v; memcpy(&v, p, 4); return v; }
@@ -265,6 +270,8 @@ static int32_t labhash[LABHASH];
 static int labhash_init = 0;
 
 static size_t *labnlen;
+static uint64_t *labh;             /* fnv of each label, for the row hash */
+static uint64_t ROWHASH;           /* the rows as words, what binds a track used as --ref */
 static int lastid = -1;
 
 /* A track has a handful of distinct labels, 31 on a real chromosome track,
@@ -300,9 +307,11 @@ static int intern(const char *s, size_t n) {
         labcap = labcap ? labcap * 2 : 256;
         labtab = xrealloc(labtab, labcap * sizeof(char *));
         labnlen = xrealloc(labnlen, labcap * sizeof(size_t));
+        labh = xrealloc(labh, labcap * sizeof(uint64_t));
     }
     labtab[nlabtab] = strndup(s, n);
     labnlen[nlabtab] = n;
+    labh[nlabtab] = fnvbuf(FNV0, s, n);
     labhash[k] = nlabtab;
     lcache[ck] = nlabtab;
     return lastid = nlabtab++;
@@ -651,6 +660,7 @@ typedef struct ktw {
     blkmeta *bm; size_t nraw, rawcap;
     buf lalt[2], rawalt[2];       /* plain; plus-strand sentinels only */
     uint64_t plen, pval; int phas, prev;
+    uint64_t curnh;               /* fnv of cur, for the row hash */
 } ktw;
 
 static void rawput(int fd, off_t off, const void *p, size_t n) {
@@ -753,7 +763,7 @@ static void ktw_close(ktw *w);
 
 static ktw *ktw_open(FILE *out) {
     ktw *w = xcalloc(1, sizeof(ktw));
-    w->ordok = 1;
+    w->ordok = 1; ROWHASH = FNV0;
     const char *td = TMPD; if (!td || !*td) td = getenv("TMPDIR"); if (!td || !*td) td = "/tmp";
     char *tp; if (asprintf(&tp, "%s/karyozip.XXXXXX", td) < 0) die("oom");
     int tfd = mkstemp(tp);
@@ -787,6 +797,7 @@ static void ktw_row(ktw *w, const char *name, size_t nlen,
         ktw_pushread(w);
         if (nlen >= sizeof w->cur) die("name too long");
         memcpy(w->cur, name, nlen); w->cur[nlen] = 0; w->curlen = nlen;
+        w->curnh = fnvbuf(FNV0, name, nlen);
         w->currun = 0; w->curbp = 0;
         if (w->pend && w->pend >= BLOCK) ktw_flush(w);
         w->curblk = w->nblk; w->curoff = w->pend;
@@ -794,6 +805,7 @@ static void ktw_row(ktw *w, const char *name, size_t nlen,
 
     if (start != w->curbp) die("gap or overlap: start is not the previous end");
     uint64_t id = (uint64_t)intern(label, llen);   /* once, not once per check */
+    ROWHASH = rowmix(ROWHASH, w->curnh, start, start + run_len, labh[id]);
     /* A label the reference already gives is stored as "=". Done here, on
        the row as written, so a --sort track orders on the input's own labels
        and its order is the same with or without --aln. */
@@ -815,12 +827,15 @@ static void ktw_row(ktw *w, const char *name, size_t nlen,
 
 typedef struct { uint64_t q; uint32_t t, n; uint64_t tp; int rev; } seg;
 typedef struct { char *name; seg *s; size_t n, cap; } qseg;
-typedef struct { char *name; uint64_t *st, end; uint32_t *lab; size_t n, cap; } rcon;
+typedef struct { char *name; uint64_t *st, end; uint32_t *lab; size_t n, cap; int64_t ri; _Atomic int filled; } rcon;
 
 static qseg *QS; static size_t nqs, cqs;
 static rcon *RC; static size_t nrc, crc;
 
 static uint64_t ALNHASH;
+static int REFLAZY;                  /* readers: decode a reference contig when first asked */
+static void loadref_kst(const char *path);
+static void reffill(rcon *rc);
 static rcon *rcon_get(const char *nm, int make) {
     static size_t *idx; static size_t im;           /* open addressed by hash */
     if (!idx) { im = 1 << 16; idx = xcalloc(im, sizeof *idx); }
@@ -839,7 +854,7 @@ static rcon *rcon_get(const char *nm, int make) {
     }
     idx[j] = nrc + 1;
     if (nrc == crc) { crc = crc ? crc * 2 : 64; RC = xrealloc(RC, crc * sizeof *RC); }
-    RC[nrc] = (rcon){ xstrdup(nm), NULL, 0, NULL, 0, 0 };
+    RC[nrc] = (rcon){ xstrdup(nm), NULL, 0, NULL, 0, 0, -1, 1 };
     return RC + nrc++;
 }
 static qseg *qseg_get(const char *nm, int make) {
@@ -864,23 +879,27 @@ static qseg *qseg_get(const char *nm, int make) {
 }
 
 static void loadref(const char *path) {
+    {   FILE *k = fopen(path, "rb"); char m[8];
+        int kst = k && fread(m, 1, 8, k) == 8 && !memcmp(m, MAGIC, 8);
+        if (k) fclose(k);
+        if (kst) { loadref_kst(path); return; }
+    }
     FILE *f = zfopen(path);
     if (!f) die("cannot open the reference track");
     char *ln = NULL; size_t cap = 0; ssize_t n;
     rcon *cur = NULL; uint64_t badln = 0;
-    uint64_t rh = FNV0;
+    uint64_t rh = FNV0, nh = 0;
     while ((n = getline(&ln, &cap, f)) > 0) {
         if (ln[n - 1] == '\n') ln[--n] = 0;
         if (n && ln[n - 1] == '\r') ln[--n] = 0;
         char *t1 = memchr(ln, '\t', (size_t)n); if (!t1) { badln++; continue; }
         char *t2 = memchr(t1 + 1, '\t', (size_t)(n - (t1 + 1 - ln))); if (!t2) { badln++; continue; }
         char *t3 = memchr(t2 + 1, '\t', (size_t)(n - (t2 + 1 - ln))); if (!t3) { badln++; continue; }
-        rh = fnvbuf(rh, ln, (size_t)n); rh = fnvbuf(rh, "\n", 1);
         *t1 = 0;
         if (t1 == ln) die("reference track: empty contig name");
         if (!cur || strcmp(ln, cur->name)) {
             if (rcon_get(ln, 0)) die("reference track: a contig's rows are not together");
-            cur = rcon_get(ln, 1);
+            cur = rcon_get(ln, 1); nh = fnvbuf(FNV0, ln, (size_t)(t1 - ln));
         }
         {   uint64_t st0 = bedcoord(t1 + 1, t2, "reference start is not a number");
             if (st0 != (cur->n ? cur->end : 0)) die("reference track: rows are not sorted and gapless from 0");
@@ -894,6 +913,7 @@ static void loadref(const char *path) {
         cur->lab[cur->n] = (uint32_t)intern(t3 + 1, strlen(t3 + 1));
         cur->end = bedcoord(t2 + 1, t3, "reference end is not a number");   /* the last run's end */
         if (cur->end <= cur->st[cur->n]) die("reference track: a run of no length");
+        rh = rowmix(rh, nh, cur->st[cur->n], cur->end, labh[cur->lab[cur->n]]);
         cur->n++;
     }
     free(ln); fclose(f); ALNHASH ^= rh;
@@ -1061,8 +1081,8 @@ static void alnpack(const char *inpaf, const char *out) {
             if (ZSTD_isError(bn)) die("packing the alignment failed");
             best = zo; bc = 0;
             ZSTD_freeCCtx(zc);
-            static const int C[] = { 0x100, 1, 65, 521, CODEC_ARITH, CODEC_ARITH | 1,
-                                     CODEC_BZIP3 | 16, CODEC_BZIP3 | 64 };
+            /* read whole at every query: bzip3 decodes at 8 MB/s, so no */
+            static const int C[] = { 0x100, 1, 65, 521, CODEC_ARITH, CODEC_ARITH | 1 };
             for (unsigned c = 0; c < sizeof C / sizeof *C; c++) {
                 uint8_t *t = NULL; size_t g = paycomp(st[k]->d, st[k]->n, C[c], &t);
                 if (g && g < bn) { free(best); best = t; bn = g; bc = C[c]; }
@@ -1253,7 +1273,7 @@ static uint32_t reflabel(const qseg *Q, uint64_t pos) {
     const seg *g = segat(Q, pos);
     if (!g) return UINT32_MAX;
     uint64_t tpos = g->rev ? g->tp + (g->q + g->n - 1 - pos) : g->tp + (pos - g->q);
-    const rcon *rc = RC + g->t;
+    rcon *rc = RC + g->t; reffill(rc);
     size_t a = runat(rc, tpos);
     return a ? rc->lab[a - 1] : UINT32_MAX;
 }
@@ -1263,7 +1283,7 @@ static uint64_t refend(const qseg *Q, uint64_t pos) {
     LASTREV = g ? g->rev : 0;
     if (!g) return 0;
     uint64_t tpos = g->rev ? g->tp + (g->q + g->n - 1 - pos) : g->tp + (pos - g->q);
-    const rcon *rc = RC + g->t;
+    rcon *rc = RC + g->t; reffill(rc);
     size_t a = runat(rc, tpos);
     if (!a) return 0;
     uint64_t tend = a < rc->n ? rc->st[a] : rc->end;   /* target end of that run */
@@ -2380,7 +2400,7 @@ static void ktw_close(ktw *w) {
                       (uint64_t)(uint32_t)LENCODEC | (DBFEATS ? (fh & 0xffffffffu) << 32 : 0),
                       lzl, (uint64_t)nlabtab, BLOCK,
                       (uint64_t)(uint32_t)IDCODEC | (DBFEATS ? (fh >> 32) << 32 : 0), nichunk, itl,
-                      TAILPRED, (uint64_t)TAILSKIP | (ALNPAF ? ALNHASH << 8 : 0), npl, 0 };
+                      TAILPRED, (uint64_t)TAILSKIP | ((ALNPAF ? ALNHASH : ROWHASH) << 8), npl, 0 };
 
     {   uint64_t mh = fnvbuf(FNV0, h, 128); mh = fnvbuf(mh, lz, lzl);
         mh = fnvbuf(mh, nz, nzl);
@@ -2498,6 +2518,7 @@ typedef struct {
     uint8_t *ichunk; uint64_t nichunk, *coff, *cpendv, curchunk, ibcap;
     uint64_t *sst, *sen; int *sfeat; uint8_t *snov; uint64_t scap;
     const uint8_t *curlp, *curip;
+    uint64_t rowhash, tailpred, tailskip; int taildec;   /* for a track read as --ref */
 } R;
 
 static void loadichunk(R *r, uint64_t c) {
@@ -2650,6 +2671,7 @@ static R *ropen(const char *path) {
     TAILDEC = (h[1] & TAILFLAG) != 0;
     TAILPRED_R = h[12]; TAILSKIP_R = h[13] & 0xff;
     if (TAILDEC && TAILSKIP_R != TAILSKIP) die("corrupt file: tail skip is not the format constant");
+    r->taildec = TAILDEC; r->tailpred = h[12]; r->tailskip = TAILSKIP_R; r->rowhash = was_aln ? 0 : h[13] >> 8;
     if (was_aln && ALNPAF && (h[13] >> 8) != (ALNHASH & ((1ull << 56) - 1)))
         die("this PAF, reference or name map is not the one the track was encoded with");
     r->cart = (h[1] & CARTFLAG) != 0;
@@ -3205,7 +3227,7 @@ static void loadinformed(const char *who) {
     if (SETNAME && !DBFEATS) die("--set needs --db");
     if (HIERTAB && !DBFEATS) die("--hier does nothing without --db");
     if (DBFEATS) { loadfeatures(DBFEATS); if (HIERTAB) loadvocab(HIERTAB); setcols(); }
-    if (ALNPAF) { if (ALNNAMES) loadordinals(ALNNAMES); loadref(ALNREF); loadaln(ALNPAF); }
+    if (ALNPAF) { if (ALNNAMES) loadordinals(ALNNAMES); REFLAZY = 1; loadref(ALNREF); loadaln(ALNPAF); }
 }
 static R *ropen_informed(const char *path) {
     R *r = ropen(path);
@@ -3664,6 +3686,66 @@ static uint64_t loadseq(R *r, int64_t ri, uint64_t **st, uint64_t **en, int **fe
     r->curblk = q.blk; r->curoff = q.off + n;
     r->curlp = lp; r->curip = ip;
     return n;
+}
+
+/* --ref R.kst: the reference as a track. Its contigs are decoded when
+   first asked, so a query pays one contig, not a gigabyte of text. Its
+   labels are interned in table order, the order the text would have given. */
+static R *REFR; static uint32_t *REFLAB;
+static void loadref_kst(const char *path) {
+    uint64_t hh[16];
+    {   FILE *f = fopen(path, "rb");
+        if (!f || fseek(f, 8, SEEK_SET) || fread(hh, 8, 16, f) != 16) die("cannot read the reference track");
+        fclose(f); }
+    if (hh[1] & (ALNFLAG | DBFLAG | SIDEFLAG | DROPPED | PERMFLAG))
+        die("the reference .kst must be a plain track: not --aln, --db, --sort or --names drop, names in the file");
+    const char *na = NAMESARG; int ix = INDEXING, ld = LENDEC, td = TAILDEC; uint64_t tp = TAILPRED_R, ts = TAILSKIP_R;
+    NAMESARG = NULL; INDEXING = 1;                  /* no companion, no --names of the track being read */
+    R *r = ropen(path);
+    NAMESARG = na; INDEXING = ix; LENDEC = ld; TAILDEC = td; TAILPRED_R = tp; TAILSKIP_R = ts;
+    if (!r->rowhash) die("the reference .kst carries no row hash: encode it again with this version");
+    ensurenames(r);
+    REFLAB = xmalloc(mul(r->nlab ? r->nlab : 1, 4));
+    for (uint64_t j = 0; j < r->nlab; j++) REFLAB[j] = (uint32_t)intern(r->lab[j], strlen(r->lab[j]));
+    uint64_t tot = 0;
+    for (uint64_t i = 0; i < r->nreads; i++) {
+        if (rcon_get(r->name[i], 0)) die("reference track: a contig's rows are not together");
+        rcon *rc = rcon_get(r->name[i], 1);
+        rc->ri = (int64_t)i; rc->filled = 0;
+        tot += getidx(r, i).nruns;
+    }
+    ALNHASH ^= r->rowhash;
+    REFR = r;
+    fprintf(stderr, "reference: %zu contigs, %llu runs\n", nrc, (unsigned long long)tot);
+    if (!REFLAZY) for (size_t i = 0; i < nrc; i++) reffill(RC + i);
+}
+static void reffill(rcon *rc) {
+    if (rc->filled) return;
+#ifdef _OPENMP
+#pragma omp critical(reffill)
+#endif
+    if (!rc->filled) {
+        R *r = REFR; int ld = LENDEC, td = TAILDEC; uint64_t tp = TAILPRED_R, ts = TAILSKIP_R; const uint8_t *pe = PAYEND;
+        TAILDEC = r->taildec; TAILPRED_R = r->tailpred; TAILSKIP_R = r->tailskip;
+        rec q = getidx(r, (uint64_t)rc->ri);
+        loadblk(r, q.blk);                          /* a plain track: LENDEC is 0 in it */
+        const uint8_t *lp = r->lp0, *ip = r->ip0;
+        for (uint32_t k = 0; k < q.off; k++) { vget(&lp); vget(&ip); }
+        span sp = { q.blk, r->b[q.blk].rows - q.off };
+        size_t n = q.nruns ? q.nruns : 1;
+        rc->st = xmalloc(mul(n, 8)); rc->lab = xmalloc(mul(n, 4)); rc->n = rc->cap = q.nruns;
+        uint64_t s = 0;
+        for (uint64_t k = 0; k < q.nruns; k++) {
+            spannext(r, &sp, &lp, &ip); sp.left--;
+            uint64_t e = s + rlen(&lp, rc->name, s, k + 1 == q.nruns && (uint64_t)rc->ri >= TAILSKIP_R), f = vget(&ip);
+            if (f >= r->nlab) die("corrupt block: a label id past the table");
+            if (e <= s) die("reference track: a run of no length");
+            rc->st[k] = s; rc->lab[k] = REFLAB[f]; s = e;
+        }
+        rc->end = s; r->curblk = UINT64_MAX;
+        LENDEC = ld; TAILDEC = td; TAILPRED_R = tp; TAILSKIP_R = ts; PAYEND = pe;
+        rc->filled = 1;
+    }
 }
 
 static char out[1 << 22];
@@ -4184,7 +4266,7 @@ int main(int argc, char **argv) {
             "  karyozip encode [--block N|all] [--level N] [--slow: smaller, slower]\n"
             "                  [--names keep|drop|drop:FILE]\n"
             "                  [--sort | --sort=MEM]\n"
-            "                  [--db features.tsv [--hier H]] [--aln P.paf --ref R [--aln-names F]]\n"
+            "                  [--db features.tsv [--hier H]] [--aln P.paf --ref R.bed|R.kst [--aln-names F]]\n"
             "  karyozip decode F | --db features.tsv [--hier H] [--out DIR] [--set A,B] F | --aln P.paf --ref R F\n"
             "                  --names F reads the names, from drop:FILE or a FASTA, FASTQ or list\n"
             "                  --names ordinal accepts a track whose names were dropped\n"

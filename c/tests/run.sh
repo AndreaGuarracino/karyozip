@@ -21,6 +21,11 @@ cmp -s "$W/got" "$W/want" && echo "aln delta: correct" || { echo "aln delta: WRO
 
 $KT decode --aln "$D/p.paf" --ref "$D/ref.bed" "$W/d.kt" 2>/dev/null > "$W/rt"
 cmp -s "$W/rt" "$D/s.bed" && echo "aln restore: byte-identical" || { echo "aln restore: WRONG"; fail=1; }
+# the reference as a track: the same bytes written, the same rows read
+$KT encode < "$D/ref.bed" > "$W/ref.kst" 2>/dev/null
+$KT encode --aln "$D/p.paf" --ref "$W/ref.kst" < "$D/s.bed" 2>/dev/null | cmp -s - "$W/d.kt" && echo "aln with a .kst reference: same bytes" || { echo "aln with a .kst reference: WRONG"; fail=1; }
+$KT decode --aln "$D/p.paf" --ref "$W/ref.kst" "$W/d.kt" 2>/dev/null | cmp -s - "$D/s.bed" && echo "aln restore from a .kst reference: byte-identical" || { echo "aln restore from a .kst reference: WRONG"; fail=1; }
+$KT decode --aln "$D/p.paf" --ref "$W/d.kt" "$W/d.kt" >/dev/null 2>&1 && { echo "an --aln track as reference: ACCEPTED"; fail=1; } || echo "an --aln track as reference: refused, as it should"
 
 $KT encode < "$D/s.bed" > "$W/p.kt" 2>/dev/null
 $KT encode < "$D/db.rall.bed" > "$W/omp.ref" 2>/dev/null
@@ -993,7 +998,7 @@ awk 'BEGIN{p=0; for(k=0;k<400000;k++){printf "r1\t%d\t%d\tchr%d\n", p, p+20, k%2
 # promise identical output across its own releases. Pin them here: a bump
 # has to be a deliberate act that re-records this line, never a silent one
 # that invalidates every ratio already measured.
-want=e3f9edf95b404c3cd58e8b337d8da59c183b7e77bcbe79eec7fb267883ba9071
+want=55b6e9eadfe851a4374e094e045ee8ecb4ffac9a2fdd83de126ff076724e700b
 got=$($KT --block 4 encode < "$D/db.rall.bed" 2>/dev/null | sha256sum | cut -d' ' -f1)
 if [ "$got" = "$want" ]; then echo "codec versions: stored bytes unchanged"
 else

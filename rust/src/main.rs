@@ -118,7 +118,7 @@ fn main() {
                      reorders the records, so the ordinal name map is invalid");
             }
             if c.db.is_some() && files.is_empty() { die("--db: give one BED per feature set"); }
-            let a = load_aln(&c.aln, &c.refbed, &c.aln_names, "");
+            let a = load_aln(&c.aln, &c.refbed, &c.aln_names, "", false);
             match &c.db {
                 Some(fp) => {
                     if c.hier.is_some() && c.db.is_none() { die("--hier does nothing without --db"); }
@@ -210,7 +210,7 @@ fn main() {
                 _ => die("usage: karyozip aln-pack P.paf REF.bed OUT"),
             };
             let mut a = aln::Aln::default();
-            a.load_ref(rbed);
+            a.load_ref(rbed, false);
             let rh = aln::refhash(&a);
             a.load_paf(paf);
             aln::pack(&a, dest, rh);
@@ -281,7 +281,7 @@ fn informed(c: &cli::Cli, ro: &mut reader::ReadOpts, who: &str, hier: Option<&st
     if c.set.is_some() && c.db.is_none() { die("--set needs --db"); }
     if c.hier.is_some() && c.db.is_none() { die("--hier does nothing without --db"); }
     let feats = c.db.as_deref().map(|fp| load_feats(fp, c.hier.as_deref().or(hier)));
-    ro.aln = load_aln(&c.aln, &c.refbed, &c.aln_names, who).map(std::sync::Arc::new);
+    ro.aln = load_aln(&c.aln, &c.refbed, &c.aln_names, who, true).map(std::sync::Arc::new);
     feats
 }
 
@@ -294,7 +294,7 @@ fn load_feats(fp: &str, hier: Option<&str>) -> db::Feats {
 }
 
 fn load_aln(paf: &Option<String>, refbed: &Option<String>,
-            ordfile: &Option<String>, who: &str) -> Option<aln::Aln> {
+            ordfile: &Option<String>, who: &str, lazy: bool) -> Option<aln::Aln> {
     match (paf, refbed) {
         (Some(_), None) => die(&format!("{who}--aln needs --ref")),
         (None, Some(_)) => die("--ref does nothing without --aln"),
@@ -305,7 +305,7 @@ fn load_aln(paf: &Option<String>, refbed: &Option<String>,
             // compared line for line.
             let mut a = aln::Aln::default();
             if let Some(o) = ordfile { a.load_ordinals(o); }
-            a.load_ref(r);
+            a.load_ref(r, lazy);
             a.load_aln(p);
             Some(a)
         }

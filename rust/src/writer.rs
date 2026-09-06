@@ -71,6 +71,9 @@ pub struct Writer {
     labmap: HashMap<Vec<u8>, u32, kst::Fnv>,
     lastid: Option<u32>,
     cur: Vec<u8>,
+    /// fnv of each label and of cur, for the row hash
+    labh: Vec<u64>,
+    curnh: u64,
     currun: u64,
     curbp: u64,
     blkbp0: u64,
@@ -96,6 +99,8 @@ pub struct Writer {
     natn: u32,
     natord: bool,
     feathash: Option<u64>,
+    /// the input rows as text, stored so the track can serve as --ref
+    rowhash: u64,
     cart: bool,
     /// --aln: the alignment, the query it is on, and the two alternate
     /// length spellings each block also keeps.
@@ -142,7 +147,7 @@ impl Writer {
             nidx: 0, ordok: true, labtab: Vec::new(), labmap: HashMap::default(), lastid: None,
             cur: Vec::new(), currun: 0, curbp: 0, blkbp0: 0, pend: 0, nblk: 0, rows: 0,
             plen: 0, pval: 0, phas: false, tailsamp: Vec::new(), tailpred: 0, tailon: None,
-            srec: Vec::new(), sortbp: 0, natbuf: Vec::new(), natord: true, feathash: None, cart: false,
+            srec: Vec::new(), sortbp: 0, natbuf: Vec::new(), natord: true, feathash: None, cart: false, rowhash: kst::FNV0, labh: Vec::new(), curnh: 0,
             aln: None, alnq: None, alnhit: 0,
             lalt: [Vec::new(), Vec::new()], rawalt: [Vec::new(), Vec::new()],
             prev_rev: false,
@@ -160,6 +165,7 @@ impl Writer {
         }
         let id = self.labtab.len() as u32;
         self.labtab.push(label.to_vec());
+        self.labh.push(kst::fnv(kst::FNV0, label));
         self.labmap.insert(label.to_vec(), id);
         self.lastid = Some(id);
         id
@@ -429,6 +435,7 @@ impl Writer {
             self.pushread();
             self.cur.clear();
             self.cur.extend_from_slice(name);
+            self.curnh = kst::fnv(kst::FNV0, name);
             // --sort writes ranks; the PAF still wants the real name.
             let ln: &[u8] = self.alnname.as_deref().unwrap_or(name);
             self.alnq = self.aln.as_ref().and_then(|a| a.find(ln));
@@ -442,6 +449,7 @@ impl Writer {
         // The C interns first and then decides, so the label joins the table
         // even when the reference answers for it.
         let mut id = self.intern(label);
+        self.rowhash = kst::rowmix(self.rowhash, self.curnh, start, start + run_len, self.labh[id as usize]);
         if let Some(a) = self.aln.take() {
             if label == b"=" { return Err("a label \"=\" is reserved under --aln".into()); }
             if let Some(q) = self.alnq {
@@ -724,7 +732,7 @@ impl Writer {
         h[10] = nichunk;
         h[11] = itz.len() as u64;
         h[12] = self.tailpred;
-        h[13] = TAILSKIP as u64 | if aln_on { self.aln_hash() << 8 } else { 0 };
+        h[13] = TAILSKIP as u64 | (if aln_on { self.aln_hash() } else { self.rowhash } << 8);
         h[14] = npl as u64;
         let mut hb = Vec::with_capacity(128);
         for v in h { hb.extend_from_slice(&v.to_le_bytes()); }

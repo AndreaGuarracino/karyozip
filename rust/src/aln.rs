@@ -9,9 +9,11 @@ use std::collections::HashMap;
 #[derive(Clone, Copy)]
 pub struct Seg { pub q: u64, pub t: u32, pub n: u32, pub tp: u64, pub rev: bool }
 
-/// A reference contig: run starts, its end, and a label id per run.
+/// A reference contig: run starts, a label id per run, and its end. From a
+/// .kst reference the rows are decoded when first asked.
+pub type Rows = (Vec<u64>, Vec<u32>, u64);
 #[derive(Clone)]
-pub struct Rcon { pub name: Vec<u8>, pub st: Vec<u64>, pub end: u64, pub lab: Vec<u32> }
+pub struct Rcon { pub name: Vec<u8>, ri: u64, rows: std::sync::OnceLock<Rows> }
 
 #[derive(Default, Clone)]
 pub struct Aln {
@@ -21,11 +23,17 @@ pub struct Aln {
     qsix: HashMap<Vec<u8>, usize>,
     pub labs: Vec<Vec<u8>>,
     labix: HashMap<Vec<u8>, u32>,
+    labh: Vec<u64>,
     /// --aln-names: ordinal N is line N+1, for tracks named by ordinal.
     pub ord: Vec<Vec<u8>>,
     pub hash: u64,
+    /// --ref R.kst: the track, and its label ids as this table's
+    refkst: Option<std::sync::Arc<std::sync::Mutex<crate::reader::Reader>>>,
+    reflab: Vec<u32>,
     /// the last segment answered, so a walk in order does not re-search
     cur: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// the last reference run answered, contig and index, the same way
+    rcur: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Aln {
@@ -33,46 +41,94 @@ impl Aln {
         if let Some(&i) = self.labix.get(s) { return i; }
         let i = self.labs.len() as u32;
         self.labs.push(s.to_vec());
+        self.labh.push(kst::fnv(FNV0, s));
         self.labix.insert(s.to_vec(), i);
         i
     }
 
     /// The reference track: one contig's rows together, sorted, gapless.
-    pub fn load_ref(&mut self, path: &str) {
+    /// A .kst is taken as a track; `lazy` leaves its contigs until asked.
+    pub fn load_ref(&mut self, path: &str, lazy: bool) {
+        if let Ok(mut f) = std::fs::File::open(path) {
+            let mut m = [0u8; 8];
+            if std::io::Read::read_exact(&mut f, &mut m).is_ok() && &m == crate::writer::MAGIC {
+                drop(f);
+                return self.load_ref_kst(path, lazy);
+            }
+        }
         let mut lines = crate::Lines::open(path, "cannot open the reference track");
         let mut rh = FNV0;
         let (mut badln, mut cur) = (0u64, usize::MAX);
+        let (mut st, mut lab, mut end): (Vec<u64>, Vec<u32>, u64) = (Vec::new(), Vec::new(), 0);
+        let mut nh = 0u64;
         while let Some(raw) = lines.next_line() {
             let mut line = raw;
             if line.last() == Some(&b'\r') { line = &line[..line.len() - 1]; }
             let c: Vec<&[u8]> = line.splitn(4, |&x| x == b'\t').collect();
             if c.len() < 4 { if !line.is_empty() { badln += 1; } continue; }
-            rh = kst::fnv(rh, line);
-            rh = kst::fnv(rh, b"\n");
             if c[0].is_empty() { crate::bail("reference track: empty contig name"); }
             if cur == usize::MAX || self.rc[cur].name != c[0] {
                 if self.rcix.contains_key(c[0]) {
                     crate::bail("reference track: a contig's rows are not together");
                 }
+                if cur != usize::MAX {
+                    let _ = self.rc[cur].rows.set((std::mem::take(&mut st), std::mem::take(&mut lab), end));
+                }
                 self.rcix.insert(c[0].to_vec(), self.rc.len() as u32);
-                self.rc.push(Rcon { name: c[0].to_vec(), st: Vec::new(), end: 0, lab: Vec::new() });
+                self.rc.push(Rcon { name: c[0].to_vec(), ri: 0, rows: std::sync::OnceLock::new() });
                 cur = self.rc.len() - 1;
+                nh = kst::fnv(FNV0, c[0]);
             }
-            let st = crate::bedcoord(c[1], "reference start is not a number");
+            let s = crate::bedcoord(c[1], "reference start is not a number");
             let en = crate::bedcoord(c[2], "reference end is not a number");
-            let want = if self.rc[cur].st.is_empty() { 0 } else { self.rc[cur].end };
-            if st != want { crate::bail("reference track: rows are not sorted and gapless from 0"); }
-            if en <= st { crate::bail("reference track: a run of no length"); }
+            let want = if st.is_empty() { 0 } else { end };
+            if s != want { crate::bail("reference track: rows are not sorted and gapless from 0"); }
+            if en <= s { crate::bail("reference track: a run of no length"); }
             let l = self.lab(c[3]);
-            let r = &mut self.rc[cur];
-            r.st.push(st);
-            r.lab.push(l);
-            r.end = en;
+            rh = kst::rowmix(rh, nh, s, en, self.labh[l as usize]);
+            st.push(s);
+            lab.push(l);
+            end = en;
         }
+        if cur != usize::MAX { let _ = self.rc[cur].rows.set((st, lab, end)); }
         self.hash ^= rh;
         if badln > 0 { eprintln!("reference: {badln} lines without four columns skipped"); }
-        let tot: usize = self.rc.iter().map(|x| x.st.len()).sum();
+        let tot: usize = self.rc.iter().map(|x| x.rows.get().map_or(0, |r| r.0.len())).sum();
         eprintln!("reference: {} contigs, {tot} runs", self.rc.len());
+    }
+
+    /// The labels are interned in table order, the order the text would
+    /// have given, so the ids the reference answers with are the track's.
+    fn load_ref_kst(&mut self, path: &str, lazy: bool) {
+        let ro = crate::reader::ReadOpts { index: true, ..Default::default() };
+        let mut r = crate::reader::Reader::open_with(path, &ro);
+        if !r.plainref {
+            crate::bail("the reference .kst must be a plain track: not --aln, --db, --sort or --names drop, names in the file");
+        }
+        if r.rowhash == 0 { crate::bail("the reference .kst carries no row hash: encode it again with this version"); }
+        self.reflab = r.labels().to_vec().iter().map(|l| self.lab(l)).collect();
+        let mut tot = 0u64;
+        for i in 0..r.nreads {
+            let name = r.name_at(i).to_vec();
+            if self.rcix.contains_key(&name) { crate::bail("reference track: a contig's rows are not together"); }
+            self.rcix.insert(name.clone(), self.rc.len() as u32);
+            self.rc.push(Rcon { name, ri: i, rows: std::sync::OnceLock::new() });
+            tot += r.nruns_of(i);
+        }
+        self.hash ^= r.rowhash;
+        eprintln!("reference: {} contigs, {tot} runs", self.rc.len());
+        self.refkst = Some(std::sync::Arc::new(std::sync::Mutex::new(r)));
+        if !lazy { for t in 0..self.rc.len() { self.rows(t as u32); } }
+    }
+
+    /// A contig's rows, decoded from the .kst on first use.
+    fn rows(&self, t: u32) -> &Rows {
+        let rc = &self.rc[t as usize];
+        rc.rows.get_or_init(|| {
+            let mut r = self.refkst.as_ref().unwrap().lock().unwrap_or_else(|e| e.into_inner());
+            let (st, lab, end) = r.seq_runs(rc.ri);
+            (st, lab.into_iter().map(|f| self.reflab[f as usize]).collect(), end)
+        })
     }
 
     /// The PAF, read for its cg:Z: CIGARs. Everything else is dead weight.
@@ -324,17 +380,31 @@ impl Aln {
         if pos < g.q + g.n as u64 { Some(g) } else { None }
     }
 
-    fn runat(rc: &Rcon, tpos: u64) -> usize {
-        if tpos >= rc.end { return 0; }
-        rc.st.partition_point(|&x| x <= tpos)
+    /// count of starts <= tpos, from where the last answer was, as the C's
+    /// runat: a walk in order costs a few steps, not a binary search
+    fn runat(&self, t: u32, rc: &Rows, tpos: u64) -> usize {
+        if tpos >= rc.2 { return 0; }
+        let st = &rc.0;
+        let packed = self.rcur.load(std::sync::atomic::Ordering::Relaxed);
+        let mut a = usize::MAX;
+        if (packed >> 32) as u32 == t {
+            let mut l = (packed & 0xffff_ffff) as usize;
+            let mut k = 0;
+            while l < st.len() && st[l] <= tpos && k < 8 { l += 1; k += 1; }
+            while l > 0 && st[l - 1] > tpos && k < 16 { l -= 1; k += 1; }
+            if k < 16 && !(l < st.len() && st[l] <= tpos) { a = l; }
+        }
+        if a == usize::MAX { a = st.partition_point(|&x| x <= tpos); }
+        self.rcur.store(((t as u64) << 32) | a as u64, std::sync::atomic::Ordering::Relaxed);
+        a
     }
 
     pub fn label(&self, qi: usize, pos: u64) -> u32 {
         let Some(g) = self.segat(qi, pos) else { return u32::MAX };
         let tpos = if g.rev { g.tp + (g.q + g.n as u64 - 1 - pos) } else { g.tp + (pos - g.q) };
-        let rc = &self.rc[g.t as usize];
-        let a = Self::runat(rc, tpos);
-        if a > 0 { rc.lab[a - 1] } else { u32::MAX }
+        let rc = self.rows(g.t);
+        let a = self.runat(g.t, rc, tpos);
+        if a > 0 { rc.1[a - 1] } else { u32::MAX }
     }
 
     /// The query position where the reference run under `pos` ends.
@@ -342,12 +412,13 @@ impl Aln {
         let Some(g) = self.segat(qi, pos) else { return (0, false) };
         let rev = g.rev;
         let tpos = if rev { g.tp + (g.q + g.n as u64 - 1 - pos) } else { g.tp + (pos - g.q) };
-        let rc = &self.rc[g.t as usize];
-        let a = Self::runat(rc, tpos);
+        let rc = self.rows(g.t);
+        let a = self.runat(g.t, rc, tpos);
         if a == 0 { return (0, rev); }
-        let tend = if a < rc.st.len() { rc.st[a] } else { rc.end };
+        let (st, end) = (&rc.0, rc.2);
+        let tend = if a < st.len() { st[a] } else { end };
         if rev {
-            let ts = rc.st[a - 1];
+            let ts = st[a - 1];
             if ts < g.tp { return (0, rev); }
             return (g.q + g.n as u64 - (ts - g.tp), rev);
         }
@@ -416,7 +487,8 @@ pub fn pack(a: &Aln, out: &str, refhash: u64) {
             if bc < 0 {
                 best = ffi::zstd(raw, 19);
                 bc = 0;
-                for c in crate::writer::CAND_FAST {
+                // read whole at every query: bzip3 decodes at 8 MB/s, so no
+                for c in crate::writer::CAND_FAST.into_iter().filter(|&c| c & ffi::CODEC_BZIP3 == 0) {
                     if let Some(t) = ffi::paycomp(raw, c) {
                         if t.len() < best.len() { best = t; bc = c as i64; }
                     }

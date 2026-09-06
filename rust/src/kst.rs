@@ -30,6 +30,11 @@ pub fn zz(v: i64) -> u64 {
 
 /// FNV-1a, the hash the format uses everywhere.
 pub const FNV0: u64 = 0xcbf2_9ce4_8422_2325;
+/// one row into the row hash: name hash, start, end, label hash, as words
+pub fn rowmix(h: u64, nh: u64, st: u64, en: u64, lh: u64) -> u64 {
+    let m = |h: u64, v: u64| (h ^ v).wrapping_mul(0x0100_0000_01b3);
+    m(m(m(m(h, nh), st), en), lh)
+}
 
 pub fn fnv(mut h: u64, b: &[u8]) -> u64 {
     for &x in b {

@@ -19,15 +19,14 @@ if [ -z "$SAN" ]; then BUILT=1
 fi
 W=$(mktemp -d); trap 'rm -rf "$W" ${BUILT:+"$SAN"}' EXIT
 fail=0
-run() {   # description, then the command
+run() {   # description, then the command; a refusal is a failure unless the description says (refused)
   local what=$1; shift
   printf '  %-46s ' "$what"
-  if "$@" >/dev/null 2>"$W/err"; then
-    if grep -q LeakSanitizer "$W/err"; then echo "LEAKED"; fail=1; else echo clean; fi
-  else
-    if grep -q LeakSanitizer "$W/err"; then echo "LEAKED"; fail=1
-    else echo "clean (refused)"; fi
-  fi
+  "$@" >/dev/null 2>"$W/err"; local rc=$?
+  if grep -q LeakSanitizer "$W/err"; then echo "LEAKED"; fail=1
+  elif [ $rc = 0 ] && [[ "$what" != *"(refused)"* ]]; then echo clean
+  elif [ $rc != 0 ] && [[ "$what" == *"(refused)"* ]]; then echo "clean (refused)"
+  else echo "WRONG EXIT $rc"; fail=1; fi
 }
 printf 'feature_set\tchild\tparent\nfs\tA\tcategorized\nfs\tB\tcategorized\nfs\tC\tcategorized\nfs\tD\tcategorized\n' > "$W/h.tsv"
 "$SAN" encode < "$D/ls.bed" > "$W/p.kt" 2>/dev/null
@@ -50,7 +49,7 @@ run "decode --names F"             "$SAN" --names "$W/side" decode "$W/s.kt"
 run "decode --aln --ref"           "$SAN" decode --aln "$D/lp.paf" --ref "$D/lref.bed" "$W/a.kt"
 run "decode --db --out"            "$SAN" decode --db "$D/db.features.tsv" --out "$W/out" "$W/f.kt"
 run "region, a name that is there" "$SAN" region "$W/p.kt" r1
-run "region, a name that is not"   "$SAN" region "$W/p.kt" nosuchname
+run "region, a name that is not (refused)" "$SAN" region "$W/p.kt" nosuchname
 run "region SEQ POS"               "$SAN" region "$W/p.kt" r1 150
 run "region SEQ START END HALO"    "$SAN" region "$W/p.kt" r1 0 200 3
 run "index"                        "$SAN" index "$W/p.kt"

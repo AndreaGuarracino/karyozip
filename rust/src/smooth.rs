@@ -234,25 +234,38 @@ pub fn run(path: &str, hier: &str, fs: &[u8], seq: Option<&[u8]>,
     let (nthr, chunk) = (rayon::current_num_threads() as u64, 4096u64);
     if nthr > 1 && last - first >= 64 {
         // As the C's smooth_mt: chunks of sequences on worker threads, each
-        // with its own reader, written in order, eight chunks per thread in flight.
-        use rayon::prelude::*;
-        thread_local! { static RD: std::cell::RefCell<Option<Reader>> = const { std::cell::RefCell::new(None) }; }
+        // with its own reader, taken in order and written in order through a
+        // bounded channel, so at most a few chunks are held. A window of
+        // eight chunks per thread held 2 GB against the C's 0.45 GB on ONT.
+        use std::sync::atomic::{AtomicU64, Ordering};
         let names = r.names_shared();
         let nchunk = (last - first).div_ceil(chunk);
-        let mut c0 = 0;
-        while c0 < nchunk {
-            let c1 = (c0 + nthr * 8).min(nchunk);
-            let parts: Vec<Vec<u8>> = (c0..c1).into_par_iter().map(|c| RD.with(|cell| {
-                let mut g = cell.borrow_mut();
-                let r = g.get_or_insert_with(|| { let mut r = Reader::open_with(path, ro); r.adopt_names(names.clone()); r });
-                let (a, b) = (first + c * chunk, (first + (c + 1) * chunk).min(last));
-                let mut buf = Vec::new();
-                for ri in a..b { one(r, ri, &mut buf, false); }
-                buf
-            })).collect();
-            for p in &parts { wr(out, p); }
-            c0 = c1;
-        }
+        let next = AtomicU64::new(0);
+        let (tx, rx) = std::sync::mpsc::sync_channel::<(u64, Vec<u8>)>(nthr as usize);
+        let one = &one;
+        std::thread::scope(|sc| {
+            for _ in 0..nthr {
+                let (tx, names, next) = (tx.clone(), names.clone(), &next);
+                sc.spawn(move || {
+                    let mut r = Reader::open_with(path, ro);
+                    r.adopt_names(names);
+                    loop {
+                        let c = next.fetch_add(1, Ordering::Relaxed);
+                        if c >= nchunk { break; }
+                        let (a, b) = (first + c * chunk, (first + (c + 1) * chunk).min(last));
+                        let mut buf = Vec::new();
+                        for ri in a..b { one(&mut r, ri, &mut buf, false); }
+                        if tx.send((c, buf)).is_err() { break; }
+                    }
+                });
+            }
+            drop(tx);
+            let (mut pending, mut want) = (std::collections::BTreeMap::new(), 0u64);
+            for (c, buf) in rx {
+                pending.insert(c, buf);
+                while let Some(b) = pending.remove(&want) { wr(out, &b); want += 1; }
+            }
+        });
         return;
     }
     let mut buf = Vec::with_capacity(1 << 20);

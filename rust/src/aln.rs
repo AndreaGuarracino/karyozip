@@ -118,7 +118,21 @@ impl Aln {
         self.hash ^= r.rowhash;
         eprintln!("reference: {} contigs, {tot} runs", self.rc.len());
         self.refkst = Some(std::sync::Arc::new(std::sync::Mutex::new(r)));
-        if !lazy { for t in 0..self.rc.len() { self.rows(t as u32); } }
+        if lazy { return; }
+        // every contig at once: a reader per chunk of contigs, on the pool
+        use rayon::prelude::*;
+        let n = self.rc.len();
+        let per = n.div_ceil(rayon::current_num_threads().max(1)).max(1);
+        let ris: Vec<u64> = self.rc.iter().map(|c| c.ri).collect();
+        let (ris, reflab): (&[u64], &[u32]) = (&ris, &self.reflab);
+        let filled: Vec<(usize, Rows)> = (0..n).collect::<Vec<_>>().par_chunks(per).flat_map_iter(|ch| {
+            let mut r = crate::reader::Reader::open_with(path, &ro);
+            ch.iter().map(move |&t| {
+                let (st, lab, end) = r.seq_runs(ris[t]);
+                (t, (st, lab.into_iter().map(|f| reflab[f as usize]).collect(), end))
+            }).collect::<Vec<_>>()
+        }).collect();
+        for (t, rows) in filled { let _ = self.rc[t].rows.set(rows); }
     }
 
     /// A contig's rows, decoded from the .kst on first use.

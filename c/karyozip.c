@@ -3692,6 +3692,14 @@ static uint64_t loadseq(R *r, int64_t ri, uint64_t **st, uint64_t **en, int **fe
    first asked, so a query pays one contig, not a gigabyte of text. Its
    labels are interned in table order, the order the text would have given. */
 static R *REFR; static uint32_t *REFLAB;
+static void reffill_r(R *r, rcon *rc);
+static R *refopen(const char *path) {   /* a plain track, opened as no companion and under no --names */
+    const char *na = NAMESARG; int ix = INDEXING, ld = LENDEC, td = TAILDEC; uint64_t tp = TAILPRED_R, ts = TAILSKIP_R;
+    NAMESARG = NULL; INDEXING = 1;
+    R *r = ropen(path);
+    NAMESARG = na; INDEXING = ix; LENDEC = ld; TAILDEC = td; TAILPRED_R = tp; TAILSKIP_R = ts;
+    return r;
+}
 static void loadref_kst(const char *path) {
     uint64_t hh[16];
     {   FILE *f = fopen(path, "rb");
@@ -3699,10 +3707,7 @@ static void loadref_kst(const char *path) {
         fclose(f); }
     if (hh[1] & (ALNFLAG | DBFLAG | SIDEFLAG | DROPPED | PERMFLAG))
         die("the reference .kst must be a plain track: not --aln, --db, --sort or --names drop, names in the file");
-    const char *na = NAMESARG; int ix = INDEXING, ld = LENDEC, td = TAILDEC; uint64_t tp = TAILPRED_R, ts = TAILSKIP_R;
-    NAMESARG = NULL; INDEXING = 1;                  /* no companion, no --names of the track being read */
-    R *r = ropen(path);
-    NAMESARG = na; INDEXING = ix; LENDEC = ld; TAILDEC = td; TAILPRED_R = tp; TAILSKIP_R = ts;
+    R *r = refopen(path);
     if (!r->rowhash) die("the reference .kst carries no row hash: encode it again with this version");
     ensurenames(r);
     REFLAB = xmalloc(mul(r->nlab ? r->nlab : 1, 4));
@@ -3717,15 +3722,32 @@ static void loadref_kst(const char *path) {
     ALNHASH ^= r->rowhash;
     REFR = r;
     fprintf(stderr, "reference: %zu contigs, %llu runs\n", nrc, (unsigned long long)tot);
-    if (!REFLAZY) for (size_t i = 0; i < nrc; i++) reffill(RC + i);
+    if (REFLAZY) return;
+    int nthr = nthreads(); if (nthr > (int)nrc) nthr = (int)nrc; if (nthr < 1) nthr = 1;
+#ifdef _OPENMP
+#pragma omp parallel num_threads(nthr)
+#endif
+    {   R *rr;                              /* every contig at once: one reader per thread */
+#ifdef _OPENMP
+#pragma omp critical(refopen)
+#endif
+        rr = refopen(path);                 /* refopen toggles plain globals: one at a time */
+#ifdef _OPENMP
+#pragma omp for schedule(dynamic, 1)
+#endif
+        for (size_t i = 0; i < nrc; i++) reffill_r(rr, RC + i);
+        rclose(rr);
+    }
 }
 static void reffill(rcon *rc) {
     if (rc->filled) return;
 #ifdef _OPENMP
 #pragma omp critical(reffill)
 #endif
-    if (!rc->filled) {
-        R *r = REFR; int ld = LENDEC, td = TAILDEC; uint64_t tp = TAILPRED_R, ts = TAILSKIP_R; const uint8_t *pe = PAYEND;
+    if (!rc->filled) reffill_r(REFR, rc);
+}
+static void reffill_r(R *r, rcon *rc) {
+    {   int ld = LENDEC, td = TAILDEC; uint64_t tp = TAILPRED_R, ts = TAILSKIP_R; const uint8_t *pe = PAYEND;
         TAILDEC = r->taildec; TAILPRED_R = r->tailpred; TAILSKIP_R = r->tailskip;
         rec q = getidx(r, (uint64_t)rc->ri);
         loadblk(r, q.blk);                          /* a plain track: LENDEC is 0 in it */

@@ -1049,8 +1049,9 @@ pub fn tok_best(names: &[u8], slow: bool) -> Option<Vec<u8>> {
     for (i, &chunk) in TCAND.iter().enumerate() {
         // The default takes the two ends; --slow tries every chunk size.
         if !slow && i > 0 && i + 1 < TCAND.len() { continue; }
+        // A larger chunk must save 0.1% to win: chunks decode in parallel.
         if let Some(b) = tok_chunked(names, chunk) {
-            if best.as_ref().is_none_or(|x| b.len() < x.len()) { best = Some(b); }
+            if best.as_ref().is_none_or(|x| b.len() + b.len() / 1000 < x.len()) { best = Some(b); }
         }
     }
     best

@@ -518,7 +518,8 @@ static size_t tokbest(buf *in, uint8_t **out) {
         if (FASTMODE && i && i + 1 < n) continue;    /* fast: ends only */
         uint8_t *o2 = NULL;
         size_t b = tokc(in, &o2, TCAND[i]);
-        if (b && (!best || b < best)) { free(*out); *out = o2; best = b; }
+        /* a larger chunk must save 0.1% to win: chunks decode in parallel */
+        if (b && (!best || b + b / 1000 < best)) { free(*out); *out = o2; best = b; }
         else free(o2);
     }
     return best;

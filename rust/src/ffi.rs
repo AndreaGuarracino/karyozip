@@ -64,6 +64,20 @@ pub fn ignore_sigxfsz() {
     unsafe { signal(25, 1); }
 }
 
+/// Whether fds 0, 1 and 2 were open when the process started. The runtime
+/// reopens a closed one on /dev/null before main, so the check runs from
+/// .init_array, ahead of it, as the C's fcntl check at the top of main.
+pub static STDFDS_OPEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+#[used]
+#[unsafe(link_section = ".init_array")]
+static CHECK_STDFDS: extern "C" fn() = check_stdfds;
+extern "C" fn check_stdfds() {
+    unsafe extern "C" { fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int; }
+    // SAFETY: F_GETFD is 1 and takes no argument.
+    let open = (0..3).all(|fd| unsafe { fcntl(fd, 1) } >= 0);
+    STDFDS_OPEN.store(open, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// The vendored htscodecs, from its own version.h at build time.
 pub const HTSCODECS_VERSION: &str = env!("HTSCODECS_VERSION");
 

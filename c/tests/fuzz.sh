@@ -252,12 +252,12 @@ hh = list(h); hh[4] = h[4] - 1; open("%s/fidx%d.kt" % (W, k), "wb").write(build(
 hh = list(h); hh[8] = 16; open("%s/fidx%d.kt" % (W, k), "wb").write(build(frames, chunks, hh)); k += 1
 hh = list(h); hh[13] = 3; open("%s/fidx%d.kt" % (W, k), "wb").write(build(frames, chunks, hh)); k += 1
 PY
-$KT query "$W/t5.kt" s69999 2>/dev/null > "$W/want5"
+$KT region "$W/t5.kt" s69999 2>/dev/null > "$W/want5"
 printf 'feature_set\tchild\tparent\nfs\tA\tcategorized\nfs\tB\tcategorized\n' > "$W/hier.tsv"
 $KT smooth "$W/t5.kt" "$W/hier.tsv" fs 2>/dev/null > "$W/want5s"
 one_fidx() {
   local m=$1 e="$1.err" out rc
-  out=$(ASAN_OPTIONS=detect_leaks=0 timeout 30 ${SAN:-$KT} query "$m" s69999 2>"$e"); rc=$?
+  out=$(ASAN_OPTIONS=detect_leaks=0 timeout 30 ${SAN:-$KT} region "$m" s69999 2>"$e"); rc=$?
   [ $rc -gt 1 ] && { echo "fuzz: forged index $(basename $m) crashed rc=$rc"; return 1; }
   grep -qE "AddressSanitizer|runtime error" "$e" && { echo "fuzz: forged index $(basename $m) sanitizer report"; return 1; }
   [ $rc -eq 0 ] && { printf '%s\n' "$out" | cmp -s - "$W/want5" || { echo "fuzz: forged index $(basename $m) WRONG rows with exit 0"; return 1; }; }

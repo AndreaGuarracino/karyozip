@@ -12,15 +12,15 @@ encode: 342 forms identical
 decode: 95 forms give the input back
 cross-decode: the C reads the Rust's files
 region: 110 forms identical
-index: byte-identical trailer
+index: byte-identical trailer / index cross-read: 1 forms identical
 sorted decode: 12 forms identical
 reader flags: 16 forms identical
-smooth: 27 forms identical
---db encode: identical / --db decode: identical, restores all six inputs
+smooth: 24 forms identical
+--db encode: identical / --db decode: identical, restores all six inputs / --db --hier: 2 forms identical
 --aln and aln-pack: 11 forms identical
 refusals: same message from both
 gzip input: 10 forms match the plain track
-cli: 69 forms give the same words and code
+cli: 74 forms give the same words and code
 DIFF_PASS
 ```
 

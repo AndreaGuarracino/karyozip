@@ -13,7 +13,7 @@ rust:
 # which only compares outputs, could not see.
 rust-test: all rust
 	cd rust && cargo test --release
-	KT=$(CURDIR)/rust/target/release/karyozip bash c/tests/run.sh
+	KT=$(CURDIR)/rust/target/release/karyozip LT=$(CURDIR)/c/build/libtest bash c/tests/run.sh
 	bash tests/diff.sh
 
 diff: all rust

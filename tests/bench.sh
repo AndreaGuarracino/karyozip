@@ -86,7 +86,7 @@ pafB=$(stat -c%s "$PAF")
 for kind in presmoothed smoothed; do
   for set in $sets; do
     q=$(ls "$D"/*."$set"."$kind".bed.gz 2>/dev/null | head -1); [ -n "$q" ] || continue
-    ref=$(ls "$REFD"/*."$set"."$kind".bed.gz 2>/dev/null | head -1)
+    ref=$(ls "$REFD"/ref.*."$set"."$kind".bed.gz "$REFD"/*."$set"."$kind".bed.gz 2>/dev/null | head -1)   # a cut cell keeps its reference beside its tracks
     for seek in seekable non-seekable; do bf=""; [ $seek = non-seekable ] && bf="--block all"
       for mode in default slow; do mf=""; [ $mode = slow ] && mf="--slow"
         for impl in C Rust; do bin=$C; [ $impl = Rust ] && bin=$R
@@ -99,7 +99,7 @@ for kind in presmoothed smoothed; do
   # --db takes every set at once: one row per kind, set = ALL
   ins=""; for set in $sets; do f=$(ls "$D"/*."$set"."$kind".bed.gz 2>/dev/null | head -1); [ -n "$f" ] && ins="$ins $f"; done
   [ $(echo $ins | wc -w) = $(echo $sets | wc -w) ] || continue
-  ref=$(ls "$REFD"/*.chromosome."$kind".bed.gz 2>/dev/null | head -1)
+  ref=$(ls "$REFD"/ref.*.chromosome."$kind".bed.gz "$REFD"/*.chromosome."$kind".bed.gz 2>/dev/null | head -1)
   for seek in seekable non-seekable; do bf=""; [ $seek = non-seekable ] && bf="--block all"
     for mode in default slow; do mf=""; [ $mode = slow ] && mf="--slow"
       for impl in C Rust; do bin=$C; [ $impl = Rust ] && bin=$R

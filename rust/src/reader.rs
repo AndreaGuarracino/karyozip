@@ -439,12 +439,15 @@ impl Reader {
             for k in 0..nruns {
                 let (len, f) = self.step(&mut c, st, k + 1 == nruns && i >= tskip);
                 let en = st + len;
+                let mut nb = [0u8; 44];        // \tSTART\tEND\t in one piece
+                nb[0] = b'\t';
+                let mut nl = 1 + kst::putu64_at(&mut nb[1..], st);
+                nb[nl] = b'\t'; nl += 1;
+                nl += kst::putu64_at(&mut nb[nl..], en);
+                nb[nl] = b'\t'; nl += 1;
+                buf.reserve(name.len() + nl + 32);
                 buf.extend_from_slice(&name);
-                buf.push(b'\t');
-                kst::putu64(&mut buf, st);
-                buf.push(b'\t');
-                kst::putu64(&mut buf, en);
-                buf.push(b'\t');
+                buf.extend_from_slice(&nb[..nl]);
                 if self.aln.is_some() && self.lab.get(f as usize).is_some_and(|l| l == b"=") { restored += 1; }
                 self.label(f, &mut buf, st, len);
                 buf.push(b'\n');

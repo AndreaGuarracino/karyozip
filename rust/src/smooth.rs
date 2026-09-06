@@ -172,12 +172,15 @@ fn emit(h: &Hier, out: &mut Vec<u8>, seq: &[u8], st: &[u64], en: &[u64],
             let nm: &[u8] = if cf == h.root && cn != 0 { b"novel" } else { &h.node[cf as usize] };
             let mut ml = nm.len();
             if v1 && cf != h.root && ml > 9 && &nm[ml - 9..] == b"_specific" { ml -= 9; }
+            let mut b = [0u8; 44];      // \tSTART\tEND\t in one piece
+            b[0] = b'\t';
+            let mut i = 1 + crate::kst::putu64_at(&mut b[1..], cs);
+            b[i] = b'\t'; i += 1;
+            i += crate::kst::putu64_at(&mut b[i..], ce);
+            b[i] = b'\t'; i += 1;
+            out.reserve(seq.len() + i + ml + 1);
             out.extend_from_slice(seq);
-            out.push(b'\t');
-            crate::kst::putu64(out, cs);
-            out.push(b'\t');
-            crate::kst::putu64(out, ce);
-            out.push(b'\t');
+            out.extend_from_slice(&b[..i]);
             out.extend_from_slice(&nm[..ml]);
             out.push(b'\n');
         }

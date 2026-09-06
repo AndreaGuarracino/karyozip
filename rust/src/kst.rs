@@ -48,15 +48,25 @@ pub fn fnv(mut h: u64, b: &[u8]) -> u64 {
 /// per number, which is a quarter of decode's time on a 40M-row track.
 pub fn putu64(out: &mut Vec<u8>, v: u64) {
     let mut b = [0u8; 20];
-    let mut i = b.len();
+    let n = putu64_at(&mut b, v);
+    out.extend_from_slice(&b[..n]);
+}
+
+/// The digits at the front of `b`, and how many: one row of a BED goes into
+/// a stack buffer and reaches the output in one call, as the C writes it
+/// through one pointer.
+pub fn putu64_at(b: &mut [u8], v: u64) -> usize {
+    let mut t = [0u8; 20];
+    let mut i = t.len();
     let mut n = v;
     loop {
         i -= 1;
-        b[i] = b'0' + (n % 10) as u8;
+        t[i] = b'0' + (n % 10) as u8;
         n /= 10;
         if n == 0 { break; }
     }
-    out.extend_from_slice(&b[i..]);
+    b[..t.len() - i].copy_from_slice(&t[i..]);
+    t.len() - i
 }
 
 /// FNV-1a as a `HashMap` hasher. The default is SipHash, which on a

@@ -1047,8 +1047,8 @@ pub fn tok_best(names: &[u8], slow: bool) -> Option<Vec<u8>> {
     const TCAND: [usize; 4] = [250_000, 1_000_000, 3_000_000, 9_000_000];
     let mut best: Option<Vec<u8>> = None;
     for (i, &chunk) in TCAND.iter().enumerate() {
-        // The default takes the two ends; --slow tries every chunk size.
-        if !slow && i > 0 && i + 1 < TCAND.len() { continue; }
+        // The default takes the smallest chunk; --slow tries every size.
+        if !slow && i > 0 { continue; }
         // A larger chunk must save 0.1% to win: chunks decode in parallel.
         if let Some(b) = tok_chunked(names, chunk) {
             if best.as_ref().is_none_or(|x| b.len() + b.len() / 1000 < x.len()) { best = Some(b); }
@@ -1114,16 +1114,19 @@ pub fn best_names(names: &[u8], n: u64, level: i32, slow: bool) -> BestNames {
 
 /// A repeated sequence name would make the index ambiguous, so it is refused.
 pub fn check_unique(names: &[u8]) -> Result<(), String> {
-    let mut seen: HashSet<u64> = HashSet::new();
+    // As the C: hash every name, sort, and compare text only where two
+    // hashes collide. A set of 10,000,000 names was a sixth of an encode.
+    let lines = names.split(|&c| c == b'\n').filter(|l| !l.is_empty());
+    let mut hs: Vec<u64> = lines.clone().map(|l| kst::fnv(FNV0, l)).collect();
+    hs.sort_unstable();
+    let rep: HashSet<u64> = hs.windows(2).filter(|w| w[0] == w[1]).map(|w| w[0]).collect();
+    if rep.is_empty() { return Ok(()); }
     let mut exact: HashSet<&[u8]> = HashSet::new();
-    for line in names.split(|&c| c == b'\n') {
-        if line.is_empty() { continue; }
-        let h = kst::fnv(FNV0, line);
-        if !seen.insert(h) && !exact.insert(line) {
-            return Err(format!("sequence {} appears twice",
-                               String::from_utf8_lossy(line)));
+    for line in lines {
+        if rep.contains(&kst::fnv(FNV0, line)) && !exact.insert(line) {
+            eprintln!("karyozip: sequence {} appears twice", String::from_utf8_lossy(line));
+            return Err("a sequence name repeats".into());
         }
-        exact.insert(line);
     }
     Ok(())
 }

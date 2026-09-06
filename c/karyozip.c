@@ -515,7 +515,7 @@ static size_t tokbest(buf *in, uint8_t **out) {
     if (TOKSET) return tokc(in, out, TOKCHUNK);
     size_t n = sizeof TCAND / sizeof *TCAND, best = 0;
     for (size_t i = 0; i < n; i++) {
-        if (FASTMODE && i && i + 1 < n) continue;    /* fast: ends only */
+        if (FASTMODE && i) continue;    /* fast: the smallest chunk only; --slow tries all */
         uint8_t *o2 = NULL;
         size_t b = tokc(in, &o2, TCAND[i]);
         /* a larger chunk must save 0.1% to win: chunks decode in parallel */

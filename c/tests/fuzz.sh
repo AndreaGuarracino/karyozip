@@ -6,6 +6,7 @@
 # that thousands of flips missed.
 set -u
 KT=${1:-$(dirname "$0")/../build/karyozip}
+for t in python3 zstd; do command -v $t >/dev/null || { echo "fuzz: $t not on PATH"; exit 1; }; done
 # A sanitizer build is made here unless KARYOZIP_SAN names one, so the search
 # always runs with memory checking on, not only when someone remembers.
 # The C build gets a sanitizer twin; any other binary under test, the Rust,
@@ -129,7 +130,7 @@ echo "fuzz: $d damaged files, none crashed"
 # wrapped before the allocation cap saw them. A plain track: smooth refuses a
 # sidecar track before it reads a row, which hid a forged label count.
 $KT encode --block 32 < "$W/ok.bed" > "$W/t3.kt" 2>/dev/null
-python3 - "$W" "$D" <<'PY'
+python3 - "$W" "$D" <<'PY' || { echo "fuzz: stage 3 generator FAILED"; exit 1; }
 import struct, sys; sys.path.insert(0, sys.argv[2]); from kt import *
 W = sys.argv[1]
 src = bytearray(open(W + "/t3.kt", "rb").read()); h0 = list(struct.unpack_from("<16Q", src, 8))
@@ -166,7 +167,7 @@ echo "fuzz: $f forged-header runs, none crashed"
 awk 'BEGIN{for(i=0;i<300;i++){p=0;for(j=0;j<4;j++){c=p+29;printf "r%d\t%d\t%d\t%s\n",i,p,c,(i<50?"A":(j%2?"B":"C"));p=c}}}' > "$W/t4.bed"
 $KT encode --block 200 < "$W/t4.bed" > "$W/t4.kt" 2>/dev/null
 cut -f2,3,4 "$W/t4.bed" > "$W/want4"
-python3 - "$W" "$D" <<'PY'
+python3 - "$W" "$D" <<'PY' || { echo "fuzz: stage 4 generator FAILED"; exit 1; }
 import struct, sys; sys.path.insert(0, sys.argv[2]); from kt import *
 W = sys.argv[1]
 src = bytearray(open(W + "/t4.kt", "rb").read()); h = list(struct.unpack_from("<16Q", src, 8))
@@ -212,7 +213,7 @@ echo "fuzz: $g forged-sizes runs, none wrong"
 # entry once moved every later sequence with exit 0.
 awk 'BEGIN{for(i=0;i<70000;i++){printf "s%d\t0\t7\tA\ns%d\t7\t9\tB\n",i,i}}' > "$W/t5.bed"
 $KT encode < "$W/t5.bed" > "$W/t5.kt" 2>/dev/null
-python3 - "$W" "$D" <<'PY'
+python3 - "$W" "$D" <<'PY' || { echo "fuzz: stage 5 generator FAILED"; exit 1; }
 import struct, sys; sys.path.insert(0, sys.argv[2]); from kt import *
 W = sys.argv[1]
 src = bytearray(open(W + "/t5.kt", "rb").read()); h = list(struct.unpack_from("<16Q", src, 8))

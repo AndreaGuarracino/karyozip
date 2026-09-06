@@ -529,25 +529,35 @@ pub fn tok_d(b: &[u8]) -> Vec<u8> {
     if nchunk > (b.len() - 8) / 8 || hdr > b.len() {
         crate::bail("corrupt tokenised names header");
     }
-    let mut coff = vec![0usize];
-    for (i, _) in (0..nchunk).enumerate() {
-        let o = 8 + 4 * (nchunk + i);
-        let cl = u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
-        coff.push(coff[i] + cl as usize);
+    // raw and coded length per chunk, as the C's tokd
+    let (mut woff, mut coff) = (vec![0usize], vec![0usize]);
+    for i in 0..nchunk {
+        let at = |o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap()) as usize;
+        woff.push(woff[i] + at(8 + 4 * i));
+        coff.push(coff[i] + at(8 + 4 * (nchunk + i)));
     }
     if coff[nchunk] > b.len() - hdr {
         crate::bail("corrupt tokenised names: chunks overrun the stream");
     }
-    // One chunk per thread, as the C's tokd does. The tokeniser separates
-    // with NUL; the format stores newlines.
+    // One chunk per thread into one preallocated buffer, so the peak is the
+    // names once, not twice. The tokeniser separates with NUL; the format
+    // stores newlines.
     use rayon::prelude::*;
-    let parts: Vec<Vec<u8>> = (0..nchunk).into_par_iter().map(|i| {
-        let mut d = ffi::tok_decode(&b[hdr + coff[i]..hdr + coff[i + 1]])
-            .unwrap_or_else(|| crate::bail("name tokeniser decode failed"));
-        for c in d.iter_mut() { if *c == 0 { *c = b'\n'; } }
-        d
-    }).collect();
-    parts.concat()
+    let mut out = vec![0u8; crate::ckalloc(woff[nchunk])];
+    let mut slots: Vec<&mut [u8]> = Vec::with_capacity(nchunk);
+    let mut rest = out.as_mut_slice();
+    for i in 0..nchunk { let (a, r) = rest.split_at_mut(woff[i + 1] - woff[i]); slots.push(a); rest = r; }
+    let ok = slots.into_par_iter().enumerate().all(|(i, slot)| {
+        match ffi::tok_decode(&b[hdr + coff[i]..hdr + coff[i + 1]]) {
+            Some(d) if d.len() == slot.len() => {
+                for (o, &c) in slot.iter_mut().zip(&d) { *o = if c == 0 { b'\n' } else { c }; }
+                true
+            }
+            _ => false,
+        }
+    });
+    if !ok { crate::bail("name tokeniser decode failed"); }
+    out
 }
 
 pub use crate::kst::{unzz, vget};

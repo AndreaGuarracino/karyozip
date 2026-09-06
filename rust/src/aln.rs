@@ -411,7 +411,7 @@ pub fn pack(a: &Aln, out: &str, refhash: u64) {
         let (mut best, mut bc): (Vec<u8>, i64) = (Vec::new(), -1);
         if !raw.is_empty() {
             if k == 0 {
-                if let Some(t) = crate::writer::tok_best(raw, false) { best = t; bc = 0x7fff_0000; }
+                if let Some(t) = crate::writer::tok_best(raw, false, None) { best = t; bc = 0x7fff_0000; }
             }
             if bc < 0 {
                 best = ffi::zstd(raw, 19);

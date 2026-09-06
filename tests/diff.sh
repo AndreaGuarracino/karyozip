@@ -34,7 +34,7 @@ echo "codecs: every candidate round-trips"
 
 # 2. encode must be byte-identical, over every fixture and flag.
 for f in "$D"/*.bed; do
-  for fl in "" "--block 4" "--block all" "--level 3" "--level 22" "--names keep" \
+  for fl in "" "--block 4" "--block all" "--level 3" "--level 22" "--names keep" "--tok-chunk 2" \
             "--slow" "--slow --block 4" "--tail 0" "--tail 1" "--names drop" \
             "--tok-chunk 250000" "--slow --level 22" \
             "--sort" "--sort --names keep" "--sort --names drop" "--sort=1M" \
@@ -174,9 +174,9 @@ done
 # 11. the same refusals, with the same words.
 EXPECT=fail
 for bad_in in 'r1\t0\t10' 'r1\t5\t10\tA' 'r1\t0\t0\tA' '\t0\t10\tA' 'r1\tx\t10\tA'; do
-  cm=$(printf "$bad_in\n" | "$C" encode 2>&1 >/dev/null | tail -1)
-  rm2=$(printf "$bad_in\n" | "$R" encode 2>&1 >/dev/null | tail -1)
-  [ "$cm" = "$rm2" ] || { echo "  refusal differs on [$bad_in]: c=[$cm] rust=[$rm2]"; fail=1; }
+  printf "$bad_in\n" | "$C" encode 2> "$W/ce" >/dev/null; c1=$?; cm=$(tail -1 "$W/ce")
+  printf "$bad_in\n" | "$R" encode 2> "$W/re" >/dev/null; r1=$?; rm2=$(tail -1 "$W/re")
+  [ "$cm" = "$rm2" ] && [ "$c1" = 1 ] && [ "$r1" = 1 ] || { echo "  refusal differs on [$bad_in]: c=[$cm] rc $c1, rust=[$rm2] rc $r1"; fail=1; }
 done
 echo "refusals: same message from both"
 

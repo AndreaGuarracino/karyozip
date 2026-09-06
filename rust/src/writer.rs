@@ -615,13 +615,13 @@ impl Writer {
                     None => break,
                 }
             }
-            let b = best_names(&self.names[..q], smpn, level, self.opt.slow);
+            let b = best_names(&self.names[..q], smpn, level, self.opt.slow, self.opt.tok_chunk);
             if q == self.names.len() {
                 (b.bytes, b.kind == 2, b.kind == 1)      // the sample was all of it
             } else {
                 let whole = match b.kind {
                     1 => int_names(&self.names, self.nidx).map(|v| ffi::zstd(&v, level)),
-                    2 => tok_best(&self.names, self.opt.slow),
+                    2 => tok_best(&self.names, self.opt.slow, self.opt.tok_chunk),
                     _ => None,
                 };
                 match whole {
@@ -652,9 +652,9 @@ impl Writer {
                 srt.extend_from_slice(nt[v as usize]);
                 srt.push(b'\n');
             }
-            let b = best_names(&srt, self.nidx, level, self.opt.slow);
+            let b = best_names(&srt, self.nidx, level, self.opt.slow, self.opt.tok_chunk);
             let p1 = ffi::zstd(&self.natbuf, level);
-            let p2 = tok_best(&self.natbuf, self.opt.slow);
+            let p2 = tok_best(&self.natbuf, self.opt.slow, self.opt.tok_chunk);
             let (pbest, ptok) = match p2 {
                 Some(t) if t.len() < p1.len() => (t, true),
                 _ => (p1, false),
@@ -1043,8 +1043,9 @@ pub fn int_names(names: &[u8], n: u64) -> Option<Vec<u8>> {
 
 /// The tokeniser, over the chunk sizes the C tries. In fast mode it tries
 /// only the ends of the list, which is what the default encode does.
-pub fn tok_best(names: &[u8], slow: bool) -> Option<Vec<u8>> {
+pub fn tok_best(names: &[u8], slow: bool, fixed: Option<usize>) -> Option<Vec<u8>> {
     const TCAND: [usize; 4] = [250_000, 1_000_000, 3_000_000, 9_000_000];
+    if let Some(k) = fixed { return tok_chunked(names, k); }   // --tok-chunk
     let mut best: Option<Vec<u8>> = None;
     for (i, &chunk) in TCAND.iter().enumerate() {
         // The default takes the smallest chunk; --slow tries every size.
@@ -1096,10 +1097,10 @@ fn tok_chunked(names: &[u8], chunk: usize) -> Option<Vec<u8>> {
 /// Smallest of zstd, integer deltas and the tokeniser. The losers are
 /// dropped. zstd and the tokeniser are independent and neither gains from
 /// threads on a buffer this size, so they run side by side.
-pub fn best_names(names: &[u8], n: u64, level: i32, slow: bool) -> BestNames {
+pub fn best_names(names: &[u8], n: u64, level: i32, slow: bool, chunk: Option<usize>) -> BestNames {
     let (z, t) = rayon::join(
         || ffi::zstd(names, level),
-        || tok_best(names, slow),
+        || tok_best(names, slow, chunk),
     );
     let i = int_names(names, n).map(|v| ffi::zstd(&v, level));
     let mut out = BestNames { bytes: z, kind: 0 };
@@ -1124,7 +1125,8 @@ pub fn check_unique(names: &[u8]) -> Result<(), String> {
     let mut exact: HashSet<&[u8]> = HashSet::new();
     for line in lines {
         if rep.contains(&kst::fnv(FNV0, line)) && !exact.insert(line) {
-            eprintln!("karyozip: sequence {} appears twice", String::from_utf8_lossy(line));
+            let mut e = std::io::stderr().lock();
+            let _ = e.write_all(b"karyozip: sequence ").and_then(|_| e.write_all(line)).and_then(|_| e.write_all(b" appears twice\n"));
             return Err("a sequence name repeats".into());
         }
     }

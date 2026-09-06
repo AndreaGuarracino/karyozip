@@ -28,12 +28,12 @@ DIFF_PASS
 
 |                        |     C |  Rust |
 |------------------------|------:|------:|
-| lines, excluding vendored C | 4,218 | 3,993 |
-| files                  |     2 |    10 |
-| `unsafe` blocks        |     — |    13 |
-| stripped binary        | 358 KB | 2,491 KB |
+| lines, excluding vendored C | 4,389 | 4,426 |
+| files                  |     2 |    11 |
+| `unsafe` blocks        |     — |    14 |
+| stripped binary        | 383 KB | 2,557 KB |
 
-The Rust is 5% shorter. Some of that is real, the parallel arrays and the
+The two are the same length within 1%. Some of that is real, the parallel arrays and the
 manual memory management that `Vec` and ownership remove; some is that the
 C carries its own hash tables and buffer type where the Rust uses the
 standard library. The command line is `clap`, which costs 589 KB of binary
@@ -46,8 +46,9 @@ of `c/karyozip.c` at build time, so `--help` is the same bytes from both by
 construction. The htscodecs and bzip3 version strings come the same way,
 from `c/htscodecs/version.h` and `c/Makefile`.
 
-All 13 `unsafe` blocks are in `src/ffi.rs`, the one module that calls the
-vendored C codecs. Nothing else in the crate is unsafe.
+All 14 `unsafe` blocks are in `src/ffi.rs`, the one module that calls the
+vendored C codecs and checks the standard fds before the runtime touches
+them. Nothing else in the crate is unsafe.
 
 ## Speed
 

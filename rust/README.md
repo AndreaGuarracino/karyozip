@@ -18,7 +18,7 @@ releases, so that pin is what makes byte-identity testable.
 
 ## unsafe
 
-`src/ffi.rs` is the only `unsafe` in the crate, besides the reader's mmap.
+`src/ffi.rs` is the only `unsafe` in the crate.
 Every raw pointer and every length check lives there; callers see slices and
 `Option<Vec<u8>>`. Beyond that, `unsafe` needs a measured win recorded in
 `notes/log.md`, not an argument.

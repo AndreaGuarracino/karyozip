@@ -71,7 +71,7 @@ for kind in presmoothed smoothed; do
     ref=$(ls "$D"/ref.*."$fs"."$kind".bed.gz 2>/dev/null | head -1)
     zcat "$q" > "$W/in.bed"; seq=$(head -1 "$W/in.bed" | cut -f1)
     for strat in plain aln; do
-      [ $strat = aln ] && { [ -s "$ref" ] && [ -s "$paf" ] || continue; }
+      [ $strat = aln ] && { [ -s "$ref" ] && [ -s "$paf" ] || { fail "$fs $kind: no reference track or PAF in the cell"; continue; }; }
       a=""; [ $strat = aln ] && a="--aln $paf --ref $ref $alnnames"
       for fl in "${FLAGS[@]}"; do
         lbl="$fs $kind $strat [$fl]"

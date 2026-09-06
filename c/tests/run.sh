@@ -1001,7 +1001,7 @@ else
   echo "  want $want"; echo "  got  $got"; $KT --version | sed 's/^/  /'
 fi
 
-if bash "$D/leaks.sh"; then :; else echo "leaks: FOUND SOMETHING"; fail=1; fi
+if KT="$KT" bash "$D/leaks.sh"; then :; else echo "leaks: FOUND SOMETHING"; fail=1; fi
 if bash "$D/fuzz.sh" "$KT"; then echo "fuzz: clean"; else echo "fuzz: FOUND SOMETHING"; fail=1; fi
 
 exit $fail

@@ -9,9 +9,10 @@ pub const USAGE: &str = include_str!(concat!(env!("OUT_DIR"), "/usage.txt"));
 
 /// What --version prints: the tool, the format, and the linked codecs.
 fn version_text() -> &'static str {
-    format!("{}, format KST00001\n  zstd       {}\n  libbz3     {}\n  htscodecs  {}",
+    static V: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    V.get_or_init(|| format!("{}, format KST00001\n  zstd       {}\n  libbz3     {}\n  htscodecs  {}",
             env!("CARGO_PKG_VERSION"), karyozip::ffi::zstd_version(),
-            karyozip::ffi::bzip3_version(), karyozip::ffi::HTSCODECS_VERSION).leak()
+            karyozip::ffi::bzip3_version(), karyozip::ffi::HTSCODECS_VERSION))
 }
 
 #[derive(Parser)]

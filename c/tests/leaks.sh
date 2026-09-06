@@ -7,6 +7,14 @@ set -u
 D=$(cd "$(dirname "$0")" && pwd)
 SRC=$D/..
 SAN=${1:-${KARYOZIP_SAN:-}}; BUILT=""
+W=$(mktemp -d)
+# a Rust binary under test runs under valgrind, which sees the same leaks
+if [ -z "$SAN" ] && [ -n "${KT:-}" ] && grep -q rust_begin_unwind "$KT" 2>/dev/null; then
+  command -v valgrind >/dev/null || { echo "leaks: skipped, no valgrind for the Rust"; exit 0; }
+  # glibc's thread-local storage of pool threads still alive at exit is not a leak
+  printf '{\n  tls\n  Memcheck:Leak\n  match-leak-kinds: definite\n  fun:calloc\n  fun:allocate_dtv\n}\n' > "$W/supp"
+  printf '#!/bin/bash\nexec valgrind -q --leak-check=full --errors-for-leak-kinds=definite --error-exitcode=99 --suppressions="%s" "%s" "$@"\n' "$W/supp" "$KT" > "$W/san"; chmod +x "$W/san"; SAN=$W/san
+fi
 if [ -z "$SAN" ]; then BUILT=1
   command -v gcc >/dev/null || { echo "leaks: skipped, no gcc"; exit 0; }
   SAN=$(mktemp -u /tmp/kz-lsan.XXXXXX)
@@ -17,15 +25,15 @@ if [ -z "$SAN" ]; then BUILT=1
       "$SRC"/htscodecs/utils.c "$SRC"/bzip3/libbz3.c -I"$SRC" -lzstd -lz -lm -lpthread \
       >/dev/null 2>&1 || { echo "leaks: sanitizer build FAILED"; exit 1; }
 fi
-W=$(mktemp -d); trap 'rm -rf "$W" ${BUILT:+"$SAN"}' EXIT
+trap 'rm -rf "$W" ${BUILT:+"$SAN"}' EXIT
 fail=0
 run() {   # description, then the command; a refusal is a failure unless the description says (refused)
   local what=$1; shift
   printf '  %-46s ' "$what"
   "$@" >/dev/null 2>"$W/err"; local rc=$?
-  if grep -q LeakSanitizer "$W/err"; then echo "LEAKED"; fail=1
+  if grep -qE "LeakSanitizer|definitely lost: [1-9]" "$W/err" || [ $rc = 99 ]; then echo "LEAKED"; fail=1
   elif [ $rc = 0 ] && [[ "$what" != *"(refused)"* ]]; then echo clean
-  elif [ $rc != 0 ] && [[ "$what" == *"(refused)"* ]]; then echo "clean (refused)"
+  elif [ $rc = 1 ] && [[ "$what" == *"(refused)"* ]]; then echo "clean (refused)"
   else echo "WRONG EXIT $rc"; fail=1; fi
 }
 printf 'feature_set\tchild\tparent\nfs\tA\tcategorized\nfs\tB\tcategorized\nfs\tC\tcategorized\nfs\tD\tcategorized\n' > "$W/h.tsv"

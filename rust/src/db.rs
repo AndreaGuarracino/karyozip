@@ -6,8 +6,10 @@ use std::io::Write;
 
 pub struct Feats {
     pub sets: Vec<Vec<u8>>,
-    /// featureID to its label per set, dense as the C's fid2lab.
-    id2lab: Vec<Option<Vec<Vec<u8>>>>,
+    /// featureID to its label per set: a dense position table, as the C's
+    /// fid2lab, 4 bytes a slot so a sparse id costs less than the C's 8.
+    idpos: Vec<u32>,
+    labs: Vec<Vec<Vec<u8>>>,
     pub nids: usize,
     /// the label tuple, tab-joined, to its featureID
     tup: HashMap<Vec<u8>, u32>,
@@ -28,7 +30,7 @@ pub const CARTBASE: u32 = 1 << 26;
 impl Feats {
     pub fn load(path: &str) -> Feats {
         let data = crate::slurp(path, "cannot open the features table");
-        let mut f = Feats { sets: Vec::new(), id2lab: Vec::new(), nids: 0,
+        let mut f = Feats { sets: Vec::new(), idpos: Vec::new(), labs: Vec::new(), nids: 0,
                             tup: HashMap::default(), intern: Vec::new(), tupint: HashMap::default(), hash: FNV0, voc: Vec::new(), stride: Vec::new(),
                             prod: 0, cart: false, hierhash: 0 };
         let mut first = true;
@@ -64,8 +66,13 @@ impl Feats {
             if cols.len() - 1 > f.sets.len() { crate::bail("a features.tsv row has more labels than sets"); }
             if f.has(id) { crate::bail("features.tsv defines a featureID twice"); }
             f.tup.insert(cols[1..].join(&b'\t'), id);
-            if f.id2lab.len() <= id as usize { f.id2lab.resize(id as usize + 1024, None); }
-            f.id2lab[id as usize] = Some(cols[1..].iter().map(|c| c.to_vec()).collect());
+            if f.idpos.len() <= id as usize {
+                let n = id as usize + 1024 - f.idpos.len();
+                f.idpos.try_reserve(n).unwrap_or_else(|_| crate::bail("oom"));
+                f.idpos.resize(id as usize + 1024, u32::MAX);
+            }
+            f.idpos[id as usize] = f.labs.len() as u32;
+            f.labs.push(cols[1..].iter().map(|c| c.to_vec()).collect());
             f.nids += 1;
             if f.intern.is_empty() { f.intern = vec![HashMap::default(); f.sets.len()]; }
             let key: Vec<u32> = cols[1..].iter().enumerate().map(|(k, c)| {
@@ -75,7 +82,7 @@ impl Feats {
         if f.sets.is_empty() { crate::bail("features table has no header"); }
         f
     }
-    fn has(&self, id: u32) -> bool { self.id2lab.get(id as usize).is_some_and(|t| t.is_some()) }
+    fn has(&self, id: u32) -> bool { self.idpos.get(id as usize).is_some_and(|&p| p != u32::MAX) }
     /// A label's interned id in set k, or MAX when no table tuple has it.
     fn labid(&self, k: usize, lab: &[u8]) -> u32 { self.intern[k].get(lab).copied().unwrap_or(u32::MAX) }
 
@@ -93,7 +100,7 @@ impl Feats {
     /// The label of one set for a featureID.
     pub fn lab(&self, id: u32, k: usize) -> &[u8] {
         if id == 0 { b"novel" }
-        else if id < CARTBASE { &self.id2lab[id as usize].as_ref().unwrap()[k] }
+        else if id < CARTBASE { &self.labs[self.idpos[id as usize] as usize][k] }
         else { &self.voc[k][((id - CARTBASE) as u64 / self.stride[k] % self.voc[k].len() as u64) as usize] }
     }
 
@@ -103,7 +110,7 @@ impl Feats {
         let n = self.sets.len();
         let mut voc: Vec<Vec<Vec<u8>>> = (0..n).map(|k| {
             let mut v = vec![b"novel".to_vec()];
-            v.extend(self.id2lab.iter().flatten().map(|t| t[k].clone()));
+            v.extend(self.labs.iter().map(|t| t[k].clone()));
             v
         }).collect();
         self.hierhash = self.hash;
@@ -199,6 +206,7 @@ impl Brd {
             if std::fs::metadata(path).is_err() { eprintln!("cannot open {path}"); }
             crate::Lines::open(path, "cannot open an input BED")
         };
+        let mut lines = lines; lines.err = "read error on an input BED";
         let mut b = Brd { lines, line: Vec::new(), seq: Vec::new(), st: 0, en: 0, lab: Vec::new(), labid: u32::MAX,
                           pseq: Vec::new(), pen: 0, plab: Vec::new(), had: false, eof: false };
         b.next();

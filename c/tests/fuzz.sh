@@ -7,6 +7,7 @@
 set -u
 KT=${1:-$(dirname "$0")/../build/karyozip}
 for t in python3 zstd; do command -v $t >/dev/null || { echo "fuzz: $t not on PATH"; exit 1; }; done
+"$KT" --help >/dev/null 2>&1 || { echo "fuzz: $KT does not run"; exit 1; }   # a binary that cannot run refuses everything
 # A sanitizer build is made here unless KARYOZIP_SAN names one, so the search
 # always runs with memory checking on, not only when someone remembers.
 # The C build gets a sanitizer twin; any other binary under test, the Rust,

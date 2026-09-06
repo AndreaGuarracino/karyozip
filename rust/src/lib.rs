@@ -28,6 +28,7 @@ pub fn ckalloc(n: usize) -> usize {
 
 /// A BED coordinate: digits only, and it must fit in 64 bits.
 pub fn bedcoord_r(b: &[u8], what: &'static str) -> Result<u64, &'static str> {
+    if b.is_empty() { return Err("empty start or end column"); }
     let mut v: u64 = 0;
     for &c in b {
         if !c.is_ascii_digit() { return Err(what); }

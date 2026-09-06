@@ -8,7 +8,7 @@ set -u
 D=$1; C=${2:-$(dirname "$0")/../c/build/karyozip}; R=${3:-$(dirname "$0")/../rust/target/release/karyozip}
 W=$(mktemp -d); trap 'rm -rf "$W"' EXIT
 export TMPDIR=$W
-ok=0; bad=0; refused=0; oracle_ok=0; oracle_miss=0
+ok=0; bad=0; refused=0; oracle_ok=0; oracle_miss=0; ALLOW=0
 fail() { bad=$((bad+1)); echo "  DIFFER $*"; }
 
 # both binaries, same stdin and args: stdout bytes and the last stderr line
@@ -23,7 +23,8 @@ same() {  # same LABEL [IN=file] -- args...
     fail "$lbl: rc $rc1/$rc2, $(stat -c%s "$W/c.out")/$(stat -c%s "$W/r.out") B, c=[$(tail -1 "$W/c.err" | cut -c1-70)] r=[$(tail -1 "$W/r.err" | cut -c1-70)]"
     return 1
   fi
-  [ $rc1 = 0 ] && ok=$((ok+1)) || refused=$((refused+1))
+  # a refusal both binaries agree on is a pass only where the design says so
+  if [ $rc1 = 0 ]; then ok=$((ok+1)); elif [ "$ALLOW" = 1 ]; then refused=$((refused+1)); else fail "$lbl: refused by both: $(tail -1 "$W/c.err" | cut -c1-90)"; fi
   return $rc1
 }
 
@@ -47,9 +48,9 @@ readers() {  # readers KST SEQ FS HIER "DECODE FLAGS"
   same "region pos" -- $dec region "$k" "$seq" 100
   same "region range" -- $dec region "$k" "$seq" 0 5000
   same "region halo" -- $dec region "$k" "$seq" 0 5000 3
-  cp "$k" "$W/ixc.kst"; cp "$k" "$W/ixr.kst"
-  "$C" index "$W/ixc.kst" > /dev/null 2> "$W/c.err"; "$R" index "$W/ixr.kst" > /dev/null 2> "$W/r.err"
-  if cmp -s "$W/ixc.kst" "$W/ixr.kst" && [ "$(tail -1 "$W/c.err")" = "$(tail -1 "$W/r.err")" ]; then ok=$((ok+1)); else fail "index: $(stat -c%s "$W/ixc.kst")/$(stat -c%s "$W/ixr.kst") B"; fi
+  cp "$k" "$W/ixc.kst"; cp "$k" "$W/ixr.kst"; local nm=""; case "$dec" in *"--names ordinal"*) nm="--names ordinal";; esac
+  "$C" $nm index "$W/ixc.kst" > /dev/null 2> "$W/c.err"; rc1=$?; "$R" $nm index "$W/ixr.kst" > /dev/null 2> "$W/r.err"; rc2=$?
+  if [ $rc1 = 0 ] && [ $rc2 = 0 ] && cmp -s "$W/ixc.kst" "$W/ixr.kst" && [ "$(tail -1 "$W/c.err")" = "$(tail -1 "$W/r.err")" ]; then ok=$((ok+1)); else fail "index: rc $rc1/$rc2, $(stat -c%s "$W/ixc.kst")/$(stat -c%s "$W/ixr.kst") B"; fi
   same "region after index" -- $dec region "$W/ixc.kst" "$seq" 0 5000
   same "smooth" -- $dec smooth "$k" "$h" "$fs" && cp "$W/c.out" "$W/smooth.out"
   same "smooth seq" -- $dec smooth "$k" "$h" "$fs" "$seq"
@@ -73,7 +74,9 @@ for kind in presmoothed smoothed; do
       a=""; [ $strat = aln ] && a="--aln $paf --ref $ref $alnnames"
       for fl in "${FLAGS[@]}"; do
         lbl="$fs $kind $strat [$fl]"
-        same "$lbl encode" "$q" -- $a $fl encode || continue
+        # --aln with --names drop and no name map cannot be decoded: refused by design
+        case "$strat:$fl:$alnnames" in aln:*"--names drop"*:) ALLOW=1;; esac
+        same "$lbl encode" "$q" -- $a $fl encode; rc=$?; ALLOW=0; [ $rc = 0 ] || continue
         cp "$W/c.out" "$W/t.kst"
         # the round trip, with the decoder given what the encoder was given
         dec=""; [ $strat = aln ] && dec="--aln $paf --ref $ref $alnnames"
@@ -118,7 +121,9 @@ for kind in presmoothed smoothed; do
     a="--db $feat"; [ $strat = dbaln ] && { ref=$(ls "$D"/ref.*.chromosome."$kind".bed.gz | head -1); a="$a --aln $paf --ref $ref $alnnames"; }
     for fl in "" "--block all" "--block 4096" "--sort" "--slow" "--names drop"; do
       lbl="db $kind $strat [$fl]"
-      same "$lbl encode" -- $a $fl encode $ins || continue
+      # a smoothed track carries ancestor labels whose tuples are not in features.tsv: refused by design
+      [ $kind = smoothed ] && ALLOW=1; case "$strat:$fl:$alnnames" in dbaln:*"--names drop"*:) ALLOW=1;; esac
+      same "$lbl encode" -- $a $fl encode $ins; rc=$?; ALLOW=0; [ $rc = 0 ] || continue
       cp "$W/c.out" "$W/t.kst"
       mkdir -p "$W/oc" "$W/or"; rm -f "$W/oc"/* "$W/or"/*
       dec="--db $feat --out"; [ $strat = dbaln ] && dec="--aln $paf --ref $ref $alnnames $dec"
@@ -142,4 +147,4 @@ for kind in presmoothed smoothed; do
   done
 done
 echo "matrix: $ok identical, $refused refused alike, $bad differ; smooth oracle: $oracle_ok match KaryoScope, $oracle_miss differ in both"
-[ $bad = 0 ] && echo MATRIX_PASS || echo MATRIX_FAIL
+[ $bad = 0 ] && echo MATRIX_PASS || { echo MATRIX_FAIL; exit 1; }

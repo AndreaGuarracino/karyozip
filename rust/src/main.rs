@@ -207,6 +207,7 @@ fn main() {
         }
         Cmd::Index { track, rest: _ } => {
             let track = need(track);
+            ro.index = true;
             reader::Reader::open_with(track, &ro).build_index(track)
         }
         Cmd::Codecs { file } => probe(need(file)),

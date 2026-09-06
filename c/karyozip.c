@@ -353,6 +353,7 @@ static size_t RAWHELD = 0;            /* raw block payload held in memory at the
 static int RAW = 0;
 static const char *OUTDIR = NULL;   /* --out DIR, for decode --db */
 static const char *SETNAME = NULL;  /* --set NAME: one set of a --db track */
+static int INDEXING = 0;            /* the index command: names only, no companions */
 static int ORDNAMES = 0;              /* --names ordinal: accept dropped names */
 static const char *ALNREF = NULL;     /* --ref reference track */
 static const char *ALNNAMES = NULL;   /* --names FILE: ordinal N is line N+1 */
@@ -2554,7 +2555,7 @@ static R *ropen(const char *path) {
     if (NAMESARG) { if (was_side) NAMESIN = NAMESARG; else NAMEFILE = NAMESARG; }
     int was_perm = (h[1] & PERMFLAG) != 0, perm_tok = (h[1] & PERMTOK) != 0;
 
-    if (!RAW) {
+    if (!RAW && !INDEXING) {   /* index reads names only: no companion to bind */
         if (was_aln && !ALNPAF)
             die("this track was written with --aln: decode it with --aln PAF --ref R, "
                 "or --raw to see what is stored");
@@ -4283,7 +4284,7 @@ int main(int argc, char **argv) {
         loadinformed("region ");
         region(argv[2], argv[3], rlo, rhi, argc > 6 ? num_arg(argv[6], UINT64_MAX, "region: halo is not a number") : 0);
     }
-    else if (!strcmp(argv[1], "index") && argc > 2) buildindex(argv[2]);
+    else if (!strcmp(argv[1], "index") && argc > 2) { INDEXING = 1; buildindex(argv[2]); }
     else if (!strcmp(argv[1], "smooth") && argc > 4) {
         if (argc == 7 || argc > 8) die("smooth: give SEQ, or SEQ START END");
         uint64_t slo = argc > 6 ? num_arg(argv[6], UINT64_MAX, "smooth: start is not a number") : 0;

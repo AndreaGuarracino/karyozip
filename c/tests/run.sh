@@ -141,6 +141,9 @@ $KT --db "$D/db.features.tsv" --set gene,acrocentric decode "$W/f.kt" 2>/dev/nul
 [ "$(awk -F'\t' '{print NF}' "$W/ga.bed" | sort -u)" = 5 ] && awk -F'\t' 'NR>1 && $1==p && $2==e && $5==l {e=$3; next} NR>1 {print p"\t"s"\t"e"\t"l} {p=$1; s=$2; e=$3; l=$5} END{print p"\t"s"\t"e"\t"l}' "$W/ga.bed" | cmp -s - "$D/db.acrocentric.bed" && echo "decode --set gene,acrocentric: two columns, merged jointly" || { echo "decode --set gene,acrocentric: WRONG"; fail=1; }
 $KT --db "$D/db.features.tsv" decode "$W/f.kt" 2>/dev/null | cmp -s - <($KT --db "$D/db.features.tsv" --set all decode "$W/f.kt" 2>/dev/null) && echo "decode --db on stdout: all sets, same as --set all" || { echo "decode --db on stdout: DIFFERS from --set all"; fail=1; }
 mkdir -p "$W/so"; $KT --db "$D/db.features.tsv" --set repeat,gene --out "$W/so/new" decode "$W/f.kt" 2>/dev/null; [ "$(ls "$W/so/new" | tr '\n' ' ')" = "gene.bed repeat.bed " ] && cmp -s "$W/so/new/gene.bed" "$D/db.gene.bed" && echo "decode --set --out: only the picked sets, directory created" || { echo "decode --set --out: WRONG"; fail=1; }
+# index reads names only: an --aln or --db track is indexed without its companions
+cp "$W/d.kt" "$W/di.kt"; cp "$W/f.kt" "$W/fi.kt"
+$KT index "$W/di.kt" >/dev/null 2>&1 && $KT index "$W/fi.kt" >/dev/null 2>&1 && $KT --aln "$D/p.paf" --ref "$D/ref.bed" region "$W/di.kt" q1 2>/dev/null | cmp -s - <($KT --aln "$D/p.paf" --ref "$D/ref.bed" region "$W/d.kt" q1 2>/dev/null) && echo "index on --aln and --db tracks: built, same answers" || { echo "index on --aln and --db tracks: FAILED"; fail=1; }
 must_fail "--set without --db" $KT --set gene decode "$W/pa.kt"
 must_fail "--set not in features.tsv" $KT --db "$D/db.features.tsv" --set gene,nosuch decode "$W/f.kt"
 must_fail "--set names a set twice" $KT --db "$D/db.features.tsv" --set gene,gene decode "$W/f.kt"

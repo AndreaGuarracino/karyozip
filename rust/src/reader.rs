@@ -70,6 +70,8 @@ pub type RowFn<'a> = dyn FnMut(&[u8], u64, u64, &[u8]) + 'a;
 #[derive(Default)]
 pub struct ReadOpts {
     pub raw: bool,
+    /// the index command: names only, so no companion is asked for
+    pub index: bool,
     pub db: bool,
     pub aln: Option<std::sync::Arc<crate::aln::Aln>>,
     pub ordnames: bool,
@@ -177,7 +179,7 @@ impl Reader {
         }
         let was_side = h[1] & SIDEFLAG != 0;
         let dropped = h[1] & DROPPED != 0;
-        if !o.raw {
+        if !o.raw && !o.index {
             if h[1] & ALNFLAG != 0 && o.aln.is_none() {
                 crate::bail("this track was written with --aln: decode it with --aln PAF --ref R, or --raw to see what is stored");
             }
@@ -778,6 +780,7 @@ impl Reader {
     /// region F SEQ | SEQ POS | SEQ START END [HALO].
     /// --db: the sequence's rows over the picked sets, touching equal tuples
     /// merged, so one set gives what its own track gives. Needs the whole sequence.
+    #[allow(clippy::too_many_arguments)]
     fn region_set(&mut self, ri: u64, seq: &[u8], lo: u64, hi: u64, halo: u64,
                   fe: &crate::db::Feats, cols: &[usize], out: &mut impl std::io::Write) {
         let (blk, off, nruns) = self.locate(ri);
@@ -813,6 +816,7 @@ impl Reader {
         rd(out.write_all(&buf), "write failed");
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn region(&mut self, seq: &[u8], lo: u64, hi: u64, halo: u64,
                   feats: Option<&crate::db::Feats>, cols: &[usize], out: &mut impl std::io::Write) {
         let ri = self.find(seq);

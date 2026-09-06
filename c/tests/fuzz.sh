@@ -8,19 +8,21 @@ set -u
 KT=${1:-$(dirname "$0")/../build/karyozip}
 # A sanitizer build is made here unless KARYOZIP_SAN names one, so the search
 # always runs with memory checking on, not only when someone remembers.
-SAN=${KARYOZIP_SAN:-}
+# The C build gets a sanitizer twin; any other binary under test, the Rust,
+# is fuzzed as itself.
+SAN=${KARYOZIP_SAN:-}; BUILT=""
+if [ -z "$SAN" ] && ! [ "$KT" -ef "$(dirname "$0")/../build/karyozip" ]; then SAN=$KT; fi
 if [ -z "$SAN" ] && command -v gcc >/dev/null; then
   SRC=$(dirname "$0")/..
-  SAN=$(mktemp -u /tmp/kz-san.XXXXXX)
+  SAN=$(mktemp -u /tmp/kz-san.XXXXXX); BUILT=1
   gcc -O1 -g -fsanitize=address,undefined -std=gnu11 -fopenmp -D_GNU_SOURCE -DVERSION='"1.5.3"' \
       -o "$SAN" "$SRC"/karyozip.c "$SRC"/htscodecs/tokenise_name3.c "$SRC"/htscodecs/rANS_static4x16pr.c \
       "$SRC"/htscodecs/rANS_static32x16pr.c "$SRC"/htscodecs/arith_dynamic.c "$SRC"/htscodecs/rle.c \
       "$SRC"/htscodecs/pack.c "$SRC"/htscodecs/utils.c "$SRC"/bzip3/libbz3.c -I"$SRC" -lzstd -lz -lm -lpthread \
       >/dev/null 2>&1 || { echo "fuzz: sanitizer build FAILED"; exit 1; }
-  [ -n "$SAN" ] && trap 'rm -rf "$W" "$SAN"' EXIT
 fi
 D=$(dirname "$0")
-W=$(mktemp -d); trap 'rm -rf "$W"' EXIT
+W=$(mktemp -d); trap 'rm -rf "$W" ${BUILT:+"$SAN"}' EXIT
 fail=0
 N=${FUZZ_N:-60}
 J=${FUZZ_J:-$(nproc)}          # forged files run several at a time
@@ -45,7 +47,7 @@ for i, b in enumerate(bad):
 PY
 n=0
 for f in "$W"/bad*.bed; do
-  for m in "" "--sort --sort-tmp-dir $W --sort-mem 1G"; do
+  for m in "" "--sort=1G"; do
     $KT encode --block 4 $m < "$f" > /dev/null 2>&1 && { echo "fuzz: malformed BED ACCEPTED ($f $m)"; fail=1; }
     n=$((n+1))
   done
@@ -79,11 +81,9 @@ d=0
 # every writer path: plain, one block, slow, sorted with names, sorted
 # without, a sidecar, and a --db track
 $KT encode --block 32 --names drop:"$W/side.names" < "$W/ok.bed" > "$W/side.kt" 2>/dev/null
-for m in "--block 32" "--one-block --level 22" "--block 32 --slow" \
-         "--block 32 --sort --sort-tmp-dir $W --sort-mem 1G" \
-         "--block 32 --sort --sort-tmp-dir $W --sort-mem 1G --names drop" \
-         "--block 32 --names $W/side.names"; do
-  case "$m" in *names-in*) cp "$W/side.kt" "$W/t.kt";; *) $KT encode $m < "$W/ok.bed" > "$W/t.kt" 2>/dev/null || continue;; esac
+for m in "--block 32" "--block all --level 22" "--block 32 --slow" "--block 32 --sort=1G" \
+         "--block 32 --sort=1G --names drop" "names-in"; do
+  case "$m" in *names-in*) cp "$W/side.kt" "$W/t.kt";; *) $KT encode $m < "$W/ok.bed" > "$W/t.kt" 2>/dev/null || { echo "fuzz: encode $m FAILED"; fail=1; continue; };; esac
   sz=$(stat -c%s "$W/t.kt")
   NIN=""; case "$m" in *names-in*) NIN="--names $W/side.names";; esac
   $KT decode --names ordinal $NIN "$W/t.kt" 2>/dev/null | cut -f2,3,4 > "$W/want"

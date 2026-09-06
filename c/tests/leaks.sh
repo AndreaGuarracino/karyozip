@@ -6,8 +6,8 @@
 set -u
 D=$(cd "$(dirname "$0")" && pwd)
 SRC=$D/..
-SAN=${1:-${KARYOZIP_SAN:-}}
-if [ -z "$SAN" ]; then
+SAN=${1:-${KARYOZIP_SAN:-}}; BUILT=""
+if [ -z "$SAN" ]; then BUILT=1
   command -v gcc >/dev/null || { echo "leaks: skipped, no gcc"; exit 0; }
   SAN=$(mktemp -u /tmp/kz-lsan.XXXXXX)
   gcc -O1 -g -fsanitize=address -std=gnu11 -fopenmp -D_GNU_SOURCE -DVERSION='"1.5.3"' \
@@ -16,9 +16,8 @@ if [ -z "$SAN" ]; then
       "$SRC"/htscodecs/arith_dynamic.c "$SRC"/htscodecs/rle.c "$SRC"/htscodecs/pack.c \
       "$SRC"/htscodecs/utils.c "$SRC"/bzip3/libbz3.c -I"$SRC" -lzstd -lz -lm -lpthread \
       >/dev/null 2>&1 || { echo "leaks: sanitizer build FAILED"; exit 1; }
-  trap 'rm -f "$SAN"' EXIT
 fi
-W=$(mktemp -d); trap 'rm -rf "$W" "${SAN:-}"' EXIT
+W=$(mktemp -d); trap 'rm -rf "$W" ${BUILT:+"$SAN"}' EXIT
 fail=0
 run() {   # description, then the command
   local what=$1; shift

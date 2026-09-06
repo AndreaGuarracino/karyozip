@@ -192,8 +192,9 @@ fn main() {
             };
             if start.is_some() && lo >= hi { die("smooth: end must be past start"); }
             let feats = informed(&c, &mut ro, "smooth ", Some(hier));
-            let so = std::io::stdout();
-            let mut o = BufWriter::new(so.lock());
+            // not stdout().lock(): a lock guard cannot cross to the smooth
+            // workers, and they are serialized by turn anyway
+            let mut o = BufWriter::new(std::io::stdout());
             smooth::run(track, hier, fs.as_bytes(), seq.as_ref().map(|s| s.as_bytes()),
                         lo, hi, c.v1, maxgap, &ro, feats.as_ref(), &mut o);
             o.flush().unwrap_or_else(|e| die(&e.to_string()));

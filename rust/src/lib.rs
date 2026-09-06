@@ -61,19 +61,23 @@ pub fn unzip(r: impl std::io::Read + 'static) -> Box<dyn std::io::Read> {
 
 /// A text input one line at a time, plain or gzipped, without holding the
 /// file: a reference track is a gigabyte of text for 24 million runs.
-pub struct Lines { r: std::io::BufReader<Box<dyn std::io::Read>>, buf: Vec<u8> }
+pub struct Lines { r: std::io::BufReader<Box<dyn std::io::Read>>, buf: Vec<u8>, pub nl: bool }
 impl Lines {
     pub fn open(path: &str, what: &'static str) -> Lines {
         let f = std::fs::File::open(path).unwrap_or_else(|_| bail(what));
-        Lines { r: std::io::BufReader::with_capacity(1 << 20, unzip(f)), buf: Vec::new() }
+        Lines::new(f)
     }
-    /// The next line without its newline, or None at the end.
+    pub fn new(r: impl std::io::Read + 'static) -> Lines {
+        Lines { r: std::io::BufReader::with_capacity(1 << 20, unzip(r)), buf: Vec::new(), nl: true }
+    }
+    /// The next line without its newline, or None at the end; `nl` says
+    /// whether the line had one.
     pub fn next_line(&mut self) -> Option<&[u8]> {
         use std::io::BufRead;
         self.buf.clear();
         match self.r.read_until(b'\n', &mut self.buf) {
             Ok(0) => None,
-            Ok(_) => { if self.buf.last() == Some(&b'\n') { self.buf.pop(); } Some(&self.buf) }
+            Ok(_) => { self.nl = self.buf.last() == Some(&b'\n'); if self.nl { self.buf.pop(); } Some(&self.buf) }
             Err(_) => bail("read error"),
         }
     }

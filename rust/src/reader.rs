@@ -106,7 +106,9 @@ pub struct Reader {
     /// name -> rank, built on the first lookup, which is also where the C
     /// notices that two sequences share a name.
     nameix: std::cell::OnceCell<HashMap<Vec<u8>, u64>>,
-    ibx: Vec<u8>,
+    /// the sequence index: chunk frames, their offsets, the run count each
+    /// starts at, and the one chunk decoded now, as the C's loadichunk
+    iz: Vec<u8>, coff: Vec<u64>, cpend: Vec<u64>, ibx: Vec<u8>, cur_chunk: u64,
     hasidx: bool,
     mhash: u64,
     cur_ri: u64,
@@ -355,25 +357,6 @@ impl Reader {
         if h[10] != h[0].div_ceil(ICHUNK) {
             crate::bail("corrupt file: index chunks do not match the sequence count");
         }
-        // Each chunk must hold exactly its share of the sequences and add up
-        // to the run count its table entry promised.
-        let mut ibx = Vec::new();
-        for c in 0..h[10] as usize {
-            let d = zdec(&iz[coff[c] as usize..coff[c + 1] as usize], "index chunk");
-            let want = if (c as u64) + 1 < h[10] { ICHUNK } else { h[0] - c as u64 * ICHUNK };
-            let (mut i, mut sum, mut k) = (0usize, 0u64, 0u64);
-            while k < want && i < d.len() {
-                let (v, n) = vget(&d, i);
-                if v > u32::MAX as u64 { crate::bail("corrupt index: a run count past 32 bits"); }
-                sum += v;
-                i = n;
-                k += 1;
-            }
-            if k != want || i != d.len() || cpend[c] + sum != cpend[c + 1] {
-                crate::bail("corrupt index: an index chunk does not match its table entry");
-            }
-            ibx.extend_from_slice(&d);
-        }
 
         // A permutation track with no stored blob keeps its names outside,
         // so --names FILE is the source there, not a replacement.
@@ -397,7 +380,7 @@ impl Reader {
             f, nreads: h[0], rows: h[4], lab, block: blk, b, data0,
             nameix: std::cell::OnceCell::new(),
             idcodec: idc, lencodec: lenc,
-            taildec, tailpred: h[12], tailskip: h[13] & 0xff, ibx,
+            taildec, tailpred: h[12], tailskip: h[13] & 0xff, iz, coff, cpend, ibx: Vec::new(), cur_chunk: u64::MAX,
             names: std::cell::OnceCell::new(), nz, pz, names_file: o.names_file.clone(),
             ordnames: o.ordnames, nf, idx,
             hasidx, mhash: h[15], cur_ri: 0, cur_q: 0, cur_pend: 0, cached: None, sc: None,
@@ -412,12 +395,11 @@ impl Reader {
     pub fn for_each_row(&mut self, f: &mut RowFn) {
         let mut c = Cursor { blk: usize::MAX, data: std::rc::Rc::new(Vec::new()),
                              lp: 0, ip: 0, left: 0 };
-        let (mut ipos, mut emitted) = (0usize, 0u64);
+        let mut emitted = 0u64;
         let tskip = self.tailskip;
         let (mut name, mut lab) = (Vec::new(), Vec::new());
         for i in 0..self.nreads {
-            let (nruns, next) = vget(&self.ibx, ipos);
-            ipos = next;
+            let nruns = self.locate(i).2;
             name.clear(); name.extend_from_slice(self.name_at(i));
             self.alnq = self.aln.as_ref().and_then(|a| a.find(&name));
             let mut st = 0u64;
@@ -440,12 +422,11 @@ impl Reader {
     pub fn decode(&mut self, out: &mut impl std::io::Write) {
         let mut buf: Vec<u8> = Vec::with_capacity(1 << 22);
         let mut c = Cursor { blk: usize::MAX, data: std::rc::Rc::new(Vec::new()), lp: 0, ip: 0, left: 0 };
-        let (mut ipos, mut emitted, mut restored) = (0usize, 0u64, 0u64);
+        let (mut emitted, mut restored) = (0u64, 0u64);
         let tskip = self.tailskip;
         let mut name = Vec::new();
         for i in 0..self.nreads {
-            let (nruns, next) = vget(&self.ibx, ipos);
-            ipos = next;
+            let nruns = self.locate(i).2;
             name.clear(); name.extend_from_slice(self.name_at(i));
             self.alnq = self.aln.as_ref().and_then(|a| a.find(&name));
             let mut st = 0u64;
@@ -580,8 +561,27 @@ struct Cursor { blk: usize, data: std::rc::Rc<Vec<u8>>, lp: usize, ip: usize, le
 impl Reader {
     /// (block, offset in it, run count) for sequence `ri`. A forward cursor,
     /// so walking every sequence is linear and not quadratic.
+    /// One index chunk decoded and checked, the cursor at its first sequence.
+    fn load_ichunk(&mut self, c: u64) {
+        if c >= self.coff.len() as u64 - 1 { crate::bail("index chunk out of range"); }
+        let d = zdec(&self.iz[self.coff[c as usize] as usize..self.coff[c as usize + 1] as usize], "index chunk");
+        let want = if c + 1 < self.cpend.len() as u64 - 1 { ICHUNK } else { self.nreads - c * ICHUNK };
+        let (mut i, mut sum, mut k) = (0usize, 0u64, 0u64);
+        while k < want && i < d.len() {
+            let (v, n) = vget(&d, i);
+            if v > u32::MAX as u64 { crate::bail("corrupt index: a run count past 32 bits"); }
+            sum += v; i = n; k += 1;
+        }
+        if k != want || i != d.len() || self.cpend[c as usize] + sum != self.cpend[c as usize + 1] {
+            crate::bail("corrupt index: an index chunk does not match its table entry");
+        }
+        self.ibx = d; self.cur_chunk = c;
+        self.cur_ri = c * ICHUNK; self.cur_q = 0; self.cur_pend = self.cpend[c as usize];
+    }
+
     fn locate(&mut self, ri: u64) -> (usize, u64, u64) {
-        if ri < self.cur_ri { self.cur_ri = 0; self.cur_q = 0; self.cur_pend = 0; }
+        let want = ri / ICHUNK;
+        if want != self.cur_chunk || ri < self.cur_ri { self.load_ichunk(want); }
         let mut nruns = 0u64;
         while self.cur_ri <= ri {
             let (n, next) = vget(&self.ibx, self.cur_q);

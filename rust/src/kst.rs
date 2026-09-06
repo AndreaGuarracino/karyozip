@@ -69,3 +69,5 @@ impl std::hash::Hasher for FnvHasher {
     fn finish(&self) -> u64 { self.0 }
     fn write(&mut self, b: &[u8]) { self.0 = fnv(self.0, b); }
 }
+
+pub type FnvMap<K, V> = std::collections::HashMap<K, V, Fnv>;

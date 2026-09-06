@@ -287,7 +287,7 @@ fn informed(c: &cli::Cli, ro: &mut reader::ReadOpts, who: &str, hier: Option<&st
 
 fn load_feats(fp: &str, hier: Option<&str>) -> db::Feats {
     let mut f = db::Feats::load(fp);
-    eprintln!("features: {} ids, {} sets", f.id2lab.len(), f.sets.len());
+    eprintln!("features: {} ids, {} sets", f.nids, f.sets.len());
     if f.sets.len() <= 32 { eprintln!("features: integer-tuple index on"); }
     if let Some(h) = hier { f.load_hier(h); }
     f

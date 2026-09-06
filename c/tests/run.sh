@@ -140,6 +140,27 @@ n=0; for r in "$sq" "$sq 100" "$sq 0 100000" "$sq 50 400 2"; do $KT --db "$D/db.
 $KT --db "$D/db.features.tsv" --set gene,acrocentric decode "$W/f.kt" 2>/dev/null > "$W/ga.bed"
 [ "$(awk -F'\t' '{print NF}' "$W/ga.bed" | sort -u)" = 5 ] && awk -F'\t' 'NR>1 && $1==p && $2==e && $5==l {e=$3; next} NR>1 {print p"\t"s"\t"e"\t"l} {p=$1; s=$2; e=$3; l=$5} END{print p"\t"s"\t"e"\t"l}' "$W/ga.bed" | cmp -s - "$D/db.acrocentric.bed" && echo "decode --set gene,acrocentric: two columns, merged jointly" || { echo "decode --set gene,acrocentric: WRONG"; fail=1; }
 $KT --db "$D/db.features.tsv" decode "$W/f.kt" 2>/dev/null | cmp -s - <($KT --db "$D/db.features.tsv" --set all decode "$W/f.kt" 2>/dev/null) && echo "decode --db on stdout: all sets, same as --set all" || { echo "decode --db on stdout: DIFFERS from --set all"; fail=1; }
+# --hier: a tuple outside features.tsv (a smoothed track's ancestor label)
+# gets 2^26 + its rank in the sorted vocabulary, the same in every file.
+# Without --hier it stays refused; with it a presmoothed track is unchanged.
+{ printf 'feature_set\tchild\tparent\n'; for f in $sets; do for l in $(cut -f4 "$D/db.$f.bed" | sort -u | grep -v '^novel$'); do printf '%s\t%s\tcategorized\n' "$f" "$l"; done; done; printf 'repeat\tLINE\trepeat\nrepeat\trepeat\tcategorized\n'; } | awk -F'\t' '!s[$1 FS $2]++' > "$W/hv.tsv"
+mkdir -p "$W/hv"; for f in $sets; do cp "$D/db.$f.bed" "$W/hv/$f.bed"; done
+awk -F'\t' 'NR==5{$4="repeat"} {print}' OFS='\t' "$D/db.repeat.bed" > "$W/hv/repeat.bed"
+hin=$(for f in $sets; do echo "$W/hv/$f.bed"; done)
+must_fail "a tuple outside features.tsv without --hier" $KT encode --db "$D/db.features.tsv" $hin
+$KT encode --db "$D/db.features.tsv" --hier "$W/hv.tsv" $hin > "$W/hv.kt" 2>/dev/null
+$KT --raw decode "$W/hv.kt" 2>/dev/null | awk -F'\t' '$4>=67108864' | grep -q . && echo "--hier: a vocabulary featureID stored" || { echo "--hier: NO vocabulary featureID"; fail=1; }
+mkdir -p "$W/hvo"; $KT decode --db "$D/db.features.tsv" --hier "$W/hv.tsv" --out "$W/hvo" "$W/hv.kt" 2>/dev/null
+n=0; for f in $sets; do cmp -s "$W/hvo/$f.bed" "$W/hv/$f.bed" && n=$((n+1)); done
+[ "$n" = 6 ] && echo "--hier: 6/6 restored" || { echo "--hier: only $n/6 restored"; fail=1; }
+$KT encode --db "$D/db.features.tsv" --hier "$W/hv.tsv" $in 2>/dev/null | cmp -s - "$W/f.kt" && echo "--hier: a presmoothed track is byte-identical" || { echo "--hier: presmoothed track CHANGED"; fail=1; }
+must_fail "a vocabulary track decoded without --hier" $KT decode --db "$D/db.features.tsv" --out "$W/hvo" "$W/hv.kt"
+sed '$d' "$W/hv.tsv" > "$W/hv2.tsv"
+must_fail "a vocabulary track with another hierarchy" $KT decode --db "$D/db.features.tsv" --hier "$W/hv2.tsv" --out "$W/hvo" "$W/hv.kt"
+must_fail "--hier without --db" $KT --hier "$W/hv.tsv" decode "$W/hv.kt"
+$KT encode < "$W/hv/repeat.bed" > "$W/hvp.kt" 2>/dev/null
+$KT --db "$D/db.features.tsv" smooth "$W/hv.kt" "$W/hv.tsv" repeat 2>/dev/null | cmp -s - <($KT smooth "$W/hvp.kt" "$W/hv.tsv" repeat 2>/dev/null) && echo "--hier: smooth --db same as the plain track" || { echo "--hier: smooth --db DIFFERS"; fail=1; }
+$KT --db "$D/db.features.tsv" --hier "$W/hv.tsv" --set repeat decode "$W/hv.kt" 2>/dev/null | cmp -s - "$W/hv/repeat.bed" && echo "--hier: --set repeat gives the input" || { echo "--hier: --set repeat DIFFERS"; fail=1; }
 mkdir -p "$W/so"; $KT --db "$D/db.features.tsv" --set repeat,gene --out "$W/so/new" decode "$W/f.kt" 2>/dev/null; [ "$(ls "$W/so/new" | tr '\n' ' ')" = "gene.bed repeat.bed " ] && cmp -s "$W/so/new/gene.bed" "$D/db.gene.bed" && echo "decode --set --out: only the picked sets, directory created" || { echo "decode --set --out: WRONG"; fail=1; }
 # index reads names only: an --aln or --db track is indexed without its companions
 cp "$W/d.kt" "$W/di.kt"; cp "$W/f.kt" "$W/fi.kt"
@@ -895,7 +916,7 @@ $KT encode < "$D/s.bed" 2>&1 >/dev/null | grep -qi "htscodecs" \
 # The library and the CLI must produce the same file: an annotator that
 # calls kt_row instead of writing a BED gets byte-identical output, or the
 # whole point of the API is lost.
-LT="$(dirname "$KT")/libtest"
+LT=${LT:-"$(dirname "$KT")/libtest"}
 if [ -x "$LT" ]; then
   lok=1
   for f in s.bed ls.bed db.rall.bed db.chromosome.bed ord.bed; do

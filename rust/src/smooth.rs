@@ -204,7 +204,7 @@ pub fn run(path: &str, hier: &str, fs: &[u8], seq: Option<&[u8]>,
         if let Some(f) = feats {
             if l.is_empty() || !l.iter().all(u8::is_ascii_digit) { labmap.push(i32::MIN + 1); novelid.push(0); continue; }
             let id = f.featid(&l);
-            l = if id == 0 { b"novel".to_vec() } else { f.id2lab[&id][setk.unwrap()].clone() };
+            l = f.lab(id, setk.unwrap()).to_vec();
         }
         novelid.push(u8::from(l == b"novel"));
         labmap.push(h.id(&l));
@@ -218,15 +218,10 @@ pub fn run(path: &str, hier: &str, fs: &[u8], seq: Option<&[u8]>,
     };
     // One sequence: smoothed whole, printed where it overlaps the range.
     let one = |r: &mut Reader, ri: u64, buf: &mut Vec<u8>| {
-        let _s = crate::prof::span(6);
         let (st, en, mut feat, novel) = r.seq_rows(ri, &labmap, &novelid, h.root);
-        drop(_s);
         if hi > 0 && en.last().is_none_or(|&e| lo >= e) { return; }
-        let _s = crate::prof::span(4);
         smooth_one(&h, &st, &en, &mut feat, maxgap);
-        drop(_s);
         let name = r.name_at(ri).to_vec();
-        let _s = crate::prof::span(5);
         emit(&h, buf, &name, &st, &en, &feat, &novel, lo, hi, v1);
     };
     let wr = |out: &mut dyn Write, b: &[u8]| out.write_all(b).unwrap_or_else(|_| crate::bail("write failed"));

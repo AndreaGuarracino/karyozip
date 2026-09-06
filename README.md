@@ -31,7 +31,7 @@ and the hierarchy. A bgzipped file works too, being many gzip members.
 ```
 karyozip encode [flags] < in.bed        > out.kst
 karyozip encode [flags] < in.bed.gz     > out.kst
-karyozip decode F | --db F.tsv [--out DIR] [--set A,B] F
+karyozip decode F | --db F.tsv [--hier H] [--out DIR] [--set A,B] F
 karyozip region F SEQ | SEQ POS | SEQ START END [HALO]
 karyozip smooth F HIER FS [SEQ [START END]]
 karyozip index  F                       appends an index to the track
@@ -49,6 +49,7 @@ karyozip aln-pack P.paf REF.bed OUT     packs a PAF to only what --aln reads
 | `--names keep` | store names even when they are 0,1,2,... |
 | `--names drop`, `--names drop:F` | store none, or write them beside the track |
 | `--db features.tsv` | one BED per feature set, or one merged featureID track; every reader takes it, and region then prints one label per set |
+| `--hier hierarchy.tsv` | with `--db`: a label tuple outside features.tsv, as a smoothed track carries, gets 2^26 plus its rank in the sorted per-set vocabulary (the features.tsv column, the hierarchy nodes of that set, `novel`), the same id in every file. A presmoothed track is unchanged; a track that used one such id needs the same two files to read, and smooth takes its HIER as the `--hier` |
 | `--aln P.paf --ref R` | do not store what the reference already gives; every reader takes the same pair |
 | `--aln-names F` | ordinal N is line N+1 of `F` |
 | `--names F`, `--names ordinal` | on the readers |

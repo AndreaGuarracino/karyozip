@@ -17,6 +17,7 @@ const DROPPED: u64 = 1 << 60;
 const SIDEFLAG: u64 = 1 << 57;
 const ALNFLAG: u64 = 1 << 59;
 const DBFLAG: u64 = 1 << 58;
+const CARTFLAG: u64 = 1 << 52;
 const LENFLAG: u64 = 1 << 56;
 const PERMFLAG: u64 = 1 << 54;
 const PERMTOK: u64 = 1 << 53;
@@ -95,6 +96,7 @@ pub struct Writer {
     natn: u32,
     natord: bool,
     feathash: Option<u64>,
+    cart: bool,
     /// --aln: the alignment, the query it is on, and the two alternate
     /// length spellings each block also keeps.
     aln: Option<crate::aln::Aln>,
@@ -121,7 +123,7 @@ fn tmpfile(dir: &std::path::Path) -> std::io::Result<std::fs::File> {
 
 impl Writer {
     /// --db binds the track to the features.tsv it came from.
-    pub fn set_feathash(&mut self, h: u64) { self.feathash = Some(h); }
+    pub fn set_feathash(&mut self, h: u64, cart: bool) { self.feathash = Some(h); self.cart = cart; }
 
     /// The reference's labels share the track's table: loadref interns them
     /// first, so the ids the reference answers with are the track's ids.
@@ -140,7 +142,7 @@ impl Writer {
             nidx: 0, ordok: true, labtab: Vec::new(), labmap: HashMap::default(), lastid: None,
             cur: Vec::new(), currun: 0, curbp: 0, blkbp0: 0, pend: 0, nblk: 0, rows: 0,
             plen: 0, pval: 0, phas: false, tailsamp: Vec::new(), tailpred: 0, tailon: None,
-            srec: Vec::new(), sortbp: 0, natbuf: Vec::new(), natord: true, feathash: None,
+            srec: Vec::new(), sortbp: 0, natbuf: Vec::new(), natord: true, feathash: None, cart: false,
             aln: None, alnq: None, alnhit: 0,
             lalt: [Vec::new(), Vec::new()], rawalt: [Vec::new(), Vec::new()],
             prev_rev: false,
@@ -708,6 +710,7 @@ impl Writer {
              | if npl > 0 || (perm_on && self.opt.drop_names) { PERMFLAG } else { 0 }
              | if permtok { PERMTOK } else { 0 }
              | if self.feathash.is_some() { DBFLAG } else { 0 }
+             | if self.cart { CARTFLAG } else { 0 }
              | if aln_on { ALNFLAG | LENFLAG } else { 0 }
              | if self.tailon == Some(true) { TAILFLAG } else { 0 };
         h[2] = ichunks.len() as u64;

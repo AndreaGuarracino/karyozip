@@ -80,10 +80,10 @@ tally region
 # 6. index: the same trailer, and each reads the other's.
 "$C" encode < "$D/db.rall.bed" > "$W/ci.kst" 2>/dev/null
 cp "$W/ci.kst" "$W/ri.kst"
-"$C" index "$W/ci.kst" >/dev/null 2>&1
-"$R" index "$W/ri.kst" >/dev/null 2>&1
-if cmp -s "$W/ci.kst" "$W/ri.kst"; then echo "index: byte-identical trailer"
-else echo "index: TRAILERS DIFFER"; fail=1; fi
+"$C" index "$W/ci.kst" >/dev/null 2>&1; irc=$?
+"$R" index "$W/ri.kst" >/dev/null 2>&1; irr=$?
+if [ $irc = 0 ] && [ $irr = 0 ] && cmp -s "$W/ci.kst" "$W/ri.kst"; then echo "index: byte-identical trailer"
+else echo "index: TRAILERS DIFFER (rc $irc/$irr)"; fail=1; fi
 both "index cross-read" region "$W/ci.kst" seq0005; tally "index cross-read"
 
 # 6b. a sorted track: the Rust must resolve the ranks the same way.
@@ -131,6 +131,12 @@ rm -rf "$W/co" "$W/ro"; mkdir -p "$W/co" "$W/ro"
 "$R" decode --db "$D/db.features.tsv" --out "$W/ro" "$W/cdb.kst" >/dev/null 2>&1
 if diff -r "$W/co" "$W/ro" >/dev/null 2>&1; then echo "--db decode: identical"
 else echo "--db decode: DIFFERS"; fail=1; fi
+# a tuple outside features.tsv, given the hierarchy: 2^26 + its rank, on both
+{ printf 'feature_set\tchild\tparent\nrepeat\trepeat\tcategorized\nrepeat\tLINE\trepeat\n'; } > "$W/hv.tsv"
+awk -F'\t' 'NR==5{$4="repeat"} {print}' OFS='\t' "$D/db.repeat.bed" > "$W/hv.repeat.bed"
+HV=${DB/$D\/db.repeat.bed/$W\/hv.repeat.bed}
+both "--db --hier" encode --db "$D/db.features.tsv" --hier "$W/hv.tsv" $HV; cp "$W/c.out" "$W/hv.kst"
+both "--db --hier decode" --db "$D/db.features.tsv" --hier "$W/hv.tsv" --set repeat decode "$W/hv.kst"; tally "--db --hier"
 dn=0
 for b in $DB; do
   n=$(basename "$b" .bed); n=${n#db.}
@@ -203,11 +209,11 @@ done
 # every malformed form, including --help and --version.
 cok=0; cbad=0
 cli() {
-  co=$("$C" "$@" </dev/null 2>&1; echo "rc=$?"); co=${co//$'\0'/}; cr=${co##*rc=}
-  ro=$("$R" "$@" </dev/null 2>&1; echo "rc=$?"); ro=${ro//$'\0'/}; rr=${ro##*rc=}
-  if [ "$co" = "$ro" ] && [ "$cr" = "$rr" ]; then cok=$((cok+1)); return; fi
-  cbad=$((cbad+1)); echo "  cli differs: [$*]"; echo "    c=[$(echo "$co" | head -1)]"
-  echo "    rust=[$(echo "$ro" | head -1)]"
+  "$C" "$@" </dev/null > "$W/cliout.c" 2>&1; local cr=$?
+  "$R" "$@" </dev/null > "$W/cliout.r" 2>&1; local rr=$?
+  if cmp -s "$W/cliout.c" "$W/cliout.r" && [ "$cr" = "$rr" ]; then cok=$((cok+1)); return; fi
+  cbad=$((cbad+1)); echo "  cli differs: [$*] rc $cr/$rr"; echo "    c=[$(head -c 200 "$W/cliout.c" | tr -d '\0' | head -1)]"
+  echo "    rust=[$(head -c 200 "$W/cliout.r" | tr -d '\0' | head -1)]"
 }
 cli; cli --help; cli -h; cli --version; cli --bogus; cli --bogus encode
 cli decode; cli encode extra; cli --profile; cli --threads; cli --threads 4

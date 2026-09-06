@@ -76,8 +76,9 @@ row() {  # row SET KIND INFORMED SEEK MODE IMPL BIN INPUT(s) ENCFLAGS DECFLAGS C
   local ix=0 q="NA NA NA NA"
   if [ "$seek" = seekable ] && [ "$set" != ALL ]; then
     cp "$W/k.kst" "$W/ki.kst"
-    if "$bin" index "$W/ki.kst" >/dev/null 2>&1; then ix=$(( $(stat -c%s "$W/ki.kst") - kst )); else echo "index refused on $set $kind $inf $mode $impl" >&2; ix=NA; fi
-    q=$(NQ=$([ "$inf" = not-informed ] || [ "$inf" = db-informed ] && echo $NQ || echo $NQ_ALN) queries "$bin" "$df" "$W/ki.kst" "$W/names")
+    if "$bin" index "$W/ki.kst" >/dev/null 2>&1; then ix=$(( $(stat -c%s "$W/ki.kst") - kst ))
+      q=$(NQ=$([ "$inf" = not-informed ] || [ "$inf" = db-informed ] && echo $NQ || echo $NQ_ALN) queries "$bin" "$df" "$W/ki.kst" "$W/names")
+    else echo "index refused on $set $kind $inf $mode $impl" >&2; ix=NA; fi
   fi
   local tot=$((kst + comp))
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
@@ -107,8 +108,8 @@ for kind in presmoothed smoothed; do
   for seek in seekable non-seekable; do bf=""; [ $seek = non-seekable ] && bf="--block all"
     for mode in default slow; do mf=""; [ $mode = slow ] && mf="--slow"
       for impl in C Rust; do bin=$C; [ $impl = Rust ] && bin=$R
-        row ALL "$kind" db-informed "$seek" "$mode" "$impl" "$bin" "$ins" "--db $FEAT $bf $mf" "--db $FEAT" 0
-        [ -s "$ref" ] && row ALL "$kind" db+aln-informed "$seek" "$mode" "$impl" "$bin" "$ins" "--db $FEAT $bf $mf --aln $PAF --ref $ref $alnnames" "--db $FEAT --aln $PAF --ref $ref $alnnames" "$pafB"
+        row ALL "$kind" db-informed "$seek" "$mode" "$impl" "$bin" "$ins" "--db $FEAT --hier $HIER $bf $mf" "--db $FEAT --hier $HIER" 0
+        [ -s "$ref" ] && row ALL "$kind" db+aln-informed "$seek" "$mode" "$impl" "$bin" "$ins" "--db $FEAT --hier $HIER $bf $mf --aln $PAF --ref $ref $alnnames" "--db $FEAT --hier $HIER --aln $PAF --ref $ref $alnnames" "$pafB"
       done
     done
   done

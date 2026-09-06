@@ -328,6 +328,7 @@ static size_t zc(buf *in, uint8_t **out) { return zcl(in, out, LEVEL); }
 #define DROPPED (1ULL << 60)          /* names deliberately not stored */
 #define ALNFLAG (1ULL << 59)          /* rows deltaed against a reference */
 #define DBFLAG  (1ULL << 58)          /* labels are featureIDs, not labels */
+#define CARTFLAG (1ULL << 52)         /* some featureIDs are 2^26 + a vocabulary rank */
 #define PERMFLAG (1ULL << 54)         /* names in input order + a permutation */
 #define PERMTOK  (1ULL << 53)         /* that blob went through the tokeniser */
 #define SIDEFLAG (1ULL << 57)
@@ -348,6 +349,7 @@ static int SORT = 0;                  /* --sort: order records by label tuple */
 static uint64_t SORTBP;               /* end of the run --sort last took */
 static uint64_t SORTMEM = 0;
 static const char *DBFEATS = NULL;    /* --db features.tsv */
+static const char *HIERTAB = NULL;    /* --hier hierarchy.tsv, with --db */
 static int DBIDS = 0;
 static const char *ALNPAF = NULL;     /* --aln alignment.paf */
 static uint64_t ALNHIT = 0;           /* rows the reference already answered */
@@ -1456,6 +1458,63 @@ static void loadfeatures(const char *path) {
     }
 }
 
+/* --hier: the label vocabulary of each set, features.tsv column plus the
+   hierarchy nodes of that set plus "novel", sorted. A tuple outside
+   features.tsv gets 2^26 + its mixed-radix rank, the same in every file. */
+static char ***VOC; static size_t *NVOC; static uint64_t *VSTRIDE, VPROD, HIERHASH;
+static int CARTON, CARTUSED;
+#define CARTBASE (1u << 26)
+static int cmpstr(const void *a, const void *b) { return strcmp(*(char *const *)a, *(char *const *)b); }
+static void vocadd(size_t k, const char *w, size_t n) {
+    if (NVOC[k] % 1024 == 0) VOC[k] = xrealloc(VOC[k], (NVOC[k] + 1024) * sizeof **VOC);
+    VOC[k][NVOC[k]++] = strndup(w, n);
+}
+static void loadvocab(const char *path) {
+    FILE *f = zfopen(path);
+    if (!f) die("cannot open the hierarchy file");
+    VOC = xcalloc(nfset, sizeof *VOC); NVOC = xcalloc(nfset, sizeof *NVOC); VSTRIDE = xcalloc(nfset, sizeof *VSTRIDE);
+    for (size_t k = 0; k < nfset; k++) {
+        vocadd(k, "novel", 5);
+        for (uint32_t id = 0; id < nfid; id++) if (fid2lab[id]) vocadd(k, fid2lab[id][k], strlen(fid2lab[id][k]));
+    }
+    char *line = NULL; size_t cap = 0; ssize_t len; HIERHASH = FEATHASH;
+    while ((len = getline(&line, &cap, f)) > 0) {
+        HIERHASH = fnvbuf(HIERHASH, line, (size_t)len);
+        if (len && line[len - 1] == '\n') line[--len] = 0;
+        if (len && line[len - 1] == '\r') line[--len] = 0;
+        if (!len) continue;
+        char *t1 = memchr(line, '\t', (size_t)len); if (!t1) continue;
+        char *t2 = memchr(t1 + 1, '\t', (size_t)(len - (t1 + 1 - line))); if (!t2) continue;
+        if (memchr(t2 + 1, '\t', (size_t)(len - (t2 + 1 - line)))) die("hierarchy: a row has more than three columns");
+        if (!strncmp(line, "feature_set\t", 12)) continue;
+        for (size_t k = 0; k < nfset; k++)
+            if ((size_t)(t1 - line) == strlen(fset[k]) && !memcmp(line, fset[k], strlen(fset[k]))) {
+                vocadd(k, t1 + 1, (size_t)(t2 - t1 - 1)); vocadd(k, t2 + 1, (size_t)(len - (t2 + 1 - line))); }
+    }
+    free(line); fclose(f);
+    VPROD = 1;
+    for (size_t k = nfset; k-- > 0;) {
+        qsort(VOC[k], NVOC[k], sizeof **VOC, cmpstr);
+        size_t u = 0;
+        for (size_t i = 0; i < NVOC[k]; i++) if (!u || strcmp(VOC[k][u - 1], VOC[k][i])) VOC[k][u++] = VOC[k][i]; else free(VOC[k][i]);
+        NVOC[k] = u; VSTRIDE[k] = VPROD;
+        if (VPROD > (UINT32_MAX - CARTBASE) / u) die("the label vocabulary is too large for featureIDs");
+        VPROD *= u;
+    }
+    CARTON = 1;
+    fprintf(stderr, "hierarchy: %llu label tuples possible\n", (unsigned long long)VPROD);
+}
+static size_t vocidx(size_t k, const char *w) {   /* the rank of a label in its set, or SIZE_MAX */
+    size_t lo = 0, hi = NVOC[k];
+    while (lo < hi) { size_t m = (lo + hi) / 2; int c = strcmp(VOC[k][m], w); if (!c) return m; if (c < 0) lo = m + 1; else hi = m; }
+    return SIZE_MAX;
+}
+static const char *flab(uint32_t id, size_t k) {   /* the label of set k for a featureID */
+    if (!id) return "novel";
+    if (id < CARTBASE) return fid2lab[id][k];
+    return VOC[k][(id - CARTBASE) / VSTRIDE[k] % NVOC[k]];
+}
+
 /* --sort  Records are a set: */
 typedef struct { uint64_t nam; uint32_t off, nrun, idx; } srec;  /* name in rbuf, runs in rrun */
 typedef struct { uint32_t len; uint32_t lab; } srun;
@@ -2306,16 +2365,17 @@ static void ktw_close(ktw *w) {
     uint8_t *npz = PERMBLOB; size_t npl = PERMON ? PERMBLOBLEN : 0;
     int permtok = PERMBLOBTOK;
     WR(MAGIC, 8);
-    uint64_t h[16] = { nidx, (NAMES_OUT ? 0 : nzl) | (tokused ? TOKFLAG : 0)
+    uint64_t fh = CARTUSED ? HIERHASH : FEATHASH;
+    uint64_t h[16] = { nidx, (NAMES_OUT ? 0 : nzl) | (tokused ? TOKFLAG : 0) | (CARTUSED ? CARTFLAG : 0)
                              | (intused ? INTFLAG : 0) | (dropnames && !(w->ordok && nidx > 0) ? DROPPED : 0)
                              | (ALNPAF ? LENFLAG : 0) | (TAILON > 0 ? TAILFLAG : 0)
                              | (ALNPAF ? ALNFLAG : 0) | (DBFEATS ? DBFLAG : 0)
                              | (NAMES_OUT ? SIDEFLAG : 0)
                              | (npl || (PERMON && NAMEMODE == 1) ? PERMFLAG : 0)
                              | (permtok ? PERMTOK : 0), izl, szl, rows,
-                      (uint64_t)(uint32_t)LENCODEC | (DBFEATS ? (FEATHASH & 0xffffffffu) << 32 : 0),
+                      (uint64_t)(uint32_t)LENCODEC | (DBFEATS ? (fh & 0xffffffffu) << 32 : 0),
                       lzl, (uint64_t)nlabtab, BLOCK,
-                      (uint64_t)(uint32_t)IDCODEC | (DBFEATS ? (FEATHASH >> 32) << 32 : 0), nichunk, itl,
+                      (uint64_t)(uint32_t)IDCODEC | (DBFEATS ? (fh >> 32) << 32 : 0), nichunk, itl,
                       TAILPRED, (uint64_t)TAILSKIP | (ALNPAF ? ALNHASH << 8 : 0), npl, 0 };
 
     {   uint64_t mh = fnvbuf(FNV0, h, 128); mh = fnvbuf(mh, lz, lzl);
@@ -2426,7 +2486,7 @@ typedef struct {
     uint8_t *ibuf; int idcodec, lencodec;
     const uint8_t *cp, *cpe;   /* cpe: end of the decoded index chunk */
     uint64_t ci, cpend; int cvalid; rec crec;
-    off_t nz_off; uint64_t mhash, feathash;
+    off_t nz_off; uint64_t mhash, feathash; int cart;
     uint64_t fsz; int hasidx;   /* data size, and whether an index trailer follows it */
     uint8_t *pz; size_t pzl; int perm_tok, perm_ext;  /* names in input order */
     char *namebuf, *natbufp;
@@ -2518,7 +2578,7 @@ static R *ropen(const char *path) {
     if (fseeko(r->f, 8 + 128, SEEK_SET)) die("seek");
     uint64_t nml = h[1] & ~(TOKFLAG | INTFLAG | DROPPED | ALNFLAG | DBFLAG
                             | SIDEFLAG | LENFLAG | TAILFLAG | PERMFLAG
-                            | PERMTOK);   /* h[1] also holds flags */
+                            | PERMTOK | CARTFLAG);   /* h[1] also holds flags */
 
     if (nml > fsz || h[2] > fsz || h[3] > fsz || h[6] > fsz || h[11] > fsz
         || h[14] > fsz || h[11] + h[14] > fsz
@@ -2588,8 +2648,10 @@ static R *ropen(const char *path) {
     if (TAILDEC && TAILSKIP_R != TAILSKIP) die("corrupt file: tail skip is not the format constant");
     if (was_aln && ALNPAF && (h[13] >> 8) != (ALNHASH & ((1ull << 56) - 1)))
         die("this PAF, reference or name map is not the one the track was encoded with");
+    r->cart = (h[1] & CARTFLAG) != 0;
+    if (r->cart && !was_db) die("corrupt file: vocabulary featureIDs without --db");
     h[1] &= ~(TOKFLAG | INTFLAG | DROPPED | ALNFLAG | DBFLAG | SIDEFLAG | LENFLAG
-              | TAILFLAG | PERMFLAG | PERMTOK);
+              | TAILFLAG | PERMFLAG | PERMTOK | CARTFLAG);
     uint8_t *iz = xmalloc(h[2]), *sz = xmalloc(h[3]);
     uint8_t *nz = NULL;
     r->nz_off = ftello(r->f);
@@ -3137,13 +3199,16 @@ static void loadinformed(const char *who) {
     if (ALNREF && !ALNPAF) die("--ref does nothing without --aln");
     if (ALNNAMES && !ALNPAF) die("--aln-names does nothing without --aln");
     if (SETNAME && !DBFEATS) die("--set needs --db");
-    if (DBFEATS) { loadfeatures(DBFEATS); setcols(); }
+    if (HIERTAB && !DBFEATS) die("--hier does nothing without --db");
+    if (DBFEATS) { loadfeatures(DBFEATS); if (HIERTAB) loadvocab(HIERTAB); setcols(); }
     if (ALNPAF) { if (ALNNAMES) loadordinals(ALNNAMES); loadref(ALNREF); loadaln(ALNPAF); }
 }
 static R *ropen_informed(const char *path) {
     R *r = ropen(path);
-    if (DBFEATS && (!r->feathash || r->feathash != FEATHASH))
-        die("this features.tsv is not the one the track was encoded with");
+    if (DBFEATS && r->cart && !CARTON) die("this track holds label tuples outside features.tsv: give --hier HIERARCHY");
+    if (DBFEATS && (!r->feathash || r->feathash != (r->cart ? HIERHASH : FEATHASH)))
+        die(r->cart ? "this features.tsv and hierarchy are not the ones the track was encoded with"
+                    : "this features.tsv is not the one the track was encoded with");
     return r;
 }
 static size_t *SETK, NSETK;   /* --set as columns of features.tsv, default all */
@@ -3162,8 +3227,8 @@ static void setcols(void) {
     if (!NSETK) die("--set needs at least one set");
 }
 static uint32_t featid(const char *L) {   /* a --db label, checked */
-    uint32_t id = (uint32_t)num_arg(L, (1u << 26) - 1, "corrupt --db track: a label is not a featureID");
-    if (id && (id >= nfid || !fid2lab[id])) die("a featureID in the track is not in the features table");
+    uint32_t id = (uint32_t)num_arg(L, CARTON ? CARTBASE - 1 + VPROD : CARTBASE - 1, "corrupt --db track: a label is not a featureID");
+    if (id && id < CARTBASE && (id >= nfid || !fid2lab[id])) die("a featureID in the track is not in the features table");
     return id;
 }
 /* the label a reader prints: restored under --aln, a set tuple under --db */
@@ -3179,7 +3244,7 @@ static char *putlab(char *o, const R *r, uint64_t f, const char *seq, uint64_t s
     if (!DBFEATS) { size_t n = strlen(L); memcpy(o, L, n); return o + n; }
     uint32_t id = featid(L);
     for (size_t j = 0; j < NSETK; j++) {
-        const char *Lb = id ? fid2lab[id][SETK[j]] : "novel"; size_t n = strlen(Lb);
+        const char *Lb = flab(id, SETK[j]); size_t n = strlen(Lb);
         if (j) *o++ = '\t';
         memcpy(o, Lb, n); o += n;
     }
@@ -3192,6 +3257,9 @@ static size_t maxlablen(const R *r) {   /* the longest label putlab writes */
     for (uint32_t id = 0; id < nfid; id++) if (fid2lab[id]) {
         size_t L = 0; for (size_t j = 0; j < NSETK; j++) L += strlen(fid2lab[id][SETK[j]]) + 1;
         if (L > m) m = L; }
+    if (CARTON) for (size_t j = 0; j < NSETK; j++) { size_t L = 0;
+        for (size_t i = 0; i < NVOC[SETK[j]]; i++) if (strlen(VOC[SETK[j]][i]) > L) L = strlen(VOC[SETK[j]][i]);
+        m += L + 1; }
     return m;
 }
 
@@ -3542,7 +3610,7 @@ static int *labnodes(R *r, const char *fs) {   /* label id to hierarchy node */
         if (DBFEATS) {                      /* a reference label need not be a featureID */
             size_t n = strspn(L, "0123456789");
             if (!n || L[n]) { m[i] = INT_MIN + 1; isnovel[i] = 0; continue; }
-            uint32_t id = featid(L); L = id ? fid2lab[id][k] : "novel"; }
+            L = flab(featid(L), k); }
         isnovel[i] = (uint8_t)(strcmp(L, "novel") == 0);
         m[i] = nodeid(L, strlen(L));
     }
@@ -3833,7 +3901,9 @@ static void bnext(brd *b) {
 }
 
 static void encode_db(int nfiles, char **files) {
+    if (HIERTAB && !DBFEATS) die("--hier does nothing without --db");
     loadfeatures(DBFEATS);
+    if (HIERTAB) loadvocab(HIERTAB);
     /* --db takes either form: */
     if ((size_t)nfiles != nfset) {
         if (nfiles != 1)
@@ -3876,8 +3946,9 @@ static void encode_db(int nfiles, char **files) {
             char *e3 = NULL;
             (void)e3;
             if (b[0].lab[0] == '0' && b[0].lab[1]) die("--db: a featureID with a leading zero");
-            uint64_t v = num_arg(b[0].lab, (1u << 26) - 1, "--db: a label is not a featureID; give one BED per feature set instead");
-            if (v >= nfid || (v && !fid2lab[v])) die("--db: featureID not in the features table");
+            uint64_t v = num_arg(b[0].lab, CARTON ? CARTBASE - 1 + VPROD : CARTBASE - 1, "--db: a label is not a featureID; give one BED per feature set instead");
+            if (v < CARTBASE && (v >= nfid || (v && !fid2lab[v]))) die("--db: featureID not in the features table");
+            if (v >= CARTBASE) CARTUSED = 1;
             id = (uint32_t)v;
         } else if (DBFAST) {
             uint32_t tv[DBMAXSET];
@@ -3897,8 +3968,15 @@ static void encode_db(int nfiles, char **files) {
 
             int alln = 1;
             for (int i = 0; i < nfiles && alln; i++) alln = !strcmp(b[i].lab, "novel");
-            if (!alln) die("a label tuple is not in the features table");
-            id = 0; missing++;
+            if (alln) { id = 0; missing++; }
+            else if (!CARTON) die("a label tuple is not in the features table");
+            else {                       /* its rank in the vocabulary */
+                uint64_t rank = 0;
+                for (int i = 0; i < nfiles; i++) { size_t x = vocidx((size_t)i, b[i].lab);
+                    if (x == SIZE_MAX) die("a label is neither in features.tsv nor in the hierarchy of its set");
+                    rank += x * VSTRIDE[i]; }
+                id = CARTBASE + (uint32_t)rank; CARTUSED = 1;
+            }
         }
 
         if (prevfid != UINT32_MAX && id == prevfid && lastend == lo)
@@ -4030,16 +4108,16 @@ static void decode_db(const char *path, const char *dir) {
             for (size_t j = 0; j < nout; j++) {
                 const char *Lb; size_t Lbn;
                 if (tostd) {                        /* the selected columns, one tuple */
-                    size_t need = 1; for (size_t t = 0; t < NSETK; t++) need += strlen(id ? fid2lab[id][SETK[t]] : "novel") + 1;
+                    size_t need = 1; for (size_t t = 0; t < NSETK; t++) need += strlen(flab(id, SETK[t])) + 1;
                     if (need > jcap[jw]) { jcap[jw] = need * 2; jb[jw] = xrealloc(jb[jw], jcap[jw]); }
                     char *q = jb[jw];
                     for (size_t t = 0; t < NSETK; t++) {
-                        const char *L = id ? fid2lab[id][SETK[t]] : "novel"; size_t L2 = strlen(L);
+                        const char *L = flab(id, SETK[t]); size_t L2 = strlen(L);
                         if (t) *q++ = '\t';
                         memcpy(q, L, L2); q += L2;
                     }
                     *q = 0; Lb = jb[jw]; Lbn = (size_t)(q - jb[jw]);
-                } else { Lb = id ? fid2lab[id][SETK[j]] : "novel"; Lbn = strlen(Lb); }
+                } else { Lb = flab(id, SETK[j]); Lbn = strlen(Lb); }
                 if (cseq && c1[j] == s && cll[j] == Lbn && !memcmp(cl[j], Lb, Lbn)) {
                     c1[j] = s + len;                       /* extend the run */
                 } else {
@@ -4102,8 +4180,8 @@ int main(int argc, char **argv) {
             "  karyozip encode [--block N|all] [--level N] [--slow: smaller, slower]\n"
             "                  [--names keep|drop|drop:FILE]\n"
             "                  [--sort | --sort=MEM]\n"
-            "                  [--db features.tsv] [--aln P.paf --ref R [--aln-names F]]\n"
-            "  karyozip decode F | --db features.tsv [--out DIR] [--set A,B] F | --aln P.paf --ref R F\n"
+            "                  [--db features.tsv [--hier H]] [--aln P.paf --ref R [--aln-names F]]\n"
+            "  karyozip decode F | --db features.tsv [--hier H] [--out DIR] [--set A,B] F | --aln P.paf --ref R F\n"
             "                  --names F reads the names, from drop:FILE or a FASTA, FASTQ or list\n"
             "                  --names ordinal accepts a track whose names were dropped\n"
             "                  --raw shows what is stored, reversing no transform\n"
@@ -4146,7 +4224,7 @@ int main(int argc, char **argv) {
         {"--max-gap",1},{"--v1",0},{"--aln-names",1},{"--sort",0},
         {"--slow",0},
         {"--block",1},{"--level",1},{"--db",1},{"--aln",1},
-        {"--ref",1},{"--out",1},{"--set",1},{"--raw",0},
+        {"--ref",1},{"--out",1},{"--set",1},{"--raw",0},{"--hier",1},
     };
     const char *cmd = "";   /* the first word that is not a flag or its value */
     for (int i = 1; i < argc; i++) {
@@ -4209,6 +4287,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--level")) { ok = enc;
             LEVEL = (int)int_arg(v, 1, 22, "--level is a zstd level, 1 to 22"); LEVELSET = 1; take = 2; }
         else if (!strcmp(a, "--db")) { ok = inf; DBFEATS = v; take = 2; }
+        else if (!strcmp(a, "--hier")) { ok = inf; HIERTAB = v; take = 2; }
         else if (!strcmp(a, "--aln")) { ok = inf; ALNPAF = v; take = 2; }
         else if (!strcmp(a, "--ref")) { ok = inf; ALNREF = v; take = 2; }
         else if (!strcmp(a, "--out")) { ok = dec; OUTDIR = v; take = 2; }
@@ -4299,6 +4378,7 @@ int main(int argc, char **argv) {
         uint64_t slo = argc > 6 ? num_arg(argv[6], UINT64_MAX, "smooth: start is not a number") : 0;
         uint64_t shi = argc > 7 ? num_arg(argv[7], UINT64_MAX, "smooth: end is not a number") : 0;
         if (argc > 7 && slo >= shi) die("smooth: end must be past start");
+        if (DBFEATS && !HIERTAB) HIERTAB = argv[3];   /* the hierarchy it smooths with */
         loadinformed("smooth ");
         smoothcmd(argv[2], argv[3], argv[4], argc > 5 ? argv[5] : NULL, slo, shi, V1);
     }

@@ -12,13 +12,22 @@ pub struct Feats {
     /// the label tuple, tab-joined, to its featureID
     tup: HashMap<Vec<u8>, u32>,
     pub hash: u64,
+    /// --hier: per set, features.tsv column plus the hierarchy nodes plus
+    /// "novel", sorted; a tuple outside features.tsv is 2^26 + its rank
+    voc: Vec<Vec<Vec<u8>>>,
+    stride: Vec<u64>,
+    pub prod: u64,
+    pub cart: bool,
+    pub hierhash: u64,
 }
+pub const CARTBASE: u32 = 1 << 26;
 
 impl Feats {
     pub fn load(path: &str) -> Feats {
         let data = crate::slurp(path, "cannot open the features table");
         let mut f = Feats { sets: Vec::new(), id2lab: HashMap::new(),
-                            tup: HashMap::new(), hash: FNV0 };
+                            tup: HashMap::new(), hash: FNV0, voc: Vec::new(), stride: Vec::new(),
+                            prod: 0, cart: false, hierhash: 0 };
         let mut first = true;
         for raw in data.split_inclusive(|&c| c == b'\n') {
             f.hash = kst::fnv(f.hash, raw);
@@ -60,11 +69,68 @@ impl Feats {
 
     /// A track label as a featureID, checked as decode checks it.
     pub fn featid(&self, lab: &[u8]) -> u32 {
-        let id = num(lab, (1u32 << 26) - 1, "corrupt --db track: a label is not a featureID");
-        if id != 0 && !self.id2lab.contains_key(&id) {
+        let id = num(lab, self.idmax(), "corrupt --db track: a label is not a featureID");
+        if id != 0 && id < CARTBASE && !self.id2lab.contains_key(&id) {
             crate::bail("a featureID in the track is not in the features table");
         }
         id
+    }
+    /// The largest featureID the track may hold.
+    pub fn idmax(&self) -> u32 { if self.cart { CARTBASE - 1 + self.prod as u32 } else { CARTBASE - 1 } }
+
+    /// The label of one set for a featureID.
+    pub fn lab(&self, id: u32, k: usize) -> &[u8] {
+        if id == 0 { b"novel" }
+        else if id < CARTBASE { &self.id2lab[&id][k] }
+        else { &self.voc[k][((id - CARTBASE) as u64 / self.stride[k] % self.voc[k].len() as u64) as usize] }
+    }
+
+    /// The vocabulary of every set, and the hash continued over the file.
+    pub fn load_hier(&mut self, path: &str) {
+        let data = crate::slurp(path, "cannot open the hierarchy file");
+        let n = self.sets.len();
+        let mut voc: Vec<Vec<Vec<u8>>> = (0..n).map(|k| {
+            let mut v = vec![b"novel".to_vec()];
+            v.extend(self.id2lab.values().map(|t| t[k].clone()));
+            v
+        }).collect();
+        self.hierhash = self.hash;
+        for raw in data.split_inclusive(|&c| c == b'\n') {
+            self.hierhash = kst::fnv(self.hierhash, raw);
+            let mut line = raw.strip_suffix(b"\n").unwrap_or(raw);
+            if line.last() == Some(&b'\r') { line = &line[..line.len() - 1]; }
+            if line.is_empty() { continue; }
+            let cols: Vec<&[u8]> = line.split(|&c| c == b'\t').collect();
+            if cols.len() < 3 { continue; }
+            if cols.len() > 3 { crate::bail("hierarchy: a row has more than three columns"); }
+            if cols[0] == b"feature_set" { continue; }
+            if let Some(k) = self.sets.iter().position(|s| s == cols[0]) {
+                voc[k].push(cols[1].to_vec()); voc[k].push(cols[2].to_vec());
+            }
+        }
+        self.stride = vec![0; n];
+        self.prod = 1;
+        for k in (0..n).rev() {
+            voc[k].sort(); voc[k].dedup();
+            self.stride[k] = self.prod;
+            let u = voc[k].len() as u64;
+            if self.prod > (u32::MAX - CARTBASE) as u64 / u { crate::bail("the label vocabulary is too large for featureIDs"); }
+            self.prod *= u;
+        }
+        self.voc = voc;
+        self.cart = true;
+        eprintln!("hierarchy: {} label tuples possible", self.prod);
+    }
+
+    /// 2^26 + the mixed-radix rank of a tuple outside features.tsv.
+    fn cart_id(&self, labs: &[&[u8]]) -> u32 {
+        let mut rank = 0u64;
+        for (k, l) in labs.iter().enumerate() {
+            let x = self.voc[k].binary_search_by(|v| v.as_slice().cmp(l))
+                .unwrap_or_else(|_| crate::bail("a label is neither in features.tsv nor in the hierarchy of its set"));
+            rank += x as u64 * self.stride[k];
+        }
+        CARTBASE + rank as u32
     }
 
     /// --set A,B as columns of features.tsv; None or "all" is every set.
@@ -87,12 +153,16 @@ impl Feats {
         out.clear();
         for (i, &k) in cols.iter().enumerate() {
             if i > 0 { out.push(b'\t'); }
-            out.extend_from_slice(if id == 0 { b"novel" } else { &self.id2lab[&id][k] });
+            out.extend_from_slice(self.lab(id, k));
         }
     }
 
     pub fn check_hash(&self, r: &crate::reader::Reader) {
-        if r.feathash() != self.hash { crate::bail("this features.tsv is not the one the track was encoded with"); }
+        if r.cart() && !self.cart { crate::bail("this track holds label tuples outside features.tsv: give --hier HIERARCHY"); }
+        if r.feathash() != if r.cart() { self.hierhash } else { self.hash } {
+            crate::bail(if r.cart() { "this features.tsv and hierarchy are not the ones the track was encoded with" }
+                        else { "this features.tsv is not the one the track was encoded with" });
+        }
     }
 }
 
@@ -167,7 +237,9 @@ impl Brd {
 }
 
 /// One BED per feature set in header order, or one merged featureID track.
-pub fn encode(files: &[String], feats: &Feats, w: &mut crate::writer::Writer) {
+/// True when some featureID came from the vocabulary.
+pub fn encode(files: &[String], feats: &Feats, w: &mut crate::writer::Writer) -> bool {
+    let mut cart_used = false;
     let dbids = files.len() != feats.sets.len();
     if dbids && files.len() != 1 {
         crate::bail("--db: give one BED per feature set in features.tsv column order, or one merged featureID track");
@@ -198,23 +270,20 @@ pub fn encode(files: &[String], feats: &Feats, w: &mut crate::writer::Writer) {
             if b[0].lab.first() == Some(&b'0') && b[0].lab.len() > 1 {
                 crate::bail("--db: a featureID with a leading zero");
             }
-            let v = num(&b[0].lab, (1u32 << 26) - 1,
+            let v = num(&b[0].lab, feats.idmax(),
                         "--db: a label is not a featureID; give one BED per feature set instead");
-            if v != 0 && !feats.id2lab.contains_key(&v) {
+            if v != 0 && v < CARTBASE && !feats.id2lab.contains_key(&v) {
                 crate::bail("--db: featureID not in the features table");
             }
+            if v >= CARTBASE { cart_used = true; }
             v
         } else {
             let key = b.iter().map(|x| x.lab.clone()).collect::<Vec<_>>().join(&b'\t');
             match feats.tup.get(&key) {
                 Some(&v) => v,
-                None => {
-                    if !b.iter().all(|x| x.lab == b"novel") {
-                        crate::bail("a label tuple is not in the features table");
-                    }
-                    missing += 1;
-                    0
-                }
+                None if b.iter().all(|x| x.lab == b"novel") => { missing += 1; 0 }
+                None if !feats.cart => crate::bail("a label tuple is not in the features table"),
+                None => { cart_used = true; feats.cart_id(&b.iter().map(|x| x.lab.as_slice()).collect::<Vec<_>>()) }
             }
         };
         if prevfid != u32::MAX && id == prevfid && lastend == lo {
@@ -234,6 +303,7 @@ pub fn encode(files: &[String], feats: &Feats, w: &mut crate::writer::Writer) {
     }
     if b[1..].iter().any(|x| !x.eof) { crate::bail("the input BEDs have different lengths"); }
     eprintln!("db: {rows} rows from {} tracks, {missing} all-novel", b.len());
+    cart_used
 }
 
 /// decode --db --out DIR: one BED per feature set, the featureIDs expanded.
@@ -279,7 +349,6 @@ pub fn decode(r: &mut crate::reader::Reader, feats: &Feats, dir: Option<&str>, c
     let mut cur: Vec<Option<(u64, u64, Vec<u8>)>> = vec![None; n];
     let mut cseq: Vec<u8> = Vec::new();
     let mut rows = 0u64;
-    let novel = b"novel".to_vec();
     r.for_each_row(&mut |seq: &[u8], st: u64, en: u64, lab: &[u8]| {
         if seq != cseq {
             for j in 0..n {
@@ -292,7 +361,7 @@ pub fn decode(r: &mut crate::reader::Reader, feats: &Feats, dir: Option<&str>, c
         let id = feats.featid(lab);
         if dir.is_none() { feats.joined(id, cols, &mut joined); }
         for j in 0..n {
-            let l: &[u8] = if dir.is_none() { &joined } else if id == 0 { &novel } else { &feats.id2lab[&id][cols[j]] };
+            let l: &[u8] = if dir.is_none() { &joined } else { feats.lab(id, cols[j]) };
             match &mut cur[j] {
                 Some((_, e, cl)) if *e == st && cl == l => *e = en,
                 slot => {

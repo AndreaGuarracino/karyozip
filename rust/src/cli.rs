@@ -41,6 +41,9 @@ pub struct Cli {
     /// one BED per feature set, or one merged featureID track
     #[arg(long, global = true, value_name = "features.tsv")]
     pub db: Option<String>,
+    /// with --db: label tuples outside features.tsv get an id from the hierarchy
+    #[arg(long, global = true, value_name = "hierarchy.tsv")]
+    pub hier: Option<String>,
     /// per-set BEDs go here
     #[arg(long, global = true, value_name = "DIR")]
     pub out: Option<String>,
@@ -96,7 +99,8 @@ pub enum Cmd {
     Region { track: Option<String>, seq: Option<String>, a: Option<String>,
              b: Option<String>, hl: Option<String>, rest: Vec<String> },
     /// promote noisy runs through a hierarchy
-    Smooth { track: Option<String>, hier: Option<String>, fs: Option<String>,
+    /// (clap shares one id between a global flag and a positional of the same name)
+    Smooth { track: Option<String>, #[arg(value_name = "HIER")] hpath: Option<String>, fs: Option<String>,
              seq: Option<String>, start: Option<String>, end: Option<String>,
              rest: Vec<String> },
     /// append a name index to the track
@@ -171,6 +175,7 @@ impl Cli {
         if self.raw && !dec { bad("--raw")?; }
         let inf = enc || dec || sm || c == "region";
         if self.db.is_some() && !inf { bad("--db")?; }
+        if self.hier.is_some() && !inf { bad("--hier")?; }
         if self.aln.is_some() && !inf { bad("--aln")?; }
         if self.refbed.is_some() && !inf { bad("--ref")?; }
         if self.aln_names.is_some() && !inf { bad("--aln-names")?; }

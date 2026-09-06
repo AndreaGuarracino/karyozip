@@ -26,18 +26,7 @@ fn need(v: &Option<String>) -> &str {
 
 fn main() {
     ffi::ignore_sigxfsz();
-    // The runtime reopens a closed standard fd on /dev/null, read-write; a
-    // shell redirection to /dev/null is write-only or read-only. The C
-    // refuses a closed fd outright, and so must this.
-    for fd in 0..3 {
-        let dst = std::fs::read_link(format!("/proc/self/fd/{fd}")).ok();
-        let info = std::fs::read_to_string(format!("/proc/self/fdinfo/{fd}")).unwrap_or_default();
-        let flags = info.lines().find_map(|l| l.strip_prefix("flags:\t"))
-            .and_then(|f| u32::from_str_radix(f.trim(), 8).ok()).unwrap_or(0);
-        if dst.is_none() || (dst.as_deref() == Some(std::path::Path::new("/dev/null")) && flags & 3 == 2) {
-            die("stdin, stdout or stderr is closed");
-        }
-    }
+    if !ffi::STDFDS_OPEN.load(std::sync::atomic::Ordering::Relaxed) { die("stdin, stdout or stderr is closed"); }
     let c = Cli::get();
     // --threads, else OMP_NUM_THREADS, else one per core capped at 8, which
     // is what the C does. The pool is always explicit, so RAYON_NUM_THREADS
@@ -132,16 +121,15 @@ fn main() {
             let a = load_aln(&c.aln, &c.refbed, &c.aln_names, "");
             match &c.db {
                 Some(fp) => {
-                    let feats = db::Feats::load(fp);
-                    eprintln!("features: {} ids, {} sets", feats.id2lab.len(), feats.sets.len());
-                    if feats.sets.len() <= 32 { eprintln!("features: integer-tuple index on"); }
+                    if c.hier.is_some() && c.db.is_none() { die("--hier does nothing without --db"); }
+                    let feats = load_feats(fp, c.hier.as_deref());
                     let mut w = writer::Writer::new(opt, std::path::Path::new(&tmpdir))
                         .unwrap_or_else(|e| die(&e.to_string()));
-                    w.set_feathash(feats.hash);
                     let aln_on = a.is_some();
                     if let Some(x) = a { w.set_aln(x); }
                     let files: Vec<String> = if files.is_empty() { vec!["-".into()] } else { files.clone() };
-                    db::encode(&files, &feats, &mut w);
+                    let used = db::encode(&files, &feats, &mut w);
+                    w.set_feathash(if used { feats.hierhash } else { feats.hash }, used);
                     finish(w, aln_on);
                 }
                 None => {
@@ -153,7 +141,7 @@ fn main() {
         Cmd::Decode { track, rest } => {
             if !rest.is_empty() { die("decode takes one track"); }
             let track = need(track);
-            let feats = informed(&c, &mut ro, "decode ");
+            let feats = informed(&c, &mut ro, "decode ", None);
             let mut r = reader::Reader::open_with(track, &ro);
             if let Some(f) = &feats { f.check_hash(&r); }
             match &feats {
@@ -182,7 +170,7 @@ fn main() {
                     (x, y, hl.as_ref().map_or(0, |_| p(hl, "region: halo is not a number")))
                 }
             };
-            let feats = informed(&c, &mut ro, "region ");
+            let feats = informed(&c, &mut ro, "region ", None);
             let mut r = reader::Reader::open_with(track, &ro);
             if let Some(f) = &feats { f.check_hash(&r); }
             let cols = feats.as_ref().map_or(Vec::new(), |f| f.setcols(c.set.as_deref()));
@@ -191,8 +179,8 @@ fn main() {
             r.region(seq.as_bytes(), lo, hi, hlo, feats.as_ref(), &cols, &mut o);
             o.flush().unwrap_or_else(|e| die(&e.to_string()));
         }
-        Cmd::Smooth { track, hier, fs, seq, start, end, rest } => {
-            let (track, hier, fs) = (need(track), need(hier), need(fs));
+        Cmd::Smooth { track, hpath, fs, seq, start, end, rest } => {
+            let (track, hier, fs) = (need(track), need(hpath), need(fs));
             if !rest.is_empty() { die("smooth: give SEQ, or SEQ START END"); }
             let maxgap = num(&c.max_gap, 0, u64::MAX, "--max-gap needs a number").unwrap_or(1000);
             let (lo, hi) = match (start, end) {
@@ -203,7 +191,7 @@ fn main() {
                 _ => die("smooth: give SEQ, or SEQ START END"),
             };
             if start.is_some() && lo >= hi { die("smooth: end must be past start"); }
-            let feats = informed(&c, &mut ro, "smooth ");
+            let feats = informed(&c, &mut ro, "smooth ", Some(hier));
             let so = std::io::stdout();
             let mut o = BufWriter::new(so.lock());
             smooth::run(track, hier, fs.as_bytes(), seq.as_ref().map(|s| s.as_bytes()),
@@ -288,16 +276,21 @@ fn parse_codec(s: &str, flag: &str) -> i32 {
 
 /// --aln needs --ref, and the two are read once, before any row.
 /// --db and --aln companions for a reader, in the C's order: features first.
-fn informed(c: &cli::Cli, ro: &mut reader::ReadOpts, who: &str) -> Option<db::Feats> {
+/// smooth's positional hierarchy stands in for --hier under --db.
+fn informed(c: &cli::Cli, ro: &mut reader::ReadOpts, who: &str, hier: Option<&str>) -> Option<db::Feats> {
     if c.set.is_some() && c.db.is_none() { die("--set needs --db"); }
-    let feats = c.db.as_deref().map(|fp| {
-        let f = db::Feats::load(fp);
-        eprintln!("features: {} ids, {} sets", f.id2lab.len(), f.sets.len());
-        if f.sets.len() <= 32 { eprintln!("features: integer-tuple index on"); }
-        f
-    });
+    if c.hier.is_some() && c.db.is_none() { die("--hier does nothing without --db"); }
+    let feats = c.db.as_deref().map(|fp| load_feats(fp, c.hier.as_deref().or(hier)));
     ro.aln = load_aln(&c.aln, &c.refbed, &c.aln_names, who).map(std::sync::Arc::new);
     feats
+}
+
+fn load_feats(fp: &str, hier: Option<&str>) -> db::Feats {
+    let mut f = db::Feats::load(fp);
+    eprintln!("features: {} ids, {} sets", f.id2lab.len(), f.sets.len());
+    if f.sets.len() <= 32 { eprintln!("features: integer-tuple index on"); }
+    if let Some(h) = hier { f.load_hier(h); }
+    f
 }
 
 fn load_aln(paf: &Option<String>, refbed: &Option<String>,

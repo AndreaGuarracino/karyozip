@@ -17,8 +17,9 @@ const LENFLAG: u64 = 1 << 56;
 const TAILFLAG: u64 = 1 << 55;
 const PERMFLAG: u64 = 1 << 54;
 const PERMTOK: u64 = 1 << 53;
+const CARTFLAG: u64 = 1 << 52;
 const FLAGS: u64 = TOKFLAG | INTFLAG | DROPPED | ALNFLAG | DBFLAG | SIDEFLAG
-                 | LENFLAG | TAILFLAG | PERMFLAG | PERMTOK;
+                 | LENFLAG | TAILFLAG | PERMFLAG | PERMTOK | CARTFLAG;
 const IDXMAGIC: u64 = 0x3130_5844_4954_534b;   // "KSTIDX01"
 const ICHUNK: u64 = 65536;
 
@@ -116,6 +117,7 @@ pub struct Reader {
     /// walk in order continues instead of re-skipping the block's rows
     sc: Option<(usize, u64, Cursor)>,
     feathash: u64,
+    cart: bool,
     aln: Option<std::sync::Arc<crate::aln::Aln>>,
     lenfile: bool,
     /// --raw shows what is stored, so a zero length is the answer, not a fault.
@@ -131,6 +133,7 @@ fn rd<T>(r: Result<T, std::io::Error>, what: &str) -> T {
 impl Reader {
 
     pub fn feathash(&self) -> u64 { self.feathash }
+    pub fn cart(&self) -> bool { self.cart }
 
     pub fn open_with(path: &str, o: &ReadOpts) -> Reader {
         let mut f = rd(std::fs::File::open(path), "open");
@@ -191,6 +194,9 @@ impl Reader {
             }
             if h[1] & DBFLAG == 0 && o.db {
                 crate::bail("this track does not hold featureIDs");
+            }
+            if h[1] & CARTFLAG != 0 && h[1] & DBFLAG == 0 {
+                crate::bail("corrupt file: vocabulary featureIDs without --db");
             }
             if h[1] & LENFLAG != 0 && o.aln.is_none() {
                 crate::bail("this track leaves out every length the reference implies: decode it with --aln PAF --ref R");
@@ -396,6 +402,7 @@ impl Reader {
             ordnames: o.ordnames, nf, idx,
             hasidx, mhash: h[15], cur_ri: 0, cur_q: 0, cur_pend: 0, cached: None, sc: None,
             feathash: (h[5] >> 32) | ((h[9] >> 32) << 32),
+            cart: h[1] & CARTFLAG != 0,
             aln: o.aln.clone(), lenfile: h[1] & LENFLAG != 0 && !o.raw, raw: o.raw,
             alnq: None, blk_nos,
         }

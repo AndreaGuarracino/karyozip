@@ -67,7 +67,7 @@ mergecol() {  # mergecol COL: one label column of a --db region, runs merged
 
 for kind in presmoothed smoothed; do
   for fs in $sets; do
-    q=$(ls "$D"/*."$fs"."$kind".bed.gz 2>/dev/null | grep -v '/ref\.' | head -1); [ -n "$q" ] || continue
+    q=$(ls "$D"/*."$fs"."$kind".bed.gz 2>/dev/null | grep -v '/ref\.' | head -1); [ -n "$q" ] || { fail "$fs $kind: no track in the cell"; continue; }
     ref=$(ls "$D"/ref.*."$fs"."$kind".bed.gz 2>/dev/null | head -1)
     zcat "$q" > "$W/in.bed"; seq=$(head -1 "$W/in.bed" | cut -f1)
     for strat in plain aln; do
@@ -86,10 +86,9 @@ for kind in presmoothed smoothed; do
                       *) cp "$W/in.bed" "$W/want.bed"; "$C" $dec decode "$W/t.kst" > "$W/got.bed" 2>/dev/null;; esac
         case "$fl" in *"--names drop"*) cut -f2- "$W/want.bed" > "$W/w2"; cut -f2- "$W/got.bed" > "$W/g2"; mv "$W/w2" "$W/want.bed"; mv "$W/g2" "$W/got.bed";; esac
         cmp -s "$W/want.bed" "$W/got.bed" || fail "$lbl round trip"
-        # every reader, on the default form only: the bytes are the same file
-        # the readers run on every form that changes what a reader sees
+        # every reader on every form
         rseq=$seq; case "$fl" in *"--names drop"*) rseq=0;; esac   # dropped names: sequences are their ordinals
-        case "$fl" in ""|"--block all"|"--sort"|"--names drop") readers "$W/t.kst" "$rseq" "$fs" "$hier" "$dec";; esac
+        readers "$W/t.kst" "$rseq" "$fs" "$hier" "$dec"
         if [ -z "$fl" ]; then
           if [ $strat = plain ]; then plainref "$fs" "$kind"
           else cmp -s "$W/smooth.out" "$W/plain.$fs.$kind.smooth" || fail "$lbl smooth differs from the plain track's"
@@ -119,17 +118,16 @@ for kind in presmoothed smoothed; do
   done
   # --db: one BED per set, in header column order, and with --aln on top
   ins=""; for fs in $sets; do f=$(ls "$D"/*."$fs"."$kind".bed.gz 2>/dev/null | grep -v '/ref\.' | head -1); [ -n "$f" ] && ins="$ins $f"; done
-  [ $(echo $ins | wc -w) = $(echo $sets | wc -w) ] || { echo "  (db: not every set present for $kind, skipped)"; continue; }
+  [ $(echo $ins | wc -w) = $(echo $sets | wc -w) ] || { fail "db $kind: not every set has a track"; continue; }
   for strat in db dbaln; do
-    a="--db $feat"; [ $strat = dbaln ] && { ref=$(ls "$D"/ref.*.chromosome."$kind".bed.gz | head -1); a="$a --aln $paf --ref $ref $alnnames"; }
+    a="--db $feat --hier $hier"; [ $strat = dbaln ] && { ref=$(ls "$D"/ref.*.chromosome."$kind".bed.gz | head -1); a="$a --aln $paf --ref $ref $alnnames"; }
     for fl in "" "--block all" "--block 4096" "--sort" "--slow" "--names drop"; do
       lbl="db $kind $strat [$fl]"
-      # a smoothed track carries ancestor labels whose tuples are not in features.tsv: refused by design
-      [ $kind = smoothed ] && ALLOW=1; case "$strat:$fl:$alnnames" in dbaln:*"--names drop"*:) ALLOW=1;; esac
+      case "$strat:$fl:$alnnames" in dbaln:*"--names drop"*:) ALLOW=1;; esac
       same "$lbl encode" -- $a $fl encode $ins; rc=$?; ALLOW=0; [ $rc = 0 ] || continue
       cp "$W/c.out" "$W/t.kst"
       mkdir -p "$W/oc" "$W/or"; rm -f "$W/oc"/* "$W/or"/*
-      dec="--db $feat --out"; [ $strat = dbaln ] && dec="--aln $paf --ref $ref $alnnames $dec"
+      dec="--db $feat --hier $hier --out"; [ $strat = dbaln ] && dec="--aln $paf --ref $ref $alnnames $dec"
       case "$fl" in *"--names drop"*) dec="--names ordinal $dec";; esac
       "$C" $dec "$W/oc" decode "$W/t.kst" >/dev/null 2>&1; "$R" $dec "$W/or" decode "$W/t.kst" >/dev/null 2>&1
       for f in "$W/oc"/*.bed; do cmp -s "$f" "$W/or/$(basename "$f")" || fail "$lbl decode --db $(basename "$f")"; done

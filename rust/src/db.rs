@@ -185,14 +185,16 @@ impl Feats {
     }
 }
 
+/// Digits, in 64 bits, at most `max`: the C's num_arg, same words in the same order.
 fn num(b: &[u8], max: u32, what: &str) -> u32 {
     if b.is_empty() { crate::bail(what); }
     let mut v: u64 = 0;
     for &c in b {
         if !c.is_ascii_digit() { crate::bail(what); }
+        if v > (u64::MAX - (c - b'0') as u64) / 10 { crate::bail("a coordinate does not fit in 64 bits"); }
         v = v * 10 + (c - b'0') as u64;
-        if v > max as u64 { crate::bail(what); }
     }
+    if v > max as u64 { crate::bail(what); }
     v as u32
 }
 

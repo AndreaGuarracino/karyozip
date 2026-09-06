@@ -22,12 +22,3 @@ releases, so that pin is what makes byte-identity testable.
 Every raw pointer and every length check lives there; callers see slices and
 `Option<Vec<u8>>`. Beyond that, `unsafe` needs a measured win recorded in
 `notes/log.md`, not an argument.
-
-## State
-
-Milestone 1 done: the codec layer. Five zstd levels, rANS order 0 and 1,
-rANS with RLE and with pack, arith order 0 and 1, and bzip3 at two block
-sizes all give byte-identical output from Rust and from C on a 23.8 MB
-slice of a real track, and all eight round-trip.
-
-Next: the writer, then the reader, then the CLI.

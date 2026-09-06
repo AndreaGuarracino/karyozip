@@ -42,8 +42,11 @@ static inline double nowsec(void) {
     return t.tv_sec + 1e-9 * t.tv_nsec;
 }
 #define PH_RSS(i) do { if (PROF) PHRSS[i] = rss_now(); } while (0)
-#define PH_ADD(i, t0) do { if (PROF) { PH[i] += nowsec() - (t0); PHRSS[i] = rss_now(); } } while (0)
-static size_t PHRSS[9];
+/* the high-water mark is read from /proc at most every 10 ms: a span per
+   sequence over 3,000,000 sequences made a 1.7 s smooth take 104 s */
+#define PH_ADD(i, t0) do { if (PROF) { double _n = nowsec(); PH[i] += _n - (t0); \
+    if (_n - PHLAST > 0.01) { PHRSS[i] = rss_now(); PHLAST = _n; } } } while (0)
+static size_t PHRSS[9]; static double PHLAST;
 static double WALL0 = 0;
 /* --threads, else OMP_NUM_THREADS, else one per core capped at 8. The cap is
    measured, not guessed: encode is about half serial, so past 8 threads the

@@ -28,7 +28,7 @@ DIFF_PASS
 
 |                        |     C |  Rust |
 |------------------------|------:|------:|
-| lines, excluding vendored C | 4,389 | 4,426 |
+| lines, excluding vendored C | 4,392 | 4,451 |
 | files                  |     2 |    11 |
 | `unsafe` blocks        |     — |    14 |
 | stripped binary        | 383 KB | 2,557 KB |

@@ -100,6 +100,7 @@ for kind in presmoothed smoothed; do
         # difference, not ours, and is reported as such.
         if [ -z "$fl" ] && [ $strat = plain ] && [ $kind = presmoothed ]; then
           smo=$(ls "$D"/*."$fs".smoothed.bed.gz 2>/dev/null | grep -v '/ref\.' | head -1)
+          [ -n "$smo" ] || fail "$fs: no KaryoScope smoothed track in the cell"
           if [ -n "$smo" ]; then
             "$C" smooth "$W/t.kst" "$hier" "$fs" > "$W/sc.bed" 2>/dev/null
             "$R" smooth "$W/t.kst" "$hier" "$fs" > "$W/sr.bed" 2>/dev/null

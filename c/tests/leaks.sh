@@ -10,10 +10,10 @@ SAN=${1:-${KARYOZIP_SAN:-}}; BUILT=""
 W=$(mktemp -d)
 # a Rust binary under test runs under valgrind, which sees the same leaks
 if [ -z "$SAN" ] && [ -n "${KT:-}" ] && grep -q rust_begin_unwind "$KT" 2>/dev/null; then
-  command -v valgrind >/dev/null || { echo "leaks: skipped, no valgrind for the Rust"; exit 0; }
+  command -v valgrind >/dev/null || { echo "leaks: FAILED, no valgrind for the Rust"; exit 1; }
   # glibc's thread-local storage of pool threads still alive at exit is not a leak
   printf '{\n  tls\n  Memcheck:Leak\n  match-leak-kinds: definite\n  fun:calloc\n  fun:allocate_dtv\n}\n' > "$W/supp"
-  printf '#!/bin/bash\nexec valgrind -q --leak-check=full --errors-for-leak-kinds=definite --error-exitcode=99 --suppressions="%s" "%s" "$@"\n' "$W/supp" "$KT" > "$W/san"; chmod +x "$W/san"; SAN=$W/san
+  printf '#!/bin/bash\nulimit -n 4096 2>/dev/null\nexec valgrind -q --leak-check=full --errors-for-leak-kinds=definite --error-exitcode=99 --suppressions="%s" "%s" "$@"\n' "$W/supp" "$KT" > "$W/san"; chmod +x "$W/san"; SAN=$W/san
 fi
 if [ -z "$SAN" ]; then BUILT=1
   command -v gcc >/dev/null || { echo "leaks: skipped, no gcc"; exit 0; }

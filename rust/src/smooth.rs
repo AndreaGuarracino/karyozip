@@ -217,11 +217,17 @@ pub fn run(path: &str, hier: &str, fs: &[u8], seq: Option<&[u8]>,
         None => (0, r.nreads),
     };
     // One sequence: smoothed whole, printed where it overlaps the range.
-    let one = |r: &mut Reader, ri: u64, buf: &mut Vec<u8>| {
+    // The phases are the C's serial ones; its threaded path records none.
+    let one = |r: &mut Reader, ri: u64, buf: &mut Vec<u8>, prof: bool| {
+        let s = crate::prof::span(if prof { 6 } else { 9 });
         let (st, en, mut feat, novel) = r.seq_rows(ri, &labmap, &novelid, h.root);
+        drop(s);
         if hi > 0 && en.last().is_none_or(|&e| lo >= e) { return; }
+        let s = crate::prof::span(if prof { 4 } else { 9 });
         smooth_one(&h, &st, &en, &mut feat, maxgap);
+        drop(s);
         let name = r.name_at(ri).to_vec();
+        let _s = crate::prof::span(if prof { 5 } else { 9 });
         emit(&h, buf, &name, &st, &en, &feat, &novel, lo, hi, v1);
     };
     let wr = |out: &mut dyn Write, b: &[u8]| out.write_all(b).unwrap_or_else(|_| crate::bail("write failed"));
@@ -241,7 +247,7 @@ pub fn run(path: &str, hier: &str, fs: &[u8], seq: Option<&[u8]>,
                 let r = g.get_or_insert_with(|| { let mut r = Reader::open_with(path, ro); r.adopt_names(names.clone()); r });
                 let (a, b) = (first + c * chunk, (first + (c + 1) * chunk).min(last));
                 let mut buf = Vec::new();
-                for ri in a..b { one(r, ri, &mut buf); }
+                for ri in a..b { one(r, ri, &mut buf, false); }
                 buf
             })).collect();
             for p in &parts { wr(out, p); }
@@ -251,7 +257,7 @@ pub fn run(path: &str, hier: &str, fs: &[u8], seq: Option<&[u8]>,
     }
     let mut buf = Vec::with_capacity(1 << 20);
     for ri in first..last {
-        one(&mut r, ri, &mut buf);
+        one(&mut r, ri, &mut buf, true);
         if buf.len() > (1 << 20) - 4096 { wr(out, &buf); buf.clear(); }
     }
     wr(out, &buf);

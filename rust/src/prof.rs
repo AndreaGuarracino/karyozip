@@ -6,8 +6,8 @@ use std::sync::OnceLock;
 use std::time::Instant;
 
 pub static ON: AtomicBool = AtomicBool::new(false);
-static NS: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
-static HW: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
+static NS: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
+static HW: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
 static THR: AtomicU64 = AtomicU64::new(0);
 static T0: OnceLock<Instant> = OnceLock::new();
 static NAME: [&str; 9] = ["parse", "compress", "names", "index", "smooth",
@@ -24,10 +24,16 @@ pub struct Span(usize, Instant);
 pub fn span(i: usize) -> Option<Span> {
     ON.load(Relaxed).then(|| Span(i, Instant::now()))
 }
+/// The high-water mark is read from /proc at most every 10 ms, as the C.
+static LAST: AtomicU64 = AtomicU64::new(0);
 impl Drop for Span {
     fn drop(&mut self) {
         NS[self.0].fetch_add(self.1.elapsed().as_nanos() as u64, Relaxed);
-        HW[self.0].store(field("/proc/self/status", "VmHWM:"), Relaxed);
+        let now = T0.get().map_or(0, |t| t.elapsed().as_nanos() as u64);
+        if now - LAST.load(Relaxed) > 10_000_000 {
+            LAST.store(now, Relaxed);
+            HW[self.0].store(field("/proc/self/status", "VmHWM:"), Relaxed);
+        }
     }
 }
 

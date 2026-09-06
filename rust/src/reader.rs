@@ -991,8 +991,10 @@ impl Reader {
 
     /// One sequence as arrays: starts, ends, hierarchy node per run, and
     /// whether the label was "novel". What smoothing works on.
-    pub fn seq_rows(&mut self, ri: u64, labmap: &[i32], isnovel: &[u8], root: i32)
-        -> (Vec<u64>, Vec<u64>, Vec<i32>, Vec<u8>) {
+    /// The four arrays are the caller's and are cleared here, so a walk over
+    /// many sequences allocates once, as the C's r->sst and friends do.
+    pub fn seq_rows(&mut self, ri: u64, labmap: &[i32], isnovel: &[u8], root: i32,
+                    out: &mut SeqRows) {
         let (blk, off, nruns) = self.locate(ri);
         self.alnq = self.aln.as_ref().and_then(|a| a.find(self.name_at(ri)));
         let mut c = match self.sc.take() {
@@ -1003,8 +1005,10 @@ impl Reader {
             _ => self.at(blk, off),
         };
         let n = nruns as usize;
-        let (mut st, mut en) = (Vec::with_capacity(n), Vec::with_capacity(n));
-        let (mut feat, mut nov) = (Vec::with_capacity(n), Vec::with_capacity(n));
+        let SeqRows { st, en, feat, nov } = out;
+        for v in [&mut *st, &mut *en] { v.clear(); v.reserve(n); }
+        feat.clear(); feat.reserve(n);
+        nov.clear(); nov.reserve(n);
         let tskip = self.tailskip;
         let mut s = 0u64;
         for k in 0..nruns {
@@ -1030,6 +1034,9 @@ impl Reader {
         }
         let rows = self.b[c.blk].rows;
         self.sc = Some((c.blk, rows - c.left, c));
-        (st, en, feat, nov)
     }
 }
+
+/// One sequence as arrays, reused across sequences.
+#[derive(Default)]
+pub struct SeqRows { pub st: Vec<u64>, pub en: Vec<u64>, pub feat: Vec<i32>, pub nov: Vec<u8> }

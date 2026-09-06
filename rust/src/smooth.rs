@@ -219,17 +219,18 @@ pub fn run(path: &str, hier: &str, fs: &[u8], seq: Option<&[u8]>,
     };
     // One sequence: smoothed whole, printed where it overlaps the range.
     // The phases are the C's serial ones; its threaded path records none.
-    let one = |r: &mut Reader, ri: u64, buf: &mut Vec<u8>, prof: bool| {
+    let one = |r: &mut Reader, ri: u64, sr: &mut crate::reader::SeqRows,
+               buf: &mut Vec<u8>, prof: bool| {
         let s = crate::prof::span(if prof { 6 } else { 9 });
-        let (st, en, mut feat, novel) = r.seq_rows(ri, &labmap, &novelid, h.root);
+        r.seq_rows(ri, &labmap, &novelid, h.root, sr);
         drop(s);
-        if hi > 0 && en.last().is_none_or(|&e| lo >= e) { return; }
+        if hi > 0 && sr.en.last().is_none_or(|&e| lo >= e) { return; }
         let s = crate::prof::span(if prof { 4 } else { 9 });
-        smooth_one(&h, &st, &en, &mut feat, maxgap);
+        smooth_one(&h, &sr.st, &sr.en, &mut sr.feat, maxgap);
         drop(s);
         let name = r.name_at(ri).to_vec();
         let _s = crate::prof::span(if prof { 5 } else { 9 });
-        emit(&h, buf, &name, &st, &en, &feat, &novel, lo, hi, v1);
+        emit(&h, buf, &name, &sr.st, &sr.en, &sr.feat, &sr.nov, lo, hi, v1);
     };
     let wr = |out: &mut dyn Write, b: &[u8]| out.write_all(b).unwrap_or_else(|_| crate::bail("write failed"));
     let (nthr, chunk) = (rayon::current_num_threads() as u64, 4096u64);
@@ -252,12 +253,13 @@ pub fn run(path: &str, hier: &str, fs: &[u8], seq: Option<&[u8]>,
                     let mut r = Reader::open_with(path, ro);
                     r.adopt_names(names);
                     let mut buf = Vec::with_capacity(1 << 20);
+                    let mut sr = crate::reader::SeqRows::default();
                     loop {
                         let c = next.fetch_add(1, Ordering::Relaxed);
                         if c >= nchunk { break; }
                         let (a, b) = (first + c * chunk, (first + (c + 1) * chunk).min(last));
                         buf.clear();
-                        for ri in a..b { one(&mut r, ri, &mut buf, false); }
+                        for ri in a..b { one(&mut r, ri, &mut sr, &mut buf, false); }
                         let mut g = turn.lock().unwrap_or_else(|e| e.into_inner());
                         while g.0 != c { g = bell.wait(g).unwrap_or_else(|e| e.into_inner()); }
                         wr(&mut *g.1, &buf);
@@ -271,8 +273,9 @@ pub fn run(path: &str, hier: &str, fs: &[u8], seq: Option<&[u8]>,
         return;
     }
     let mut buf = Vec::with_capacity(1 << 20);
+    let mut sr = crate::reader::SeqRows::default();
     for ri in first..last {
-        one(&mut r, ri, &mut buf, true);
+        one(&mut r, ri, &mut sr, &mut buf, true);
         if buf.len() > (1 << 20) - 4096 { wr(out, &buf); buf.clear(); }
     }
     wr(out, &buf);

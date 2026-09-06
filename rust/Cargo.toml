@@ -32,3 +32,8 @@ cc = "1.4.5"
 [profile.release]
 opt-level = 3
 debug     = true
+# One codegen unit and fat LTO: the hot loops are small and cross-module
+# (reader::step, smooth_one, the hierarchy tables), and the C sees all of
+# them in one translation unit.
+lto            = "fat"
+codegen-units  = 1

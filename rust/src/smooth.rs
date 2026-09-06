@@ -78,9 +78,6 @@ impl Hier {
         }
     }
 
-    fn is_anc(&self, node: i32, pa: i32) -> bool {
-        self.anc[node as usize * self.node.len() + pa as usize] != 0
-    }
 }
 
 /// One sequence, in place. Promotes a run to the lowest common ancestor of
@@ -89,6 +86,10 @@ fn smooth_one(h: &Hier, st: &[u64], en: &[u64], feat: &mut [i32], maxgap: u64) {
     let n = feat.len();
     if n == 0 { return; }
     let nn = h.node.len();
+    // the tables as slices, so the inner loops index them directly, as the
+    // C's ISANC macro does
+    let (anc, par, lca) = (&h.anc[..], &h.par[..], &h.lca[..]);
+    let isanc = |node: i32, pa: i32| anc[node as usize * nn + pa as usize] != 0;
     let mut was = vec![0u8; n];
     let mut dis = vec![0u32; nn];
     let mut rel: Vec<usize> = Vec::with_capacity(n);
@@ -108,13 +109,13 @@ fn smooth_one(h: &Hier, st: &[u64], en: &[u64], feat: &mut [i32], maxgap: u64) {
             while j + 1 < n {
                 let nf = feat[j + 1];
                 if st[j + 1] - lre > maxgap { break; }
-                if h.is_anc(lrf, nf) {
+                if isanc(lrf, nf) {
                     if dis[nf as usize] == mark { break; }
                     rel.push(j + 1);
                     lri = j + 1; lrf = nf; lre = en[j + 1]; j += 1;
-                } else if !h.is_anc(nf, lrf) {
+                } else if !isanc(nf, lrf) {
                     let mut c = nf;
-                    while c >= 0 { dis[c as usize] = mark; c = h.par[c as usize]; }
+                    while c >= 0 { dis[c as usize] = mark; c = par[c as usize]; }
                     if firstun < 0 && was[j + 1] == 0 { firstun = (j + 1) as i64; }
                     j += 1;
                 } else { break; }
@@ -125,11 +126,11 @@ fn smooth_one(h: &Hier, st: &[u64], en: &[u64], feat: &mut [i32], maxgap: u64) {
             while k + 1 < n {
                 let nf = feat[k + 1];
                 if st[k + 1] - lre > maxgap { break; }
-                if h.is_anc(nf, lrf) {
+                if isanc(nf, lrf) {
                     rel.push(k + 1);
                     lri = k + 1; lrf = nf; lre = en[k + 1]; k += 1;
-                } else if !h.is_anc(lrf, nf) {
-                    if h.is_anc(nf, peak) { break; }
+                } else if !isanc(lrf, nf) {
+                    if isanc(nf, peak) { break; }
                     if firstun < 0 && was[k + 1] == 0 { firstun = (k + 1) as i64; }
                     k += 1;
                 } else { break; }
@@ -139,10 +140,10 @@ fn smooth_one(h: &Hier, st: &[u64], en: &[u64], feat: &mut [i32], maxgap: u64) {
             if nrel >= 2 { nrel -= 1; }   // archive quirk, kept
             for &t in &rel[..nrel] { was[t] = 1; }
             if we > ws {
-                let l = h.lca[feat[ws] as usize * nn + feat[we] as usize] as i32;
+                let l = lca[feat[ws] as usize * nn + feat[we] as usize] as i32;
                 if l >= 0 {
                     for x in feat.iter_mut().take(we).skip(ws + 1) {
-                        if *x != l && h.is_anc(l, *x) { *x = l; changes = true; }
+                        if *x != l && isanc(l, *x) { *x = l; changes = true; }
                     }
                 }
             }

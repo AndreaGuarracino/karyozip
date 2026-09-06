@@ -2517,6 +2517,7 @@ typedef struct {
     int name_borrowed;         /* the table belongs to another reader */
     uint8_t *ichunk; uint64_t nichunk, *coff, *cpendv, curchunk, ibcap;
     uint64_t *sst, *sen; int *sfeat; uint8_t *snov; uint64_t scap;
+    const uint8_t *payend;        /* the cached block's payload end, per reader */
     const uint8_t *curlp, *curip;
     uint64_t rowhash, tailpred, tailskip; int taildec;   /* for a track read as --ref */
 } R;
@@ -3136,7 +3137,10 @@ static int64_t rfind(R *r, const char *nm) {
 static void loadblk(R *r, uint64_t b) {
 
     if (b >= r->nblk) die("corrupt index: a block number is past the end");
-    if (r->cached == b) return;
+    /* PAYEND and LENDEC describe the block being read, and two readers
+       interleave under --ref R.kst: re-establish them even when this
+       reader's block is already decoded. */
+    if (r->cached == b) { PAYEND = r->payend; LENDEC = r->lenfile && r->b[b].nos != 1; return; }
     r->curblk = UINT64_MAX;   /* a new block invalidates the cursor */
     uint8_t *cb = xmalloc(r->b[b].size);
     if (fseeko(r->f, (off_t)(r->data0 + r->b[b].off), SEEK_SET)) die("seek");
@@ -3162,7 +3166,7 @@ static void loadblk(R *r, uint64_t b) {
     if (g != r->b[b].lraw || h2 != r->b[b].raw)
         die("corrupt block: a stream decodes to a size the index does not claim");
     r->lp0 = r->blkbuf; r->ip0 = r->blkbuf + g;
-    PAYEND = r->blkbuf + g + h2;
+    r->payend = PAYEND = r->blkbuf + g + h2;
     r->cached = b;
 }
 

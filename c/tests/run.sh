@@ -25,6 +25,15 @@ cmp -s "$W/rt" "$D/s.bed" && echo "aln restore: byte-identical" || { echo "aln r
 $KT encode < "$D/ref.bed" > "$W/ref.kst" 2>/dev/null
 $KT encode --aln "$D/p.paf" --ref "$W/ref.kst" < "$D/s.bed" 2>/dev/null | cmp -s - "$W/d.kt" && echo "aln with a .kst reference: same bytes" || { echo "aln with a .kst reference: WRONG"; fail=1; }
 $KT decode --aln "$D/p.paf" --ref "$W/ref.kst" "$W/d.kt" 2>/dev/null | cmp -s - "$D/s.bed" && echo "aln restore from a .kst reference: byte-identical" || { echo "aln restore from a .kst reference: WRONG"; fail=1; }
+# Two readers interleave under --ref R.kst, and the payload bound and the
+# length mode are thread-globals: a reference contig taken from a block the
+# reference reader already held left the track's bound in place and decode
+# died with "a run reads past the payload". Many contigs, many blocks.
+$KT encode --block 4 < "$D/db.rall.bed" > "$W/rall.kst" 2>/dev/null
+$KT encode --block 4 --aln "$D/db.self.paf" --ref "$D/db.rall.bed" < "$D/db.rall.bed" > "$W/rall.aln.kst" 2>/dev/null
+$KT decode --aln "$D/db.self.paf" --ref "$D/db.rall.bed" "$W/rall.aln.kst" > "$W/rall.want" 2>/dev/null
+$KT decode --aln "$D/db.self.paf" --ref "$W/rall.kst" "$W/rall.aln.kst" 2>/dev/null | cmp -s - "$W/rall.want" \
+  && echo "a .kst reference read across contigs: same rows" || { echo "a .kst reference read across contigs: WRONG"; fail=1; }
 $KT decode --aln "$D/p.paf" --ref "$W/d.kt" "$W/d.kt" >/dev/null 2>&1 && { echo "an --aln track as reference: ACCEPTED"; fail=1; } || echo "an --aln track as reference: refused, as it should"
 
 $KT encode < "$D/s.bed" > "$W/p.kt" 2>/dev/null

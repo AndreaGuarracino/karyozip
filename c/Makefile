@@ -23,12 +23,13 @@ SRC := karyozip.c \
 # binary and every library check "differs".
 all: build/karyozip build/libkaryozip.a build/libtest
 
-build/karyozip: $(SRC)
+HDR := karyozip.h $(wildcard htscodecs/*.h bzip3/*.h)
+build/karyozip: $(SRC) $(HDR)
 	mkdir -p build
 	$(CC) $(CFLAGS) $(ZSTD_CFLAGS) -o $@ $(SRC) $(LDFLAGS) $(ZSTD_LIBS) -lm -lpthread -lz
 
 # the same sources, minus main: an annotator can write .kst without a BED
-build/libkaryozip.a: $(SRC) karyozip.h
+build/libkaryozip.a: $(SRC) $(HDR)
 	mkdir -p build/lib
 	$(CC) $(CFLAGS) $(ZSTD_CFLAGS) -DKARYOZIP_LIB -c $(SRC) && mv *.o build/lib/
 	$(AR) rcs $@ build/lib/*.o

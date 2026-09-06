@@ -145,8 +145,8 @@ PY
 printf 'feature_set\tchild\tparent\nfs\tL0\tcategorized\n' > "$W/hier.tsv"
 one_forged() {   # one file, three commands, its own error file
   local m=$1 e="$1.err"
-  for c in "decode --names ordinal" "query --names ordinal" smooth; do
-    case $c in query*) args="$m read1";; smooth) args="$m $W/hier.tsv fs";; *) args="$m";; esac
+  for c in "decode --names ordinal" "region --names ordinal" smooth; do
+    case $c in region*) args="$m read1";; smooth) args="$m $W/hier.tsv fs";; *) args="$m";; esac
     ASAN_OPTIONS=detect_leaks=0 timeout 30 ${SAN:-$KT} $c $args > /dev/null 2>"$e"; rc=$?
     [ $rc -gt 1 ] && { echo "fuzz: forged $(basename $m) $c crashed rc=$rc"; return 1; }
     grep -qE "AddressSanitizer|runtime error" "$e" && { echo "fuzz: forged $(basename $m) $c sanitizer report"; return 1; }

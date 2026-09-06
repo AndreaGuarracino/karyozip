@@ -15,13 +15,13 @@ else echo "codec versions DIFFER: c=[$cv] rust=[$rv]"; fail=1; fi
 
 # Run both on the same input and arguments: stdout bytes and exit code must
 # match. IN names the stdin file. Every section below tallies with these.
-ok=0; bad=0
-both() {  # both LABEL args...
+ok=0; bad=0; EXPECT=ok
+both() {  # both LABEL args...  a shared refusal passes only where EXPECT=fail
   local l=$1; shift
   "$C" "$@" < "${IN:-/dev/null}" > "$W/c.out" 2>/dev/null; local a=$?
   "$R" "$@" < "${IN:-/dev/null}" > "$W/r.out" 2>/dev/null; local b=$?
-  if cmp -s "$W/c.out" "$W/r.out" && [ $a = $b ]; then ok=$((ok+1))
-  else bad=$((bad+1)); echo "  differs: $l"; fi
+  if cmp -s "$W/c.out" "$W/r.out" && [ $a = $b ] && { [ $a = 0 ] || [ $EXPECT = fail ]; }; then ok=$((ok+1))
+  else bad=$((bad+1)); echo "  differs: $l (rc $a/$b)"; fi
 }
 tally() { [ $bad = 0 ] && echo "$1: $ok forms identical" || { echo "$1: $bad of $((ok+bad)) DIFFER"; fail=1; }; ok=0; bad=0; }
 
@@ -101,8 +101,9 @@ tally "sorted decode"
 for f in ls.bed s.bed db.rall.bed ord.bed; do
   "$C" encode --names drop < "$D/$f" > "$W/d.kst" 2>/dev/null
   for dfl in "--names ordinal" "--raw"; do both "decode $dfl on $f" $dfl decode "$W/d.kst"; done
-  "$C" encode --names "drop:$W/side" < "$D/$f" > "$W/s.kst" 2>/dev/null
-  both "sidecar $f" --names "$W/side" decode "$W/s.kst"
+  # an ordinal-named input has no names to put beside the track: refused by design
+  if "$C" encode --names "drop:$W/side" < "$D/$f" > "$W/s.kst" 2>/dev/null; then both "sidecar $f" --names "$W/side" decode "$W/s.kst"
+  else EXPECT=fail both "sidecar $f refused" encode --names "drop:$W/side2" < "$D/$f"; EXPECT=ok; fi
   "$C" encode < "$D/$f" > "$W/p.kst" 2>/dev/null
   both "--raw $f" --raw decode "$W/p.kst"
 done
@@ -165,6 +166,7 @@ done
   || { echo "--aln: $abad DIFFER"; fail=1; }
 
 # 11. the same refusals, with the same words.
+EXPECT=fail
 for bad_in in 'r1\t0\t10' 'r1\t5\t10\tA' 'r1\t0\t0\tA' '\t0\t10\tA' 'r1\tx\t10\tA'; do
   cm=$(printf "$bad_in\n" | "$C" encode 2>&1 >/dev/null | tail -1)
   rm2=$(printf "$bad_in\n" | "$R" encode 2>&1 >/dev/null | tail -1)
@@ -172,6 +174,7 @@ for bad_in in 'r1\t0\t10' 'r1\t5\t10\tA' 'r1\t0\t0\tA' '\t0\t10\tA' 'r1\tx\t10\t
 done
 echo "refusals: same message from both"
 
+EXPECT=ok
 # 11b. gzipped input, which is how the real tracks are stored. zlib and
 # zlib-rs must inflate to the same bytes, so the track must be identical to
 # the one built from the plain file.
@@ -200,8 +203,8 @@ done
 # every malformed form, including --help and --version.
 cok=0; cbad=0
 cli() {
-  co=$("$C" "$@" </dev/null 2>&1 | tr -d '\0'); cr=$?
-  ro=$("$R" "$@" </dev/null 2>&1 | tr -d '\0'); rr=$?
+  co=$("$C" "$@" </dev/null 2>&1; echo "rc=$?"); co=${co//$'\0'/}; cr=${co##*rc=}
+  ro=$("$R" "$@" </dev/null 2>&1; echo "rc=$?"); ro=${ro//$'\0'/}; rr=${ro##*rc=}
   if [ "$co" = "$ro" ] && [ "$cr" = "$rr" ]; then cok=$((cok+1)); return; fi
   cbad=$((cbad+1)); echo "  cli differs: [$*]"; echo "    c=[$(echo "$co" | head -1)]"
   echo "    rust=[$(echo "$ro" | head -1)]"

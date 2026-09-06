@@ -36,6 +36,7 @@ sets=$(head -1 "$feat" | cut -f2- | tr '\t' ' ')
 ordinal=0; zcat "$(ls "$D"/*.bed.gz | grep -v '/ref\.' | head -1)" | head -1 | cut -f1 | grep -qE '^[0-9]+$' && ordinal=1
 alnnames=""; [ $ordinal = 1 ] && alnnames="--aln-names $names"
 echo "cell $(basename "$D"): sets [$sets], ordinal-named=$ordinal"
+[ -n "$sets" ] && [ -s "$paf" ] && [ "$(ls "$D"/*.presmoothed.bed.gz 2>/dev/null | grep -vc '/ref\.')" -gt 0 ] || { echo "matrix: $D is not a fixture cell"; echo MATRIX_FAIL; exit 1; }
 
 FLAGS=("" "--block all" "--block 4096" "--level 3" "--level 22" "--names keep" \
        "--names drop" "--sort" "--sort=1M" "--slow" "--tail 0" "--tail 1")
@@ -86,8 +87,10 @@ for kind in presmoothed smoothed; do
         case "$fl" in *"--names drop"*) cut -f2- "$W/want.bed" > "$W/w2"; cut -f2- "$W/got.bed" > "$W/g2"; mv "$W/w2" "$W/want.bed"; mv "$W/g2" "$W/got.bed";; esac
         cmp -s "$W/want.bed" "$W/got.bed" || fail "$lbl round trip"
         # every reader, on the default form only: the bytes are the same file
+        # the readers run on every form that changes what a reader sees
+        rseq=$seq; case "$fl" in *"--names drop"*) rseq=0;; esac   # dropped names: sequences are their ordinals
+        case "$fl" in ""|"--block all"|"--sort"|"--names drop") readers "$W/t.kst" "$rseq" "$fs" "$hier" "$dec";; esac
         if [ -z "$fl" ]; then
-          readers "$W/t.kst" "$seq" "$fs" "$hier" "$dec"
           if [ $strat = plain ]; then plainref "$fs" "$kind"
           else cmp -s "$W/smooth.out" "$W/plain.$fs.$kind.smooth" || fail "$lbl smooth differs from the plain track's"
                cmp -s "$W/region.out" "$W/plain.$fs.$kind.region" || fail "$lbl region differs from the plain track's"
@@ -103,7 +106,7 @@ for kind in presmoothed smoothed; do
             "$R" smooth "$W/t.kst" "$hier" "$fs" > "$W/sr.bed" 2>/dev/null
             zcat "$smo" > "$W/ks.bed"
             if cmp -s "$W/sc.bed" "$W/ks.bed" && cmp -s "$W/sr.bed" "$W/ks.bed"; then oracle_ok=$((oracle_ok+1))
-            elif cmp -s "$W/sc.bed" "$W/sr.bed"; then oracle_miss=$((oracle_miss+1)); echo "  oracle: $fs smooth differs from KaryoScope, identically in both"
+            elif cmp -s "$W/sc.bed" "$W/sr.bed"; then oracle_miss=$((oracle_miss+1)); fail "$fs smooth differs from KaryoScope, identically in both"
             else fail "$fs smooth vs KaryoScope: C $(cmp -s "$W/sc.bed" "$W/ks.bed" && echo matches || echo differs), Rust $(cmp -s "$W/sr.bed" "$W/ks.bed" && echo matches || echo differs)"; fi
           fi
         fi

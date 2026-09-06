@@ -34,7 +34,7 @@ timed() {  # timed OUTFILE IN cmd... : fastest wall, largest RSS, or "refused re
 ratio() { awk -v a=$1 -v b=$2 'BEGIN{ if (b > 0) printf "%.2f", a/b; else print "NA" }'; }
 queries() {  # queries BIN "FLAGS" KST NAMEFILE : NQ random point queries, ms stats; NA unless every one answered
   local b=$1 fl=$2 k=$3 nf=$4; : > "$W/q"; : > "$W/qbad"
-  shuf -n $NQ --random-source=<(yes) "$nf" | while read -r nm; do
+  shuf -r -n $NQ --random-source=<(yes) "$nf" | while read -r nm; do   # with replacement: a cut cell may hold 10 sequences
     s=$(date +%s%N); "$b" $fl region "$k" "$nm" 100 > "$W/qo" 2>/dev/null || echo x >> "$W/qbad"; e=$(date +%s%N)
     [ -s "$W/qo" ] || echo x >> "$W/qbad"
     echo $(( (e - s) / 1000 )) >> "$W/q"
@@ -75,7 +75,8 @@ row() {  # row SET KIND INFORMED SEEK MODE IMPL BIN INPUT(s) ENCFLAGS DECFLAGS C
   fi
   local ix=0 q="NA NA NA NA"
   if [ "$seek" = seekable ] && [ "$set" != ALL ]; then
-    cp "$W/k.kst" "$W/ki.kst"; "$bin" index "$W/ki.kst" >/dev/null 2>&1; ix=$(( $(stat -c%s "$W/ki.kst") - kst ))
+    cp "$W/k.kst" "$W/ki.kst"
+    if "$bin" index "$W/ki.kst" >/dev/null 2>&1; then ix=$(( $(stat -c%s "$W/ki.kst") - kst )); else echo "index refused on $set $kind $inf $mode $impl" >&2; ix=NA; fi
     q=$(NQ=$([ "$inf" = not-informed ] || [ "$inf" = db-informed ] && echo $NQ || echo $NQ_ALN) queries "$bin" "$df" "$W/ki.kst" "$W/names")
   fi
   local tot=$((kst + comp))

@@ -7,12 +7,17 @@ use std::io::{BufWriter, Read, Write};
 
 
 /// The C's wording for a number that is not one.
-fn num(v: &Option<String>, lo: u64, hi: u64, what: &'static str) -> Option<u64> {
-    let s = v.as_ref()?;
-    let n = karyozip::bedcoord(s.as_bytes(), what);   // digits only, as the C
+/// A count: digits only, at most 18 of them, in range, as the C's int_arg.
+fn count(s: &str, lo: u64, hi: u64, what: &'static str) -> u64 {
+    if s.len() > 18 { die(what); }
+    let n = karyozip::bedcoord(s.as_bytes(), what);
     if n < lo || n > hi { die(what); }
-    Some(n)
+    n
 }
+fn num(v: &Option<String>, lo: u64, hi: u64, what: &'static str) -> Option<u64> {   // a coordinate-sized number, as num_arg
+    v.as_ref().map(|s| { let n = karyozip::bedcoord(s.as_bytes(), what); if n < lo || n > hi { die(what); } n })
+}
+fn cnt(v: &Option<String>, lo: u64, hi: u64, what: &'static str) -> Option<u64> { v.as_ref().map(|s| count(s, lo, hi, what)) }
 
 /// A positional the command cannot run without.
 fn need(v: &Option<String>) -> &str {
@@ -38,7 +43,7 @@ fn main() {
     // is what the C does. The pool is always explicit, so RAYON_NUM_THREADS
     // cannot reach it and the two binaries read the one same variable.
     const THRCAP: usize = 8;
-    let n = match num(&c.threads, 1, 1024, "--threads is a number of 1 to 1024") {
+    let n = match cnt(&c.threads, 1, 1024, "--threads is a number of 1 to 1024") {
         Some(t) => t as usize,
         None => match std::env::var("OMP_NUM_THREADS").ok().and_then(|s| s.parse().ok()) {
             Some(m @ 1..) => usize::min(m, 1024),
@@ -53,11 +58,10 @@ fn main() {
     let mut opt = writer::Options::default();
     if let Some(b) = &c.block {
         opt.block = if b == "all" { u64::MAX } else {
-            karyozip::bedcoord(b.as_bytes(), "--block is a number of runs, 1 or more, or \"all\"")
+            count(b, 1, i64::MAX as u64, "--block is a number of runs, 1 or more, or \"all\"")
         };
-        if opt.block == 0 { die("--block is a number of runs, 1 or more, or \"all\""); }
     }
-    if let Some(l) = num(&c.level, 1, 22, "--level is a zstd level, 1 to 22") {
+    if let Some(l) = cnt(&c.level, 1, 22, "--level is a zstd level, 1 to 22") {
         opt.level = l as i32;
         opt.levelset = true;
     }
@@ -69,8 +73,8 @@ fn main() {
         if m.is_empty() && std::env::args().any(|a| a == "--sort=") { mem_arg(""); }
         if !m.is_empty() { opt.sortmem = mem_arg(m); }
     }
-    opt.tail = num(&c.tail, 0, 1, "--tail is 0 or 1").map(|t| t == 1);
-    if let Some(k) = num(&c.tok_chunk, 1, 0x7fff_ffff, "--tok-chunk needs a number") {
+    opt.tail = cnt(&c.tail, 0, 1, "--tail is 0 or 1").map(|t| t == 1);
+    if let Some(k) = cnt(&c.tok_chunk, 1, 0x7fff_ffff, "--tok-chunk needs a number") {
         opt.tok_chunk = Some((k as usize).min(9_000_000));
     }
     opt.id_codec = c.id_codec.as_deref().map(|v| parse_codec(v, "--id-codec"));
@@ -169,7 +173,8 @@ fn main() {
             };
             let (lo, hi, hlo) = match (a, b) {
                 (None, _) => (0, 0, 0),
-                (Some(_), None) => { let x = p(a, "region: start is not a number"); (x, x + 1, 0) }
+                (Some(_), None) => { let x = p(a, "region: start is not a number");
+                                     if x == u64::MAX { die("region: start is not a number"); } (x, x + 1, 0) }
                 (Some(_), Some(_)) => {
                     let x = p(a, "region: start is not a number");
                     let y = p(b, "region: end is not a number");

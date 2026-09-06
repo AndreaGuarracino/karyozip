@@ -145,6 +145,8 @@ static uint64_t fnvbuf(uint64_t h, const void *p, size_t n) {
 }
 #define FNV0 0xcbf29ce484222325ULL
 static uint64_t fnvstr(const char *s) { return fnvbuf(FNV0, s, strlen(s)); }
+static uint64_t ld64(const void *p) { uint64_t v; memcpy(&v, p, 8); return v; }
+static uint32_t ld32(const void *p) { uint32_t v; memcpy(&v, p, 4); return v; }
 
 static long int_arg(const char *p, long lo, long hi, const char *what) {   /* digits only, in range */
     if (!p || !*p || strspn(p, "0123456789") != strlen(p) || strlen(p) > 18) die(what);
@@ -2992,39 +2994,43 @@ static int64_t idxlookup(R *r, const char *path, const char *nm) {
     void *m = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
     close(fd);
     if (m == MAP_FAILED) return -1;
-    /* the trailer is the last four words, magic last */
-    const uint64_t *tail = (const uint64_t *)((const char *)m + st.st_size - 32);
-    uint64_t n = tail[0];
-    if (tail[3] != IDXMAGIC || n != r->nreads || n > (uint64_t)st.st_size / 20
+    /* the trailer is the last four words, magic last. Nothing in the file is
+       aligned, so every word is read with memcpy, never through a cast. */
+    const char *tail = (const char *)m + st.st_size - 32;
+    uint64_t n = ld64(tail);
+    if (ld64(tail + 24) != IDXMAGIC || n != r->nreads || n > (uint64_t)st.st_size / 20
         || (uint64_t)st.st_size < 32 + n * 20
-        || tail[2] != (r->mhash ^ namesrc())) { munmap(m, (size_t)st.st_size); return -1; }
+        || ld64(tail + 16) != (r->mhash ^ namesrc())) { munmap(m, (size_t)st.st_size); return -1; }
     const char *base = (const char *)m + st.st_size - 32 - n * 20;
-    const uint64_t *key = (const uint64_t *)base;
-    const uint64_t *key2 = (const uint64_t *)(base + n * 8);
-    const uint32_t *ord = (const uint32_t *)(base + n * 16);
+    #define KEY(i) ld64(base + (i) * 8)
+    #define KEY2(i) ld64(base + n * 8 + (i) * 8)
+    #define ORD(i) ld32(base + n * 16 + (i) * 4)
     uint64_t want = fnvstr(nm), want2 = h64b(nm);
     int64_t out = -1;
     uint64_t lo = 0, hi = n;
     while (lo < hi) {
         uint64_t mid = lo + (hi - lo) / 2;
-        if (key[mid] == want) {
+        if (KEY(mid) == want) {
             uint64_t a2 = mid;
-            while (a2 > 0 && key[a2 - 1] == want) a2--;
+            while (a2 > 0 && KEY(a2 - 1) == want) a2--;
             uint64_t b2 = mid + 1;
-            while (b2 < n && key[b2] == want) b2++;
+            while (b2 < n && KEY(b2) == want) b2++;
 
-            if (b2 - a2 == 1 && key2[a2] == (want2 ^ (ord[a2] * 0x9e3779b97f4a7c15ULL)) && ord[a2] < r->nreads
-                && (!r->names_ready || !strcmp(r->name[ord[a2]], nm))) { out = (int64_t)ord[a2]; break; }
+            if (b2 - a2 == 1 && KEY2(a2) == (want2 ^ (ORD(a2) * 0x9e3779b97f4a7c15ULL)) && ORD(a2) < r->nreads
+                && (!r->names_ready || !strcmp(r->name[ORD(a2)], nm))) { out = (int64_t)ORD(a2); break; }
             if (b2 - a2 == 1) break;
             ensurenames(r);
             for (uint64_t j = a2; j < b2; j++)
-                if (ord[j] < r->nreads && key2[j] == (want2 ^ (ord[j] * 0x9e3779b97f4a7c15ULL)) && !strcmp(r->name[ord[j]], nm)) {
-                    out = (int64_t)ord[j]; break;
+                if (ORD(j) < r->nreads && KEY2(j) == (want2 ^ (ORD(j) * 0x9e3779b97f4a7c15ULL)) && !strcmp(r->name[ORD(j)], nm)) {
+                    out = (int64_t)ORD(j); break;
                 }
             break;
         }
-        if (key[mid] < want) lo = mid + 1; else hi = mid;
+        if (KEY(mid) < want) lo = mid + 1; else hi = mid;
     }
+    #undef KEY
+    #undef KEY2
+    #undef ORD
     munmap(m, (size_t)st.st_size);
     return out;
 }
@@ -3967,10 +3973,13 @@ static void decode_db(const char *path, const char *dir) {
     char pb[4096];
     if (tostd) { o[0].f = stdout; o[0].cap = 1 << 20; o[0].b = xmalloc(o[0].cap); }
     else {
-        for (char *q = strchr(pb, 0), *d = xstrdup(dir); ; q++) {   /* mkdir -p, as the Rust does */
-            if (q == pb) { q = d; }
-            if (*q == '/' || !*q) { char c = *q; *q = 0; if (*d && mkdir(d, 0777) && errno != EEXIST) die("cannot create the output directory"); *q = c; if (!c) { free(d); break; } }
+        char *d = xstrdup(dir);                     /* mkdir -p, as the Rust does */
+        for (char *q = d + 1; ; q++) if (*q == '/' || !*q) {
+            char c = *q; *q = 0;
+            if (mkdir(d, 0777) && errno != EEXIST) die("cannot create the output directory");
+            *q = c; if (!c) break;
         }
+        free(d);
         for (size_t i = 0; i < NSETK; i++) {
             struct stat ts; int pn = snprintf(pb, sizeof pb, "%s/%s.bed", dir, fset[SETK[i]]);
             if (pn < 0 || (size_t)pn >= sizeof pb - 16) die("--out: the output path is too long");

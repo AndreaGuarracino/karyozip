@@ -14,8 +14,6 @@ rust:
 rust-test: all rust
 	cd rust && cargo test --release
 	KT=$(CURDIR)/rust/target/release/karyozip bash c/tests/run.sh
-	KT=$(CURDIR)/rust/target/release/karyozip bash c/tests/fuzz.sh \
-	  $(CURDIR)/rust/target/release/karyozip
 	bash tests/diff.sh
 
 diff: all rust

@@ -228,14 +228,14 @@ pub fn run(path: &str, hier: &str, fs: &[u8], seq: Option<&[u8]>,
     let (nthr, chunk) = (rayon::current_num_threads() as u64, 4096u64);
     if nthr > 1 && last - first >= 64 {
         // As the C's smooth_mt: chunks of sequences on worker threads, each
-        // with its own reader, written in order, a bounded window at a time.
+        // with its own reader, written in order, eight chunks per thread in flight.
         use rayon::prelude::*;
         thread_local! { static RD: std::cell::RefCell<Option<Reader>> = const { std::cell::RefCell::new(None) }; }
         let names = r.names_shared();
         let nchunk = (last - first).div_ceil(chunk);
         let mut c0 = 0;
         while c0 < nchunk {
-            let c1 = (c0 + nthr * 2).min(nchunk);
+            let c1 = (c0 + nthr * 8).min(nchunk);
             let parts: Vec<Vec<u8>> = (c0..c1).into_par_iter().map(|c| RD.with(|cell| {
                 let mut g = cell.borrow_mut();
                 let r = g.get_or_insert_with(|| { let mut r = Reader::open_with(path, ro); r.adopt_names(names.clone()); r });

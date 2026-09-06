@@ -5,7 +5,7 @@
 #   tests/bench.sh CELLDIR PAF FEATURES HIER REFDIR [C] [RUST] > table.tsv
 # CELLDIR holds <sample>.<db>.<set>.<kind>.bed.gz; REFDIR the reference
 # tracks named *.<set>.<kind>.bed.gz; PAF may be a packed alignment.
-set -u
+set -u; BAD=0
 D=$1; PAF=$2; FEAT=$3; HIER=$4; REFD=$5
 C=${6:-$(dirname "$0")/../c/build/karyozip}; R=${7:-$(dirname "$0")/../rust/target/release/karyozip}
 T=${THREADS:-8}; NQ=${NQ:-1000}; REPS=${REPS:-3}
@@ -56,6 +56,7 @@ row() {  # row SET KIND INFORMED SEEK MODE IMPL BIN INPUT(s) ENCFLAGS DECFLAGS C
   else set -- $(timed "$W/k.kst" "$in" "$bin" -t $T $ef encode); fi
   local es=$1 em=$2
   if [ "$es" = refused ]; then
+    echo "bench: encode refused on $set $kind $inf $seek $mode $impl" >&2; BAD=$((BAD+1))
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\tNA\tNA\t%s\tNA\tNA\tNA\tNA\trefused\tNA\tNA\tNA\tNA\tNA\trefused\tNA\tNA\tNA\tNA\t%s\n' \
       "$class" "$dbv" "$backend" "$set" "$kind" "$inf" "$seek" "$mode" "$impl" "$rows" "$seqs" "$gz" "$plain" "$comp" "$T"
     return
@@ -67,6 +68,8 @@ row() {  # row SET KIND INFORMED SEEK MODE IMPL BIN INPUT(s) ENCFLAGS DECFLAGS C
     rt=exact; for f in $in; do s2=$(basename "$f" | sed -E 's/.*\.([a-z_]+)\.(pre)?smoothed\.bed\.gz/\1/'); zcat "$f" | cmp -s - "$W/o/$s2.bed" || rt=DIFFERS; done
   else set -- $(timed "$W/back.bed" /dev/null "$bin" -t $T $df decode "$W/k.kst"); ds=$1; dm=$2
     cmp -s "$W/plain.bed" "$W/back.bed" && rt=exact || rt=DIFFERS
+  fi
+  if [ "$rt" != exact ]; then echo "bench: round trip $rt on $set $kind $inf $seek $mode $impl" >&2; BAD=$((BAD+1))
   fi
   # an unsmoothed track is also smoothed, timed: what the tool replaces
   local sm="NA NA"
@@ -114,3 +117,5 @@ for kind in presmoothed smoothed; do
     done
   done
 done
+# every row must round-trip: a refusal or a difference fails the run
+[ "${BAD:-0}" = 0 ] || { echo "bench: $BAD rows did not round-trip" >&2; exit 1; }

@@ -1030,16 +1030,21 @@ impl Reader {
 
     /// One sequence of a plain track as run starts, label ids and its end:
     /// what a --ref contig is, decoded when first asked.
-    pub fn seq_runs(&mut self, ri: u64) -> (Vec<u64>, Vec<u32>, u64) {
+    pub fn seq_runs(&mut self, ri: u64) -> (crate::aln::Starts, Vec<u32>, u64) {
+        use crate::aln::Starts;
         let (blk, off, nruns) = self.locate(ri);
         let mut c = self.at(blk, off);
-        let (mut st, mut lab) = (Vec::with_capacity(nruns as usize), Vec::with_capacity(nruns as usize));
+        // starts into 4 bytes from the first row; a start past 32 bits, which
+        // no chromosome reaches, moves what is there into 8 and goes on
+        let (mut st, mut lab) = (Starts::W(Vec::with_capacity(nruns as usize)), Vec::with_capacity(nruns as usize));
         let mut s = 0u64;
         for k in 0..nruns {
             let (len, f) = self.step(&mut c, s, k + 1 == nruns && ri >= self.tailskip);
             if f as usize >= self.lab.len() { crate::bail("corrupt block: a label id past the table"); }
             if len == 0 { crate::bail("reference track: a run of no length"); }
-            st.push(s); lab.push(f as u32); s += len;
+            if let Starts::W(w) = &st { if s >> 32 != 0 { st = Starts::L(w.iter().map(|&x| x as u64).collect()); } }
+            match &mut st { Starts::W(w) => w.push(s as u32), Starts::L(l) => l.push(s) }
+            lab.push(f as u32); s += len;
         }
         self.sc = None;
         (st, lab, s)

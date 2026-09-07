@@ -156,7 +156,7 @@ impl Aln {
             let mut r = crate::reader::Reader::open_with(path, &ro);
             ch.iter().map(move |&t| {
                 let (st, lab, end) = r.seq_runs(ris[t]);
-                (t, (Starts::from(st, end), lab.into_iter().map(|f| reflab[f as usize]).collect(), end))
+                (t, (st, lab.into_iter().map(|f| reflab[f as usize]).collect(), end))
             }).collect::<Vec<_>>()
         }).collect();
         for (t, rows) in filled { let _ = self.rc[t].rows.set(rows); }
@@ -168,7 +168,7 @@ impl Aln {
         rc.rows.get_or_init(|| {
             let mut r = self.refkst.as_ref().unwrap().lock().unwrap_or_else(|e| e.into_inner());
             let (st, lab, end) = r.seq_runs(rc.ri);
-            (Starts::from(st, end), lab.into_iter().map(|f| self.reflab[f as usize]).collect(), end)
+            (st, lab.into_iter().map(|f| self.reflab[f as usize]).collect(), end)
         })
     }
 

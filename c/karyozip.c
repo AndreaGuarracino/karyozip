@@ -3820,16 +3820,24 @@ static void reffill_r(R *r, rcon *rc) {
         for (uint32_t k = 0; k < q.off; k++) { vget(&lp); vget(&ip); }
         span sp = { q.blk, r->b[q.blk].rows - q.off };
         size_t n = q.nruns ? q.nruns : 1;
-        rc->st = xmalloc(mul(n, 8)); rc->lab = xmalloc(mul(n, 4)); rc->n = rc->cap = q.nruns;
+        /* starts into 4 bytes from the first row; a start past 32 bits, which
+           no chromosome reaches, moves what is there into 8 and goes on */
+        rc->st32 = xmalloc(mul(n, 4)); rc->lab = xmalloc(mul(n, 4)); rc->n = rc->cap = q.nruns;
         uint64_t s = 0;
         for (uint64_t k = 0; k < q.nruns; k++) {
             spannext(r, &sp, &lp, &ip); sp.left--;
             uint64_t e = s + rlen(&lp, rc->name, s, k + 1 == q.nruns && (uint64_t)rc->ri >= TAILSKIP_R), f = vget(&ip);
             if (f >= r->nlab) die("corrupt block: a label id past the table");
             if (e <= s) die("reference track: a run of no length");
-            rc->st[k] = s; rc->lab[k] = REFLAB[f]; s = e;
+            if (rc->st32 && s >> 32) {
+                rc->st = xmalloc(mul(n, 8));
+                for (uint64_t i = 0; i < k; i++) rc->st[i] = rc->st32[i];
+                free(rc->st32); rc->st32 = NULL;
+            }
+            if (rc->st32) rc->st32[k] = (uint32_t)s; else rc->st[k] = s;
+            rc->lab[k] = REFLAB[f]; s = e;
         }
-        rc->end = s; r->curblk = UINT64_MAX; rcompact(rc);
+        rc->end = s; r->curblk = UINT64_MAX;
         LENDEC = ld; TAILDEC = td; TAILPRED_R = tp; TAILSKIP_R = ts; PAYEND = pe;
         rc->filled = 1;
     }

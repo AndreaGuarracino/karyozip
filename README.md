@@ -50,7 +50,7 @@ karyozip aln-pack P.paf REF.bed OUT     packs a PAF to only what --aln reads
 | `--names drop`, `--names drop:F` | store none, or write them beside the track |
 | `--db features.tsv` | one BED per feature set, or one merged featureID track; every reader takes it, and region then prints one label per set |
 | `--hier hierarchy.tsv` | with `--db`: a label tuple outside features.tsv, as a smoothed track carries, gets 2^26 plus its rank in the sorted per-set vocabulary (the features.tsv column, the hierarchy nodes of that set, `novel`), the same id in every file. A presmoothed track is unchanged; a track that used one such id needs the same two files to read, and smooth takes its HIER as the `--hier` |
-| `--aln P.paf --ref R` | do not store what the reference already gives; every reader takes the same pair. `R` is the reference BED, or that BED encoded as a `.kst`, which a query reads one contig of instead of parsing the whole text |
+| `--aln P.paf --ref R` | do not store what the reference already gives; every reader takes the same pair. `R` is the reference BED, or that BED encoded plainly as a `.kst`, which a query reads one contig of instead of parsing the whole text |
 | `--aln-names F` | ordinal N is line N+1 of `F` |
 | `--names F`, `--names ordinal` | on the readers |
 | `--raw`, `--out DIR` | on decode |

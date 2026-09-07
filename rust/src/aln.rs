@@ -103,7 +103,7 @@ impl Aln {
         let ro = crate::reader::ReadOpts { index: true, ..Default::default() };
         let mut r = crate::reader::Reader::open_with(path, &ro);
         if !r.plainref {
-            crate::bail("the reference .kst must be a plain track: not --aln, --db, --sort or --names drop, names in the file");
+            crate::bail("the reference .kst must be a plain track: not --aln, not --db, and its names in the file, neither dropped nor in a sidecar");
         }
         if r.rowhash == 0 { crate::bail("the reference .kst carries no row hash: encode it again with this version"); }
         self.reflab = r.labels().to_vec().iter().map(|l| self.lab(l)).collect();

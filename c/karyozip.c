@@ -3710,7 +3710,7 @@ static void loadref_kst(const char *path) {
         if (!f || fseek(f, 8, SEEK_SET) || fread(hh, 8, 16, f) != 16) die("cannot read the reference track");
         fclose(f); }
     if (hh[1] & (ALNFLAG | DBFLAG | SIDEFLAG | DROPPED | PERMFLAG))
-        die("the reference .kst must be a plain track: not --aln, --db, --sort or --names drop, names in the file");
+        die("the reference .kst must be a plain track: not --aln, not --db, and its names in the file, neither dropped nor in a sidecar");
     R *r = refopen(path);
     if (!r->rowhash) die("the reference .kst carries no row hash: encode it again with this version");
     ensurenames(r);

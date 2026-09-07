@@ -28,10 +28,10 @@ DIFF_PASS
 
 |                        |     C |  Rust |
 |------------------------|------:|------:|
-| lines, excluding vendored C | 4,474 | 4,560 |
+| lines, excluding vendored C | 4,500 | 4,617 |
 | files                  |     2 |    11 |
 | `unsafe` blocks        |     — |    14 |
-| stripped binary        | 378 KB | 2,518 KB |
+| stripped binary        | 378 KB | 2,267 KB |
 
 The two are the same length within 1%. Some of that is real, the parallel arrays and the
 manual memory management that `Vec` and ownership remove; some is that the

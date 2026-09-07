@@ -39,6 +39,7 @@ fn main() {
             _ => std::thread::available_parallelism().map_or(1, |p| p.get()).min(THRCAP),
         },
     };
+    ffi::pin_mmap_threshold();
     rayon::ThreadPoolBuilder::new().num_threads(n).build_global().ok();
     let tmpdir = c.tmp_dir.clone()
         .or_else(|| std::env::var("TMPDIR").ok())
@@ -401,7 +402,9 @@ fn parse_slab(s: &[u8], t: usize) -> Vec<Vec<Row>> {
 }
 
 fn parse_chunk(s: &[u8], from: usize, to: usize) -> Result<Vec<Row>, &'static str> {
-    let mut out: Vec<Row> = Vec::new();
+    // a row is at least 8 bytes: sized once, so no doubling copy and only
+    // the rows used are touched, as the C's per-thread arrays
+    let mut out: Vec<Row> = Vec::with_capacity((to - from) / 8 + 1);
     let mut p = from;
     while p < to {
         let Some(nl) = memchr::memchr(b'\n', &s[p..to]).map(|i| p + i) else { break };

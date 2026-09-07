@@ -457,6 +457,7 @@ static size_t tokc(buf *in, uint8_t **out, uint32_t chunk) {
     uint32_t *clen = xmalloc(mul(nchunk, 4));
     _Atomic int failed = 0;
     int nthr = nthreads();
+    if (nthr > (int)nchunk) nthr = nchunk ? (int)nchunk : 1;
 #ifdef _OPENMP
 #pragma omp parallel for schedule(dynamic, 1) num_threads(nthr)
 #endif
@@ -510,7 +511,8 @@ static char *tokd(const uint8_t *b, size_t n, size_t *outn) {
     char *o = xmalloc(raw + 1);
     const uint8_t *p = b + hdr;
     _Atomic int failed = 0;
-    int nthr = nthreads();
+    int nthr = nthreads();                 /* one chunk: no pool, a query pays for it */
+    if (nthr > (int)nchunk) nthr = nchunk ? (int)nchunk : 1;
 #ifdef _OPENMP
 #pragma omp parallel for schedule(dynamic, 1) num_threads(nthr)
 #endif

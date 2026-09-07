@@ -4297,7 +4297,7 @@ int main(int argc, char **argv) {
             "                  --names F reads the names, from drop:FILE or a FASTA, FASTQ or list\n"
             "                  --names ordinal accepts a track whose names were dropped\n"
             "                  --raw shows what is stored, reversing no transform\n"
-            "  karyozip aln-pack P.paf REF.bed OUT   only what --aln reads\n"
+            "  karyozip aln-pack P.paf REF.bed|REF.kst OUT   only what --aln reads\n"
             "  karyozip region F SEQ                 the whole sequence\n"
             "  karyozip region F SEQ POS             the run covering POS\n"
             "  karyozip region F SEQ START END [HALO]\n"
@@ -4425,7 +4425,7 @@ int main(int argc, char **argv) {
     if (!strcmp(argv[1], "aln-pack")) {
 
         if (argc != 5 || argv[2][0] == '-' || argv[3][0] == '-' || argv[4][0] == '-')
-            die("usage: karyozip aln-pack P.paf REF.bed OUT");
+            die("usage: karyozip aln-pack P.paf REF.bed|REF.kst OUT");
         loadref(argv[3]);
         alnpack(argv[2], argv[4]);
         return 0;

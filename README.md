@@ -35,7 +35,7 @@ karyozip decode F | --db F.tsv [--hier H] [--out DIR] [--set A,B] F
 karyozip region F SEQ | SEQ POS | SEQ START END [HALO]
 karyozip smooth F HIER FS [SEQ [START END]]
 karyozip index  F                       appends an index to the track
-karyozip aln-pack P.paf REF.bed OUT     packs a PAF to only what --aln reads
+karyozip aln-pack P.paf REF.bed|REF.kst OUT   packs a PAF to only what --aln reads
 ```
 
 ## Flags

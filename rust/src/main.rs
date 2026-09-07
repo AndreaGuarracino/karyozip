@@ -208,7 +208,7 @@ fn main() {
         Cmd::AlnPack { paf, rbed, dest, rest } => {
             let (paf, rbed, dest) = match (paf, rbed, dest) {
                 (Some(p), Some(r), Some(o)) if rest.is_empty() => (p, r, o),
-                _ => die("usage: karyozip aln-pack P.paf REF.bed OUT"),
+                _ => die("usage: karyozip aln-pack P.paf REF.bed|REF.kst OUT"),
             };
             let mut a = aln::Aln::default();
             a.load_ref(rbed, false);

@@ -56,9 +56,15 @@ pub fn putu64(out: &mut Vec<u8>, v: u64) {
 /// a stack buffer and reaches the output in one call, as the C writes it
 /// through one pointer.
 pub fn putu64_at(b: &mut [u8], v: u64) -> usize {
-    let (mut n, mut t) = (1usize, v);
-    while t >= 10 { t /= 10; n += 1; }      // count, then fill in place: a
-    let (mut i, mut t) = (n, v);            // scratch array costs a memcpy
+    // the digit count by compares, then one division a digit, in place:
+    // a count by division doubled the divisions and a scratch array cost
+    // a memcpy, and this is every coordinate of every row written
+    const P: [u64; 19] = [10, 100, 1_000, 10_000, 100_000, 1_000_000, 10_000_000, 100_000_000,
+        1_000_000_000, 10_000_000_000, 100_000_000_000, 1_000_000_000_000, 10_000_000_000_000,
+        100_000_000_000_000, 1_000_000_000_000_000, 10_000_000_000_000_000,
+        100_000_000_000_000_000, 1_000_000_000_000_000_000, 10_000_000_000_000_000_000];
+    let n = 1 + P.iter().take_while(|&&p| v >= p).count();
+    let (mut i, mut t) = (n, v);
     loop {
         i -= 1;
         b[i] = b'0' + (t % 10) as u8;

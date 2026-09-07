@@ -313,6 +313,8 @@ impl Aln {
             let name = nms[at..at + k].to_vec();
             at += k + 1;
             let (cn, j) = vget(cnt, ci); ci = j;
+            if cn == 0 || cn as usize > len.len() - li { crate::bail("corrupt packed alignment: more blocks than lengths"); }
+            if self.qsix.contains_key(&name) { crate::bail("corrupt packed alignment: a query name repeats"); }
             let qi = *self.qsix.entry(name.clone()).or_insert_with(|| {
                 self.qs.push((name, Vec::new()));
                 self.qs.len() - 1
@@ -345,10 +347,15 @@ impl Aln {
                     tp = pt.wrapping_add(unzz(b));
                 }
                 let (n, j) = vget(len, li); li = j;
+                if n == 0 || n > u32::MAX as u64 { crate::bail("corrupt packed alignment: a block of no length, or past 32 bits"); }
                 segs.push(Seg { q, t: tx, n: n as u32, tp, rev });
                 pq = q + n; pt = tp + n; left -= 1;
             }
+            if left != 0 { crate::bail("corrupt packed alignment: a target run outlives its query"); }
             nb += segs.len();
+        }
+        if ci != cnt.len() || pi != pos.len() || li != len.len() || si != tgt.len() || i != body.len() {
+            crate::bail("corrupt packed alignment: bytes left over");
         }
         eprintln!("packed alignment: {} query contigs, {nb} collinear blocks", self.qs.len());
         self.seghash();
@@ -369,13 +376,14 @@ impl Aln {
     pub fn load_ordinals(&mut self, path: &str) {
         let data = crate::slurp(path, "cannot open the file given to --names");
         let mut h = FNV0;
-        for line in data.split(|&c| c == b'\n') {
+        let body = if data.last() == Some(&b'\n') { &data[..data.len() - 1] } else { &data[..] };
+        for line in body.split(|&c| c == b'\n') {
             let mut l = line;
             if l.last() == Some(&b'\r') { l = &l[..l.len() - 1]; }
             if self.ord.is_empty() && (l.first() == Some(&b'>') || l.first() == Some(&b'@')) {
                 crate::bail("--names on encode takes a plain list, one name a line");
             }
-            if l.is_empty() && self.ord.len() as u64 > 0 { continue; }
+            if l.is_empty() { crate::bail("--aln-names: an empty line: every line is one name"); }
             self.ord.push(l.to_vec());
             h = kst::fnv(h, l);
             h = kst::fnv(h, &[0]);

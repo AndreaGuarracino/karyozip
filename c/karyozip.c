@@ -129,8 +129,9 @@ static uint64_t bedcoord(const char *p, const char *end, const char *what) {
    and a .gz on the fly. fopencookie wraps it in a FILE*, so getline, fgets
    and fread below are unchanged. A path of NULL means stdin. */
 static ssize_t zread_(void *c, char *b, size_t n) {
-    int g = gzread((gzFile)c, b, (unsigned)n);
-    return g < 0 ? -1 : g;
+    int g = gzread((gzFile)c, b, (unsigned)n), e;
+    gzerror((gzFile)c, &e);              /* a cut .gz hands over what it has with Z_BUF_ERROR: refuse it */
+    return g < 0 || (e != Z_OK && e != Z_STREAM_END) ? -1 : g;
 }
 static int zclose_(void *c) { return gzclose((gzFile)c) == Z_OK ? 0 : -1; }
 static FILE *zfopen(const char *path) {
@@ -263,10 +264,9 @@ static void bvar(buf *b, uint64_t v) {
 /* --------------------------------------------------------------- encoding */
 typedef struct { uint32_t blk, off, nruns; } rec;   /* 12 B, was 32 */
 
-#define LABHASH (1 << 16)
 static char **labtab = NULL;
 static int nlabtab = 0, labcap = 0;
-static int32_t labhash[LABHASH];
+static int32_t *labhash; static size_t LABHASH;   /* open addressed, grows at half full */
 static int labhash_init = 0;
 
 static size_t *labnlen;
@@ -294,11 +294,17 @@ static int intern(const char *s, size_t n) {
     ck = (ck ^ (ck >> 13)) & (LCACHE - 1);
     int cid = lcache[ck];
     if (cid >= 0 && labnlen[cid] == n && !memcmp(labtab[cid], s, n)) return lastid = cid;
-    if (!labhash_init) { memset(labhash, 0xff, sizeof labhash); labhash_init = 1; }
+    if (!labhash_init) { LABHASH = 1 << 16; labhash = xmalloc(LABHASH * 4); memset(labhash, 0xff, LABHASH * 4); labhash_init = 1; }
+    if ((size_t)nlabtab * 2 >= LABHASH) {           /* rehash at half full */
+        LABHASH *= 4; free(labhash); labhash = xmalloc(LABHASH * 4); memset(labhash, 0xff, LABHASH * 4);
+        for (int i = 0; i < nlabtab; i++) {
+            uint64_t h = fnvbuf(FNV0, labtab[i], labnlen[i]) & (LABHASH - 1);
+            while (labhash[h] >= 0) h = (h + 1) & (LABHASH - 1);
+            labhash[h] = i;
+        }
+    }
     uint64_t k = fnvbuf(FNV0, s, n) & (LABHASH - 1);
-    uint64_t probes = 0;
     while (labhash[k] >= 0) {
-        if (++probes >= LABHASH) die("more than LABHASH distinct labels");
         int id = labhash[k];
         if (labnlen[id] == n && !memcmp(labtab[id], s, n)) { lcache[ck] = id; return lastid = id; }
         k = (k + 1) & (LABHASH - 1);
@@ -391,7 +397,7 @@ static size_t intnames(buf *names, uint64_t n, uint8_t **out) {
             if (*p < '0' || *p > '9' || x > (int64_t)1 << 50) { free(v.d); return 0; }
             x = x * 10 + (*p++ - '0');
         }
-        if (p == end) { free(v.d); return 0; }
+        if (p == end || x > (int64_t)1 << 50) { free(v.d); return 0; }   /* what the reader refuses */
         p++;
         int64_t d = x - prev; prev = x;
 
@@ -920,6 +926,7 @@ static void loadref(const char *path) {
         rh = rowmix(rh, nh, cur->st[cur->n], cur->end, labh[cur->lab[cur->n]]);
         cur->n++;
     }
+    if (ferror(f)) die("read error on the reference track");
     free(ln); fclose(f); ALNHASH ^= rh;
     if (badln) fprintf(stderr, "reference: %llu lines without four columns skipped\n", (unsigned long long)badln);
     size_t tot = 0; for (size_t i = 0; i < nrc; i++) tot += RC[i].n;
@@ -1011,6 +1018,7 @@ static void loadpaf(const char *path) {
             if (te < ts || tcons != te - ts)
                 die("PAF CIGAR consumes a different target length than the record says"); }
     }
+    if (ferror(f)) die("read error on a companion file");
     free(ln); fclose(f);
     for (size_t i = 0; i < nqs; i++) qsort(QS[i].s, QS[i].n, sizeof *QS[i].s, segcmp);
     seghash();
@@ -1130,6 +1138,7 @@ static int alnload(const char *path) {
     uint8_t *d = xmalloc(n ? n : 1);
     if (fseek(f, ALNMAGLEN + 8, SEEK_SET)) die("cannot seek the packed alignment");
     if (n && fread(d, 1, n, f) != n) die("short read on the packed alignment");
+    if (ferror(f)) die("read error on the PAF");
     fclose(f);
     const uint8_t *p = d, *e = d + n;
     const uint8_t *sec[5]; size_t slen[5]; uint8_t *raw[5] = {0};
@@ -1163,8 +1172,9 @@ static int alnload(const char *path) {
         memcpy(name, nm, (size_t)(nl - nm)); name[nl - nm] = 0;
         qseg *Q = qseg_get(name, 1);
         free(name);
+        if (Q->s) die("corrupt packed alignment: a query name repeats");
         uint64_t cn = vgetb(&cp, cpe);
-        if (cn > (uint64_t)(lpe - lp)) die("corrupt packed alignment: more blocks than lengths");
+        if (!cn || cn > (uint64_t)(lpe - lp)) die("corrupt packed alignment: more blocks than lengths");
         Q->s = xrealloc(Q->s, mul((size_t)cn, sizeof *Q->s)); Q->cap = cn; Q->n = 0;
         uint64_t pq = 0, pt = 0; uint32_t tx = 0; int rev = 0, fresh = 1;
         uint64_t left = 0;
@@ -1184,11 +1194,15 @@ static int alnload(const char *path) {
                 tp = pt + (uint64_t)unzz(vgetb(&pp, ppe));
             }
             uint64_t ln = vgetb(&lp, lpe);
+            if (!ln || ln > UINT32_MAX) die("corrupt packed alignment: a block of no length, or past 32 bits");
             Q->s[Q->n++] = (seg){ q, tx, (uint32_t)ln, tp, rev };
             pq = q + ln; pt = tp + ln; left--;
         }
+        if (left) die("corrupt packed alignment: a target run outlives its query");
         nm = nl + 1;
     }
+    if (cp != cpe || pp != ppe || lp != lpe || sp != spe || p != e)
+        die("corrupt packed alignment: bytes left over");
     free(d);
     for (int k = 0; k < 5; k++) free(raw[k]);
     size_t nb2 = 0; for (size_t i = 0; i < nqs; i++) nb2 += QS[i].n;
@@ -1209,10 +1223,12 @@ static void loadordinals(const char *path) {
         if (ln[n - 1] == '\n') ln[--n] = 0;
         if (n && ln[n - 1] == '\r') ln[--n] = 0;
         if (!c && (ln[0] == '>' || ln[0] == '@')) die("--names on encode takes a plain list, one name a line");
+        if (!n) die("--aln-names: an empty line: every line is one name");
         if (c == nord) { nord = nord ? nord * 2 : 1 << 16;
                          ORD = xrealloc(ORD, nord * sizeof *ORD); }
         ORD[c++] = xstrdup(ln);
     }
+    if (ferror(f)) die("read error on --aln-names");
     free(ln); fclose(f); nord = c;
     {   uint64_t h = FNV0;
         for (size_t i = 0; i < nord; i++) h = fnvbuf(h, ORD[i], strlen(ORD[i]) + 1);
@@ -1473,6 +1489,7 @@ static void loadfeatures(const char *path) {
         if (k < nfset) die("a features.tsv row has fewer labels than sets");
         if (p) die("a features.tsv row has more labels than sets");
     }
+    if (ferror(f)) die("read error on a companion file");
     free(ln); fclose(f);
     if (!nfset) die("features table has no header");
     fprintf(stderr, "features: %zu ids, %zu sets\n", fn, nfset);
@@ -1529,6 +1546,7 @@ static void loadvocab(const char *path) {
             if ((size_t)(t1 - line) == strlen(fset[k]) && !memcmp(line, fset[k], strlen(fset[k]))) {
                 vocadd(k, t1 + 1, (size_t)(t2 - t1 - 1)); vocadd(k, t2 + 1, (size_t)(len - (t2 + 1 - line))); }
     }
+    if (ferror(f)) die("read error on a companion file");
     free(line); fclose(f);
     VPROD = 1;
     for (size_t k = nfset; k-- > 0;) {
@@ -2466,7 +2484,18 @@ static void ktw_close(ktw *w) {
 /* karyozip.h documents the contract. These are thin: the CLI and a caller
    that skips the BED go through exactly the same writer, so a track built
    row by row is byte-identical to one encoded from the equivalent BED. */
-kt_writer *kt_open(FILE *out) { return ktw_open(out); }
+kt_writer *kt_open(FILE *out) {
+    /* the encoder keeps global state: a second writer in one process starts
+       from nothing, and the codec flags as first given. Not in ktw_open: the
+       CLI interns the reference's labels before it opens the writer. */
+    static int idc0 = -2, lenc0;
+    if (idc0 == -2) { idc0 = IDCODEC; lenc0 = LENCODEC; }
+    IDCODEC = idc0; LENCODEC = lenc0;
+    for (int i = 0; i < nlabtab; i++) free(labtab[i]);
+    nlabtab = 0; lastid = -1; labhash_init = 0; lcache_init = 0;
+    TAILSEEN = 0; TAILON = -1; TAILPRED = 0; ALNHIT = 0;
+    return ktw_open(out);
+}
 void kt_block(kt_writer *w, uint64_t rows) { (void)w; BLOCK = rows ? rows : UINT64_MAX; BLOCKSET = 1; }
 void kt_level(kt_writer *w, int level) {
     (void)w;
@@ -2910,6 +2939,7 @@ static char *readnamefile(uint64_t nreads) {
             if (S_ISREG(st0.st_mode) && stathash(&st1) != NAMESRC_H)
                 die("the file given to --names changed while it was read");
             if (!S_ISREG(st0.st_mode)) NAMESRC_H = 0; }   /* a pipe cannot bind an index */
+        if (ferror(nf)) die("read error on --names");
         free(ln); fclose(nf);
 
         if (got != nreads) {
@@ -3393,7 +3423,7 @@ static void region_set(R *r, int64_t ri, const char *seq, uint64_t lo, uint64_t 
     for (uint64_t k = 0; k < q.off; k++) { vget(&lp); vget(&ip); }
     span sp = { q.blk, r->b[q.blk].rows - q.off };
     uint64_t n = 0, cap = 1024, *st = xmalloc(cap * 8), *en = xmalloc(cap * 8);
-    char **lab = xmalloc(cap * sizeof *lab), tmp[4096];
+    char **lab = xmalloc(cap * sizeof *lab), *tmp = xmalloc(maxlablen(r) + 64);   /* a --db row joins every picked set */
     uint64_t s = 0;
     for (uint64_t k = 0; k < q.nruns; k++) {
         spannext(r, &sp, &lp, &ip); sp.left--;
@@ -3545,6 +3575,7 @@ static void loadhier(const char *path, const char *fs) {
         if (NPAR[c] >= 0) die("hierarchy: a child is listed twice");
         NPAR[c] = pa;
     }
+    if (ferror(f)) die("read error on a companion file");
     free(line); fclose(f);
     if (!NNODE) die("feature set not found in the hierarchy");
     for (int a = 0; a < NNODE; a++)   /* every node but categorized has a parent */

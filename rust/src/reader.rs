@@ -94,7 +94,7 @@ pub struct Reader {
     tailskip: u64,
     /// every name, newline-free, back to back, and noff[i]..noff[i+1] is
     /// name i: decoded from nz/pz on first use
-    names: std::cell::OnceCell<std::sync::Arc<(Vec<u8>, Vec<u32>)>>,
+    names: std::cell::OnceCell<std::sync::Arc<(Vec<u8>, Vec<u64>)>>,
     nz: Vec<u8>,
     pz: Vec<u8>,
     names_file: Option<String>,
@@ -674,7 +674,7 @@ impl Reader {
 
     /// What the C's ensurenames does: the names, by whichever codec stored
     /// them, or from --names FILE, or the ordinals.
-    fn decode_names(&self) -> (Vec<u8>, Vec<u32>) {
+    fn decode_names(&self) -> (Vec<u8>, Vec<u64>) {
         let (side, perm_ext, dropped) = (self.nf & 1 != 0, self.nf & 2 != 0, self.nf & 4 != 0);
         let (names_int, names_tok, was_perm, perm_tok) = (self.nf & 8 != 0, self.nf & 16 != 0, self.nf & 32 != 0, self.nf & 64 != 0);
         let (nz, pz, n) = (&self.nz, &self.pz, self.nreads);
@@ -698,10 +698,10 @@ impl Reader {
             zdec(nz, "names")
         };
         if names.last() == Some(&b'\n') { names.pop(); }
-        let mut noff: Vec<u32> = vec![0];
+        let mut noff: Vec<u64> = vec![0];
         if !names.is_empty() {
-            for (i, &c) in names.iter().enumerate() { if c == b'\n' { noff.push(i as u32 + 1); } }
-            noff.push(names.len() as u32 + 1);
+            for (i, &c) in names.iter().enumerate() { if c == b'\n' { noff.push(i as u64 + 1); } }
+            noff.push(names.len() as u64 + 1);
         }
         if noff.len() as u64 - 1 != n {
             crate::bail("names stream does not match the track's sequence count");
@@ -725,13 +725,13 @@ impl Reader {
                 if tab.len() as u64 != n {
                     crate::bail("input-order names do not match the track's sequence count");
                 }
-                let (mut nn, mut no) = (Vec::new(), vec![0u32]);
+                let (mut nn, mut no) = (Vec::new(), vec![0u64]);
                 for i in 0..noff.len() - 1 {
                     let nm = &names[noff[i] as usize..noff[i + 1] as usize - 1];
                     let v: u64 = std::str::from_utf8(nm).ok().and_then(|t| t.parse().ok())
                         .unwrap_or_else(|| crate::bail("a stored rank is not a record number"));
                     if v >= n { crate::bail("a stored rank is not a record number"); }
-                    nn.extend_from_slice(tab[v as usize]); nn.push(b'\n'); no.push(nn.len() as u32);
+                    nn.extend_from_slice(tab[v as usize]); nn.push(b'\n'); no.push(nn.len() as u64);
                 }
                 names = nn; noff = no;
             }
@@ -853,14 +853,24 @@ impl Reader {
         let (blk, off, nruns) = self.locate(ri);
         let tskip = self.tailskip;
         let last_of = |k: u64| k + 1 == nruns && ri >= tskip;
+        // As the C: a block that opens inside this sequence records where,
+        // so with a START the walk begins at the last block opening at or
+        // before it, not at the sequence's first run.
+        let (start, bs) = (blk as u64 * self.block + off, self.block);
+        let (mut jump, mut kskip, mut st0) = (blk, 0u64, 0u64);
+        if lo > 0 {
+            while jump + 1 < self.b.len() && (jump as u64 + 1) * bs < start + nruns
+                  && self.b[jump + 1].bp != 0 && self.b[jump + 1].bp <= lo { jump += 1; }
+        }
+        if jump != blk { kskip = jump as u64 * bs - start; st0 = self.b[jump].bp; }
 
         // With a halo the runs to print are found first, then reprinted with
         // the neighbours the halo asks for.
         let (mut kfirst, mut klast, mut lo, mut hi) = (0u64, nruns, lo, hi);
         if halo > 0 && (lo > 0 || hi > 0) {
-            let mut c = self.at(blk, off);
-            let (mut s2, mut first, mut last) = (0u64, nruns, 0u64);
-            for k in 0..nruns {
+            let mut c = if jump != blk { self.at(jump, 0) } else { self.at(blk, off) };
+            let (mut s2, mut first, mut last) = (st0, nruns, 0u64);
+            for k in kskip..nruns {
                 if hi > 0 && s2 >= hi { break; }
                 let (len, _) = self.step(&mut c, s2, last_of(k));
                 let e2 = s2 + len;
@@ -874,12 +884,13 @@ impl Reader {
             kfirst = first.saturating_sub(halo);
             klast = if nruns - last - 1 <= halo { nruns } else { last + halo + 1 };
             lo = 0; hi = 0;
+            if kfirst < kskip { jump = blk; kskip = 0; st0 = 0; }   // the halo reaches back
         }
 
-        let mut c = self.at(blk, off);
+        let mut c = if jump != blk { self.at(jump, 0) } else { self.at(blk, off) };
         let mut buf = Vec::with_capacity(1 << 20);
-        let mut st = 0u64;
-        for k in 0..klast {
+        let mut st = st0;
+        for k in kskip..klast {
             let (len, f) = self.step(&mut c, st, last_of(k));
             let en = st + len;
             if k >= kfirst && en > lo && (hi == 0 || st < hi) {
@@ -966,10 +977,10 @@ impl Reader {
     }
     /// The decoded names, to hand to a worker's reader of the same track so
     /// the table is decoded once, as the C's smooth_mt borrows it.
-    pub fn names_shared(&self) -> std::sync::Arc<(Vec<u8>, Vec<u32>)> {
+    pub fn names_shared(&self) -> std::sync::Arc<(Vec<u8>, Vec<u64>)> {
         self.names.get_or_init(|| std::sync::Arc::new(self.decode_names())).clone()
     }
-    pub fn adopt_names(&mut self, n: std::sync::Arc<(Vec<u8>, Vec<u32>)>) { let _ = self.names.set(n); }
+    pub fn adopt_names(&mut self, n: std::sync::Arc<(Vec<u8>, Vec<u64>)>) { let _ = self.names.set(n); }
     pub fn find_seq(&self, s: &[u8]) -> i64 { self.find(s) }
     pub fn labels(&self) -> &[Vec<u8>] { &self.lab }
     /// run count of sequence `ri`, from the index alone

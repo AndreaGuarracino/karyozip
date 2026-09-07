@@ -329,7 +329,14 @@ pub fn encode(files: &[String], feats: &Feats, w: &mut crate::writer::Writer) ->
 /// decode --db --out DIR: one BED per feature set, the featureIDs expanded.
 /// The staged BEDs of a decode in flight, removed by `die` and on the way
 /// out, so a failed run never leaves half an output behind.
-static TMP: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+static TMP: std::sync::Mutex<Vec<std::path::PathBuf>> = std::sync::Mutex::new(Vec::new());
+/// DIR/<set><suffix>, from the set's bytes: a set name need not be UTF-8,
+/// and two that differ only past a lossy conversion must not share a file.
+fn setpath(dir: &str, s: &[u8], suffix: &str) -> std::path::PathBuf {
+    use std::os::unix::ffi::OsStrExt;
+    let mut f = s.to_vec(); f.extend_from_slice(suffix.as_bytes());
+    std::path::Path::new(dir).join(std::ffi::OsStr::from_bytes(&f))
+}
 
 pub fn drop_tmp() {
     if let Ok(mut v) = TMP.lock() {
@@ -341,22 +348,21 @@ pub fn drop_tmp() {
 /// together. Without: the picked columns, tab-joined, merged where they all
 /// agree, on stdout; one set gives that set's own track.
 pub fn decode(r: &mut crate::reader::Reader, feats: &Feats, dir: Option<&str>, cols: &[usize]) {
-    let name = |s: &[u8]| String::from_utf8_lossy(s).into_owned();
     let pid = std::process::id();
     let sets: Vec<&[u8]> = cols.iter().map(|&k| feats.sets[k].as_slice()).collect();
-    let mut tmps: Vec<String> = Vec::new();
+    let mut tmps: Vec<std::path::PathBuf> = Vec::new();
     let mut out: Vec<Box<dyn Write>> = Vec::new();
     if let Some(dir) = dir {
         std::fs::create_dir_all(dir).unwrap_or_else(|_| crate::bail("cannot create the output directory"));
         for s in &sets {
-            let p = format!("{dir}/{}.bed", name(s));
-            if p.len() + 16 >= 4096 { crate::bail("--out: the output path is too long"); }
+            let p = setpath(dir, s, ".bed");
+            if p.as_os_str().len() + 16 >= 4096 { crate::bail("--out: the output path is too long"); }
             if let Ok(m) = std::fs::symlink_metadata(&p) {
                 if !m.is_file() { crate::bail("--out: a set's BED exists and is not a regular file"); }
             }
         }
         // Write beside the old BEDs, then swap them in together.
-        tmps = sets.iter().map(|s| format!("{dir}/{}.bed.tmp.{pid}", name(s))).collect();
+        tmps = sets.iter().map(|s| setpath(dir, s, &format!(".bed.tmp.{pid}"))).collect();
         *TMP.lock().unwrap() = tmps.clone();
         out = tmps.iter().map(|p| Box::new(std::io::BufWriter::new(std::fs::File::create(p)
                 .unwrap_or_else(|_| crate::bail("cannot write a derived BED")))) as Box<dyn Write>).collect();
@@ -420,14 +426,14 @@ fn wr(f: &mut impl Write, seq: &[u8], st: u64, en: u64, lab: &[u8], v: &mut Vec<
 }
 
 /// Move every staged BED into place, or put back what was there.
-fn swap_in(dir: &str, sets: &[Vec<u8>], tmps: &[String]) {
+fn swap_in(dir: &str, sets: &[Vec<u8>], tmps: &[std::path::PathBuf]) {
     let pid = std::process::id();
-    let live = |s: &[u8]| format!("{dir}/{}.bed", String::from_utf8_lossy(s));
-    let mut old: Vec<Option<String>> = vec![None; sets.len()];
+    let live = |s: &[u8]| setpath(dir, s, ".bed");
+    let mut old: Vec<Option<std::path::PathBuf>> = vec![None; sets.len()];
     let mut bad = false;
     for (j, s) in sets.iter().enumerate() {
         if bad { break; }
-        let o = format!("{}.old.{pid}", live(s));
+        let o = setpath(dir, s, &format!(".bed.old.{pid}"));
         match std::fs::rename(live(s), &o) {
             Ok(()) => old[j] = Some(o),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}

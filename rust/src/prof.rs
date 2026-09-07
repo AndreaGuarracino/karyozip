@@ -22,7 +22,7 @@ pub fn start(on: bool, threads: usize) {
 /// Charges its phase for as long as it lives.
 pub struct Span(usize, Instant);
 pub fn span(i: usize) -> Option<Span> {
-    ON.load(Relaxed).then(|| Span(i, Instant::now()))
+    (ON.load(Relaxed) && i < NAME.len()).then(|| Span(i, Instant::now()))   // 9 is "not this phase"
 }
 /// The high-water mark is read from /proc at most every 10 ms, as the C.
 static LAST: AtomicU64 = AtomicU64::new(0);

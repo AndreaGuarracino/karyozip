@@ -1037,7 +1037,7 @@ pub fn int_names(names: &[u8], n: u64) -> Option<Vec<u8>> {
             x = x * 10 + (c - b'0') as i64;
             p += 1;
         }
-        if p >= names.len() { return None; }
+        if p >= names.len() || x > 1i64 << 50 { return None; }   // what the reader refuses
         p += 1;
         let d = x - prev;
         prev = x;

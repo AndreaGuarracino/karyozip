@@ -827,7 +827,11 @@ static void ktw_row(ktw *w, const char *name, size_t nlen,
 
 typedef struct { uint64_t q; uint32_t t, n; uint64_t tp; int rev; } seg;
 typedef struct { char *name; seg *s; size_t n, cap; } qseg;
-typedef struct { char *name; uint64_t *st, end; uint32_t *lab; size_t n, cap; int64_t ri; _Atomic int filled; } rcon;
+typedef struct { char *name; uint64_t *st, end; uint32_t *lab; size_t n, cap; int64_t ri;
+                 _Atomic int filled;              /* every run is in st and lab */
+                 uint64_t bp0, row0, *bend;       /* .kst per block: bases and row before the contig, */
+                 uint32_t firstblk, lastblk;      /* its block range, and the position after each */
+                 uint8_t *blkin; uint32_t nblkin; } rcon;
 
 static qseg *QS; static size_t nqs, cqs;
 static rcon *RC; static size_t nrc, crc;
@@ -854,7 +858,7 @@ static rcon *rcon_get(const char *nm, int make) {
     }
     idx[j] = nrc + 1;
     if (nrc == crc) { crc = crc ? crc * 2 : 64; RC = xrealloc(RC, crc * sizeof *RC); }
-    RC[nrc] = (rcon){ xstrdup(nm), NULL, 0, NULL, 0, 0, -1, 1 };
+    RC[nrc] = (rcon){ .name = xstrdup(nm), .ri = -1, .filled = 1 };
     return RC + nrc++;
 }
 static qseg *qseg_get(const char *nm, int make) {
@@ -1251,30 +1255,37 @@ static const seg *segat(const qseg *Q, uint64_t pos) {   /* last seg with q <= p
     const seg *g = Q->s + lo - 1;
     return pos < g->q + g->n ? g : NULL;
 }
-static size_t runat(const rcon *rc, uint64_t tpos) {   /* count of starts <= tpos */
-    if (tpos >= rc->end) return 0;      /* past the last run: no answer, not the last run's */
+/* count of starts <= tpos, inside the rows [lo, hi) that are decoded and
+   whose last run ends at wend. A whole contig is lo = 0, hi = n. */
+static size_t runat(const rcon *rc, uint64_t tpos, size_t lo, size_t hi, uint64_t wend) {
+    if (tpos >= wend) return 0;         /* past the last run: no answer, not the last run's */
     size_t a;
-    if (rc == CR) {
+    if (rc == CR && CRI >= lo && CRI <= hi) {
         a = CRI;
         int k = 0;
-        while (a < rc->n && rc->st[a] <= tpos && k++ < 8) a++;
-        while (a > 0 && rc->st[a - 1] > tpos && k++ < 16) a--;
-        if (k >= 16 || (a < rc->n && rc->st[a] <= tpos)) a = rc->n + 1;
-    } else a = rc->n + 1;
-    if (a == rc->n + 1) {
-        size_t b = rc->n; a = 0;
+        while (a < hi && rc->st[a] <= tpos && k++ < 8) a++;
+        while (a > lo && rc->st[a - 1] > tpos && k++ < 16) a--;
+        if (k >= 16 || (a < hi && rc->st[a] <= tpos)) a = hi + 1;
+    } else a = hi + 1;
+    if (a == hi + 1) {
+        size_t b = hi; a = lo;
         while (a < b) { size_t m = (a + b) / 2;
                         if (rc->st[m] <= tpos) a = m + 1; else b = m; }
     }
     CR = rc; CRI = a;
     return a;
 }
+static int refwin(rcon *rc, uint64_t tpos, size_t *lo, size_t *hi, uint64_t *wend);
+static int REFPERBLK;   /* one sequence asked for, no tail-encoded row: fill by block */
 static uint32_t reflabel(const qseg *Q, uint64_t pos) {
     const seg *g = segat(Q, pos);
     if (!g) return UINT32_MAX;
     uint64_t tpos = g->rev ? g->tp + (g->q + g->n - 1 - pos) : g->tp + (pos - g->q);
-    rcon *rc = RC + g->t; reffill(rc);
-    size_t a = runat(rc, tpos);
+    rcon *rc = RC + g->t;
+    size_t lo = 0, hi; uint64_t wend;
+    if (REFPERBLK) refwin(rc, tpos, &lo, &hi, &wend);
+    else { reffill(rc); hi = rc->n; wend = rc->end; }
+    size_t a = runat(rc, tpos, lo, hi, wend);
     return a ? rc->lab[a - 1] : UINT32_MAX;
 }
 
@@ -1283,10 +1294,13 @@ static uint64_t refend(const qseg *Q, uint64_t pos) {
     LASTREV = g ? g->rev : 0;
     if (!g) return 0;
     uint64_t tpos = g->rev ? g->tp + (g->q + g->n - 1 - pos) : g->tp + (pos - g->q);
-    rcon *rc = RC + g->t; reffill(rc);
-    size_t a = runat(rc, tpos);
+    rcon *rc = RC + g->t;
+    size_t lo = 0, hi; uint64_t wend;
+    if (REFPERBLK) refwin(rc, tpos, &lo, &hi, &wend);
+    else { reffill(rc); hi = rc->n; wend = rc->end; }
+    size_t a = runat(rc, tpos, lo, hi, wend);
     if (!a) return 0;
-    uint64_t tend = a < rc->n ? rc->st[a] : rc->end;   /* target end of that run */
+    uint64_t tend = a < hi ? rc->st[a] : wend;         /* target end of that run */
     if (g->rev) { uint64_t ts = rc->st[a - 1];
                   if (ts < g->tp) return 0;
                   return g->q + g->n - (ts - g->tp); }
@@ -3696,6 +3710,7 @@ static uint64_t loadseq(R *r, int64_t ri, uint64_t **st, uint64_t **en, int **fe
    first asked, so a query pays one contig, not a gigabyte of text. Its
    labels are interned in table order, the order the text would have given. */
 static R *REFR; static uint32_t *REFLAB;
+static int ONESEQ;                   /* region: the answer needs one contig, not the reference */
 static void reffill_r(R *r, rcon *rc);
 static R *refopen(const char *path) {   /* a plain track, opened as no companion and under no --names */
     const char *na = NAMESARG; int ix = INDEXING, ld = LENDEC, td = TAILDEC; uint64_t tp = TAILPRED_R, ts = TAILSKIP_R;
@@ -3714,13 +3729,14 @@ static void loadref_kst(const char *path) {
     R *r = refopen(path);
     if (!r->rowhash) die("the reference .kst carries no row hash: encode it again with this version");
     ensurenames(r);
+    REFPERBLK = REFLAZY && ONESEQ && !r->taildec;
     REFLAB = xmalloc(mul(r->nlab ? r->nlab : 1, 4));
     for (uint64_t j = 0; j < r->nlab; j++) REFLAB[j] = (uint32_t)intern(r->lab[j], strlen(r->lab[j]));
     uint64_t tot = 0;
     for (uint64_t i = 0; i < r->nreads; i++) {
         if (rcon_get(r->name[i], 0)) die("reference track: a contig's rows are not together");
         rcon *rc = rcon_get(r->name[i], 1);
-        rc->ri = (int64_t)i; rc->filled = 0;
+        rc->ri = (int64_t)i; rc->filled = 0; rc->blkin = NULL;
         tot += getidx(r, i).nruns;
     }
     ALNHASH ^= r->rowhash;
@@ -3772,6 +3788,88 @@ static void reffill_r(R *r, rcon *rc) {
         LENDEC = ld; TAILDEC = td; TAILPRED_R = tp; TAILSKIP_R = ts; PAYEND = pe;
         rc->filled = 1;
     }
+}
+
+/* Per block. Without a tail-encoded row every length is a plain varint, and
+   a block that opens inside a sequence records the position it opens at, so
+   the block a target position falls in can be found and decoded on its own:
+   1 of chr1's 19, not 19. */
+static void refprep(R *r, rcon *rc) {
+    rec q = getidx(r, (uint64_t)rc->ri);
+    rc->row0 = (uint64_t)q.blk * r->block + q.off;
+    rc->n = rc->cap = q.nruns;
+    rc->st = xmalloc(mul(rc->n ? rc->n : 1, 8));
+    rc->lab = xmalloc(mul(rc->n ? rc->n : 1, 4));
+    rc->bend = xcalloc(r->nblk, 8);
+    rc->firstblk = q.blk;
+    rc->lastblk = (uint32_t)((rc->row0 + (rc->n ? rc->n - 1 : 0)) / r->block);
+    rc->blkin = xcalloc(r->nblk, 1);            /* last: it is the ready flag */
+}
+static void refblk(R *r, rcon *rc, uint64_t b) {
+    loadblk(r, b);
+    const uint8_t *lp = r->lp0, *ip = r->ip0;
+    uint64_t row = b * r->block, pos = r->b[b].bp, end = row + r->b[b].rows;
+    if (b == rc->firstblk) {                    /* skip the rows before it */
+        for (; row < rc->row0; row++) { vget(&lp); vget(&ip); }
+        pos = 0;
+    }
+    if (end > rc->row0 + rc->n) end = rc->row0 + rc->n;
+    for (; row < end; row++) {
+        uint64_t len = vget(&lp), f = vget(&ip);
+        if (!len) die("corrupt track: a zero length outside a sentinel block");
+        if (f >= r->nlab) die("corrupt block: a label id past the table");
+        rc->st[row - rc->row0] = pos;
+        rc->lab[row - rc->row0] = REFLAB[f];
+        pos += len;
+    }
+    rc->bend[b] = pos;
+    rc->blkin[b] = 1;
+    /* every block in: the contig is whole, and the window checks stop */
+    if (++rc->nblkin == rc->lastblk - rc->firstblk + 1) {
+        rc->end = rc->bend[rc->lastblk];
+        rc->filled = 1;
+    }
+}
+/* One reference read, with the caller's block state put back. */
+static void refload(rcon *rc, uint64_t b, int prep) {
+    R *r = REFR;
+    int ld = LENDEC, td = TAILDEC; uint64_t tp = TAILPRED_R, ts = TAILSKIP_R;
+    const uint8_t *pe = PAYEND;
+    TAILDEC = r->taildec; TAILPRED_R = r->tailpred; TAILSKIP_R = r->tailskip;
+    if (prep) refprep(r, rc); else refblk(r, rc, b);
+    r->curblk = UINT64_MAX;
+    LENDEC = ld; TAILDEC = td; TAILPRED_R = tp; TAILSKIP_R = ts; PAYEND = pe;
+}
+/* The decoded rows around tpos: [lo, hi) and the position after them. */
+static int refwin(rcon *rc, uint64_t tpos, size_t *lo, size_t *hi, uint64_t *wend) {
+    if (rc->filled) { *lo = 0; *hi = rc->n; *wend = rc->end; return 1; }
+    static __thread rcon *WRC; static __thread size_t WLO, WHI;
+    static __thread uint64_t WST, WEN;
+    if (rc == WRC && tpos >= WST && tpos < WEN) {    /* the window last answered */
+        *lo = WLO; *hi = WHI; *wend = WEN;
+        return 1;
+    }
+    R *r = REFR;
+    if (!rc->blkin) {
+#ifdef _OPENMP
+#pragma omp critical(reffill)
+#endif
+        if (!rc->blkin) refload(rc, 0, 1);
+    }
+    uint64_t b = rc->firstblk, e = rc->lastblk;      /* the block holding tpos */
+    while (b < e) { uint64_t m = (b + e + 1) / 2;
+                    if (r->b[m].bp <= tpos) b = m; else e = m - 1; }
+    if (!rc->blkin[b]) {
+#ifdef _OPENMP
+#pragma omp critical(reffill)
+#endif
+        if (!rc->blkin[b]) refload(rc, b, 0);
+    }
+    *lo = b == rc->firstblk ? 0 : (size_t)(b * r->block - rc->row0);
+    *hi = rc->row0 + rc->n <= (b + 1) * r->block ? rc->n : (size_t)((b + 1) * r->block - rc->row0);
+    *wend = rc->bend[b];
+    WRC = rc; WLO = *lo; WHI = *hi; WST = rc->st[*lo]; WEN = *wend;
+    return 1;
 }
 
 static char out[1 << 22];
@@ -4353,6 +4451,7 @@ int main(int argc, char **argv) {
     int sm = !strcmp(cmd, "smooth");
     int dec = !strcmp(cmd, "decode");
     int rd = sm || dec || !strcmp(cmd, "region") || !strcmp(cmd, "index");
+    ONESEQ = !strcmp(cmd, "region");       /* decode and smooth walk every sequence */
     int inf = enc || rd;                   /* --db and --aln: every reader but index */
     if (!strcmp(cmd, "index")) inf = 0;
     for (int i = 1; i < argc; i++) {

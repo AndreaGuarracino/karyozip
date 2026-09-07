@@ -925,14 +925,17 @@ pub fn pick(all: &dyn Fn(usize) -> (Vec<u8>, Vec<u8>), nraw: usize, rawtot: usiz
         // decode a block back.
         let mut ti = vec![0usize; nc + 2];
         let mut tl = vec![0usize; nc + 2];
-        let mut live: Vec<bool> = (0..nc + 2).map(|k| if k < nc {
+        // a candidate lives per stream: one that does not round-trip the
+        // ids may still be the smallest for the lengths
+        let mut live_i: Vec<bool> = (0..nc + 2).map(|k| if k < nc {
             (ci[k] < usize::MAX / 4 || cl[k] < usize::MAX / 4)
                 && (!big || cand[k] & ffi::CODEC_BZIP3 != 0)
         } else { k == nc || !levelset }).collect();
+        let mut live_l = live_i.clone();
         for b in 0..nraw {
             let (lens, ids) = all(b);
             let step: Vec<(usize, usize)> = (0..nc + 2).into_par_iter().map(|k| {
-                if !live[k] { return (0, 0); }
+                if !live_i[k] && !live_l[k] { return (0, 0); }
                 // An empty stream costs nothing and is not compressed, as
                 // the C's `if (ni)` and `if (nl)` guards have it.
                 let each = |s: &[u8], f: &dyn Fn(&[u8]) -> usize| {
@@ -953,9 +956,8 @@ pub fn pick(all: &dyn Fn(usize) -> (Vec<u8>, Vec<u8>), nraw: usize, rawtot: usiz
         loop {
             qi = nc; ql = nc;
             for k in 0..nc + 2 {
-                if !live[k] { continue; }
-                if ti[k] < ti[qi] { qi = k; }
-                if tl[k] < tl[ql] { ql = k; }
+                if live_i[k] && ti[k] < ti[qi] { qi = k; }
+                if live_l[k] && tl[k] < tl[ql] { ql = k; }
             }
             let (mut bad_i, mut bad_l) = (false, false);
             for b in 0..nraw {
@@ -965,8 +967,8 @@ pub fn pick(all: &dyn Fn(usize) -> (Vec<u8>, Vec<u8>), nraw: usize, rawtot: usiz
                 if ql < nc && !lens.is_empty() && !bad_l && !verifies(&lens, cand[ql]) { bad_l = true; }
             }
             if !bad_i && !bad_l { break; }
-            if bad_i { live[qi] = false; }
-            if bad_l { live[ql] = false; }
+            if bad_i { live_i[qi] = false; }
+            if bad_l { live_l[ql] = false; }
         }
         wi = if qi < nc { cand[qi] } else { 0 };
         wl = if ql < nc { cand[ql] } else { 0 };

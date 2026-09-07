@@ -2065,10 +2065,12 @@ static void pickcodecs(int rawfd, const blkmeta *bm, size_t nraw) {
         /* --slow decides on the whole file: */
         if (SLOW) {
             size_t *ti = xcalloc(NCAND + 2, sizeof *ti), *tl = xcalloc(NCAND + 2, sizeof *tl);
-            int *live = xcalloc(NCAND + 2, sizeof *live);
+            /* a candidate lives per stream: one that does not round-trip
+               the ids may still be the smallest for the lengths */
+            int *live_i = xcalloc(NCAND + 2, sizeof *live_i), *live_l = xcalloc(NCAND + 2, sizeof *live_l);
             for (unsigned k = 0; k < NCAND; k++)
-                live[k] = ((ci[k] < (size_t)-1 / 4) || (cl[k] < (size_t)-1 / 4)) && (!big || (CAND[k] & CODEC_BZIP3));
-            live[NCAND] = 1; live[NCAND + 1] = !LEVELSET;
+                live_i[k] = live_l[k] = ((ci[k] < (size_t)-1 / 4) || (cl[k] < (size_t)-1 / 4)) && (!big || (CAND[k] & CODEC_BZIP3));
+            live_i[NCAND] = live_l[NCAND] = 1; live_i[NCAND + 1] = live_l[NCAND + 1] = !LEVELSET;
             for (size_t b2 = 0; b2 < nraw; b2++) {
                 if (bm[b2].len > sbcap) { sbcap = bm[b2].len; sbuf = xrealloc(sbuf, sbcap); }
                 rawget(rawfd, (off_t)bm[b2].off, sbuf, bm[b2].len);
@@ -2078,7 +2080,7 @@ static void pickcodecs(int rawfd, const blkmeta *bm, size_t nraw) {
 #pragma omp parallel for schedule(dynamic, 1) num_threads(nthreads())
 #endif
                 for (unsigned k = 0; k < NCAND + 2; k++) {
-                    if (!live[k]) continue;
+                    if (!live_i[k] && !live_l[k]) continue;
                     uint8_t *t = NULL; size_t g;
                     if (k < NCAND) {
                         if (ni) { g = paycomp(src + nl, ni, CAND[k], &t); ti[k] += g ? g : (size_t)-1 / 4; free(t); t = NULL; }
@@ -2099,9 +2101,8 @@ static void pickcodecs(int rawfd, const blkmeta *bm, size_t nraw) {
             for (;;) {
                 qi = NCAND; ql = NCAND;
                 for (unsigned k = 0; k < NCAND + 2; k++) {
-                    if (!live[k]) continue;
-                    if (ti[k] < ti[qi]) qi = k;
-                    if (tl[k] < tl[ql]) ql = k;
+                    if (live_i[k] && ti[k] < ti[qi]) qi = k;
+                    if (live_l[k] && tl[k] < tl[ql]) ql = k;
                 }
                 int bad_i = 0, bad_l = 0;
                 for (size_t b2 = 0; b2 < nraw && !(bad_i && bad_l); b2++) {
@@ -2120,8 +2121,8 @@ static void pickcodecs(int rawfd, const blkmeta *bm, size_t nraw) {
                         free(t); free(v); }
                 }
                 if (!bad_i && !bad_l) break;
-                if (bad_i) live[qi] = 0;
-                if (bad_l) live[ql] = 0;
+                if (bad_i) live_i[qi] = 0;
+                if (bad_l) live_l[ql] = 0;
             }
             wi = qi < NCAND ? CAND[qi] : 0;
             wl = ql < NCAND ? CAND[ql] : 0;
@@ -2129,7 +2130,7 @@ static void pickcodecs(int rawfd, const blkmeta *bm, size_t nraw) {
             if (!wl) LEVEL_L = ql == NCAND + 1 ? 22 : LEVEL;
             fprintf(stderr, "codec: --slow ran %zu live candidates over %zu blocks whole\n",
                     (size_t)NCAND + 2, nraw);
-            free(ti); free(tl); free(live);
+            free(ti); free(tl); free(live_i); free(live_l);
         }
         free(sbuf);
         if (IDCODEC < 0) IDCODEC = wi;
@@ -2488,10 +2489,11 @@ kt_writer *kt_open(FILE *out) {
     /* the encoder keeps global state: a second writer in one process starts
        from nothing, and the codec flags as first given. Not in ktw_open: the
        CLI interns the reference's labels before it opens the writer. */
-    static int idc0 = -2, lenc0;
-    if (idc0 == -2) { idc0 = IDCODEC; lenc0 = LENCODEC; }
-    IDCODEC = idc0; LENCODEC = lenc0;
+    static int idc0 = -2, lenc0, lvl0, lvlset0, blkset0; static uint64_t blk0;
+    if (idc0 == -2) { idc0 = IDCODEC; lenc0 = LENCODEC; lvl0 = LEVEL; lvlset0 = LEVELSET; blk0 = BLOCK; blkset0 = BLOCKSET; }
+    IDCODEC = idc0; LENCODEC = lenc0; LEVEL = lvl0; LEVELSET = lvlset0; BLOCK = blk0; BLOCKSET = blkset0;
     for (int i = 0; i < nlabtab; i++) free(labtab[i]);
+    free(labhash); labhash = NULL;
     nlabtab = 0; lastid = -1; labhash_init = 0; lcache_init = 0;
     TAILSEEN = 0; TAILON = -1; TAILPRED = 0; ALNHIT = 0;
     return ktw_open(out);
@@ -3439,7 +3441,9 @@ static void region_set(R *r, int64_t ri, const char *seq, uint64_t lo, uint64_t 
         for (uint64_t k = 0; k < n; k++) if (en[k] > lo && st[k] < hi) { if (k < f) f = k; l = k; }
         if (f > l) { b = 0; } else { a = f > halo ? f - halo : 0; b = n - l - 1 <= halo ? n : l + halo + 1; }
     }
-    size_t nlen = strlen(seq), cap2 = 1 << 20; char *ob = xmalloc(cap2), *o = ob;
+    size_t nlen = strlen(seq), cap2 = 1 << 20;
+    if (cap2 < nlen + maxlablen(r) + 48) cap2 = nlen + maxlablen(r) + 48;   /* the longest row fits */
+    char *ob = xmalloc(cap2), *o = ob;
     for (uint64_t k = a; k < b; k++) {
         if ((size_t)(o - ob) + nlen + strlen(lab[k]) + 48 > cap2) {
             if (fwrite(ob, 1, (size_t)(o - ob), stdout) != (size_t)(o - ob)) die("write failed");
@@ -3449,7 +3453,7 @@ static void region_set(R *r, int64_t ri, const char *seq, uint64_t lo, uint64_t 
     }
     if (o > ob && fwrite(ob, 1, (size_t)(o - ob), stdout) != (size_t)(o - ob)) die("write failed");
     for (uint64_t k = 0; k < n; k++) free(lab[k]);
-    free(st); free(en); free(lab); free(ob); rclose(r);
+    free(st); free(en); free(lab); free(ob); free(tmp); rclose(r);
 }
 
 static void region(const char *path, const char *seq, uint64_t lo, uint64_t hi,

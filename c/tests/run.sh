@@ -36,18 +36,18 @@ $KT decode --aln "$D/db.self.paf" --ref "$W/rall.kst" "$W/rall.aln.kst" 2>/dev/n
   && echo "a .kst reference read across contigs: same rows" || { echo "a .kst reference read across contigs: WRONG"; fail=1; }
 $KT decode --aln "$D/p.paf" --ref "$W/d.kt" "$W/d.kt" >/dev/null 2>&1 && { echo "an --aln track as reference: ACCEPTED"; fail=1; } || echo "an --aln track as reference: refused, as it should"
 # The review round of 2026-09-07, one case each: a label longer than any
-# stack buffer, more labels than a fixed hash, a decimal name past 2^50, a
+# stack or output buffer, more labels than a fixed hash, a decimal name past 2^50, a
 # blank --aln-names line, a cut .gz companion, a packed alignment with a
 # byte over, and a second library writer in one process.
 python3 - "$W" <<'PY'
-import sys; W = sys.argv[1]; L = "L" * 5000
+import sys; W = sys.argv[1]; L = "L" * 2100000
 open(W + "/rv.tsv", "w").write("featureID\tA\tB\n1\tx\ty\n2\t%s\tz\n" % L)
 open(W + "/rv1.bed", "w").write("s1\t0\t10\tx\ns1\t10\t20\t%s\n" % L); open(W + "/rv2.bed", "w").write("s1\t0\t10\ty\ns1\t10\t20\tz\n")
 open(W + "/rv.many", "w").write("".join("s\t%d\t%d\tlab%d\n" % (i, i + 1, i) for i in range(70000)))
 open(W + "/rv.big", "w").write("1125899906842625\t0\t10\tx\n"); open(W + "/rv.names", "w").write("q1\n\nq2\n")
 PY
 $KT --db "$W/rv.tsv" encode "$W/rv1.bed" "$W/rv2.bed" > "$W/rv.kt" 2>/dev/null
-[ "$($KT --db "$W/rv.tsv" region "$W/rv.kt" s1 12 13 2>/dev/null | wc -c)" = 5012 ] && echo "region --db, a 5000-byte label: printed" || { echo "region --db, a 5000-byte label: WRONG"; fail=1; }
+[ "$($KT --db "$W/rv.tsv" region "$W/rv.kt" s1 12 13 2>/dev/null | wc -c)" = 2100012 ] && echo "region --db, a 2100000-byte label: printed" || { echo "region --db, a 2100000-byte label: WRONG"; fail=1; }
 $KT encode < "$W/rv.many" > /dev/null 2>&1 && echo "70000 labels: encoded" || { echo "70000 labels: WRONG"; fail=1; }
 $KT encode < "$W/rv.big" > "$W/rv.big.kt" 2>/dev/null; $KT decode "$W/rv.big.kt" 2>/dev/null | cmp -s - "$W/rv.big" && echo "a name past 2^50: round trip" || { echo "a name past 2^50: WRONG"; fail=1; }
 $KT encode --aln "$D/p.paf" --ref "$D/ref.bed" --aln-names "$W/rv.names" < "$D/s.bed" >/dev/null 2>&1 && { echo "a blank --aln-names line: ACCEPTED"; fail=1; } || echo "a blank --aln-names line: refused, as it should"

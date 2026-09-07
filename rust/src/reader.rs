@@ -63,7 +63,7 @@ fn read_name_file(path: &str, nreads: u64) -> Vec<u8> {
 
 /// One block: where it is, both frame sizes, both decoded sizes, its rows,
 /// the bases before it, and its own hash.
-struct Blk { off: u64, size: u64, l: u64, raw: u64, lraw: u64, rows: u64, hash: u64 }
+struct Blk { off: u64, size: u64, l: u64, raw: u64, lraw: u64, rows: u64, bp: u64, hash: u64 }
 
 /// seq, start, end, label, as decode hands each row out.
 pub type RowFn<'a> = dyn FnMut(&[u8], u64, u64, &[u8]) + 'a;
@@ -315,7 +315,7 @@ impl Reader {
             let nos = if was_len { let x = (d2 & 3) as u8; d2 >>= 2; x } else { 0 };
             blk_nos.push(nos);
             let (e2, n5) = vget(&sbuf, n4);
-            let (_bp, n6) = vget(&sbuf, n5);
+            let (bp, n6) = vget(&sbuf, n5);
             let (g2, n7) = vget(&sbuf, n6);
             q = n7;
             if a > fsz || b2 > fsz || a + b2 > fsz || acc + a + b2 > fsz {
@@ -328,7 +328,7 @@ impl Reader {
             if c2 > h[4] * 16 + 64 || d2 > h[4] * 16 + 64 {
                 crate::bail("corrupt index: a block claims an impossible decoded size");
             }
-            b.push(Blk { off: acc, size: a + b2, l: a, raw: c2, lraw: d2, rows: e2, hash: g2 });
+            b.push(Blk { off: acc, size: a + b2, l: a, raw: c2, lraw: d2, rows: e2, bp, hash: g2 });
             acc += a + b2;
         }
         let tot: u64 = b.iter().map(|x| x.rows).sum();
@@ -974,6 +974,36 @@ impl Reader {
     pub fn labels(&self) -> &[Vec<u8>] { &self.lab }
     /// run count of sequence `ri`, from the index alone
     pub fn nruns_of(&mut self, ri: u64) -> u64 { self.locate(ri).2 }
+
+    pub fn taildec(&self) -> bool { self.taildec }
+    pub fn nblk(&self) -> usize { self.b.len() }
+    pub fn blocksz(&self) -> u64 { self.block }
+    /// where block `b` opens inside the sequence its first row belongs to
+    pub fn blk_bp(&self, b: usize) -> u64 { self.b[b].bp }
+    /// (first block, first row, run count) of sequence `ri`
+    pub fn seq_span(&mut self, ri: u64) -> (usize, u64, u64) {
+        let (blk, off, n) = self.locate(ri);
+        (blk, blk as u64 * self.block + off, n)
+    }
+    /// The rows of sequence `ri` that lie in block `b`, as (start, label id),
+    /// and the position after the last of them. The sequence's own
+    /// coordinates: block `b` opens at blk_bp(b) unless it is the first.
+    pub fn blk_runs(&mut self, ri: u64, b: usize) -> (Vec<(u64, u32)>, u64) {
+        let (fb, row0, n) = self.seq_span(ri);
+        let (mut row, mut pos) = if b == fb { (row0, 0) } else { (b as u64 * self.block, self.b[b].bp) };
+        let mut c = self.at(b, row - b as u64 * self.block);
+        let end = (b as u64 * self.block + self.b[b].rows).min(row0 + n);
+        let mut out = Vec::with_capacity((end - row) as usize);
+        while row < end {
+            let (len, f) = self.step(&mut c, pos, false);
+            if len == 0 { crate::bail("corrupt track: a zero length outside a sentinel block"); }
+            if f as usize >= self.lab.len() { crate::bail("corrupt block: a label id past the table"); }
+            out.push((pos, f as u32));
+            pos += len;
+            row += 1;
+        }
+        (out, pos)
+    }
 
     /// One sequence of a plain track as run starts, label ids and its end:
     /// what a --ref contig is, decoded when first asked.

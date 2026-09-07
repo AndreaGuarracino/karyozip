@@ -118,7 +118,7 @@ fn main() {
                      reorders the records, so the ordinal name map is invalid");
             }
             if c.db.is_some() && files.is_empty() { die("--db: give one BED per feature set"); }
-            let a = load_aln(&c.aln, &c.refbed, &c.aln_names, "", false);
+            let a = load_aln(&c.aln, &c.refbed, &c.aln_names, "", aln::Lazy::No);
             match &c.db {
                 Some(fp) => {
                     if c.hier.is_some() && c.db.is_none() { die("--hier does nothing without --db"); }
@@ -141,7 +141,7 @@ fn main() {
         Cmd::Decode { track, rest } => {
             if !rest.is_empty() { die("decode takes one track"); }
             let track = need(track);
-            let feats = informed(&c, &mut ro, "decode ", None);
+            let feats = informed(&c, &mut ro, "decode ", None, aln::Lazy::Contig);
             let mut r = reader::Reader::open_with(track, &ro);
             if let Some(f) = &feats { f.check_hash(&r); }
             match &feats {
@@ -170,7 +170,7 @@ fn main() {
                     (x, y, hl.as_ref().map_or(0, |_| p(hl, "region: halo is not a number")))
                 }
             };
-            let feats = informed(&c, &mut ro, "region ", None);
+            let feats = informed(&c, &mut ro, "region ", None, aln::Lazy::OneSeq);
             let mut r = reader::Reader::open_with(track, &ro);
             if let Some(f) = &feats { f.check_hash(&r); }
             let cols = feats.as_ref().map_or(Vec::new(), |f| f.setcols(c.set.as_deref()));
@@ -191,7 +191,7 @@ fn main() {
                 _ => die("smooth: give SEQ, or SEQ START END"),
             };
             if start.is_some() && lo >= hi { die("smooth: end must be past start"); }
-            let feats = informed(&c, &mut ro, "smooth ", Some(hier));
+            let feats = informed(&c, &mut ro, "smooth ", Some(hier), aln::Lazy::Contig);
             // not stdout().lock(): a lock guard cannot cross to the smooth
             // workers, and they are serialized by turn anyway
             let mut o = BufWriter::new(std::io::stdout());
@@ -211,7 +211,7 @@ fn main() {
                 _ => die("usage: karyozip aln-pack P.paf REF.bed|REF.kst OUT"),
             };
             let mut a = aln::Aln::default();
-            a.load_ref(rbed, false);
+            a.load_ref(rbed, aln::Lazy::No);
             let rh = aln::refhash(&a);
             a.load_paf(paf);
             aln::pack(&a, dest, rh);
@@ -278,11 +278,12 @@ fn parse_codec(s: &str, flag: &str) -> i32 {
 /// --aln needs --ref, and the two are read once, before any row.
 /// --db and --aln companions for a reader, in the C's order: features first.
 /// smooth's positional hierarchy stands in for --hier under --db.
-fn informed(c: &cli::Cli, ro: &mut reader::ReadOpts, who: &str, hier: Option<&str>) -> Option<db::Feats> {
+fn informed(c: &cli::Cli, ro: &mut reader::ReadOpts, who: &str, hier: Option<&str>,
+            lazy: aln::Lazy) -> Option<db::Feats> {
     if c.set.is_some() && c.db.is_none() { die("--set needs --db"); }
     if c.hier.is_some() && c.db.is_none() { die("--hier does nothing without --db"); }
     let feats = c.db.as_deref().map(|fp| load_feats(fp, c.hier.as_deref().or(hier)));
-    ro.aln = load_aln(&c.aln, &c.refbed, &c.aln_names, who, true).map(std::sync::Arc::new);
+    ro.aln = load_aln(&c.aln, &c.refbed, &c.aln_names, who, lazy).map(std::sync::Arc::new);
     feats
 }
 
@@ -295,7 +296,7 @@ fn load_feats(fp: &str, hier: Option<&str>) -> db::Feats {
 }
 
 fn load_aln(paf: &Option<String>, refbed: &Option<String>,
-            ordfile: &Option<String>, who: &str, lazy: bool) -> Option<aln::Aln> {
+            ordfile: &Option<String>, who: &str, lazy: aln::Lazy) -> Option<aln::Aln> {
     match (paf, refbed) {
         (Some(_), None) => die(&format!("{who}--aln needs --ref")),
         (None, Some(_)) => die("--ref does nothing without --aln"),

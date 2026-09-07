@@ -4,6 +4,11 @@
 use crate::kst::{self, unzz, vget, FNV0};
 use std::collections::HashMap;
 
+/// How a .kst reference is read: whole at load, per contig on demand, or one
+/// block at a time when a single sequence is asked for.
+#[derive(PartialEq, Clone, Copy)]
+pub enum Lazy { No, Contig, OneSeq }
+
 /// One collinear block: where it starts on the query, which reference
 /// contig, how long, where it starts there, and the strand.
 #[derive(Clone, Copy)]
@@ -12,10 +17,14 @@ pub struct Seg { pub q: u64, pub t: u32, pub n: u32, pub tp: u64, pub rev: bool 
 /// A reference contig: run starts, a label id per run, and its end. From a
 /// .kst reference the rows are decoded when first asked.
 pub type Rows = (Vec<u64>, Vec<u32>, u64);
-#[derive(Clone)]
-pub struct Rcon { pub name: Vec<u8>, ri: u64, rows: std::sync::OnceLock<Rows> }
+#[derive(Clone, Default)]
+struct Blkfill { st: Vec<u64>, lab: Vec<u32>, bend: Vec<u64>, in_: Vec<bool>,
+                 row0: u64, n: u64, first: usize, last: usize, nin: usize }
+pub struct Rcon { pub name: Vec<u8>, ri: u64, rows: std::sync::OnceLock<Rows>,
+                  /// --ref R.kst under region: one block at a time
+                  pb: std::sync::Mutex<Blkfill> }
 
-#[derive(Default, Clone)]
+#[derive(Default)]
 pub struct Aln {
     pub rc: Vec<Rcon>,
     rcix: HashMap<Vec<u8>, u32>,
@@ -30,6 +39,8 @@ pub struct Aln {
     /// --ref R.kst: the track, and its label ids as this table's
     refkst: Option<std::sync::Arc<std::sync::Mutex<crate::reader::Reader>>>,
     reflab: Vec<u32>,
+    /// one sequence asked for and no tail-encoded row: fill by block
+    perblk: bool,
     /// the last segment answered, so a walk in order does not re-search
     cur: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// the last reference run answered, contig and index, the same way
@@ -48,7 +59,7 @@ impl Aln {
 
     /// The reference track: one contig's rows together, sorted, gapless.
     /// A .kst is taken as a track; `lazy` leaves its contigs until asked.
-    pub fn load_ref(&mut self, path: &str, lazy: bool) {
+    pub fn load_ref(&mut self, path: &str, lazy: Lazy) {
         if let Ok(mut f) = std::fs::File::open(path) {
             let mut m = [0u8; 8];
             if std::io::Read::read_exact(&mut f, &mut m).is_ok() && &m == crate::writer::MAGIC {
@@ -75,7 +86,7 @@ impl Aln {
                     let _ = self.rc[cur].rows.set((std::mem::take(&mut st), std::mem::take(&mut lab), end));
                 }
                 self.rcix.insert(c[0].to_vec(), self.rc.len() as u32);
-                self.rc.push(Rcon { name: c[0].to_vec(), ri: 0, rows: std::sync::OnceLock::new() });
+                self.rc.push(Rcon { name: c[0].to_vec(), ri: 0, rows: std::sync::OnceLock::new(), pb: Default::default() });
                 cur = self.rc.len() - 1;
                 nh = kst::fnv(FNV0, c[0]);
             }
@@ -99,26 +110,28 @@ impl Aln {
 
     /// The labels are interned in table order, the order the text would
     /// have given, so the ids the reference answers with are the track's.
-    fn load_ref_kst(&mut self, path: &str, lazy: bool) {
+    fn load_ref_kst(&mut self, path: &str, lazy: Lazy) {
         let ro = crate::reader::ReadOpts { index: true, ..Default::default() };
         let mut r = crate::reader::Reader::open_with(path, &ro);
         if !r.plainref {
             crate::bail("the reference .kst must be a plain track: not --aln, not --db, and its names in the file, neither dropped nor in a sidecar");
         }
         if r.rowhash == 0 { crate::bail("the reference .kst carries no row hash: encode it again with this version"); }
+        let taildec = r.taildec();
         self.reflab = r.labels().to_vec().iter().map(|l| self.lab(l)).collect();
         let mut tot = 0u64;
         for i in 0..r.nreads {
             let name = r.name_at(i).to_vec();
             if self.rcix.contains_key(&name) { crate::bail("reference track: a contig's rows are not together"); }
             self.rcix.insert(name.clone(), self.rc.len() as u32);
-            self.rc.push(Rcon { name, ri: i, rows: std::sync::OnceLock::new() });
+            self.rc.push(Rcon { name, ri: i, rows: std::sync::OnceLock::new(), pb: Default::default() });
             tot += r.nruns_of(i);
         }
         self.hash ^= r.rowhash;
         eprintln!("reference: {} contigs, {tot} runs", self.rc.len());
+        self.perblk = lazy == Lazy::OneSeq && !taildec;
         self.refkst = Some(std::sync::Arc::new(std::sync::Mutex::new(r)));
-        if lazy { return; }
+        if lazy != Lazy::No { return; }
         // every contig at once: a reader per chunk of contigs, on the pool
         use rayon::prelude::*;
         let n = self.rc.len();
@@ -413,12 +426,54 @@ impl Aln {
         a
     }
 
+    /// The run covering `tpos` as (label, its start, its end), or None past
+    /// the contig. Under region a .kst reference fills one block, not the
+    /// contig, and the lookup happens under that contig's lock.
+    fn run(&self, t: u32, tpos: u64) -> Option<(u32, u64, u64)> {
+        if !self.perblk {
+            let rc = self.rows(t);
+            let a = self.runat(t, rc, tpos);
+            if a == 0 { return None; }
+            return Some((rc.1[a - 1], rc.0[a - 1], if a < rc.0.len() { rc.0[a] } else { rc.2 }));
+        }
+        let mut f = self.rc[t as usize].pb.lock().unwrap_or_else(|e| e.into_inner());
+        let mut r = self.refkst.as_ref().unwrap().lock().unwrap_or_else(|e| e.into_inner());
+        if f.in_.is_empty() {
+            let (fb, row0, n) = r.seq_span(self.rc[t as usize].ri);
+            *f = Blkfill { st: vec![0; n as usize], lab: vec![0; n as usize],
+                           bend: vec![0; r.nblk()], in_: vec![false; r.nblk()],
+                           row0, n, first: fb, last: ((row0 + n - 1) / r.blocksz()) as usize, nin: 0 };
+        }
+        let (mut b, mut e) = (f.first, f.last);
+        while b < e {                                   // the block holding tpos
+            let m = (b + e).div_ceil(2);
+            if r.blk_bp(m) <= tpos { b = m; } else { e = m - 1; }
+        }
+        if !f.in_[b] {
+            let (runs, bend) = r.blk_runs(self.rc[t as usize].ri, b);
+            let lo = if b == f.first { 0 } else { b as u64 * r.blocksz() - f.row0 } as usize;
+            for (i, (p, l)) in runs.iter().enumerate() {
+                f.st[lo + i] = *p;
+                f.lab[lo + i] = self.reflab[*l as usize];
+            }
+            f.bend[b] = bend;
+            f.in_[b] = true;
+            f.nin += 1;
+        }
+        let lo = if b == f.first { 0 } else { b as u64 * r.blocksz() - f.row0 } as usize;
+        let hi = if f.row0 + f.n <= (b as u64 + 1) * r.blocksz() { f.n as usize }
+                 else { ((b as u64 + 1) * r.blocksz() - f.row0) as usize };
+        let wend = f.bend[b];
+        if tpos >= wend { return None; }
+        let a = lo + f.st[lo..hi].partition_point(|&x| x <= tpos);
+        if a == 0 { return None; }
+        Some((f.lab[a - 1], f.st[a - 1], if a < hi { f.st[a] } else { wend }))
+    }
+
     pub fn label(&self, qi: usize, pos: u64) -> u32 {
         let Some(g) = self.segat(qi, pos) else { return u32::MAX };
         let tpos = if g.rev { g.tp + (g.q + g.n as u64 - 1 - pos) } else { g.tp + (pos - g.q) };
-        let rc = self.rows(g.t);
-        let a = self.runat(g.t, rc, tpos);
-        if a > 0 { rc.1[a - 1] } else { u32::MAX }
+        self.run(g.t, tpos).map_or(u32::MAX, |r| r.0)
     }
 
     /// The query position where the reference run under `pos` ends.
@@ -426,13 +481,8 @@ impl Aln {
         let Some(g) = self.segat(qi, pos) else { return (0, false) };
         let rev = g.rev;
         let tpos = if rev { g.tp + (g.q + g.n as u64 - 1 - pos) } else { g.tp + (pos - g.q) };
-        let rc = self.rows(g.t);
-        let a = self.runat(g.t, rc, tpos);
-        if a == 0 { return (0, rev); }
-        let (st, end) = (&rc.0, rc.2);
-        let tend = if a < st.len() { st[a] } else { end };
+        let Some((_, ts, tend)) = self.run(g.t, tpos) else { return (0, rev) };
         if rev {
-            let ts = st[a - 1];
             if ts < g.tp { return (0, rev); }
             return (g.q + g.n as u64 - (ts - g.tp), rev);
         }

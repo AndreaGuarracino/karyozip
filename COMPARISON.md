@@ -30,7 +30,7 @@ DIFF_PASS
 |------------------------|------:|------:|
 | lines, excluding vendored C | 4,644 | 4,759 |
 | files                  |     2 |    11 |
-| `unsafe` blocks        |     — |    14 |
+| `unsafe` blocks        |     — |    16 |
 | stripped binary        | 382 KB | 2,269 KB |
 
 The two are the same length within 1%. Some of that is real, the parallel arrays and the
@@ -46,9 +46,12 @@ of `c/karyozip.c` at build time, so `--help` is the same bytes from both by
 construction. The htscodecs and bzip3 version strings come the same way,
 from `c/htscodecs/version.h` and `c/Makefile`.
 
-All 14 `unsafe` blocks are in `src/ffi.rs`, the one module that calls the
+14 `unsafe` blocks are in `src/ffi.rs`, the one module that calls the
 vendored C codecs and checks the standard fds before the runtime touches
-them. Nothing else in the crate is unsafe.
+them. The other two are the unchecked reads inside `smooth_one`, the
+smoothing inner loop, behind one assertion at its top that proves every
+index: it took the Rust smooth phase from 2.52 s to 2.22 s against the
+C's 2.00 s on the ONT gene track. Nothing else in the crate is unsafe.
 
 ## Speed
 

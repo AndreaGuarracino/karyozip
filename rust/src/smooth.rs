@@ -85,14 +85,17 @@ impl Hier {
 fn smooth_one(h: &Hier, st: &[u64], en: &[u64], feat: &mut [i32], maxgap: u64) {
     let n = feat.len();
     if n == 0 { return; }
-    // all three are the sequence's runs: say so, and the j + 1 < n guard
-    // proves every index below
-    let (st, en) = (&st[..n], &en[..n]);
     let nn = h.node.len();
-    // the tables as slices, so the inner loops index them directly, as the
-    // C's ISANC macro does
+    // every index below is proven once here: st, en, was are n long, every
+    // feature id is a node, dis and par are nn long, anc and lca nn*nn;
+    // the loops then read unchecked, as the C's ISANC macro does
+    assert!(st.len() == n && en.len() == n && h.par.len() == nn
+            && h.anc.len() == nn * nn && h.lca.len() == nn * nn
+            && feat.iter().all(|&f| (f as usize) < nn)
+            && h.par.iter().all(|&p| p < nn as i32));
     let (anc, par, lca) = (&h.anc[..], &h.par[..], &h.lca[..]);
-    let isanc = |node: i32, pa: i32| anc[node as usize * nn + pa as usize] != 0;
+    macro_rules! at { ($v:expr, $i:expr) => { unsafe { *$v.get_unchecked($i) } } }
+    let isanc = |node: i32, pa: i32| at!(anc, node as usize * nn + pa as usize) != 0;
     let mut was = vec![0u8; n];
     let mut dis = vec![0u32; nn];
     let mut rel: Vec<usize> = Vec::with_capacity(n);
@@ -107,34 +110,34 @@ fn smooth_one(h: &Hier, st: &[u64], en: &[u64], feat: &mut [i32], maxgap: u64) {
             rel.push(i);
             let mut firstun: i64 = -1;
             mark += 1;
-            let (mut lrf, mut lri, mut lre) = (feat[i], i, en[i]);
+            let (mut lrf, mut lri, mut lre) = (at!(feat, i), i, at!(en, i));
             let mut j = i;
             while j + 1 < n {
-                let nf = feat[j + 1];
-                if st[j + 1] - lre > maxgap { break; }
+                let nf = at!(feat, j + 1);
+                if at!(st, j + 1) - lre > maxgap { break; }
                 if isanc(lrf, nf) {
-                    if dis[nf as usize] == mark { break; }
+                    if at!(dis, nf as usize) == mark { break; }
                     rel.push(j + 1);
-                    lri = j + 1; lrf = nf; lre = en[j + 1]; j += 1;
+                    lri = j + 1; lrf = nf; lre = at!(en, j + 1); j += 1;
                 } else if !isanc(nf, lrf) {
                     let mut c = nf;
-                    while c >= 0 { dis[c as usize] = mark; c = par[c as usize]; }
-                    if firstun < 0 && was[j + 1] == 0 { firstun = (j + 1) as i64; }
+                    while c >= 0 { unsafe { *dis.get_unchecked_mut(c as usize) = mark; } c = at!(par, c as usize); }
+                    if firstun < 0 && at!(was, j + 1) == 0 { firstun = (j + 1) as i64; }
                     j += 1;
                 } else { break; }
             }
             let mut we = lri;
-            let peak = feat[we];
+            let peak = at!(feat, we);
             let mut k = we;
             while k + 1 < n {
-                let nf = feat[k + 1];
-                if st[k + 1] - lre > maxgap { break; }
+                let nf = at!(feat, k + 1);
+                if at!(st, k + 1) - lre > maxgap { break; }
                 if isanc(nf, lrf) {
                     rel.push(k + 1);
-                    lri = k + 1; lrf = nf; lre = en[k + 1]; k += 1;
+                    lri = k + 1; lrf = nf; lre = at!(en, k + 1); k += 1;
                 } else if !isanc(lrf, nf) {
                     if isanc(nf, peak) { break; }
-                    if firstun < 0 && was[k + 1] == 0 { firstun = (k + 1) as i64; }
+                    if firstun < 0 && at!(was, k + 1) == 0 { firstun = (k + 1) as i64; }
                     k += 1;
                 } else { break; }
             }
@@ -143,7 +146,8 @@ fn smooth_one(h: &Hier, st: &[u64], en: &[u64], feat: &mut [i32], maxgap: u64) {
             if nrel >= 2 { nrel -= 1; }   // archive quirk, kept
             for &t in &rel[..nrel] { was[t] = 1; }
             if we > ws {
-                let l = lca[feat[ws] as usize * nn + feat[we] as usize] as i32;
+                let (a, b) = (at!(feat, ws) as usize, at!(feat, we) as usize);
+                let l = at!(lca, a * nn + b) as i32;
                 if l >= 0 {
                     for x in feat.iter_mut().take(we).skip(ws + 1) {
                         if *x != l && isanc(l, *x) { *x = l; changes = true; }

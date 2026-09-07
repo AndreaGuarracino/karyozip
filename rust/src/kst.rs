@@ -56,17 +56,15 @@ pub fn putu64(out: &mut Vec<u8>, v: u64) {
 /// a stack buffer and reaches the output in one call, as the C writes it
 /// through one pointer.
 pub fn putu64_at(b: &mut [u8], v: u64) -> usize {
-    let mut t = [0u8; 20];
-    let mut i = t.len();
-    let mut n = v;
+    let (mut n, mut t) = (1usize, v);
+    while t >= 10 { t /= 10; n += 1; }      // count, then fill in place: a
+    let (mut i, mut t) = (n, v);            // scratch array costs a memcpy
     loop {
         i -= 1;
-        t[i] = b'0' + (n % 10) as u8;
-        n /= 10;
-        if n == 0 { break; }
+        b[i] = b'0' + (t % 10) as u8;
+        t /= 10;
+        if i == 0 { return n; }
     }
-    b[..t.len() - i].copy_from_slice(&t[i..]);
-    t.len() - i
 }
 
 /// FNV-1a as a `HashMap` hasher. The default is SipHash, which on a

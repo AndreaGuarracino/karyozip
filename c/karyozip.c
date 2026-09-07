@@ -1228,7 +1228,7 @@ static void loadordinals(const char *path) {
                          ORD = xrealloc(ORD, nord * sizeof *ORD); }
         ORD[c++] = xstrdup(ln);
     }
-    if (ferror(f)) die("read error on --aln-names");
+    if (ferror(f)) die("read error on a companion file");
     free(ln); fclose(f); nord = c;
     {   uint64_t h = FNV0;
         for (size_t i = 0; i < nord; i++) h = fnvbuf(h, ORD[i], strlen(ORD[i]) + 1);
@@ -2939,7 +2939,7 @@ static char *readnamefile(uint64_t nreads) {
             if (S_ISREG(st0.st_mode) && stathash(&st1) != NAMESRC_H)
                 die("the file given to --names changed while it was read");
             if (!S_ISREG(st0.st_mode)) NAMESRC_H = 0; }   /* a pipe cannot bind an index */
-        if (ferror(nf)) die("read error on --names");
+        if (ferror(nf)) die("read error on a companion file");
         free(ln); fclose(nf);
 
         if (got != nreads) {

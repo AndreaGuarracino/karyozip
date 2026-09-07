@@ -37,6 +37,12 @@ static int abuse(int c) {
 
 int main(int argc, char **argv) {
     if (argc == 3 && !strcmp(argv[1], "-abuse")) return abuse(atoi(argv[2]));
+    if (argc == 4 && !strcmp(argv[1], "-twice")) {      /* two writers in one process */
+        FILE *a = fopen(argv[2], "wb"), *b = fopen(argv[3], "wb");
+        kt_writer *w = kt_open(a); kt_row(w, "s1", 2, 10, "AAA", 3, 0); kt_row(w, "s1", 2, 10, "BBB", 3, 10); kt_close(w); fclose(a);
+        w = kt_open(b); kt_row(w, "t1", 2, 7, "CCC", 3, 0); kt_row(w, "t1", 2, 5, "AAA", 3, 7); kt_close(w); fclose(b);
+        return 0;
+    }
     if (argc < 3) { fprintf(stderr, "usage: libtest IN.bed OUT.kst [BLOCK]\n"
                                     "       libtest -abuse N\n"); return 2; }
     FILE *in = fopen(argv[1], "r"), *out = fopen(argv[2], "wb");

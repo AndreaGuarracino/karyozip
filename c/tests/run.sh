@@ -35,6 +35,26 @@ $KT decode --aln "$D/db.self.paf" --ref "$D/db.rall.bed" "$W/rall.aln.kst" > "$W
 $KT decode --aln "$D/db.self.paf" --ref "$W/rall.kst" "$W/rall.aln.kst" 2>/dev/null | cmp -s - "$W/rall.want" \
   && echo "a .kst reference read across contigs: same rows" || { echo "a .kst reference read across contigs: WRONG"; fail=1; }
 $KT decode --aln "$D/p.paf" --ref "$W/d.kt" "$W/d.kt" >/dev/null 2>&1 && { echo "an --aln track as reference: ACCEPTED"; fail=1; } || echo "an --aln track as reference: refused, as it should"
+# The review round of 2026-09-07, one case each: a label longer than any
+# stack buffer, more labels than a fixed hash, a decimal name past 2^50, a
+# blank --aln-names line, a cut .gz companion, a packed alignment with a
+# byte over, and a second library writer in one process.
+python3 - "$W" <<'PY'
+import sys; W = sys.argv[1]; L = "L" * 5000
+open(W + "/rv.tsv", "w").write("featureID\tA\tB\n1\tx\ty\n2\t%s\tz\n" % L)
+open(W + "/rv1.bed", "w").write("s1\t0\t10\tx\ns1\t10\t20\t%s\n" % L); open(W + "/rv2.bed", "w").write("s1\t0\t10\ty\ns1\t10\t20\tz\n")
+open(W + "/rv.many", "w").write("".join("s\t%d\t%d\tlab%d\n" % (i, i + 1, i) for i in range(70000)))
+open(W + "/rv.big", "w").write("1125899906842625\t0\t10\tx\n"); open(W + "/rv.names", "w").write("q1\n\nq2\n")
+PY
+$KT --db "$W/rv.tsv" encode "$W/rv1.bed" "$W/rv2.bed" > "$W/rv.kt" 2>/dev/null
+[ "$($KT --db "$W/rv.tsv" region "$W/rv.kt" s1 12 13 2>/dev/null | wc -c)" = 5012 ] && echo "region --db, a 5000-byte label: printed" || { echo "region --db, a 5000-byte label: WRONG"; fail=1; }
+$KT encode < "$W/rv.many" > /dev/null 2>&1 && echo "70000 labels: encoded" || { echo "70000 labels: WRONG"; fail=1; }
+$KT encode < "$W/rv.big" > "$W/rv.big.kt" 2>/dev/null; $KT decode "$W/rv.big.kt" 2>/dev/null | cmp -s - "$W/rv.big" && echo "a name past 2^50: round trip" || { echo "a name past 2^50: WRONG"; fail=1; }
+$KT encode --aln "$D/p.paf" --ref "$D/ref.bed" --aln-names "$W/rv.names" < "$D/s.bed" >/dev/null 2>&1 && { echo "a blank --aln-names line: ACCEPTED"; fail=1; } || echo "a blank --aln-names line: refused, as it should"
+gzip -c "$D/ref.bed" | head -c 40 > "$W/rv.gz"
+$KT encode --aln "$D/p.paf" --ref "$W/rv.gz" < "$D/s.bed" >/dev/null 2>&1 && { echo "a cut .gz reference: ACCEPTED"; fail=1; } || echo "a cut .gz reference: refused, as it should"
+$KT aln-pack "$D/p.paf" "$D/ref.bed" "$W/rv.pk" >/dev/null 2>&1; printf '\0' >> "$W/rv.pk"
+$KT decode --aln "$W/rv.pk" --ref "$D/ref.bed" "$W/d.kt" >/dev/null 2>&1 && { echo "a packed alignment with a byte over: ACCEPTED"; fail=1; } || echo "a packed alignment with a byte over: refused, as it should"
 
 $KT encode < "$D/s.bed" > "$W/p.kt" 2>/dev/null
 $KT encode < "$D/db.rall.bed" > "$W/omp.ref" 2>/dev/null
@@ -943,6 +963,8 @@ if [ -x "$LT" ]; then
   cmp -s "$W/lc.kt" "$W/ll.kt" || { lok=0; echo "  library differs on --block all"; }
   $KT --block 4 encode < "$D/db.rall.bed" > "$W/lc.kt" 2>/dev/null
   $LT "$D/db.rall.bed" "$W/ll.kt" 4 2>/dev/null
+  $LT -twice "$W/lt1.kt" "$W/lt2.kt" 2>/dev/null; printf 't1\t0\t7\tCCC\nt1\t7\t12\tAAA\n' | $KT encode 2>/dev/null | cmp -s - "$W/lt2.kt" \
+    && echo "library API: a second writer starts clean" || { echo "library API: a second writer keeps the first's state"; fail=1; }
   cmp -s "$W/lc.kt" "$W/ll.kt" || { lok=0; echo "  library differs on --block 4"; }
   [ $lok = 1 ] && echo "library API: same bytes as the CLI" \
     || { echo "library API: DIFFERS from the CLI"; fail=1; }

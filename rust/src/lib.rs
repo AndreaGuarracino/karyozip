@@ -48,7 +48,7 @@ pub fn bedcoord(b: &[u8], what: &'static str) -> u64 {
 /// the bytes, so the C and this read the same file the same way.
 pub fn slurp(path: &str, what: &'static str) -> Vec<u8> {
     let d = std::fs::read(path).unwrap_or_else(|_| bail(what));
-    if d.len() > 1 && d[0] == 0x1f && d[1] == 0x8b { inflate(&d[..], what) } else { d }
+    if d.len() > 1 && d[0] == 0x1f && d[1] == 0x8b { inflate(&d[..], "read error on a companion file") } else { d }
 }
 
 /// The same, for a stream: stdin may be a pipe, so the first bytes are

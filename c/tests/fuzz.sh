@@ -125,6 +125,27 @@ for kind in db al; do
 done
 echo "fuzz: $d damaged files, none crashed"
 
+# 2b. a damaged packed alignment: the companion is read whole from disk, so
+# every flip and every cut must be refused or decoded right, never crash.
+$KT encode --aln "$D/p.paf" --ref "$D/ref.bed" < "$D/s.bed" > "$W/pa.kt" 2>/dev/null
+$KT aln-pack "$D/p.paf" "$D/ref.bed" "$W/pa.pk" >/dev/null 2>&1
+$KT decode --aln "$D/p.paf" --ref "$D/ref.bed" "$W/pa.kt" 2>/dev/null > "$W/pa.want"
+psz=$(stat -c%s "$W/pa.pk"); pd=0
+for cut in $(seq 1 $psz) ; do head -c $((psz - cut)) "$W/pa.pk" > "$W/m.pk"
+  out=$(ASAN_OPTIONS=detect_leaks=0 timeout 30 ${SAN:-$KT} decode --aln "$W/m.pk" --ref "$D/ref.bed" "$W/pa.kt" 2>"$W/err"); rc=$?
+  [ $rc -gt 1 ] && { echo "fuzz: packed alignment cut=$cut crashed rc=$rc"; fail=1; }
+  grep -qE "AddressSanitizer|runtime error" "$W/err" && { echo "fuzz: packed alignment cut=$cut sanitizer report"; fail=1; }
+  [ $rc -eq 0 ] && { printf '%s\n' "$out" | cmp -s - "$W/pa.want" || { echo "fuzz: packed alignment cut=$cut decoded WRONG rows"; fail=1; }; }
+  pd=$((pd+1)); done
+for i in $(seq 1 $((N * 2))); do cp "$W/pa.pk" "$W/m.pk"; off=$(( (RANDOM * 32768 + RANDOM) % psz ))
+  printf "\\x$(printf %02x $((RANDOM % 256)))" | dd of="$W/m.pk" bs=1 seek=$off conv=notrunc 2>/dev/null
+  out=$(ASAN_OPTIONS=detect_leaks=0 timeout 30 ${SAN:-$KT} decode --aln "$W/m.pk" --ref "$D/ref.bed" "$W/pa.kt" 2>"$W/err"); rc=$?
+  [ $rc -gt 1 ] && { echo "fuzz: packed alignment flip off=$off crashed rc=$rc"; fail=1; }
+  grep -qE "AddressSanitizer|runtime error" "$W/err" && { echo "fuzz: packed alignment flip off=$off sanitizer report"; fail=1; }
+  [ $rc -eq 0 ] && { printf '%s\n' "$out" | cmp -s - "$W/pa.want" || { echo "fuzz: packed alignment flip off=$off decoded WRONG rows"; fail=1; }; }
+  pd=$((pd+1)); done
+echo "fuzz: $pd damaged packed alignments, none crashed"
+
 # 3. a forged file: every header count set to an extreme and the metadata
 # hash recomputed, so the reader meets values that pass the hash. This is
 # what found a zero label count with a label table, and two multiplies that

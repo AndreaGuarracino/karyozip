@@ -68,6 +68,7 @@ impl Aln {
             }
         }
         let mut lines = crate::Lines::open(path, "cannot open the reference track");
+        lines.err = "read error on the reference track";
         let mut rh = FNV0;
         let (mut badln, mut cur) = (0u64, usize::MAX);
         let (mut st, mut lab, mut end): (Vec<u64>, Vec<u32>, u64) = (Vec::new(), Vec::new(), 0);
@@ -161,6 +162,7 @@ impl Aln {
     /// The PAF, read for its cg:Z: CIGARs. Everything else is dead weight.
     pub fn load_paf(&mut self, path: &str) {
         let mut lines = crate::Lines::open(path, "cannot open the PAF");
+        lines.err = "read error on the PAF";
         let (mut nblk, mut badpaf, mut nocg, mut noref) = (0usize, 0u64, 0u64, 0u64);
         while let Some(raw) = lines.next_line() {
             let mut line = raw;

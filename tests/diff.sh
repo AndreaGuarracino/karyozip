@@ -196,6 +196,20 @@ for form in "encode --aln $D/p.paf --ref $D/ref.bed --aln-names $W/blank" "encod
 done
 echo "refusals: same message from both"
 
+# 12. valid input of every awkward shape, the fuzz's generator: both must
+# write the same bytes under every flag form.
+python3 "$D/kt.py" gen "$W" 20
+gok=0; gbad=0
+for f in "$W"/ok*.bed; do
+  for fl in "" "--block 4" "--block all" "--sort" "--names drop" "--slow --block 3"; do
+    "$C" $fl encode < "$f" > "$W/c.kst" 2>/dev/null; c1=$?
+    "$R" $fl encode < "$f" > "$W/r.kst" 2>/dev/null; c2=$?
+    if cmp -s "$W/c.kst" "$W/r.kst" && [ $c1 = $c2 ]; then gok=$((gok+1))
+    else gbad=$((gbad+1)); echo "  awkward input differs: $(basename "$f") [$fl]"; fi
+  done
+done
+[ $gbad = 0 ] && echo "awkward input: $gok forms identical" || { echo "awkward input: $gbad DIFFER"; fail=1; }
+
 EXPECT=ok
 # 11b. gzipped input, which is how the real tracks are stored. zlib and
 # zlib-rs must inflate to the same bytes, so the track must be identical to

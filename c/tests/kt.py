@@ -1,5 +1,5 @@
 """Forging helpers for the suite: parse a track, patch it, re-sign its hashes."""
-import struct, subprocess, sys
+import struct, subprocess, sys, random, os
 FNV0 = 0xcbf29ce484222325; P = 0x100000001b3; M = (1 << 64) - 1
 FLAGS = sum(1 << b for b in (63, 62, 60, 59, 58, 57, 56, 55, 54, 53))
 def fnv(h, b):
@@ -29,7 +29,31 @@ def unzst(z):
     if r.returncode:
         raise RuntimeError("zstd -d failed: " + r.stderr.decode("utf-8", "replace").strip())
     return r.stdout
+def gen(W, N):   # valid input of every awkward shape: fuzz.sh 1b and diff.sh 12 read the same files
+    random.seed(13)
+    byt = [c for c in range(1, 256) if c not in (9, 10)]
+    def nm(i):
+        k = random.randrange(6)
+        if k == 0: return str(random.choice([2**50 - 1, 2**50, 2**50 + 1, 2**53, 10**18 - 1])).encode()
+        if k == 1: return ("0" * random.randint(1, 3) + str(random.randrange(10**6))).encode()
+        if k == 2: return bytes(random.choice(byt) for _ in range(random.choice([1, 2, 63, 64, 511])))
+        if k == 3: return ("r%d" % i).encode()
+        if k == 4: return bytes(random.choice(byt) for _ in range(random.randint(1, 40)))
+        return str(i).encode()
+    for f in range(N):
+        rows = []; seen = set()
+        for i in range(random.randint(1, 60)):
+            n = nm(i)
+            while n in seen: n = nm(i + 1000)
+            seen.add(n); p = 0
+            for _ in range(random.randint(1, 50)):
+                L = random.choice([1, 2, 7, 255, 256, 65535, 65536, random.randint(1, 3000000)])
+                lab = bytes(random.choice([c for c in byt if c != 9] + [9]) for _ in range(random.randint(1, 12))) if random.random() < 0.3 else b"L%d" % random.randrange(5)
+                rows.append(n + b"\t%d\t%d\t" % (p, p + L) + lab + b"\n"); p += L
+        open(os.path.join(W, "ok%d.bed" % f), "wb").write(b"".join(rows))
+
 if __name__ == "__main__":   # kt.py IN OUT IDX VALUE ...   (IDX "lo9" keeps the high 32 bits)
+    if sys.argv[1] == "gen": gen(sys.argv[2], int(sys.argv[3])); sys.exit(0)
     d, h = load(sys.argv[1])
     for i, v in zip(sys.argv[3::2], sys.argv[4::2]):
         v = int(v, 0)

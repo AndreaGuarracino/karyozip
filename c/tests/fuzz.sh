@@ -56,6 +56,47 @@ for f in "$W"/bad*.bed; do
 done
 echo "fuzz: $n malformed encodes, all refused"
 
+# 1b. valid input of every awkward shape must encode and come back byte for
+# byte: names of any byte but tab and newline up to the 511 the writer takes,
+# integer names on both sides of 2^50 and with leading zeros, labels of any
+# byte but newline, one to fifty runs a sequence, under every flag form.
+python3 - "$W" "$N" <<'PY'
+import random, sys, os
+W, N = sys.argv[1], int(sys.argv[2]); random.seed(13)
+byt = [c for c in range(1, 256) if c not in (9, 10)]
+def nm(i):
+    k = random.randrange(6)
+    if k == 0: return str(random.choice([2**50 - 1, 2**50, 2**50 + 1, 2**53, 10**18 - 1])).encode()
+    if k == 1: return ("0" * random.randint(1, 3) + str(random.randrange(10**6))).encode()
+    if k == 2: return bytes(random.choice(byt) for _ in range(random.choice([1, 2, 63, 64, 511])))
+    if k == 3: return ("r%d" % i).encode()
+    if k == 4: return bytes(random.choice(byt) for _ in range(random.randint(1, 40)))
+    return str(i).encode()
+for f in range(N):
+    rows = []; seen = set()
+    for i in range(random.randint(1, 60)):
+        n = nm(i)
+        while n in seen: n = nm(i + 1000)
+        seen.add(n); p = 0
+        for _ in range(random.randint(1, 50)):
+            L = random.choice([1, 2, 7, 255, 256, 65535, 65536, random.randint(1, 3000000)])
+            lab = bytes(random.choice([c for c in byt if c != 9] + [9]) for _ in range(random.randint(1, 12))) if random.random() < 0.3 else b"L%d" % random.randrange(5)
+            rows.append(n + b"\t%d\t%d\t" % (p, p + L) + lab + b"\n"); p += L
+    open(os.path.join(W, "ok%d.bed" % f), "wb").write(b"".join(rows))
+PY
+v=0
+for f in "$W"/ok*.bed; do
+  for m in "" "--block 4" "--block all" "--sort" "--names drop" "--slow --block 3" "--level 1"; do
+    $KT encode $m < "$f" > "$W/v.kt" 2>"$W/err" || { echo "fuzz: valid BED REFUSED ($f $m): $(tail -1 "$W/err")"; fail=1; continue; }
+    case "$m" in *sort*)  $KT decode "$W/v.kt" 2>/dev/null | sort | cmp -s - <(sort "$f") ;;
+                 *drop*)  $KT decode --names ordinal "$W/v.kt" 2>/dev/null | cut -f2- | cmp -s - <(cut -f2- "$f") ;;
+                 *)       $KT decode "$W/v.kt" 2>/dev/null | cmp -s - "$f" ;; esac \
+      || { echo "fuzz: valid BED did not come back ($f $m)"; fail=1; }
+    v=$((v+1))
+  done
+done
+echo "fuzz: $v valid encodes, all came back"
+
 # 2. damaged files must not read out of bounds; they may error, they may decode
 python3 - "$W" <<'PY'
 import random, sys, os

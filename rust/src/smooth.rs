@@ -85,6 +85,9 @@ impl Hier {
 fn smooth_one(h: &Hier, st: &[u64], en: &[u64], feat: &mut [i32], maxgap: u64) {
     let n = feat.len();
     if n == 0 { return; }
+    // all three are the sequence's runs: say so, and the j + 1 < n guard
+    // proves every index below
+    let (st, en) = (&st[..n], &en[..n]);
     let nn = h.node.len();
     // the tables as slices, so the inner loops index them directly, as the
     // C's ISANC macro does

@@ -16,7 +16,20 @@ pub struct Seg { pub q: u64, pub t: u32, pub n: u32, pub tp: u64, pub rev: bool 
 
 /// A reference contig: run starts, a label id per run, and its end. From a
 /// .kst reference the rows are decoded when first asked.
-pub type Rows = (Vec<u64>, Vec<u32>, u64);
+/// The starts of a whole contig: 4 bytes a run when the contig fits 32
+/// bits, which every chromosome does, 8 otherwise. 12 bytes a run to 8.
+pub enum Starts { W(Vec<u32>), L(Vec<u64>) }
+impl Starts {
+    fn from(v: Vec<u64>, end: u64) -> Starts {
+        if end < 1 << 32 { Starts::W(v.into_iter().map(|x| x as u32).collect()) } else { Starts::L(v) }
+    }
+    #[inline] fn at(&self, i: usize) -> u64 { match self { Starts::W(v) => v[i] as u64, Starts::L(v) => v[i] } }
+    #[inline] fn len(&self) -> usize { match self { Starts::W(v) => v.len(), Starts::L(v) => v.len() } }
+    #[inline] fn upto(&self, tpos: u64) -> usize {
+        match self { Starts::W(v) => v.partition_point(|&x| x as u64 <= tpos), Starts::L(v) => v.partition_point(|&x| x <= tpos) }
+    }
+}
+pub type Rows = (Starts, Vec<u32>, u64);
 #[derive(Clone, Default)]
 struct Blkfill { st: Vec<u64>, lab: Vec<u32>, bend: Vec<u64>, in_: Vec<bool>,
                  row0: u64, n: u64, first: usize, last: usize, nin: usize }
@@ -84,7 +97,7 @@ impl Aln {
                     crate::bail("reference track: a contig's rows are not together");
                 }
                 if cur != usize::MAX {
-                    let _ = self.rc[cur].rows.set((std::mem::take(&mut st), std::mem::take(&mut lab), end));
+                    let _ = self.rc[cur].rows.set((Starts::from(std::mem::take(&mut st), end), std::mem::take(&mut lab), end));
                 }
                 self.rcix.insert(c[0].to_vec(), self.rc.len() as u32);
                 self.rc.push(Rcon { name: c[0].to_vec(), ri: 0, rows: std::sync::OnceLock::new(), pb: Default::default() });
@@ -102,7 +115,7 @@ impl Aln {
             lab.push(l);
             end = en;
         }
-        if cur != usize::MAX { let _ = self.rc[cur].rows.set((st, lab, end)); }
+        if cur != usize::MAX { let _ = self.rc[cur].rows.set((Starts::from(st, end), lab, end)); }
         self.hash ^= rh;
         if badln > 0 { eprintln!("reference: {badln} lines without four columns skipped"); }
         let tot: usize = self.rc.iter().map(|x| x.rows.get().map_or(0, |r| r.0.len())).sum();
@@ -143,7 +156,7 @@ impl Aln {
             let mut r = crate::reader::Reader::open_with(path, &ro);
             ch.iter().map(move |&t| {
                 let (st, lab, end) = r.seq_runs(ris[t]);
-                (t, (st, lab.into_iter().map(|f| reflab[f as usize]).collect(), end))
+                (t, (Starts::from(st, end), lab.into_iter().map(|f| reflab[f as usize]).collect(), end))
             }).collect::<Vec<_>>()
         }).collect();
         for (t, rows) in filled { let _ = self.rc[t].rows.set(rows); }
@@ -155,7 +168,7 @@ impl Aln {
         rc.rows.get_or_init(|| {
             let mut r = self.refkst.as_ref().unwrap().lock().unwrap_or_else(|e| e.into_inner());
             let (st, lab, end) = r.seq_runs(rc.ri);
-            (st, lab.into_iter().map(|f| self.reflab[f as usize]).collect(), end)
+            (Starts::from(st, end), lab.into_iter().map(|f| self.reflab[f as usize]).collect(), end)
         })
     }
 
@@ -427,11 +440,11 @@ impl Aln {
         if (packed >> 32) as u32 == t {
             let mut l = (packed & 0xffff_ffff) as usize;
             let mut k = 0;
-            while l < st.len() && st[l] <= tpos && k < 8 { l += 1; k += 1; }
-            while l > 0 && st[l - 1] > tpos && k < 16 { l -= 1; k += 1; }
-            if k < 16 && !(l < st.len() && st[l] <= tpos) { a = l; }
+            while l < st.len() && st.at(l) <= tpos && k < 8 { l += 1; k += 1; }
+            while l > 0 && st.at(l - 1) > tpos && k < 16 { l -= 1; k += 1; }
+            if k < 16 && !(l < st.len() && st.at(l) <= tpos) { a = l; }
         }
-        if a == usize::MAX { a = st.partition_point(|&x| x <= tpos); }
+        if a == usize::MAX { a = st.upto(tpos); }
         self.rcur.store(((t as u64) << 32) | a as u64, std::sync::atomic::Ordering::Relaxed);
         a
     }
@@ -444,7 +457,7 @@ impl Aln {
             let rc = self.rows(t);
             let a = self.runat(t, rc, tpos);
             if a == 0 { return None; }
-            return Some((rc.1[a - 1], rc.0[a - 1], if a < rc.0.len() { rc.0[a] } else { rc.2 }));
+            return Some((rc.1[a - 1], rc.0.at(a - 1), if a < rc.0.len() { rc.0.at(a) } else { rc.2 }));
         }
         let mut f = self.rc[t as usize].pb.lock().unwrap_or_else(|e| e.into_inner());
         let mut r = self.refkst.as_ref().unwrap().lock().unwrap_or_else(|e| e.into_inner());

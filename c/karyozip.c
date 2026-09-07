@@ -833,7 +833,8 @@ static void ktw_row(ktw *w, const char *name, size_t nlen,
 
 typedef struct { uint64_t q; uint32_t t, n; uint64_t tp; int rev; } seg;
 typedef struct { char *name; seg *s; size_t n, cap; } qseg;
-typedef struct { char *name; uint64_t *st, end; uint32_t *lab; size_t n, cap; int64_t ri;
+typedef struct { char *name; uint64_t *st, end; uint32_t *lab, *st32; size_t n, cap; int64_t ri;
+                 /* st32 holds the starts once a whole contig is in and fits 32 bits: 8 bytes a run, not 12 */
                  _Atomic int filled;              /* every run is in st and lab */
                  uint64_t bp0, row0, *bend;       /* .kst per block: bases and row before the contig, */
                  uint32_t firstblk, lastblk;      /* its block range, and the position after each */
@@ -846,6 +847,7 @@ static uint64_t ALNHASH;
 static int REFLAZY;                  /* readers: decode a reference contig when first asked */
 static void loadref_kst(const char *path);
 static void reffill(rcon *rc);
+static void rcompact(rcon *rc);
 static rcon *rcon_get(const char *nm, int make) {
     static size_t *idx; static size_t im;           /* open addressed by hash */
     if (!idx) { im = 1 << 16; idx = xcalloc(im, sizeof *idx); }
@@ -928,6 +930,7 @@ static void loadref(const char *path) {
     }
     if (ferror(f)) die("read error on the reference track");
     free(ln); fclose(f); ALNHASH ^= rh;
+    for (size_t i = 0; i < nrc; i++) rcompact(RC + i);
     if (badln) fprintf(stderr, "reference: %llu lines without four columns skipped\n", (unsigned long long)badln);
     size_t tot = 0; for (size_t i = 0; i < nrc; i++) tot += RC[i].n;
     fprintf(stderr, "reference: %zu contigs, %zu runs\n", nrc, tot);
@@ -1271,6 +1274,13 @@ static const seg *segat(const qseg *Q, uint64_t pos) {   /* last seg with q <= p
     const seg *g = Q->s + lo - 1;
     return pos < g->q + g->n ? g : NULL;
 }
+static inline uint64_t rst(const rcon *rc, size_t i) { return rc->st32 ? rc->st32[i] : rc->st[i]; }
+static void rcompact(rcon *rc) {   /* a whole contig under 2^32: starts to 4 bytes */
+    if (rc->st32 || rc->end >= (1ull << 32)) return;
+    uint32_t *w = xmalloc(mul(rc->n ? rc->n : 1, 4));
+    for (size_t i = 0; i < rc->n; i++) w[i] = (uint32_t)rc->st[i];
+    free(rc->st); rc->st = NULL; rc->st32 = w;
+}
 /* count of starts <= tpos, inside the rows [lo, hi) that are decoded and
    whose last run ends at wend. A whole contig is lo = 0, hi = n. */
 static size_t runat(const rcon *rc, uint64_t tpos, size_t lo, size_t hi, uint64_t wend) {
@@ -1279,14 +1289,14 @@ static size_t runat(const rcon *rc, uint64_t tpos, size_t lo, size_t hi, uint64_
     if (rc == CR && CRI >= lo && CRI <= hi) {
         a = CRI;
         int k = 0;
-        while (a < hi && rc->st[a] <= tpos && k++ < 8) a++;
-        while (a > lo && rc->st[a - 1] > tpos && k++ < 16) a--;
-        if (k >= 16 || (a < hi && rc->st[a] <= tpos)) a = hi + 1;
+        while (a < hi && rst(rc, a) <= tpos && k++ < 8) a++;
+        while (a > lo && rst(rc, a - 1) > tpos && k++ < 16) a--;
+        if (k >= 16 || (a < hi && rst(rc, a) <= tpos)) a = hi + 1;
     } else a = hi + 1;
     if (a == hi + 1) {
         size_t b = hi; a = lo;
         while (a < b) { size_t m = (a + b) / 2;
-                        if (rc->st[m] <= tpos) a = m + 1; else b = m; }
+                        if (rst(rc, m) <= tpos) a = m + 1; else b = m; }
     }
     CR = rc; CRI = a;
     return a;
@@ -1316,8 +1326,8 @@ static uint64_t refend(const qseg *Q, uint64_t pos) {
     else { reffill(rc); hi = rc->n; wend = rc->end; }
     size_t a = runat(rc, tpos, lo, hi, wend);
     if (!a) return 0;
-    uint64_t tend = a < hi ? rc->st[a] : wend;         /* target end of that run */
-    if (g->rev) { uint64_t ts = rc->st[a - 1];
+    uint64_t tend = a < hi ? rst(rc, a) : wend;        /* target end of that run */
+    if (g->rev) { uint64_t ts = rst(rc, a - 1);
                   if (ts < g->tp) return 0;
                   return g->q + g->n - (ts - g->tp); }
     if (tend < g->tp || tend - g->tp > g->n) return 0;
@@ -3819,7 +3829,7 @@ static void reffill_r(R *r, rcon *rc) {
             if (e <= s) die("reference track: a run of no length");
             rc->st[k] = s; rc->lab[k] = REFLAB[f]; s = e;
         }
-        rc->end = s; r->curblk = UINT64_MAX;
+        rc->end = s; r->curblk = UINT64_MAX; rcompact(rc);
         LENDEC = ld; TAILDEC = td; TAILPRED_R = tp; TAILSKIP_R = ts; PAYEND = pe;
         rc->filled = 1;
     }
@@ -3903,7 +3913,7 @@ static int refwin(rcon *rc, uint64_t tpos, size_t *lo, size_t *hi, uint64_t *wen
     *lo = b == rc->firstblk ? 0 : (size_t)(b * r->block - rc->row0);
     *hi = rc->row0 + rc->n <= (b + 1) * r->block ? rc->n : (size_t)((b + 1) * r->block - rc->row0);
     *wend = rc->bend[b];
-    WRC = rc; WLO = *lo; WHI = *hi; WST = rc->st[*lo]; WEN = *wend;
+    WRC = rc; WLO = *lo; WHI = *hi; WST = rc->st[*lo]; WEN = *wend;   /* per block: st stays 8 bytes */
     return 1;
 }
 

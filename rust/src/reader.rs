@@ -2,7 +2,6 @@
 //! sidecar, no permutation. Every refusal message is the C's, because the
 //! two are meant to be interchangeable.
 
-use std::collections::HashMap;
 use crate::ffi;
 use crate::kst::{self, FNV0};
 use std::io::{Read, Seek, SeekFrom};
@@ -105,7 +104,9 @@ pub struct Reader {
     idx: Option<(u64, u64)>,
     /// name -> rank, built on the first lookup, which is also where the C
     /// notices that two sequences share a name.
-    nameix: std::cell::OnceCell<HashMap<Vec<u8>, u64>>,
+    /// as the C's buildhash: a power-of-two table of ordinals over the
+    /// decoded names, open addressed, no key copied
+    nameix: std::cell::OnceCell<(Vec<u32>, u64)>,
     /// the sequence index: chunk frames, their offsets, the run count each
     /// starts at, and the one chunk decoded now, as the C's loadichunk
     iz: Vec<u8>, coff: Vec<u64>, cpend: Vec<u64>, ibx: Vec<u8>, cur_chunk: u64,
@@ -791,16 +792,27 @@ impl Reader {
     fn find(&self, seq: &[u8]) -> i64 {
         let hit = self.idxlookup(seq);
         if hit >= 0 { return hit; }
-        let ix = self.nameix.get_or_init(|| {
-            let mut m = HashMap::with_capacity(self.nreads as usize);
+        let (tab, mask) = self.nameix.get_or_init(|| {
+            if self.nreads > u32::MAX as u64 { crate::bail("more than 2^32 sequences: the name table stores the ordinal in 32 bits"); }
+            let mut cap = 1u64; while cap < self.nreads * 2 { cap <<= 1; }
+            let (mut tab, mask) = (vec![u32::MAX; cap as usize], cap - 1);
             for i in 0..self.nreads {
-                if m.insert(self.name_at(i).to_vec(), i).is_some() {
-                    crate::bail("a sequence name repeats: the names are not usable");
+                let nm = self.name_at(i);
+                let mut s = (kst::fnv(FNV0, nm) & mask) as usize;
+                while tab[s] != u32::MAX {
+                    if self.name_at(tab[s] as u64) == nm { crate::bail("a sequence name repeats: the names are not usable"); }
+                    s = (s + 1) & mask as usize;
                 }
+                tab[s] = i as u32;
             }
-            m
+            (tab, mask)
         });
-        ix.get(seq).map_or(-1, |&i| i as i64)
+        let mut s = (kst::fnv(FNV0, seq) & mask) as usize;
+        while tab[s] != u32::MAX {
+            if self.name_at(tab[s] as u64) == seq { return tab[s] as i64; }
+            s = (s + 1) & *mask as usize;
+        }
+        -1
     }
 
     /// region F SEQ | SEQ POS | SEQ START END [HALO].

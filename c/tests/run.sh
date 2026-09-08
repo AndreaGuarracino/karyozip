@@ -35,6 +35,24 @@ $KT decode --aln "$D/db.self.paf" --ref "$D/db.rall.bed" "$W/rall.aln.kst" > "$W
 $KT decode --aln "$D/db.self.paf" --ref "$W/rall.kst" "$W/rall.aln.kst" 2>/dev/null | cmp -s - "$W/rall.want" \
   && echo "a .kst reference read across contigs: same rows" || { echo "a .kst reference read across contigs: WRONG"; fail=1; }
 $KT decode --aln "$D/p.paf" --ref "$W/d.kt" "$W/d.kt" >/dev/null 2>&1 && { echo "an --aln track as reference: ACCEPTED"; fail=1; } || echo "an --aln track as reference: refused, as it should"
+# Eight readers on one track at once, plain and with a .kst reference whose
+# contigs are filled lazily: nothing a reader mutates may be shared.
+$KT decode "$W/rall.kst" > "$W/conc.want" 2>/dev/null
+seq=$(head -1 "$D/db.rall.bed" | cut -f1)
+$KT region "$W/rall.kst" "$seq" > "$W/conc.rwant" 2>/dev/null
+for i in 1 2 3 4 5 6 7 8; do
+  ( $KT decode "$W/rall.kst" > "$W/c.d.$i" 2>/dev/null
+    $KT region "$W/rall.kst" "$seq" > "$W/c.r.$i" 2>/dev/null
+    $KT decode --aln "$D/db.self.paf" --ref "$W/rall.kst" "$W/rall.aln.kst" > "$W/c.a.$i" 2>/dev/null ) &
+done
+wait
+bad=0
+for i in 1 2 3 4 5 6 7 8; do
+  cmp -s "$W/c.d.$i" "$W/conc.want" || bad=1
+  cmp -s "$W/c.r.$i" "$W/conc.rwant" || bad=1
+  cmp -s "$W/c.a.$i" "$W/rall.want" || bad=1
+done
+[ $bad = 0 ] && echo "eight readers at once: same bytes" || { echo "eight readers at once: WRONG"; fail=1; }
 # The review round of 2026-09-07, one case each: a label longer than any
 # stack or output buffer, more labels than a fixed hash, a decimal name past 2^50, a
 # blank --aln-names line, a cut .gz companion, a packed alignment with a
@@ -184,6 +202,16 @@ hin=$(for f in $sets; do echo "$W/hv/$f.bed"; done)
 must_fail "a tuple outside features.tsv without --hier" $KT encode --db "$D/db.features.tsv" $hin
 $KT encode --db "$D/db.features.tsv" --hier "$W/hv.tsv" $hin > "$W/hv.kt" 2>/dev/null
 $KT --raw decode "$W/hv.kt" 2>/dev/null | awk -F'\t' '$4>=67108864' | grep -q . && echo "--hier: a vocabulary featureID stored" || { echo "--hier: NO vocabulary featureID"; fail=1; }
+# A featureID one below 2^26 must round trip, and 2^26 must be refused: above
+# it the ids are vocabulary ranks and a wrap would name another tuple.
+printf 'featureID\tacrocentric\tchromosome\n67108863\tacro\tchr1\n' > "$W/big.tsv"
+printf 'a\t0\t10\t67108863\n' > "$W/big.bed"
+$KT encode --db "$W/big.tsv" "$W/big.bed" > "$W/big.kt" 2>/dev/null \
+  && $KT decode --db "$W/big.tsv" --set acrocentric "$W/big.kt" 2>/dev/null | grep -q acro \
+  && echo "featureID 2^26-1: round trip" || { echo "featureID 2^26-1: WRONG"; fail=1; }
+printf 'featureID\tacrocentric\tchromosome\n67108864\tacro\tchr1\n' > "$W/over.tsv"
+$KT encode --db "$W/over.tsv" "$W/big.bed" > /dev/null 2>&1 \
+  && { echo "featureID 2^26: ACCEPTED"; fail=1; } || echo "featureID 2^26: refused, as it should"
 mkdir -p "$W/hvo"; $KT decode --db "$D/db.features.tsv" --hier "$W/hv.tsv" --out "$W/hvo" "$W/hv.kt" 2>/dev/null
 n=0; for f in $sets; do cmp -s "$W/hvo/$f.bed" "$W/hv/$f.bed" && n=$((n+1)); done
 [ "$n" = 6 ] && echo "--hier: 6/6 restored" || { echo "--hier: only $n/6 restored"; fail=1; }

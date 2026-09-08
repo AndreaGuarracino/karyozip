@@ -10,6 +10,7 @@ D=$1; PAF=$2; FEAT=$3; HIER=$4; REFD=$5
 C=${6:-$(dirname "$0")/../c/build/karyozip}; R=${7:-$(dirname "$0")/../rust/target/release/karyozip}
 T=${THREADS:-8}; NQ=${NQ:-1000}; REPS=${REPS:-3}
 BLOCKS=${BLOCKS:-"65536 1048576"}; LEVELS=${LEVELS:-"9 22"}   # swept beside the 262144 and 17 defaults
+KINDS=${KINDS:-"presmoothed smoothed"}   # one half at a time, so a short window finishes one
 NQ_ALN=${NQ_ALN:-100}   # an aln-informed query parses the whole reference track, seconds each
 W=$(mktemp -d); trap 'rm -rf "$W"' EXIT; export TMPDIR=$W
 LASTIN=""; gz=0; plain=0; rows=0; seqs=0
@@ -123,7 +124,7 @@ row() {  # row SET KIND INFORMED SEEK MODE IMPL BIN INPUT(s) ENCFLAGS DECFLAGS C
 }
 
 pafB=$(stat -c%s "$PAF")
-for kind in presmoothed smoothed; do
+for kind in $KINDS; do
   for set in $sets; do
     q=$(ls "$D"/*."$set"."$kind".bed.gz 2>/dev/null | grep -v '/ref\.' | head -1); [ -n "$q" ] || { echo "bench: no $set $kind track in the cell" >&2; BAD=$((BAD+1)); continue; }
     ref=$(refof "$set" "$kind"); [ -s "$ref" ] && ref=$(kstref "$ref"); [ -s "$ref" ] || { echo "bench: no $set $kind reference track" >&2; BAD=$((BAD+1)); }

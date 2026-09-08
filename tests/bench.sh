@@ -66,7 +66,7 @@ row() {  # row SET KIND INFORMED SEEK MODE IMPL BIN INPUT(s) ENCFLAGS DECFLAGS C
       tb=$((tb + $(stat -c%s "$W/k.$n.kst")))
     done
     set -- $ts $tm
-  elif [ "$set" = ALL ]; then set -- $(timed "$W/k.kst" /dev/null "$bin" -t $T $ef encode)
+  elif [ "$set" = ALL ]; then set -- $(timed "$W/k.kst" /dev/null "$bin" -t $T $ef encode $in)
   else set -- $(timed "$W/k.kst" "$in" "$bin" -t $T $ef encode); fi
   local es=$1 em=$2
   if [ "$es" = refused ]; then

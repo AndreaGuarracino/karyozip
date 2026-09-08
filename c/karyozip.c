@@ -14,6 +14,7 @@
 #include <sys/stat.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <malloc.h>
 #include <signal.h>
 #include <unistd.h>
 #include <math.h>
@@ -4437,6 +4438,10 @@ static void decode_db(const char *path, const char *dir) {
 
 #ifndef KARYOZIP_LIB
 int main(int argc, char **argv) {
+    /* glibc raises its mmap threshold to the first large mapped chunk it
+       frees, after which every big buffer comes from a per-thread heap and
+       stays resident: 113 MB against 57 on one --slow encode. Pin it. */
+    mallopt(M_MMAP_THRESHOLD, 128 << 10);
     signal(SIGXFSZ, SIG_IGN);
     for (int fd = 0; fd < 3; fd++) if (fcntl(fd, F_GETFD) < 0) die("stdin, stdout or stderr is closed");
     atexit(profdump);

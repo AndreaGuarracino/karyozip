@@ -76,6 +76,7 @@ row() {  # row SET KIND INFORMED SEEK MODE IMPL BIN INPUT(s) ENCFLAGS DECFLAGS C
     return
   fi
   local kst=$(stat -c%s "$W/k.kst")
+  [ "$comp" = side ] && comp=$(stat -c%s "$W/side")
   local ds dm rt
   if [ "$set" = ALL ] && [ "$inf" = not-informed ]; then
     kst=$tb; ds=0; dm=0; rt=exact; n=0
@@ -91,7 +92,12 @@ row() {  # row SET KIND INFORMED SEEK MODE IMPL BIN INPUT(s) ENCFLAGS DECFLAGS C
   else set -- $(timed "$W/back.bed" /dev/null "$bin" -t $T $df decode "$W/k.kst"); ds=$1; dm=$2
     cmp -s "$W/plain.bed" "$W/back.bed" && rt=exact || rt=DIFFERS
   fi
-  if [ "$rt" != exact ]; then echo "bench: round trip $rt on $set $kind $inf $seek $mode $impl" >&2; BAD=$((BAD+1))
+  # sorting permutes whole records, so both sides are sorted before the
+  # comparison, as the matrix does
+  if [ "$inf" = sorted ]; then
+    sort "$W/plain.bed" > "$W/w.bed"; sort "$W/back.bed" | cmp -s - "$W/w.bed" && rt=reordered || rt=DIFFERS
+  fi
+  if [ "$rt" != exact ] && [ "$rt" != reordered ]; then echo "bench: round trip $rt on $set $kind $inf $seek $mode $impl" >&2; BAD=$((BAD+1))
   fi
   # an unsmoothed track is also smoothed, timed: what the tool replaces
   local sm="NA NA"
@@ -122,6 +128,11 @@ for kind in presmoothed smoothed; do
         for impl in C Rust; do bin=$C; [ $impl = Rust ] && bin=$R
           row "$set" "$kind" not-informed "$seek" "$mode" "$impl" "$bin" "$q" "$bf $mf" "" 0
           [ -s "$ref" ] && row "$set" "$kind" aln-informed "$seek" "$mode" "$impl" "$bin" "$q" "$bf $mf --aln $PAF --ref $ref $alnnames" "--aln $PAF --ref $ref $alnnames" "$pafB"
+          # what the names cost and what reordering buys, on the
+          # presmoothed track the archive stores
+          [ "$kind" = presmoothed ] && [ "$seek" = seekable ] && {
+            row "$set" "$kind" names-dropped "$seek" "$mode" "$impl" "$bin" "$q" "$bf $mf --names drop:$W/side" "--names $W/side" side
+            [ "$mode" = default ] && row "$set" "$kind" sorted "$seek" "$mode" "$impl" "$bin" "$q" "$bf $mf --sort" "" 0; }
         done
       done
     done

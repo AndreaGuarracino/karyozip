@@ -2379,6 +2379,10 @@ static void ktw_close(ktw *w) {
                   if (e5 != nl4 || e5 == q4 || v >= nidx) die("a stored rank is not a record number");
                   bput(&srt, nt[v], strlen(nt[v])); bput(&srt, "\n", 1);
                   q4 = nl4 + 1; } }
+            /* nt[] NUL-terminated every name in place and the tokeniser
+               chunks on newlines: without this the whole buffer is one
+               chunk and tok3 refuses it, which cost 6.7% on 20547946 reads */
+            for (uint64_t k5 = 0; k5 < nidx; k5++) nt[k5][strlen(nt[k5])] = '\n';
             uint8_t *bp = NULL; int bpick;
             size_t best = bestnames(&srt, nidx, &bp, &bpick);
             uint8_t *na = NULL, *nb2 = NULL;

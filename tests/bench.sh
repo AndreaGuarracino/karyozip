@@ -121,7 +121,7 @@ row() {  # row SET KIND INFORMED SEEK MODE IMPL BIN INPUT(s) ENCFLAGS DECFLAGS C
 pafB=$(stat -c%s "$PAF")
 for kind in presmoothed smoothed; do
   for set in $sets; do
-    q=$(ls "$D"/*."$set"."$kind".bed.gz 2>/dev/null | head -1); [ -n "$q" ] || { echo "bench: no $set $kind track in the cell" >&2; BAD=$((BAD+1)); continue; }
+    q=$(ls "$D"/*."$set"."$kind".bed.gz 2>/dev/null | grep -v '/ref\.' | head -1); [ -n "$q" ] || { echo "bench: no $set $kind track in the cell" >&2; BAD=$((BAD+1)); continue; }
     ref=$(refof "$set" "$kind"); [ -s "$ref" ] && ref=$(kstref "$ref"); [ -s "$ref" ] || { echo "bench: no $set $kind reference track" >&2; BAD=$((BAD+1)); }
     for seek in seekable non-seekable; do bf=""; [ $seek = non-seekable ] && bf="--block all"
       for mode in default slow; do mf=""; [ $mode = slow ] && mf="--slow"
@@ -138,7 +138,7 @@ for kind in presmoothed smoothed; do
     done
   done
   # --db takes every set at once: one row per kind, set = ALL
-  ins=""; for set in $sets; do f=$(ls "$D"/*."$set"."$kind".bed.gz 2>/dev/null | head -1); [ -n "$f" ] && ins="$ins $f"; done
+  ins=""; for set in $sets; do f=$(ls "$D"/*."$set"."$kind".bed.gz 2>/dev/null | grep -v '/ref\.' | head -1); [ -n "$f" ] && ins="$ins $f"; done
   [ $(echo $ins | wc -w) = $(echo $sets | wc -w) ] || { echo "bench: not every set has a $kind track" >&2; BAD=$((BAD+1)); continue; }
   ref=$(refof chromosome "$kind"); [ -s "$ref" ] && ref=$(kstref "$ref"); [ -s "$ref" ] || { echo "bench: no chromosome $kind reference track" >&2; BAD=$((BAD+1)); }
   for seek in seekable non-seekable; do bf=""; [ $seek = non-seekable ] && bf="--block all"

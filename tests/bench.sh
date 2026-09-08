@@ -9,6 +9,7 @@ set -u; BAD=0
 D=$1; PAF=$2; FEAT=$3; HIER=$4; REFD=$5
 C=${6:-$(dirname "$0")/../c/build/karyozip}; R=${7:-$(dirname "$0")/../rust/target/release/karyozip}
 T=${THREADS:-8}; NQ=${NQ:-1000}; REPS=${REPS:-3}
+BLOCKS=${BLOCKS:-"65536 1048576"}; LEVELS=${LEVELS:-"9 22"}   # swept beside the 262144 and 17 defaults
 NQ_ALN=${NQ_ALN:-100}   # an aln-informed query parses the whole reference track, seconds each
 W=$(mktemp -d); trap 'rm -rf "$W"' EXIT; export TMPDIR=$W
 LASTIN=""; gz=0; plain=0; rows=0; seqs=0
@@ -107,8 +108,11 @@ row() {  # row SET KIND INFORMED SEEK MODE IMPL BIN INPUT(s) ENCFLAGS DECFLAGS C
   local ix=0 q="NA NA NA NA"
   if [ "$seek" = seekable ] && [ "$set" != ALL ]; then
     cp "$W/k.kst" "$W/ki.kst"
-    if "$bin" index "$W/ki.kst" >/dev/null 2>&1; then ix=$(( $(stat -c%s "$W/ki.kst") - kst ))
-      q=$(NQ=$([ "$inf" = not-informed ] || [ "$inf" = db-informed ] && echo $NQ || echo $NQ_ALN) queries "$bin" "$df" "$W/ki.kst" "$W/names")
+    # a track whose names are in a sidecar indexes from that sidecar, and
+    # only that flag: index takes no --aln or --db
+    local ixf=""; case "$df" in "--names "*) ixf="$df";; esac
+    if "$bin" $ixf index "$W/ki.kst" >/dev/null 2>&1; then ix=$(( $(stat -c%s "$W/ki.kst") - kst ))
+      q=$(NQ=$(case "$inf" in not-informed|db-informed|names-dropped|sorted|block-*|level-*) echo $NQ;; *) echo $NQ_ALN;; esac) queries "$bin" "$df" "$W/ki.kst" "$W/names")
     else echo "index refused on $set $kind $inf $mode $impl" >&2; ix=NA; fi
   fi
   local tot=$((kst + comp))
@@ -132,7 +136,13 @@ for kind in presmoothed smoothed; do
           # presmoothed track the archive stores
           [ "$kind" = presmoothed ] && [ "$seek" = seekable ] && {
             row "$set" "$kind" names-dropped "$seek" "$mode" "$impl" "$bin" "$q" "$bf $mf --names drop:$W/side" "--names $W/side" side
-            [ "$mode" = default ] && row "$set" "$kind" sorted "$seek" "$mode" "$impl" "$bin" "$q" "$bf $mf --sort" "" 0; }
+            [ "$mode" = default ] && row "$set" "$kind" sorted "$seek" "$mode" "$impl" "$bin" "$q" "$bf $mf --sort" "" 0
+            # a block is decoded whole, so its size trades bytes against the
+            # query; the level trades bytes against the encode
+            [ "$mode" = default ] && for v in $BLOCKS; do
+              row "$set" "$kind" "block-$v" "$seek" "$mode" "$impl" "$bin" "$q" "--block $v" "" 0; done
+            [ "$mode" = default ] && for v in $LEVELS; do
+              row "$set" "$kind" "level-$v" "$seek" "$mode" "$impl" "$bin" "$q" "--level $v" "" 0; done; }
         done
       done
     done

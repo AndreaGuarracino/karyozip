@@ -135,7 +135,8 @@ for kind in presmoothed smoothed; do
           # what the names cost and what reordering buys, on the
           # presmoothed track the archive stores
           [ "$kind" = presmoothed ] && [ "$seek" = seekable ] && {
-            row "$set" "$kind" names-dropped "$seek" "$mode" "$impl" "$bin" "$q" "$bf $mf --names drop:$W/side" "--names $W/side" side
+            # ordinal-named tracks have no names to move to a sidecar
+            [ $ordinal = 0 ] && row "$set" "$kind" names-dropped "$seek" "$mode" "$impl" "$bin" "$q" "$bf $mf --names drop:$W/side" "--names $W/side" side
             [ "$mode" = default ] && row "$set" "$kind" sorted "$seek" "$mode" "$impl" "$bin" "$q" "$bf $mf --sort" "" 0
             # a block is decoded whole, so its size trades bytes against the
             # query; the level trades bytes against the encode

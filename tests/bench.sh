@@ -94,11 +94,11 @@ row() {  # row SET KIND INFORMED SEEK MODE IMPL BIN INPUT(s) ENCFLAGS DECFLAGS C
     cmp -s "$W/plain.bed" "$W/back.bed" && rt=exact || rt=DIFFERS
   fi
   # sorting permutes whole records, so both sides are sorted before the
-  # comparison, as the matrix does
+  # comparison, as the matrix does: the verdict stays exact or DIFFERS
   if [ "$inf" = sorted ]; then
-    sort "$W/plain.bed" > "$W/w.bed"; sort "$W/back.bed" | cmp -s - "$W/w.bed" && rt=reordered || rt=DIFFERS
+    sort "$W/plain.bed" > "$W/w.bed"; sort "$W/back.bed" | cmp -s - "$W/w.bed" && rt=exact || rt=DIFFERS
   fi
-  if [ "$rt" != exact ] && [ "$rt" != reordered ]; then echo "bench: round trip $rt on $set $kind $inf $seek $mode $impl" >&2; BAD=$((BAD+1))
+  if [ "$rt" != exact ]; then echo "bench: round trip $rt on $set $kind $inf $seek $mode $impl" >&2; BAD=$((BAD+1))
   fi
   # an unsmoothed track is also smoothed, timed: what the tool replaces
   local sm="NA NA"

@@ -954,7 +954,15 @@ pub fn pick(all: &dyn Fn(usize) -> (Vec<u8>, Vec<u8>), nraw: usize, rawtot: usiz
                 && (!big || cand[k] & ffi::CODEC_BZIP3 != 0)
         } else { k == nc || !levelset }).collect();
         let mut live_l = live_i.clone();
-        for b in 0..nraw {
+        // one block whose streams fit the sample: the sample already
+        // compressed exactly this, so its sizes are the file's
+        let reuse = nraw == 1 && scap >= maxstream;
+        if reuse {
+            for k in 0..nc { ti[k] = ci[k]; tl[k] = cl[k]; }
+            ti[nc] = zi; tl[nc] = zl;
+            ti[nc + 1] = z22i; tl[nc + 1] = z22l;
+        }
+        for b in (0..nraw).take_while(|_| !reuse) {
             let (lens, ids) = all(b);
             let step: Vec<(usize, usize)> = (0..nc + 2).into_par_iter().map(|k| {
                 if !live_i[k] && !live_l[k] { return (0, 0); }

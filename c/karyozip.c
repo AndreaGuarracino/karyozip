@@ -2128,7 +2128,15 @@ static void pickcodecs(int rawfd, const blkmeta *bm, size_t nraw) {
             for (unsigned k = 0; k < NCAND; k++)
                 live_i[k] = live_l[k] = ((ci[k] < (size_t)-1 / 4) || (cl[k] < (size_t)-1 / 4)) && (!big || (CAND[k] & CODEC_BZIP3));
             live_i[NCAND] = live_l[NCAND] = 1; live_i[NCAND + 1] = live_l[NCAND + 1] = !LEVELSET;
-            for (size_t b2 = 0; b2 < nraw; b2++) {
+            /* one block whose streams fit the sample: the sample already
+               compressed exactly this, so its sizes are the file's */
+            int reuse = nraw == 1 && bm[0].lens <= SCAP && bm[0].len - bm[0].lens <= SCAP;
+            if (reuse) {
+                for (unsigned k = 0; k < NCAND; k++) { ti[k] = ci[k]; tl[k] = cl[k]; }
+                ti[NCAND] = zi; tl[NCAND] = zl;             /* the zstd baselines */
+                ti[NCAND + 1] = z22i; tl[NCAND + 1] = z22l;
+            }
+            for (size_t b2 = 0; !reuse && b2 < nraw; b2++) {
                 if (bm[b2].len > sbcap) { sbcap = bm[b2].len; sbuf = xrealloc(sbuf, sbcap); }
                 rawget(rawfd, (off_t)bm[b2].off, sbuf, bm[b2].len);
                 const uint8_t *src = sbuf;

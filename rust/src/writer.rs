@@ -819,7 +819,8 @@ pub const CAND_SLOW: [i32; 46] = [
 
 /// bzip3 decodes at about 8 MB/s against zstd's ~1000, so it is the wrong
 /// pick for a file a query will seek into.
-fn fast_enough(codec: i32) -> bool { codec & ffi::CODEC_BZIP3 == 0 }
+// a query decodes a whole block: bzip3 at 8 MB/s, arith at 2.5x rANS
+fn fast_enough(codec: i32) -> bool { codec & (ffi::CODEC_BZIP3 | ffi::CODEC_ARITH) == 0 }
 
 /// One --sort record: the name, its (length, label id) runs, and the input
 /// rank, which travels with it across a spill.

@@ -1949,8 +1949,9 @@ static void encode(void) {
 }
 
 
+/* a query decodes a whole block: bzip3 at 8 MB/s, arith at 2.5x rANS */
 static int fastenough(int codec) {
-    return (codec & CODEC_BZIP3) == 0;
+    return (codec & (CODEC_BZIP3 | CODEC_ARITH)) == 0;
 }
 
 static void pickcodecs(int rawfd, const blkmeta *bm, size_t nraw) {
@@ -3296,11 +3297,19 @@ static void seqdone(R *r, uint64_t ri, cur_t *c, const uint8_t *lp,
     c->lp = lp; c->ip = ip;
 }
 
+/* the digit count by compares, then one division a digit, in place: a
+   count by division doubles the divisions and a scratch array costs a
+   memcpy, and this writes every coordinate of every row */
 static inline char *putu64(char *o, uint64_t v) {
-    char t[20]; int n = 0;
-    do { t[n++] = (char)('0' + v % 10); v /= 10; } while (v);
-    while (n) *o++ = t[--n];
-    return o;
+    static const uint64_t P[19] = { 10ULL, 100ULL, 1000ULL, 10000ULL, 100000ULL,
+        1000000ULL, 10000000ULL, 100000000ULL, 1000000000ULL, 10000000000ULL,
+        100000000000ULL, 1000000000000ULL, 10000000000000ULL, 100000000000000ULL,
+        1000000000000000ULL, 10000000000000000ULL, 100000000000000000ULL,
+        1000000000000000000ULL, 10000000000000000000ULL };
+    int n = 1;
+    while (n <= 19 && v >= P[n - 1]) n++;
+    for (int i = n; i-- > 0; ) { o[i] = (char)('0' + v % 10); v /= 10; }
+    return o + n;
 }
 
 static void setcols(void);

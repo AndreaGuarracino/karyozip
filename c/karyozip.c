@@ -22,7 +22,7 @@
 #include <omp.h>
 #endif
 
-static uint64_t BLOCK = 262144;
+static uint64_t BLOCK = UINT64_MAX;      /* one block: the smallest file */
 static int BLOCKSET = 0;                 /* --block was given */
 /* 0 means use every core; --threads overrides */
 static int NTHREADS = 0;
@@ -361,9 +361,9 @@ static const char *NAMESIN = NULL;
  * sequences themselves. The track says which, so the file is never sniffed
  * (a pipe cannot be reopened). Resolved in ropen, see NAMESARG. */
 static const char *NAMESARG = NULL;
-/* the default trades size for decode speed; --slow does not */
-static int SLOW = 0;                  /* --slow: every codec over every block */
-static int FASTMODE = 1;              /* the default: quick-decoding codecs */
+/* the default searches hard; --fast trades size for encode time */
+static int SLOW = 1;                  /* every codec over every block */
+static int FASTMODE = 0;              /* --fast: the sampled search */
 static int SORT = 0;                  /* --sort: order records by label tuple */
 static uint64_t SORTBP;               /* end of the run --sort last took */
 static uint64_t SORTMEM = 0;
@@ -2041,7 +2041,7 @@ static void pickcodecs(int rawfd, const blkmeta *bm, size_t nraw) {
                 /* A candidate the selection below cannot take is not worth
                    compressing. On a seekable track that is both bzip3
                    entries, whose bz3_new alone asks for its 16 or 64 MB. */
-                if (!((SLOW || !seekable || !FASTMODE || fastenough(CAND[k]))
+                if (!((!seekable || fastenough(CAND[k]))
                       && (!big || (CAND[k] & CODEC_BZIP3)))) {
                     ci[k] = cl[k] = (size_t)-1 / 2; continue;
                 }
@@ -2078,7 +2078,7 @@ static void pickcodecs(int rawfd, const blkmeta *bm, size_t nraw) {
         int lvl_i = (SLOW && !LEVELSET && z22i < zi) ? 22 : LEVEL;
         int lvl_l = (SLOW && !LEVELSET && z22l < zl) ? 22 : LEVEL;
         for (unsigned k = 0; k < NCAND; k++) {
-            int ok = (SLOW || !seekable || !FASTMODE || fastenough(CAND[k])) && (!big || (CAND[k] & CODEC_BZIP3));
+            int ok = (!seekable || fastenough(CAND[k])) && (!big || (CAND[k] & CODEC_BZIP3));
             size_t need_i = SLOW ? bi : (size_t)(0.995 * (double)zi);
             size_t need_l = SLOW ? bl2 : (size_t)(0.995 * (double)zl);
             if (zi && ci[k] < bi && ci[k] < need_i + (SLOW ? 1 : 0) && ok)
@@ -4469,7 +4469,8 @@ int main(int argc, char **argv) {
     atexit(profdump);
     atexit(emitflush);
     static const char *const USAGE = "usage:\n"
-            "  karyozip encode [--block N|all] [--level N] [--slow: smaller, slower]\n"
+            "  karyozip encode [--queryable: random access] [--fast: quicker, larger]\n"
+            "                  [--block N|all] [--level N]\n"
             "                  [--names keep|drop|drop:FILE]\n"
             "                  [--sort | --sort=MEM]\n"
             "                  [--db features.tsv [--hier H]] [--aln P.paf --ref R.bed|R.kst [--aln-names F]]\n"
@@ -4485,7 +4486,7 @@ int main(int argc, char **argv) {
             "  karyozip index  F                     appends an index to the track itself\n"
             "  any command: --threads N, -t N  --profile  --tmp-dir DIR  --help, -h\n"
             "               --version prints the zstd, libbz3 and htscodecs versions\n"
-            "  encode:      --block N|all  --level N  --slow  --sort[=MEM]\n"
+            "  encode:      --queryable  --fast  --block N|all  --level N  --sort[=MEM]\n"
             "               --names keep|drop|drop:FILE  --db F  --aln P --ref R\n"
             "               --tail 0|1  --tok-chunk N  --id-codec N  --len-codec N\n"
             "  decode:      --raw  --out DIR\n"
@@ -4514,7 +4515,7 @@ int main(int argc, char **argv) {
         {"--version",0},{"--threads",1},{"-t",1},{"--profile",0},{"--tmp-dir",1},{"--names",1},
         {"--tok-chunk",1},{"--tail",1},{"--id-codec",1},{"--len-codec",1},
         {"--max-gap",1},{"--v1",0},{"--aln-names",1},{"--sort",0},
-        {"--slow",0},
+        {"--fast",0},{"--queryable",0},
         {"--block",1},{"--level",1},{"--db",1},{"--aln",1},
         {"--ref",1},{"--out",1},{"--set",1},{"--raw",0},{"--hier",1},
     };
@@ -4571,8 +4572,8 @@ int main(int argc, char **argv) {
             ok = inf; ALNNAMES = v; take = 2; }
         else if (!strcmp(a, "--sort")) { ok = enc; SORT = 1; take = 1; }
         else if (!strncmp(a, "--sort=", 7)) { ok = enc; SORT = 1; SORTMEM = mem_arg(a + 7); take = 1; }
-        else if (!strcmp(a, "--slow")) { ok = enc; SLOW = 1; FASTMODE = 0; take = 1; }
-        /* --slow also takes the block the sweep found smallest on every read class */
+        else if (!strcmp(a, "--fast")) { ok = enc; SLOW = 0; FASTMODE = 1; take = 1; }
+        else if (!strcmp(a, "--queryable")) { ok = enc; BLOCK = 262144; BLOCKSET = 1; take = 1; }
         else if (!strcmp(a, "--block")) { ok = enc;
             BLOCK = !strcmp(v, "all") ? UINT64_MAX      /* one block, no random access */
                   : (uint64_t)int_arg(v, 1, 0x7fffffffffffffffL,
@@ -4612,7 +4613,6 @@ int main(int argc, char **argv) {
         alnpack(argv[2], argv[4]);
         return 0;
     }
-    if (SLOW && !BLOCKSET) BLOCK = 1048576;   /* the block the sweep found smallest on every read class */
     if (!strcmp(argv[1], "encode")) {
 
         char *freearg[64]; int nfree = 0;

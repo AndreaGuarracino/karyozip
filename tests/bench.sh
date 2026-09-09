@@ -128,8 +128,8 @@ for kind in $KINDS; do
   for set in $sets; do
     q=$(ls "$D"/*."$set"."$kind".bed.gz 2>/dev/null | grep -v '/ref\.' | head -1); [ -n "$q" ] || { echo "bench: no $set $kind track in the cell" >&2; BAD=$((BAD+1)); continue; }
     ref=$(refof "$set" "$kind"); [ -s "$ref" ] && ref=$(kstref "$ref"); [ -s "$ref" ] || { echo "bench: no $set $kind reference track" >&2; BAD=$((BAD+1)); }
-    for seek in seekable non-seekable; do bf=""; [ $seek = non-seekable ] && bf="--block all"
-      for mode in default slow; do mf=""; [ $mode = slow ] && mf="--slow"
+    for seek in seekable non-seekable; do bf=""; [ $seek = seekable ] && bf="--queryable"
+      for mode in default fast; do mf=""; [ $mode = fast ] && mf="--fast"
         for impl in C Rust; do bin=$C; [ $impl = Rust ] && bin=$R
           row "$set" "$kind" not-informed "$seek" "$mode" "$impl" "$bin" "$q" "$bf $mf" "" 0
           [ -s "$ref" ] && row "$set" "$kind" aln-informed "$seek" "$mode" "$impl" "$bin" "$q" "$bf $mf --aln $PAF --ref $ref $alnnames" "--aln $PAF --ref $ref $alnnames" "$pafB"
@@ -153,8 +153,8 @@ for kind in $KINDS; do
   ins=""; for set in $sets; do f=$(ls "$D"/*."$set"."$kind".bed.gz 2>/dev/null | grep -v '/ref\.' | head -1); [ -n "$f" ] && ins="$ins $f"; done
   [ $(echo $ins | wc -w) = $(echo $sets | wc -w) ] || { echo "bench: not every set has a $kind track" >&2; BAD=$((BAD+1)); continue; }
   ref=$(refof chromosome "$kind"); [ -s "$ref" ] && ref=$(kstref "$ref"); [ -s "$ref" ] || { echo "bench: no chromosome $kind reference track" >&2; BAD=$((BAD+1)); }
-  for seek in seekable non-seekable; do bf=""; [ $seek = non-seekable ] && bf="--block all"
-    for mode in default slow; do mf=""; [ $mode = slow ] && mf="--slow"
+  for seek in seekable non-seekable; do bf=""; [ $seek = seekable ] && bf="--queryable"
+    for mode in default fast; do mf=""; [ $mode = fast ] && mf="--fast"
       for impl in C Rust; do bin=$C; [ $impl = Rust ] && bin=$R
         row ALL "$kind" not-informed "$seek" "$mode" "$impl" "$bin" "$ins" "$bf $mf" "" 0
         row ALL "$kind" db-informed "$seek" "$mode" "$impl" "$bin" "$ins" "--db $FEAT --hier $HIER $bf $mf" "--db $FEAT --hier $HIER" 0

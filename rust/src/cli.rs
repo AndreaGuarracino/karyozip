@@ -29,9 +29,12 @@ pub struct Cli {
     /// zstd level, 1 to 22
     #[arg(long, global = true, value_name = "N")]
     pub level: Option<String>,
-    /// every codec over every block: smaller, slower
+    /// the sampled codec search: quicker, larger
     #[arg(long, global = true)]
-    pub slow: bool,
+    pub fast: bool,
+    /// blocks and an index, for random access
+    #[arg(long, global = true)]
+    pub queryable: bool,
     /// order by label tuple, then lengths
     #[arg(long, global = true, num_args = 0..=1, require_equals = true,
           default_missing_value = "", value_name = "MEM")]
@@ -165,7 +168,8 @@ impl Cli {
         };
         if self.block.is_some() && !enc { bad("--block")?; }
         if self.level.is_some() && !enc { bad("--level")?; }
-        if self.slow && !enc { bad("--slow")?; }
+        if self.fast && !enc { bad("--fast")?; }
+        if self.queryable && !enc { bad("--queryable")?; }
         if self.sort.is_some() && !enc { bad("--sort")?; }
         if self.tail.is_some() && !enc { bad("--tail")?; }
         if self.tok_chunk.is_some() && !enc { bad("--tok-chunk")?; }

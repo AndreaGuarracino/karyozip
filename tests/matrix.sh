@@ -38,8 +38,8 @@ alnnames=""; [ $ordinal = 1 ] && alnnames="--aln-names $names"
 echo "cell $(basename "$D"): sets [$sets], ordinal-named=$ordinal"
 [ -n "$sets" ] && [ -s "$paf" ] && [ "$(ls "$D"/*.presmoothed.bed.gz 2>/dev/null | grep -vc '/ref\.')" -gt 0 ] || { echo "matrix: $D is not a fixture cell"; echo MATRIX_FAIL; exit 1; }
 
-FLAGS=("" "--block all" "--block 4096" "--level 3" "--level 22" "--names keep" \
-       "--names drop" "--sort" "--sort=1M" "--slow" "--tail 0" "--tail 1")
+FLAGS=("" "--queryable" "--block 4096" "--level 3" "--level 22" "--names keep" \
+       "--names drop" "--sort" "--sort=1M" "--fast" "--tail 0" "--tail 1")
 
 readers() {  # readers KST SEQ FS HIER "DECODE FLAGS"
   local k=$1 seq=$2 fs=$3 h=$4 dec=$5
@@ -125,7 +125,7 @@ for kind in presmoothed smoothed; do
   [ $(echo $ins | wc -w) = $(echo $sets | wc -w) ] || { fail "db $kind: not every set has a track"; continue; }
   for strat in db dbaln; do
     a="--db $feat --hier $hier"; [ $strat = dbaln ] && { ref=$(ls "$D"/ref.*.chromosome."$kind".bed.gz | head -1); a="$a --aln $paf --ref $ref $alnnames"; }
-    for fl in "" "--block all" "--block 4096" "--sort" "--slow" "--names drop"; do
+    for fl in "" "--queryable" "--block 4096" "--sort" "--fast" "--names drop"; do
       lbl="db $kind $strat [$fl]"
       case "$strat:$fl:$alnnames" in dbaln:*"--names drop"*:) ALLOW=1;; esac
       same "$lbl encode" -- $a $fl encode $ins; rc=$?; ALLOW=0; [ $rc = 0 ] || continue

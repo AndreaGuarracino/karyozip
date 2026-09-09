@@ -44,8 +44,8 @@ DB="$D/db.acrocentric.bed $D/db.chromosome.bed $D/db.gene.bed $D/db.region.bed $
 "$SAN" encode --db "$D/db.features.tsv" $DB > "$W/f.kt" 2>/dev/null
 mkdir -p "$W/out"
 run "encode"                       "$SAN" encode < "$D/ls.bed"
-run "encode --slow"                "$SAN" --slow encode < "$D/ls.bed"
-run "encode --block all"           "$SAN" --block all encode < "$D/ls.bed"
+run "encode --fast"                "$SAN" --fast encode < "$D/ls.bed"
+run "encode --queryable"           "$SAN" --queryable encode < "$D/ls.bed"
 run "encode --sort"                "$SAN" --sort encode < "$D/ls.bed"
 run "encode --sort=1M"             "$SAN" --tmp-dir "$W" --sort=1M encode < "$D/ls.bed"
 run "encode --names drop:F"        "$SAN" encode --names drop:"$W/side2" < "$D/ls.bed"

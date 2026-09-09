@@ -44,7 +44,7 @@ pub struct Options {
 
 impl Default for Options {
     fn default() -> Self {
-        Options { block: 262144, level: 17, levelset: false, slow: false, sortmem: 0,
+        Options { block: u64::MAX, level: 17, levelset: false, slow: true, sortmem: 0,
                   keep_names: false, drop_names: false, names_out: None,
                   tail: None, tok_chunk: None, sort: false,
                   id_codec: None, len_codec: None }
@@ -867,7 +867,7 @@ pub fn pick(all: &dyn Fn(usize) -> (Vec<u8>, Vec<u8>), nraw: usize, rawtot: usiz
     // A candidate the selection cannot take is not worth compressing. On a
     // seekable track that is both bzip3 entries, whose bz3_new alone asks
     // for its 16 MB or 64 MB block.
-    let usable = |c: i32| (slow || !seekable || fast_enough(c))
+    let usable = |c: i32| (!seekable || fast_enough(c))
                        && (!big || c & ffi::CODEC_BZIP3 != 0);
     let (mut zi, mut zl, mut z22i, mut z22l) = (0usize, 0usize, 0usize, 0usize);
     let mut ci = vec![0usize; nc];
@@ -905,7 +905,7 @@ pub fn pick(all: &dyn Fn(usize) -> (Vec<u8>, Vec<u8>), nraw: usize, rawtot: usiz
     let lvl_i = if slow && !levelset && z22i < zi { 22 } else { level };
     let lvl_l = if slow && !levelset && z22l < zl { 22 } else { level };
     for (k, &c) in cand.iter().enumerate() {
-        let ok = (slow || !seekable || fast_enough(c)) && (!big || c & ffi::CODEC_BZIP3 != 0);
+        let ok = (!seekable || fast_enough(c)) && (!big || c & ffi::CODEC_BZIP3 != 0);
         let need_i = if slow { bi } else { (0.995_f64 * zi as f64) as usize };
         let need_l = if slow { bl } else { (0.995_f64 * zl as f64) as usize };
         let m = usize::from(slow);

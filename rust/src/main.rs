@@ -55,8 +55,8 @@ fn main() {
         opt.level = l as i32;
         opt.levelset = true;
     }
-    opt.slow = c.slow;
-    if c.slow && c.block.is_none() { opt.block = 1_048_576; }   // the block the sweep found smallest on every read class
+    opt.slow = !c.fast;
+    if c.queryable && c.block.is_none() { opt.block = 262144; }
     if let Some(m) = &c.sort {
         opt.sort = true;
         // clap cannot tell "--sort" from "--sort=", and the C refuses the

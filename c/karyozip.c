@@ -225,14 +225,15 @@ static inline void vput(uint8_t **p, uint64_t v) {
 
 static __thread const uint8_t *PAYEND;
 static inline uint64_t vget(const uint8_t **p) {
+    const uint8_t *q = *p;      /* VGUARD bytes spare: bound once, not per byte */
     uint64_t v = 0; int s = 0; uint8_t b;
-
-    do { if (PAYEND && *p >= PAYEND) die("corrupt block: a run reads past the payload");
-         b = *(*p)++;
+    do { b = *q++;
          if (s < 64) v |= (uint64_t)(b & 0x7f) << s;
          s += 7;
          if (s > 70) die("corrupt stream: a varint does not terminate");
     } while (b & 0x80);
+    if (PAYEND && q > PAYEND) die("corrupt block: a run reads past the payload");
+    *p = q;
     return v;
 }
 
@@ -3635,6 +3636,7 @@ static void region(const char *path, const char *seq, uint64_t lo, uint64_t hi,
 static char *NODE[MAXNODE];
 static int NPAR[MAXNODE];
 static int NNODE = 0;
+static size_t NLEN[MAXNODE], NLEN1[MAXNODE];   /* name and --v1 name lengths */
 static uint8_t *ANC = NULL;
 static int16_t *LCA = NULL;
 static int ROOTID = -1;
@@ -3679,6 +3681,11 @@ static void loadhier(const char *path, const char *fs) {
 }
 
 static void buildanc(void) {
+    for (int a = 0; a < NNODE; a++) {   /* emit needs no strlen a row */
+        size_t l = strlen(NODE[a]);
+        NLEN[a] = l;
+        NLEN1[a] = a != ROOTID && l > 9 && !strcmp(NODE[a] + l - 9, "_specific") ? l - 9 : l;
+    }
     ANC = xcalloc((size_t)NNODE * NNODE, 1);
     LCA = xmalloc(sizeof(int16_t) * (size_t)NNODE * NNODE);
     for (int a = 0; a < NNODE; a++)
@@ -4028,9 +4035,9 @@ static void emit_to(char **ob, size_t *cap, size_t *len, FILE *f,
                    && (cf != ROOTID || novel[k] == cn);
         if (same) { ce = en[k]; continue; }
         if ((hi == 0 && lo == 0) || (ce > lo && (hi == 0 || cs < hi))) {
-            const char *nm = (cf == ROOTID && cn) ? "novel" : NODE[cf];
-            size_t ml = strlen(nm);
-            if (v1 && cf != ROOTID && ml > 9 && !strcmp(nm + ml - 9, "_specific")) ml -= 9;
+            int root = cf == ROOTID && cn;
+            const char *nm = root ? "novel" : NODE[cf];
+            size_t ml = root ? 5 : (v1 ? NLEN1[cf] : NLEN[cf]);
             size_t need = sl + ml + 48;
             if (*len + need > *cap) {
                 if (f) {

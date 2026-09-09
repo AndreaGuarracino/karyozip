@@ -63,14 +63,27 @@ pub fn putu64_at(b: &mut [u8], v: u64) -> usize {
         1_000_000_000, 10_000_000_000, 100_000_000_000, 1_000_000_000_000, 10_000_000_000_000,
         100_000_000_000_000, 1_000_000_000_000_000, 10_000_000_000_000_000,
         100_000_000_000_000_000, 1_000_000_000_000_000_000, 10_000_000_000_000_000_000];
-    let n = 1 + P.iter().take_while(|&&p| v >= p).count();
+    const D2: &[u8; 200] = b"00010203040506070809101112131415161718192021222324\
+2526272829303132333435363738394041424344454647484950515253545556575859\
+60616263646566676869707172737475767778798081828384858687888990919293949596979899";
+    let mut n = ((63 - (v | 1).leading_zeros()) * 1233 >> 12) as usize + 1;
+    if n <= 19 && v >= P[n - 1] { n += 1; }   // the estimate is off by one
+    // n <= 20 and the table index is under 200: proven here, so the digit
+    // writes need no check, and this runs twice for every row written
+    assert!(b.len() >= n && n <= 20);
     let (mut i, mut t) = (n, v);
-    loop {
-        i -= 1;
-        b[i] = b'0' + (t % 10) as u8;
-        t /= 10;
-        if i == 0 { return n; }
+    unsafe {
+        while t >= 100 {
+            let q = (t % 100) as usize; t /= 100; i -= 2;
+            *b.get_unchecked_mut(i) = *D2.get_unchecked(2 * q);
+            *b.get_unchecked_mut(i + 1) = *D2.get_unchecked(2 * q + 1);
+        }
+        if t < 10 { i -= 1; *b.get_unchecked_mut(i) = b'0' + t as u8; }
+        else { i -= 2;
+            *b.get_unchecked_mut(i) = *D2.get_unchecked(2 * t as usize);
+            *b.get_unchecked_mut(i + 1) = *D2.get_unchecked(2 * t as usize + 1); }
     }
+    n
 }
 
 /// FNV-1a as a `HashMap` hasher. The default is SipHash, which on a

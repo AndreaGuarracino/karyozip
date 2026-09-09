@@ -870,6 +870,17 @@ pub fn pick(all: &dyn Fn(usize) -> (Vec<u8>, Vec<u8>), nraw: usize, rawtot: usiz
     // for its 16 MB or 64 MB block.
     let usable = |c: i32| (!seekable || fast_enough(c))
                        && (!big || c & ffi::CODEC_BZIP3 != 0);
+    // bzip3 splits the input into blocks of its MB argument, so every size at
+    // or above the stream gives one block and the same bytes: the smallest
+    // such size stands for all of them
+    let bz3dup = |c: i32, n: usize| -> bool {
+        if c & ffi::CODEC_BZIP3 == 0 { return false; }
+        let mb = ((c & 0xffff) as usize) << 20;
+        let keep = cand.iter().filter(|&&o| o & ffi::CODEC_BZIP3 != 0)
+            .map(|&o| ((o & 0xffff) as usize) << 20)
+            .filter(|&o| o >= n).min();
+        keep.is_some_and(|kp| mb > kp)
+    };
     let (mut zi, mut zl, mut z22i, mut z22l) = (0usize, 0usize, 0usize, 0usize);
     let mut ci = vec![0usize; nc];
     let mut cl = vec![0usize; nc];
@@ -881,7 +892,7 @@ pub fn pick(all: &dyn Fn(usize) -> (Vec<u8>, Vec<u8>), nraw: usize, rawtot: usiz
         let z22 = slow && !levelset;
         let step: Vec<(usize, usize)> = (0..nc + 2).into_par_iter()
             .map(|k| match k {
-                _ if k < nc => if usable(cand[k]) {
+                _ if k < nc => if usable(cand[k]) && !bz3dup(cand[k], ni.max(nl)) {
                         (accumulate(0, &ids[..ni], cand[k], BAD),
                          accumulate(0, &lens[..nl], cand[k], BAD))
                     } else { (BAD, BAD) },

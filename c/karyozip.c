@@ -1949,6 +1949,20 @@ static void encode(void) {
 }
 
 
+/* bzip3 splits the input into blocks of its MB argument, so every size at
+   or above the stream gives one block and the same bytes: the smallest
+   such size stands for all of them, and the rest are searched for nothing */
+static int bz3dup(int codec, size_t n, const int *cand, size_t ncand) {
+    if (!(codec & CODEC_BZIP3)) return 0;
+    uint64_t mb = (uint64_t)(codec & 0xffff) << 20, keep = 0;
+    for (size_t j = 0; j < ncand; j++)          /* the smallest that covers n */
+        if (cand[j] & CODEC_BZIP3) {
+            uint64_t o = (uint64_t)(cand[j] & 0xffff) << 20;
+            if (o >= n && (!keep || o < keep)) keep = o;
+        }
+    return keep && mb > keep;
+}
+
 /* a query decodes a whole block: bzip3 at 8 MB/s, arith at 2.5x rANS */
 static int fastenough(int codec) {
     return (codec & (CODEC_BZIP3 | CODEC_ARITH)) == 0;
@@ -2042,6 +2056,7 @@ static void pickcodecs(int rawfd, const blkmeta *bm, size_t nraw) {
                 /* A candidate the selection below cannot take is not worth
                    compressing. On a seekable track that is both bzip3
                    entries, whose bz3_new alone asks for its 16 or 64 MB. */
+                if (bz3dup(CAND[k], ni > nl ? ni : nl, CAND, NCAND)) { ci[k] = cl[k] = (size_t)-1 / 2; continue; }
                 if (!((!seekable || fastenough(CAND[k]))
                       && (!big || (CAND[k] & CODEC_BZIP3)))) {
                     ci[k] = cl[k] = (size_t)-1 / 2; continue;

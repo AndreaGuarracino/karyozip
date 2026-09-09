@@ -2126,8 +2126,11 @@ static void pickcodecs(int rawfd, const blkmeta *bm, size_t nraw) {
             /* a candidate lives per stream: one that does not round-trip
                the ids may still be the smallest for the lengths */
             int *live_i = xcalloc(NCAND + 2, sizeof *live_i), *live_l = xcalloc(NCAND + 2, sizeof *live_l);
-            for (unsigned k = 0; k < NCAND; k++)
-                live_i[k] = live_l[k] = ((ci[k] < (size_t)-1 / 4) || (cl[k] < (size_t)-1 / 4)) && (!big || (CAND[k] & CODEC_BZIP3));
+            for (unsigned k = 0; k < NCAND; k++) {
+                int ok = !big || (CAND[k] & CODEC_BZIP3);
+                live_i[k] = ci[k] < (size_t)-1 / 4 && ok;
+                live_l[k] = cl[k] < (size_t)-1 / 4 && ok;
+            }
             live_i[NCAND] = live_l[NCAND] = 1; live_i[NCAND + 1] = live_l[NCAND + 1] = !LEVELSET;
             /* one block whose streams fit the sample: the sample already
                compressed exactly this, so its sizes are the file's */

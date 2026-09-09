@@ -949,11 +949,13 @@ pub fn pick(all: &dyn Fn(usize) -> (Vec<u8>, Vec<u8>), nraw: usize, rawtot: usiz
         let mut tl = vec![0usize; nc + 2];
         // a candidate lives per stream: one that does not round-trip the
         // ids may still be the smallest for the lengths
+        let ok = |k: usize| !big || cand[k] & ffi::CODEC_BZIP3 != 0;
         let mut live_i: Vec<bool> = (0..nc + 2).map(|k| if k < nc {
-            (ci[k] < usize::MAX / 4 || cl[k] < usize::MAX / 4)
-                && (!big || cand[k] & ffi::CODEC_BZIP3 != 0)
+            ci[k] < usize::MAX / 4 && ok(k)
         } else { k == nc || !levelset }).collect();
-        let mut live_l = live_i.clone();
+        let mut live_l: Vec<bool> = (0..nc + 2).map(|k| if k < nc {
+            cl[k] < usize::MAX / 4 && ok(k)
+        } else { k == nc || !levelset }).collect();
         // one block whose streams fit the sample: the sample already
         // compressed exactly this, so its sizes are the file's
         let reuse = nraw == 1 && scap >= maxstream;

@@ -9,6 +9,7 @@
 #include <zlib.h>
 #include <time.h>
 #include <zstd.h>
+#include <lzma.h>
 #include "karyozip.h"
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -345,6 +346,7 @@ static size_t zc(buf *in, uint8_t **out) { return zcl(in, out, LEVEL); }
 
 #define CODEC_ARITH 0x10000
 #define CODEC_BZIP3 0x20000           /* 0x20000|MB: bzip3, block size in MB */
+#define CODEC_LZMA  0x40000           /* LZMA2, the settings lzmafilt pins */
 #define DROPPED (1ULL << 60)          /* names deliberately not stored */
 #define ALNFLAG (1ULL << 59)          /* rows deltaed against a reference */
 #define DBFLAG  (1ULL << 58)          /* labels are featureIDs, not labels */
@@ -587,14 +589,34 @@ static size_t bestnames(buf *b, uint64_t n, uint8_t **out, int *kind) {
 static int nosz(int c) { unsigned u = (unsigned)c; return u && !(u & CODEC_BZIP3) && (u & 0x10); }
 static int badcodec(int c) {   /* bits no codec defines, or a bzip3 block size out of range */
     unsigned u = (unsigned)c;
+    if (u & CODEC_LZMA) return u != (unsigned)CODEC_LZMA;
     if (u & CODEC_BZIP3) { unsigned mb = u & 0xffff;
                            return (u & ~(unsigned)(CODEC_BZIP3 | 0xffff)) || mb < 1 || mb > 511; }
     return (u & ~(unsigned)(CODEC_ARITH | 0x3ff)) != 0;
 }
 static int noext(int c) { unsigned u = (unsigned)c; return (u & CODEC_ARITH) && !(u & CODEC_BZIP3) && (u & 0x04); }
 
+/* every field pinned: a preset that moved between liblzma releases would
+   change the bytes, and the C and the Rust must write the same ones */
+static void lzmafilt(lzma_filter *f, lzma_options_lzma *o) {
+    memset(o, 0, sizeof *o);
+    o->dict_size = 64u << 20; o->lc = 3; o->lp = 0; o->pb = 0;
+    o->mode = LZMA_MODE_NORMAL; o->nice_len = 273;
+    o->mf = LZMA_MF_BT4; o->depth = 0;
+    f[0].id = LZMA_FILTER_LZMA2; f[0].options = o;
+    f[1].id = LZMA_VLI_UNKNOWN;  f[1].options = NULL;
+}
+
 static size_t paycomp(const uint8_t *src, size_t n, int codec, uint8_t **out) {
     unsigned int ol;
+    if (codec & CODEC_LZMA) {
+        lzma_filter f[2]; lzma_options_lzma o; lzmafilt(f, &o);
+        size_t ob = n + n / 16 + 4096, op = 0;
+        *out = malloc(ob);
+        if (!*out || lzma_raw_buffer_encode(f, NULL, src, n, *out, &op, ob) != LZMA_OK) {
+            free(*out); *out = NULL; return 0; }
+        return op;
+    }
     /* htscodecs is 32-bit throughout; bzip3 is not */
     if (!(codec & CODEC_BZIP3) && n >= 0x7fffffffu) { *out = NULL; return 0; }   /* rANS and arith decode below INT_MAX */
     if (codec & CODEC_BZIP3) {
@@ -624,7 +646,13 @@ static size_t paycomp(const uint8_t *src, size_t n, int codec, uint8_t **out) {
 }
 
 static size_t paydecomp(const uint8_t *src, size_t n, int codec, uint8_t *dst, size_t raw) {
-
+    if (codec & CODEC_LZMA) {
+        lzma_filter f[2]; lzma_options_lzma o; lzmafilt(f, &o);
+        size_t ip = 0, op = 0;
+        if (lzma_raw_buffer_decode(f, NULL, src, &ip, n, dst, &op, raw) != LZMA_OK
+            || op != raw) return 0;
+        return op;
+    }
     if (codec & CODEC_BZIP3) {
         size_t got = raw;
         if (bz3_decompress(src, dst, n, &got) || got != raw) return 0;
@@ -1973,9 +2001,10 @@ static int bz3dup(int codec, size_t n, const int *cand, size_t ncand) {
     return keep && mb > keep;
 }
 
-/* a query decodes a whole block: bzip3 at 8 MB/s, arith at 2.5x rANS */
+/* a query decodes a whole block: bzip3 at 8 MB/s, lzma at 44, arith at
+   2.5x rANS */
 static int fastenough(int codec) {
-    return (codec & (CODEC_BZIP3 | CODEC_ARITH)) == 0;
+    return (codec & (CODEC_BZIP3 | CODEC_ARITH | CODEC_LZMA)) == 0;
 }
 
 static void pickcodecs(int rawfd, const blkmeta *bm, size_t nraw) {
@@ -1996,6 +2025,7 @@ static void pickcodecs(int rawfd, const blkmeta *bm, size_t nraw) {
             CODEC_ARITH | 1, CODEC_ARITH | 0x81, CODEC_ARITH | 0x41, CODEC_ARITH | 0xc1,
             CODEC_BZIP3 | 8, CODEC_BZIP3 | 16, CODEC_BZIP3 | 32,
             CODEC_BZIP3 | 64, CODEC_BZIP3 | 128, CODEC_BZIP3 | 256,
+            CODEC_LZMA,
         };
         const int *CAND = FASTMODE ? CAND_FAST : CAND_SLOW;
         const size_t NCAND = (FASTMODE ? sizeof CAND_FAST : sizeof CAND_SLOW) / sizeof *CAND;
@@ -2068,7 +2098,7 @@ static void pickcodecs(int rawfd, const blkmeta *bm, size_t nraw) {
                    entries, whose bz3_new alone asks for its 16 or 64 MB. */
                 if (bz3dup(CAND[k], ni > nl ? ni : nl, CAND, NCAND)) { ci[k] = cl[k] = (size_t)-1 / 2; continue; }
                 if (!((!seekable || fastenough(CAND[k]))
-                      && (!big || (CAND[k] & CODEC_BZIP3)))) {
+                      && (!big || (CAND[k] & (CODEC_BZIP3 | CODEC_LZMA))))) {
                     ci[k] = cl[k] = (size_t)-1 / 2; continue;
                 }
                 /* Size alone does not qualify a codec, so the sample round
@@ -2108,7 +2138,7 @@ static void pickcodecs(int rawfd, const blkmeta *bm, size_t nraw) {
         int lvl_i = (SLOW && !LEVELSET && z22i < zi) ? 22 : LEVEL;
         int lvl_l = (SLOW && !LEVELSET && z22l < zl) ? 22 : LEVEL;
         for (unsigned k = 0; k < NCAND; k++) {
-            int ok = (!seekable || fastenough(CAND[k])) && (!big || (CAND[k] & CODEC_BZIP3));
+            int ok = (!seekable || fastenough(CAND[k])) && (!big || (CAND[k] & (CODEC_BZIP3 | CODEC_LZMA)));
             size_t need_i = SLOW ? bi : (size_t)(0.995 * (double)zi);
             size_t need_l = SLOW ? bl2 : (size_t)(0.995 * (double)zl);
             if (zi && ci[k] < bi && ci[k] < need_i + (SLOW ? 1 : 0) && ok)
@@ -2127,7 +2157,7 @@ static void pickcodecs(int rawfd, const blkmeta *bm, size_t nraw) {
                the ids may still be the smallest for the lengths */
             int *live_i = xcalloc(NCAND + 2, sizeof *live_i), *live_l = xcalloc(NCAND + 2, sizeof *live_l);
             for (unsigned k = 0; k < NCAND; k++) {
-                int ok = !big || (CAND[k] & CODEC_BZIP3);
+                int ok = !big || (CAND[k] & (CODEC_BZIP3 | CODEC_LZMA));
                 live_i[k] = ci[k] < (size_t)-1 / 4 && ok;
                 live_l[k] = cl[k] < (size_t)-1 / 4 && ok;
             }

@@ -806,7 +806,7 @@ pub const CAND_FAST: [i32; 8] = [
 
 /// --slow: rANS order 0/1 x {PACK,RLE,X32,STRIPE}, arith order 0/1 x
 /// {PACK,RLE}, bzip3 at six block sizes. A strict superset of the default.
-pub const CAND_SLOW: [i32; 46] = [
+pub const CAND_SLOW: [i32; 47] = [
     0x100, 0x80, 0x40, 0xc0, 0x8, 0x88, 0x48, 0xc8,
     0x4, 0x84, 0x44, 0xc4, 0xc, 0x8c, 0x4c, 0xcc,
     0x1, 0x81, 0x41, 0xc1, 0x9, 0x89, 0x49, 0xc9,
@@ -815,12 +815,15 @@ pub const CAND_SLOW: [i32; 46] = [
     ffi::CODEC_ARITH | 1, ffi::CODEC_ARITH | 0x81, ffi::CODEC_ARITH | 0x41, ffi::CODEC_ARITH | 0xc1,
     ffi::CODEC_BZIP3 | 8, ffi::CODEC_BZIP3 | 16, ffi::CODEC_BZIP3 | 32,
     ffi::CODEC_BZIP3 | 64, ffi::CODEC_BZIP3 | 128, ffi::CODEC_BZIP3 | 256,
+    ffi::CODEC_LZMA,
 ];
 
 /// bzip3 decodes at about 8 MB/s against zstd's ~1000, so it is the wrong
 /// pick for a file a query will seek into.
 // a query decodes a whole block: bzip3 at 8 MB/s, arith at 2.5x rANS
-fn fast_enough(codec: i32) -> bool { codec & (ffi::CODEC_BZIP3 | ffi::CODEC_ARITH) == 0 }
+fn fast_enough(codec: i32) -> bool {
+    codec & (ffi::CODEC_BZIP3 | ffi::CODEC_ARITH | ffi::CODEC_LZMA) == 0
+}
 
 /// One --sort record: the name, its (length, label id) runs, and the input
 /// rank, which travels with it across a spill.
@@ -869,7 +872,7 @@ pub fn pick(all: &dyn Fn(usize) -> (Vec<u8>, Vec<u8>), nraw: usize, rawtot: usiz
     // seekable track that is both bzip3 entries, whose bz3_new alone asks
     // for its 16 MB or 64 MB block.
     let usable = |c: i32| (!seekable || fast_enough(c))
-                       && (!big || c & ffi::CODEC_BZIP3 != 0);
+                       && (!big || c & (ffi::CODEC_BZIP3 | ffi::CODEC_LZMA) != 0);
     // bzip3 splits the input into blocks of its MB argument, so every size at
     // or above the stream gives one block and the same bytes: the smallest
     // such size stands for all of them
@@ -928,7 +931,7 @@ pub fn pick(all: &dyn Fn(usize) -> (Vec<u8>, Vec<u8>), nraw: usize, rawtot: usiz
     let lvl_i = if slow && !levelset && z22i < zi { 22 } else { level };
     let lvl_l = if slow && !levelset && z22l < zl { 22 } else { level };
     for (k, &c) in cand.iter().enumerate() {
-        let ok = (!seekable || fast_enough(c)) && (!big || c & ffi::CODEC_BZIP3 != 0);
+        let ok = (!seekable || fast_enough(c)) && (!big || c & (ffi::CODEC_BZIP3 | ffi::CODEC_LZMA) != 0);
         let need_i = if slow { bi } else { (0.995_f64 * zi as f64) as usize };
         let need_l = if slow { bl } else { (0.995_f64 * zl as f64) as usize };
         let m = usize::from(slow);
@@ -949,7 +952,7 @@ pub fn pick(all: &dyn Fn(usize) -> (Vec<u8>, Vec<u8>), nraw: usize, rawtot: usiz
         let mut tl = vec![0usize; nc + 2];
         // a candidate lives per stream: one that does not round-trip the
         // ids may still be the smallest for the lengths
-        let ok = |k: usize| !big || cand[k] & ffi::CODEC_BZIP3 != 0;
+        let ok = |k: usize| !big || cand[k] & (ffi::CODEC_BZIP3 | ffi::CODEC_LZMA) != 0;
         let mut live_i: Vec<bool> = (0..nc + 2).map(|k| if k < nc {
             ci[k] < usize::MAX / 4 && ok(k)
         } else { k == nc || !levelset }).collect();

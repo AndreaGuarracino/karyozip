@@ -22,7 +22,7 @@ if [ -z "$SAN" ]; then BUILT=1
       -o "$SAN" "$SRC"/karyozip.c "$SRC"/htscodecs/tokenise_name3.c \
       "$SRC"/htscodecs/rANS_static4x16pr.c "$SRC"/htscodecs/rANS_static32x16pr.c \
       "$SRC"/htscodecs/arith_dynamic.c "$SRC"/htscodecs/rle.c "$SRC"/htscodecs/pack.c \
-      "$SRC"/htscodecs/utils.c "$SRC"/bzip3/libbz3.c -I"$SRC" -lzstd -lz -lm -lpthread \
+      "$SRC"/htscodecs/utils.c "$SRC"/bzip3/libbz3.c -I"$SRC" -lzstd -llzma -lz -lm -lpthread \
       >/dev/null 2>&1 || { echo "leaks: sanitizer build FAILED"; exit 1; }
 fi
 trap 'rm -rf "$W" ${BUILT:+"$SAN"}' EXIT

@@ -10,10 +10,12 @@ use std::os::raw::{c_char, c_int, c_uchar, c_uint, c_void};
 
 pub const CODEC_ARITH: i32 = 0x10000;
 pub const CODEC_BZIP3: i32 = 0x20000;
+pub const CODEC_LZMA: i32 = 0x40000;
 
 /// Bits no codec defines, or a bzip3 block size out of range.
 pub fn badcodec(c: i32) -> bool {
     let u = c as u32;
+    if u & CODEC_LZMA as u32 != 0 { return u != CODEC_LZMA as u32; }
     if u & CODEC_BZIP3 as u32 != 0 {
         let mb = u & 0xffff;
         return u & !(CODEC_BZIP3 as u32 | 0xffff) != 0 || !(1..=511).contains(&mb);
@@ -147,8 +149,35 @@ pub fn zstd_version() -> String {
 /// One payload codec, chosen by `codec`, exactly as the C `paycomp` does.
 /// Returns None when the codec refuses, which the caller treats as "did not
 /// win" rather than as an error.
+/// every field pinned: a preset that moved between liblzma releases would
+/// change the bytes, and the C and the Rust must write the same ones
+fn lzma_filt(o: &mut lzma_sys::lzma_options_lzma) -> [lzma_sys::lzma_filter; 2] {
+    o.dict_size = 64 << 20; o.lc = 3; o.lp = 0; o.pb = 0;
+    o.mode = lzma_sys::LZMA_MODE_NORMAL; o.nice_len = 273;
+    o.mf = lzma_sys::LZMA_MF_BT4; o.depth = 0;
+    [lzma_sys::lzma_filter { id: lzma_sys::LZMA_FILTER_LZMA2,
+                             options: o as *mut _ as *mut std::ffi::c_void },
+     lzma_sys::lzma_filter { id: lzma_sys::LZMA_VLI_UNKNOWN, options: std::ptr::null_mut() }]
+}
+
 pub fn paycomp(src: &[u8], codec: i32) -> Option<Vec<u8>> {
     let n = src.len();
+    if codec & CODEC_LZMA != 0 {
+        let mut o: lzma_sys::lzma_options_lzma = unsafe { std::mem::zeroed() };
+        let f = lzma_filt(&mut o);
+        let ob = n + n / 16 + 4096;
+        // SAFETY: out is ob bytes and op is where the encoder stopped.
+        unsafe {
+            let mut out = raw_buf(ob);
+            let mut op = 0usize;
+            if lzma_sys::lzma_raw_buffer_encode(f.as_ptr(), std::ptr::null(),
+                    src.as_ptr(), n, out.as_mut_ptr(), &mut op, ob) != lzma_sys::LZMA_OK {
+                return None;
+            }
+            out.set_len(op);
+            return Some(out);
+        }
+    }
     if codec & CODEC_BZIP3 != 0 {
         // SAFETY: out is bz3_bound(n), which is what bz3_compress needs.
         unsafe {
@@ -192,6 +221,20 @@ pub fn paycomp(src: &[u8], codec: i32) -> Option<Vec<u8>> {
 /// The matching decompressor. `raw` is the decoded length the file claims.
 pub fn paydecomp(src: &[u8], codec: i32, raw: usize) -> Option<Vec<u8>> {
     crate::ckalloc(raw);
+    if codec & CODEC_LZMA != 0 {
+        let mut o: lzma_sys::lzma_options_lzma = unsafe { std::mem::zeroed() };
+        let f = lzma_filt(&mut o);
+        // SAFETY: out is the claimed length and op is checked against it.
+        unsafe {
+            let mut out = raw_buf(raw);
+            let (mut ip, mut op) = (0usize, 0usize);
+            if lzma_sys::lzma_raw_buffer_decode(f.as_ptr(), std::ptr::null(),
+                    src.as_ptr(), &mut ip, src.len(), out.as_mut_ptr(), &mut op, raw)
+                    != lzma_sys::LZMA_OK || op != raw { return None; }
+            out.set_len(raw);
+            return Some(out);
+        }
+    }
     if codec & CODEC_BZIP3 != 0 {
         // SAFETY: out is the claimed decoded length; got is checked against it.
         unsafe {

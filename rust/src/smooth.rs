@@ -9,6 +9,7 @@ pub struct Hier {
     par: Vec<i32>,
     anc: Vec<u8>,
     lca: Vec<i16>,
+    nlen1: Vec<usize>,   /* the --v1 name length, no compare a row */
     pub root: i32,
 }
 
@@ -25,7 +26,7 @@ impl Hier {
     pub fn load(path: &str, fs: &[u8]) -> Hier {
         let data = crate::slurp(path, "cannot open the hierarchy file");
         let mut h = Hier { node: Vec::new(), par: Vec::new(), anc: Vec::new(),
-                           lca: Vec::new(), root: -1 };
+                           lca: Vec::new(), nlen1: Vec::new(), root: -1 };
         for raw in data.split(|&c| c == b'\n') {
             let mut line = raw;
             if line.last() == Some(&b'\r') { line = &line[..line.len() - 1]; }
@@ -59,6 +60,10 @@ impl Hier {
     /// own labels are added as nodes.
     pub fn build(&mut self) {
         let n = self.node.len();
+        self.nlen1 = (0..n).map(|a| {
+            let (l, nm) = (self.node[a].len(), &self.node[a]);
+            if a as i32 != self.root && l > 9 && &nm[l - 9..] == b"_specific" { l - 9 } else { l }
+        }).collect();
         self.anc = vec![0u8; n * n];
         self.lca = vec![-1i16; n * n];
         for a in 0..n {
@@ -177,19 +182,26 @@ fn emit(h: &Hier, out: &mut Vec<u8>, seq: &[u8], st: &[u64], en: &[u64],
         if same { ce = en[k]; continue; }
         if (hi == 0 && lo == 0) || (ce > lo && (hi == 0 || cs < hi)) {
             let nm: &[u8] = if cf == h.root && cn != 0 { b"novel" } else { &h.node[cf as usize] };
-            let mut ml = nm.len();
-            if v1 && cf != h.root && ml > 9 && &nm[ml - 9..] == b"_specific" { ml -= 9; }
+            let ml = if cf == h.root && cn != 0 { 5 }
+                     else if v1 { h.nlen1[cf as usize] } else { nm.len() };
             let mut b = [0u8; 44];      // \tSTART\tEND\t in one piece
             b[0] = b'\t';
             let mut i = 1 + crate::kst::putu64_at(&mut b[1..], cs);
             b[i] = b'\t'; i += 1;
             i += crate::kst::putu64_at(&mut b[i..], ce);
             b[i] = b'\t'; i += 1;
+            // one reserve for the whole row, then one pointer through it
             out.reserve(seq.len() + i + ml + 1);
-            out.extend_from_slice(seq);
-            out.extend_from_slice(&b[..i]);
-            out.extend_from_slice(&nm[..ml]);
-            out.push(b'\n');
+            unsafe {
+                let n0 = out.len();
+                let p = out.as_mut_ptr().add(n0);
+                std::ptr::copy_nonoverlapping(seq.as_ptr(), p, seq.len());
+                std::ptr::copy_nonoverlapping(b.as_ptr(), p.add(seq.len()), i);
+                let q = p.add(seq.len() + i);
+                std::ptr::copy_nonoverlapping(nm.as_ptr(), q, ml);
+                *q.add(ml) = b'\n';
+                out.set_len(n0 + seq.len() + i + ml + 1);
+            }
         }
         if k == n { break; }
         cs = st[k]; ce = en[k]; cf = feat[k]; cn = novel[k];

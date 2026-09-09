@@ -446,12 +446,27 @@ impl Reader {
                 nb[nl] = b'\t'; nl += 1;
                 nl += kst::putu64_at(&mut nb[nl..], en);
                 nb[nl] = b'\t'; nl += 1;
-                buf.reserve(name.len() + nl + 32);
-                buf.extend_from_slice(&name);
-                buf.extend_from_slice(&nb[..nl]);
                 if self.aln.is_some() && self.lab.get(f as usize).is_some_and(|l| l == b"=") { restored += 1; }
-                self.label(f, &mut buf, st, len);
-                buf.push(b'\n');
+                match self.label_at2(f, st, len) {
+                    // one reserve for the whole row, then one pointer
+                    // through it, as the C writes it
+                    Some(l) => unsafe {
+                        buf.reserve(name.len() + nl + l.len() + 1);
+                        let n0 = buf.len();
+                        let p = buf.as_mut_ptr().add(n0);
+                        std::ptr::copy_nonoverlapping(name.as_ptr(), p, name.len());
+                        std::ptr::copy_nonoverlapping(nb.as_ptr(), p.add(name.len()), nl);
+                        let q = p.add(name.len() + nl);
+                        std::ptr::copy_nonoverlapping(l.as_ptr(), q, l.len());
+                        *q.add(l.len()) = b'\n';
+                        buf.set_len(n0 + name.len() + nl + l.len() + 1);
+                    },
+                    None => {
+                        buf.extend_from_slice(&name);
+                        buf.extend_from_slice(&nb[..nl]);
+                        kst::putu64(&mut buf, f); buf.push(b'\n');
+                    }
+                }
                 if buf.len() > (1 << 22) - 4096 {
                     rd(out.write_all(&buf), "write failed");
                     buf.clear();
@@ -657,20 +672,27 @@ impl Reader {
         (len, f)
     }
 
-    fn label(&self, f: u64, out: &mut Vec<u8>, st: u64, len: u64) {
+    /// The label bytes, or None when the table is empty and the id is the label.
+    fn label_at2(&self, f: u64, st: u64, len: u64) -> Option<&[u8]> {
         let l: &[u8] = match self.lab.get(f as usize) {
             Some(l) => l,
-            None if self.lab.is_empty() => { kst::putu64(out, f); return; }
+            None if self.lab.is_empty() => return None,
             None => crate::bail("corrupt block: a label id past the table"),
         };
         if let (b"=", Some(a)) = (l, self.aln.as_ref()) {
             let q = self.alnq.unwrap_or_else(|| crate::bail("a delta row has no reference answer: wrong PAF or reference track"));
             let rl = a.row(q, st, len);
             if rl == u32::MAX { crate::bail("a delta row has no reference answer: wrong PAF or reference track"); }
-            out.extend_from_slice(&self.lab[rl as usize]);
-            return;
+            return Some(&self.lab[rl as usize]);
         }
-        out.extend_from_slice(l);
+        Some(l)
+    }
+
+    fn label(&self, f: u64, out: &mut Vec<u8>, st: u64, len: u64) {
+        match self.label_at2(f, st, len) {
+            Some(l) => out.extend_from_slice(l),
+            None => kst::putu64(out, f),
+        }
     }
 
     /// What the C's ensurenames does: the names, by whichever codec stored

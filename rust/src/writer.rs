@@ -873,6 +873,15 @@ pub fn pick(all: &dyn Fn(usize) -> (Vec<u8>, Vec<u8>), nraw: usize, rawtot: usiz
     // bzip3 splits the input into blocks of its MB argument, so every size at
     // or above the stream gives one block and the same bytes: the smallest
     // such size stands for all of them
+    // hts_pack and its arith twin refuse above 16 distinct bytes and the
+    // encoder then clears the PACK bit, so such a candidate is its plain sibling
+    let packdup = |c: i32, p: &[u8]| -> bool {
+        if c & 0x80 == 0 || c & ffi::CODEC_BZIP3 != 0 { return false; }
+        let mut seen = [false; 256];
+        let mut d = 0;
+        for &b in p { if !seen[b as usize] { seen[b as usize] = true; d += 1; if d > 16 { return true; } } }
+        false
+    };
     let bz3dup = |c: i32, n: usize| -> bool {
         if c & ffi::CODEC_BZIP3 == 0 { return false; }
         let mb = ((c & 0xffff) as usize) << 20;
@@ -893,8 +902,10 @@ pub fn pick(all: &dyn Fn(usize) -> (Vec<u8>, Vec<u8>), nraw: usize, rawtot: usiz
         let step: Vec<(usize, usize)> = (0..nc + 2).into_par_iter()
             .map(|k| match k {
                 _ if k < nc => if usable(cand[k]) && !bz3dup(cand[k], ni.max(nl)) {
-                        (accumulate(0, &ids[..ni], cand[k], BAD),
-                         accumulate(0, &lens[..nl], cand[k], BAD))
+                        (if packdup(cand[k], &ids[..ni]) { BAD }
+                         else { accumulate(0, &ids[..ni], cand[k], BAD, slow) },
+                         if packdup(cand[k], &lens[..nl]) { BAD }
+                         else { accumulate(0, &lens[..nl], cand[k], BAD, slow) })
                     } else { (BAD, BAD) },
                 _ if k == nc => (if ni > 0 { ffi::zstd(&ids[..ni], level).len() } else { 0 },
                                  if nl > 0 { ffi::zstd(&lens[..nl], level).len() } else { 0 }),
@@ -953,8 +964,8 @@ pub fn pick(all: &dyn Fn(usize) -> (Vec<u8>, Vec<u8>), nraw: usize, rawtot: usiz
                     if s.is_empty() { 0 } else { f(s) }
                 };
                 if k < nc {
-                    (each(&ids, &|s| sz(ffi::paycomp(s, cand[k]))),
-                     each(&lens, &|s| sz(ffi::paycomp(s, cand[k]))))
+                    (if live_i[k] { each(&ids, &|s| sz(ffi::paycomp(s, cand[k]))) } else { 0 },
+                     if live_l[k] { each(&lens, &|s| sz(ffi::paycomp(s, cand[k]))) } else { 0 })
                 } else {
                     let lv = if k == nc { level } else { 22 };
                     (each(&ids, &|s| ffi::zstd(s, lv).len()),
@@ -1002,10 +1013,14 @@ fn verifies(src: &[u8], codec: i32) -> bool {
     }
 }
 
-fn accumulate(acc: usize, src: &[u8], codec: i32, bad: usize) -> usize {
+/// Size alone does not qualify a codec, so the sample round trips it; under
+/// slow the whole-file pass round trips the winner and drops it on failure,
+/// so the sample only sizes.
+fn accumulate(acc: usize, src: &[u8], codec: i32, bad: usize, slow: bool) -> usize {
     if src.is_empty() { return bad; }
     if acc >= bad { return bad; }
     match ffi::paycomp(src, codec) {
+        Some(t) if slow => acc + t.len(),
         Some(t) => match ffi::paydecomp(&t, codec, src.len()) {
             Some(v) if v == src => acc + t.len(),
             _ => bad,

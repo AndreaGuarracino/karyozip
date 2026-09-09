@@ -1952,6 +1952,15 @@ static void encode(void) {
 /* bzip3 splits the input into blocks of its MB argument, so every size at
    or above the stream gives one block and the same bytes: the smallest
    such size stands for all of them, and the rest are searched for nothing */
+/* hts_pack and its arith twin refuse above 16 distinct bytes and the encoder
+   then clears the PACK bit, so such a candidate is its plain sibling */
+static int packdup(int codec, const uint8_t *p, size_t n) {
+    if (!(codec & 0x80) || (codec & CODEC_BZIP3)) return 0;
+    uint8_t seen[256] = {0}; int d = 0;
+    for (size_t i = 0; i < n; i++) if (!seen[p[i]]) { seen[p[i]] = 1; if (++d > 16) return 1; }
+    return 0;
+}
+
 static int bz3dup(int codec, size_t n, const int *cand, size_t ncand) {
     if (!(codec & CODEC_BZIP3)) return 0;
     uint64_t mb = (uint64_t)(codec & 0xffff) << 20, keep = 0;
@@ -2061,20 +2070,24 @@ static void pickcodecs(int rawfd, const blkmeta *bm, size_t nraw) {
                       && (!big || (CAND[k] & CODEC_BZIP3)))) {
                     ci[k] = cl[k] = (size_t)-1 / 2; continue;
                 }
-                /* Size alone does not qualify a codec: */
+                /* Size alone does not qualify a codec, so the sample round
+                   trips it; under SLOW the whole-file pass round trips the
+                   winner and drops it on failure, so the sample only sizes. */
                 uint8_t *t = NULL; size_t g;
-                if (ni && (g = paycomp(ids, ni, CAND[k], &t))) {
-                    uint8_t *v = malloc(ni);
-                    if (v && paydecomp(t, g, CAND[k], v, ni) == ni
-                        && !memcmp(v, ids, ni)) ci[k] += g;
+                if (packdup(CAND[k], ids, ni)) ci[k] = (size_t)-1 / 2;
+                else if (ni && (g = paycomp(ids, ni, CAND[k], &t))) {
+                    uint8_t *v = SLOW ? NULL : malloc(ni);
+                    if (SLOW || (v && paydecomp(t, g, CAND[k], v, ni) == ni
+                        && !memcmp(v, ids, ni))) ci[k] += g;
                     else ci[k] = (size_t)-1 / 2;
                     free(v);
                 } else ci[k] = (size_t)-1 / 2;
                 free(t); t = NULL;
-                if (nl && (g = paycomp(src, nl, CAND[k], &t))) {
-                    uint8_t *v = malloc(nl);
-                    if (v && paydecomp(t, g, CAND[k], v, nl) == nl
-                        && !memcmp(v, src, nl)) cl[k] += g;
+                if (packdup(CAND[k], src, nl)) cl[k] = (size_t)-1 / 2;
+                else if (nl && (g = paycomp(src, nl, CAND[k], &t))) {
+                    uint8_t *v = SLOW ? NULL : malloc(nl);
+                    if (SLOW || (v && paydecomp(t, g, CAND[k], v, nl) == nl
+                        && !memcmp(v, src, nl))) cl[k] += g;
                     else cl[k] = (size_t)-1 / 2;
                     free(v);
                 } else cl[k] = (size_t)-1 / 2;
@@ -2127,8 +2140,8 @@ static void pickcodecs(int rawfd, const blkmeta *bm, size_t nraw) {
                     if (!live_i[k] && !live_l[k]) continue;
                     uint8_t *t = NULL; size_t g;
                     if (k < NCAND) {
-                        if (ni) { g = paycomp(src + nl, ni, CAND[k], &t); ti[k] += g ? g : (size_t)-1 / 4; free(t); t = NULL; }
-                        if (nl) { g = paycomp(src, nl, CAND[k], &t); tl[k] += g ? g : (size_t)-1 / 4; free(t); }
+                        if (ni && live_i[k]) { g = paycomp(src + nl, ni, CAND[k], &t); ti[k] += g ? g : (size_t)-1 / 4; free(t); t = NULL; }
+                        if (nl && live_l[k]) { g = paycomp(src, nl, CAND[k], &t); tl[k] += g ? g : (size_t)-1 / 4; free(t); }
                     } else {
                         int lv = k == NCAND ? LEVEL : 22;
                         if (ni) { t = malloc(ZSTD_compressBound(ni));

@@ -554,7 +554,7 @@ static size_t bestnames(buf *b, uint64_t n, uint8_t **out, int *kind) {
     /* zstd and the tokeniser are independent and neither gains from threads
        on a buffer this size, so run them side by side. tok3 overwrites every
        separator with NUL and puts it back, so it cannot share the buffer with
-       a concurrent reader: it gets a copy. b is at most the 200,000-name
+       a concurrent reader: it gets a copy. b is at most the 50,000-name
        sample here, one tokeniser chunk, so nothing is lost by not nesting. */
     buf tb = { xmalloc(b->n ? b->n : 1), b->n, b->n };
     memcpy(tb.d, b->d, b->n);
@@ -1040,7 +1040,7 @@ static void loadpaf(const char *path) {
 }
 
 /* --------------------------------------------------- packed alignment Only what --aln reads: */
-#define ALNMAGIC "KSTAL1\n"   /* carries the reference contig-order hash */
+#define ALNMAGIC "KSTAL2\n"   /* carries the reference contig-order hash */
 #define ALNMAGLEN 6
 #define ALNTOK 0x7fff0000   /* the name stream went through the tokeniser */
 
@@ -1052,7 +1052,11 @@ static uint64_t refhash(void) {   /* the reference contig names, in order */
 
 static void alnpack(const char *inpaf, const char *out) {
     loadpaf(inpaf);
-    buf names = {0}, cnt = {0}, pos = {0}, len = {0}, seg_ = {0};
+    /* A block that starts a target run carries an absolute position: its
+       query offset as a varint and its target position as four byte planes,
+       since a random genome coordinate does not shrink as a varint. Blocks
+       within a run carry zigzag deltas, interleaved. */
+    buf names = {0}, cnt = {0}, pos = {0}, len = {0}, seg_ = {0}, fq = {0}, pl[4] = {{0}, {0}, {0}, {0}};
     for (size_t i = 0; i < nqs; i++) {
         const qseg *Q = QS + i;
         if (!Q->n) continue;   /* no aligned base: nothing to pack */
@@ -1062,9 +1066,10 @@ static void alnpack(const char *inpaf, const char *out) {
         uint64_t pq = 0, pt = 0; uint32_t px = 0; int prev_rev = -1; uint64_t run = 0;
         for (size_t j = 0; j < Q->n; j++) {
             const seg *g = Q->s + j;
-            if (!j) { bvar(&pos, g->q); bvar(&pos, g->tp); }
-            else if (g->t != px || g->rev != prev_rev) {
-                bvar(&pos, g->q); bvar(&pos, g->tp);       /* absolute again */
+            if (!j || g->t != px || g->rev != prev_rev) {   /* absolute */
+                if (g->tp > UINT32_MAX) die("a target position past 32 bits cannot be packed");
+                bvar(&fq, g->q);
+                for (int k = 0; k < 4; k++) { uint8_t b = (uint8_t)(g->tp >> (8 * k)); bput(&pl[k], &b, 1); }
             } else {
                 bvar(&pos, zz((int64_t)(g->q - pq)));
                 bvar(&pos, zz((int64_t)(g->tp - pt)));
@@ -1082,9 +1087,9 @@ static void alnpack(const char *inpaf, const char *out) {
     }
     /* each stream gets the codec search */
     buf all = {0};
-    buf *st[5] = { &names, &cnt, &pos, &len, &seg_ };
-    static const char *SNAME[5] = { "names", "counts", "positions", "lengths", "targets" };
-    for (int k = 0; k < 5; k++) {
+    buf *st[10] = { &names, &cnt, &pos, &len, &seg_, &fq, &pl[0], &pl[1], &pl[2], &pl[3] };
+    static const char *SNAME[10] = { "names", "counts", "deltas", "lengths", "targets", "qstarts", "tpos0", "tpos1", "tpos2", "tpos3" };
+    for (int k = 0; k < 10; k++) {
         uint8_t *best = NULL; size_t bn = 0; int bc = -1;
         if (st[k]->n) {
             if (k == 0) {
@@ -1124,7 +1129,8 @@ static void alnpack(const char *inpaf, const char *out) {
     size_t nb = 0; for (size_t i = 0; i < nqs; i++) nb += QS[i].n;
     fprintf(stderr, "packed alignment: %zu queries, %zu blocks, %zu B (%.2f B/query)\n",
             nqs, nb, all.n + ALNMAGLEN + 8, nqs ? (double)(all.n + ALNMAGLEN + 8) / (double)nqs : 0.0);
-    free(names.d); free(cnt.d); free(pos.d); free(len.d); free(seg_.d); free(all.d);
+    free(names.d); free(cnt.d); free(pos.d); free(len.d); free(seg_.d); free(fq.d); free(all.d);
+    for (int k = 0; k < 4; k++) free(pl[k].d);
 }
 
 static int alnload(const char *path) {
@@ -1132,6 +1138,7 @@ static int alnload(const char *path) {
     if (!f) return 0;
     char mg[ALNMAGLEN];
     if (fread(mg, 1, ALNMAGLEN, f) != ALNMAGLEN || memcmp(mg, ALNMAGIC, ALNMAGLEN)) {
+        if (!memcmp(mg, "KSTAL1", 6)) die("this packed alignment is an older format: pack it again with this version");
         fclose(f); return 0;                       /* not packed: it is a PAF */
     }
     uint64_t rh;
@@ -1147,8 +1154,8 @@ static int alnload(const char *path) {
     if (ferror(f)) die("read error on the PAF");
     fclose(f);
     const uint8_t *p = d, *e = d + n;
-    const uint8_t *sec[5]; size_t slen[5]; uint8_t *raw[5] = {0};
-    for (int k = 0; k < 5; k++) {
+    const uint8_t *sec[10]; size_t slen[10]; uint8_t *raw[10] = {0};
+    for (int k = 0; k < 10; k++) {
         uint64_t cd = vgetb(&p, e), rl = vgetb(&p, e), cl2 = vgetb(&p, e);
         if (cl2 > (size_t)(e - p)) die("corrupt packed alignment: a stream overruns the file");
         if (!cd) { sec[k] = p; slen[k] = 0; continue; }
@@ -1170,6 +1177,9 @@ static int alnload(const char *path) {
     const uint8_t *pp = sec[2], *ppe = sec[2] + slen[2];
     const uint8_t *lp = sec[3], *lpe = sec[3] + slen[3];
     const uint8_t *sp = sec[4], *spe = sec[4] + slen[4];
+    const uint8_t *fqp = sec[5], *fqe = sec[5] + slen[5];
+    size_t nabs = slen[6], m = 0;
+    for (int k = 7; k < 10; k++) if (slen[k] != nabs) die("corrupt packed alignment: the position planes differ in length");
     const char *nm = (const char *)sec[0], *nme = nm + slen[0];
     while (nm < nme) {
         const char *nl = memchr(nm, '\n', (size_t)(nme - nm));
@@ -1194,7 +1204,12 @@ static int alnload(const char *path) {
                 if (!left) die("corrupt packed alignment: an empty target run");
                 fresh = 1;
             }
-            if (fresh) { q = vgetb(&pp, ppe); tp = vgetb(&pp, ppe); fresh = 0; }
+            if (fresh) {
+                if (m >= nabs) die("corrupt packed alignment: more target runs than positions");
+                q = vgetb(&fqp, fqe);
+                tp = (uint64_t)sec[6][m] | (uint64_t)sec[7][m] << 8 | (uint64_t)sec[8][m] << 16 | (uint64_t)sec[9][m] << 24;
+                m++; fresh = 0;
+            }
             else {
                 q  = pq + (uint64_t)unzz(vgetb(&pp, ppe));
                 tp = pt + (uint64_t)unzz(vgetb(&pp, ppe));
@@ -1207,10 +1222,10 @@ static int alnload(const char *path) {
         if (left) die("corrupt packed alignment: a target run outlives its query");
         nm = nl + 1;
     }
-    if (cp != cpe || pp != ppe || lp != lpe || sp != spe || p != e)
+    if (cp != cpe || pp != ppe || lp != lpe || sp != spe || fqp != fqe || m != nabs || p != e)
         die("corrupt packed alignment: bytes left over");
     free(d);
-    for (int k = 0; k < 5; k++) free(raw[k]);
+    for (int k = 0; k < 10; k++) free(raw[k]);
     size_t nb2 = 0; for (size_t i = 0; i < nqs; i++) nb2 += QS[i].n;
     fprintf(stderr, "packed alignment: %zu query contigs, %zu collinear blocks\n", nqs, nb2);
     seghash();
@@ -2342,7 +2357,7 @@ static void ktw_close(ktw *w) {
     if (!ordinal) {
         buf smp = { names.d, 0, 0 }; uint64_t smpn = 0;   /* a view, not a copy */
         { const char *q = (const char *)names.d, *e2 = q + names.n;
-          while (q < e2 && smpn < 200000) {
+          while (q < e2 && smpn < 50000) {
               const char *nl = memchr(q, '\n', (size_t)(e2 - q));
               if (!nl) break;
               q = nl + 1; smpn++; }
@@ -2407,24 +2422,27 @@ static void ktw_close(ktw *w) {
     double _ti = nowsec();
     buf ichunks = {0}, itab = {0};
     uint64_t nichunk = 0;
-    {
+    {   /* chunk bounds first, then every chunk compressed on its own thread */
         const uint8_t *q = ib.d, *qe = ib.d + ib.n;
-        uint64_t cpend = 0, seen = 0;
-        const uint8_t *cstart = q;
-        uint64_t spend = 0;
+        uint64_t cpend = 0, seen = 0, ncap = ib.n / ICHUNK + 2;
+        const uint8_t **cb = xmalloc(ncap * sizeof *cb); uint64_t *cpe = xmalloc(ncap * 8);
+        cb[0] = q; cpe[0] = 0;
         while (q < qe) {
             uint64_t nruns = vget(&q);
             cpend += nruns;
-            if (++seen % ICHUNK == 0 || q >= qe) {
-                buf one = { (uint8_t *)cstart, (size_t)(q - cstart), 0 };
-                uint8_t *cz = NULL;
-                size_t cl = zcl(&one, &cz, METALEVEL);
-                bput(&ichunks, cz, cl); free(cz);
-                bvar(&itab, cl); bvar(&itab, spend);
-                nichunk++;
-                cstart = q; spend = cpend;
-            }
+            if (++seen % ICHUNK == 0 || q >= qe) { nichunk++; cb[nichunk] = q; cpe[nichunk] = cpend; }
         }
+        uint8_t **cz = xcalloc(nichunk, sizeof *cz); size_t *cl = xcalloc(nichunk, sizeof *cl);
+#pragma omp parallel for schedule(dynamic, 1) num_threads(nthreads())
+        for (uint64_t i = 0; i < nichunk; i++) {
+            buf one = { (uint8_t *)cb[i], (size_t)(cb[i + 1] - cb[i]), 0 };
+            cl[i] = zcl(&one, &cz[i], METALEVEL);
+        }
+        for (uint64_t i = 0; i < nichunk; i++) {
+            bput(&ichunks, cz[i], cl[i]); free(cz[i]);
+            bvar(&itab, cl[i]); bvar(&itab, cpe[i]);
+        }
+        free(cz); free(cl); free(cb); free(cpe);
     }
     PH_ADD(3, _ti);
     uint8_t *iz = NULL, *itz = NULL;
@@ -4554,6 +4572,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--sort")) { ok = enc; SORT = 1; take = 1; }
         else if (!strncmp(a, "--sort=", 7)) { ok = enc; SORT = 1; SORTMEM = mem_arg(a + 7); take = 1; }
         else if (!strcmp(a, "--slow")) { ok = enc; SLOW = 1; FASTMODE = 0; take = 1; }
+        /* --slow also takes the block the sweep found smallest on every read class */
         else if (!strcmp(a, "--block")) { ok = enc;
             BLOCK = !strcmp(v, "all") ? UINT64_MAX      /* one block, no random access */
                   : (uint64_t)int_arg(v, 1, 0x7fffffffffffffffL,
@@ -4593,6 +4612,7 @@ int main(int argc, char **argv) {
         alnpack(argv[2], argv[4]);
         return 0;
     }
+    if (SLOW && !BLOCKSET) BLOCK = 1048576;   /* the block the sweep found smallest on every read class */
     if (!strcmp(argv[1], "encode")) {
 
         char *freearg[64]; int nfree = 0;

@@ -607,7 +607,7 @@ impl Writer {
         }
         if ordinal { self.names.clear(); }
 
-        // Rank the three names codecs on a 200,000-name sample, then run the
+        // Rank the three names codecs on a 50,000-name sample, then run the
         // winner over the whole buffer. Running all three over every name is
         // three times the work: a level 17 zstd of 9.4M ONT read names is
         // 130 s on its own.
@@ -615,7 +615,7 @@ impl Writer {
             (Vec::new(), false, false)
         } else {
             let (mut q, mut smpn) = (0usize, 0u64);
-            while q < self.names.len() && smpn < 200_000 {
+            while q < self.names.len() && smpn < 50_000 {
                 match memchr::memchr(b'\n', &self.names[q..]) {
                     Some(k) => { q += k + 1; smpn += 1; }
                     None => break,
@@ -682,24 +682,23 @@ impl Writer {
         // The index is chunked so a lookup decodes 65536 entries, not all.
         let meta = if level < 19 { level } else { 19 };
         let (mut ichunks, mut itab, mut nichunk) = (Vec::new(), Vec::new(), 0u64);
-        {
-            let mut q = 0usize;
-            let (mut cpend, mut seen, mut spend) = (0u64, 0u64, 0u64);
-            let mut cstart = 0usize;
+        {   // chunk bounds first, then every chunk compressed on its own thread
+            let (mut q, mut cpend, mut seen) = (0usize, 0u64, 0u64);
+            let (mut cb, mut cpe) = (vec![0usize], vec![0u64]);
             while q < self.ibx.len() {
                 let (nruns, next) = vget(&self.ibx, q);
                 q = next;
                 cpend += nruns;
                 seen += 1;
-                if seen % ICHUNK == 0 || q >= self.ibx.len() {
-                    let cz = ffi::zstd(&self.ibx[cstart..q], meta);
-                    ichunks.extend_from_slice(&cz);
-                    kst::put(&mut itab, cz.len() as u64);
-                    kst::put(&mut itab, spend);
-                    nichunk += 1;
-                    cstart = q;
-                    spend = cpend;
-                }
+                if seen % ICHUNK == 0 || q >= self.ibx.len() { cb.push(q); cpe.push(cpend); }
+            }
+            let czs: Vec<Vec<u8>> = (0..cb.len() - 1).into_par_iter()
+                .map(|i| ffi::zstd(&self.ibx[cb[i]..cb[i + 1]], meta)).collect();
+            for (i, cz) in czs.iter().enumerate() {
+                ichunks.extend_from_slice(cz);
+                kst::put(&mut itab, cz.len() as u64);
+                kst::put(&mut itab, cpe[i]);
+                nichunk += 1;
             }
         }
         let itz = ffi::zstd(&itab, meta);

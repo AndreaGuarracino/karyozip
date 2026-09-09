@@ -290,7 +290,8 @@ impl Aln {
     /// reference's contig-order hash. Returns false when it is not one.
     fn load_packed(&mut self, path: &str) -> bool {
         let Ok(d) = std::fs::read(path) else { return false };
-        if d.len() < 6 || &d[..6] != b"KSTAL1" { return false; }
+        if d.len() >= 6 && &d[..6] == b"KSTAL1" { crate::bail("this packed alignment is an older format: pack it again with this version"); }
+        if d.len() < 6 || &d[..6] != b"KSTAL2" { return false; }
         if d.len() < 14 { crate::bail("truncated packed alignment"); }
         let rh = u64::from_le_bytes(d[6..14].try_into().unwrap());
         if rh != refhash(self) {
@@ -298,8 +299,8 @@ impl Aln {
         }
         let body = &d[14..];
         let mut i = 0usize;
-        let mut sec: Vec<Vec<u8>> = Vec::with_capacity(5);
-        for _ in 0..5 {
+        let mut sec: Vec<Vec<u8>> = Vec::with_capacity(10);
+        for _ in 0..10 {
             let (cd, j) = vget(body, i);
             let (rl, j) = vget(body, j);
             let (cl, j) = vget(body, j);
@@ -316,8 +317,10 @@ impl Aln {
                         .unwrap_or_else(|| crate::bail("corrupt packed alignment: a stream does not decompress")),
             });
         }
-        let (nms, cnt, pos, len, tgt) = (&sec[0], &sec[1], &sec[2], &sec[3], &sec[4]);
-        let (mut ci, mut pi, mut li, mut si) = (0usize, 0usize, 0usize, 0usize);
+        let (nms, cnt, pos, len, tgt, fq) = (&sec[0], &sec[1], &sec[2], &sec[3], &sec[4], &sec[5]);
+        let (mut ci, mut pi, mut li, mut si, mut fi, mut m) = (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
+        let nabs = sec[6].len();
+        if (7..10).any(|k| sec[k].len() != nabs) { crate::bail("corrupt packed alignment: the position planes differ in length"); }
         let nrc = self.rc.len() as u64;
         let mut nb = 0usize;
         let mut at = 0usize;
@@ -352,9 +355,11 @@ impl Aln {
                 }
                 let (q, tp);
                 if fresh {
-                    let (a, j) = vget(pos, pi);
-                    let (b, j2) = vget(pos, j); pi = j2;
-                    q = a; tp = b; fresh = false;
+                    if m >= nabs { crate::bail("corrupt packed alignment: more target runs than positions"); }
+                    let (a, j) = vget(fq, fi); fi = j;
+                    q = a;
+                    tp = sec[6][m] as u64 | (sec[7][m] as u64) << 8 | (sec[8][m] as u64) << 16 | (sec[9][m] as u64) << 24;
+                    m += 1; fresh = false;
                 } else {
                     let (a, j) = vget(pos, pi);
                     let (b, j2) = vget(pos, j); pi = j2;
@@ -369,7 +374,7 @@ impl Aln {
             if left != 0 { crate::bail("corrupt packed alignment: a target run outlives its query"); }
             nb += segs.len();
         }
-        if ci != cnt.len() || pi != pos.len() || li != len.len() || si != tgt.len() || i != body.len() {
+        if ci != cnt.len() || pi != pos.len() || li != len.len() || si != tgt.len() || fi != fq.len() || m != nabs || i != body.len() {
             crate::bail("corrupt packed alignment: bytes left over");
         }
         eprintln!("packed alignment: {} query contigs, {nb} collinear blocks", self.qs.len());
@@ -529,8 +534,12 @@ impl Aln {
 /// A PAF is far larger than what --aln actually reads.
 pub fn pack(a: &Aln, out: &str, refhash: u64) {
     use crate::ffi;
-    let (mut names, mut cnt, mut pos, mut len, mut seg_) =
-        (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    // A block that starts a target run carries an absolute position: its
+    // query offset as a varint and its target position as four byte planes;
+    // blocks within a run carry zigzag deltas, interleaved. c/karyozip.c alnpack.
+    let (mut names, mut cnt, mut pos, mut len, mut seg_, mut fq) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let mut pl: [Vec<u8>; 4] = Default::default();
     let mut nb = 0usize;
     for (nm, segs) in &a.qs {
         if segs.is_empty() { continue; }
@@ -543,8 +552,9 @@ pub fn pack(a: &Aln, out: &str, refhash: u64) {
         for (j, g) in segs.iter().enumerate() {
             let newrun = g.t != px || (g.rev as i32) != prev_rev;
             if j == 0 || newrun {
-                kst::put(&mut pos, g.q);
-                kst::put(&mut pos, g.tp);
+                if g.tp > u32::MAX as u64 { crate::bail("a target position past 32 bits cannot be packed"); }
+                kst::put(&mut fq, g.q);
+                for (k, p) in pl.iter_mut().enumerate() { p.push((g.tp >> (8 * k)) as u8); }
             } else {
                 kst::put(&mut pos, kst::zz(g.q as i64 - pq as i64));
                 kst::put(&mut pos, kst::zz(g.tp as i64 - pt as i64));
@@ -562,8 +572,9 @@ pub fn pack(a: &Aln, out: &str, refhash: u64) {
         kst::put(&mut seg_, run);
         nb += segs.len();
     }
-    const SNAME: [&str; 5] = ["names", "counts", "positions", "lengths", "targets"];
-    let st = [names, cnt, pos, len, seg_];
+    const SNAME: [&str; 10] = ["names", "counts", "deltas", "lengths", "targets", "qstarts", "tpos0", "tpos1", "tpos2", "tpos3"];
+    let [p0, p1, p2, p3] = pl;
+    let st = [names, cnt, pos, len, seg_, fq, p0, p1, p2, p3];
     let mut all = Vec::new();
     for (k, raw) in st.iter().enumerate() {
         let (mut best, mut bc): (Vec<u8>, i64) = (Vec::new(), -1);
@@ -591,7 +602,7 @@ pub fn pack(a: &Aln, out: &str, refhash: u64) {
         all.extend_from_slice(&best);
     }
     let mut f = Vec::with_capacity(all.len() + 16);
-    f.extend_from_slice(b"KSTAL1");
+    f.extend_from_slice(b"KSTAL2");
     f.extend_from_slice(&refhash.to_le_bytes());
     f.extend_from_slice(&all);
     std::fs::write(out, &f).unwrap_or_else(|_| crate::bail("cannot write the packed alignment"));

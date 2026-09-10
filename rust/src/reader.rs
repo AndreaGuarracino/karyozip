@@ -14,11 +14,12 @@ const DBFLAG: u64 = 1 << 58;
 const SIDEFLAG: u64 = 1 << 57;
 const LENFLAG: u64 = 1 << 56;
 const TAILFLAG: u64 = 1 << 55;
+const RUNFLAG: u64 = 1 << 61;
 const PERMFLAG: u64 = 1 << 54;
 const PERMTOK: u64 = 1 << 53;
 const CARTFLAG: u64 = 1 << 52;
 const FLAGS: u64 = TOKFLAG | INTFLAG | DROPPED | ALNFLAG | DBFLAG | SIDEFLAG
-                 | LENFLAG | TAILFLAG | PERMFLAG | PERMTOK | CARTFLAG;
+                 | LENFLAG | TAILFLAG | PERMFLAG | PERMTOK | CARTFLAG | RUNFLAG;
 const IDXMAGIC: u64 = 0x3130_5844_4954_534b;   // "KSTIDX01"
 const ICHUNK: u64 = 65536;
 
@@ -62,6 +63,7 @@ fn read_name_file(path: &str, nreads: u64) -> Vec<u8> {
 
 /// One block: where it is, both frame sizes, both decoded sizes, its rows,
 /// the bases before it, and its own hash.
+#[derive(Clone, Copy)]
 struct Blk { off: u64, size: u64, l: u64, raw: u64, lraw: u64, rows: u64, bp: u64, hash: u64 }
 
 /// seq, start, end, label, as decode hands each row out.
@@ -110,6 +112,7 @@ pub struct Reader {
     /// the sequence index: chunk frames, their offsets, the run count each
     /// starts at, and the one chunk decoded now, as the C's loadichunk
     iz: Vec<u8>, coff: Vec<u64>, cpend: Vec<u64>, ibx: Vec<u8>, cur_chunk: u64,
+    runhead: bool, rtab: Vec<u32>,   // run counts lifted out of the lengths
     hasidx: bool,
     mhash: u64,
     cur_ri: u64,
@@ -243,6 +246,7 @@ impl Reader {
             crate::bail("corrupt file: names flagged both tokenised and integer");
         }
         let taildec = h[1] & TAILFLAG != 0;
+        let runhead = h[1] & RUNFLAG != 0;
         if taildec && h[13] & 0xff != 64 {
             crate::bail("corrupt file: tail skip is not the format constant");
         }
@@ -359,7 +363,7 @@ impl Reader {
         }
         cpend.push(h[4]);
         if acc2 != h[2] { crate::bail("index chunk table does not match the index"); }
-        if h[10] != h[0].div_ceil(ICHUNK) {
+        if !runhead && h[10] != h[0].div_ceil(ICHUNK) {
             crate::bail("corrupt file: index chunks do not match the sequence count");
         }
 
@@ -386,6 +390,7 @@ impl Reader {
             nameix: std::cell::OnceCell::new(),
             idcodec: idc, lencodec: lenc,
             taildec, tailpred: h[12], tailskip: h[13] & 0xff, iz, coff, cpend, ibx: Vec::new(), cur_chunk: u64::MAX,
+            runhead, rtab: Vec::new(),
             names: std::cell::OnceCell::new(), nz, pz, names_file: o.names_file.clone(),
             ordnames: o.ordnames, nf, idx,
             hasidx, mhash: h[15], cur_ri: 0, cur_q: 0, cur_pend: 0, cached: None, sc: None,
@@ -496,9 +501,32 @@ impl Reader {
         (d, sp, r)
     }
 
+    /// The run count heads every read on disk. Lift them into rtab and close
+    /// the gap, so every walk below sees the layout it always saw.
+    fn rmheads(&mut self, lens: Vec<u8>) -> Vec<u8> {
+        let (mut out, mut i, mut seen) = (Vec::with_capacity(lens.len()), 0usize, 0u64);
+        let mut tab: Vec<u32> = Vec::with_capacity(self.nreads as usize);
+        while i < lens.len() {
+            if tab.len() as u64 >= self.nreads { crate::bail("corrupt block: more reads than the header claims"); }
+            let (k, n) = vget(&lens, i); i = n;
+            if k == 0 || k > self.rows - seen { crate::bail("corrupt block: a run count is out of range"); }
+            tab.push(k as u32); seen += k;
+            for _ in 0..k {
+                if i >= lens.len() { crate::bail("corrupt block: a read runs past its lengths"); }
+                let n2 = skip(&lens, i);
+                out.extend_from_slice(&lens[i..n2]); i = n2;
+            }
+        }
+        if tab.len() as u64 != self.nreads || seen != self.rows {
+            crate::bail("corrupt block: the run counts do not add up to the row count");
+        }
+        self.rtab = tab;
+        out
+    }
+
     fn load_raw(&mut self, b: usize) -> (Vec<u8>, usize, u64) {
         if b >= self.b.len() { crate::bail("corrupt index: a block number is past the end"); }
-        let m = &self.b[b];
+        let m = self.b[b].clone();
         let mut cb = vec![0u8; crate::ckalloc(m.size as usize)];
         rd(self.f.seek(SeekFrom::Start(self.data0 + m.off)), "seek");
         rd(self.f.read_exact(&mut cb), "file is truncated: a block is missing or short");
@@ -508,6 +536,7 @@ impl Reader {
         let (la, lb) = (m.l as usize, (m.size - m.l) as usize);
         let lens = frame(&cb[..la], self.lencodec, m.lraw as usize);
         let ids = frame(&cb[la..la + lb], self.idcodec, m.raw as usize);
+        let lens = if self.runhead { self.rmheads(lens) } else { lens };
         let split = lens.len();
         let rows = m.rows;
         let mut data = lens;
@@ -615,6 +644,14 @@ impl Reader {
     }
 
     fn locate(&mut self, ri: u64) -> (usize, u64, u64) {
+        if self.runhead {
+            if ri >= self.nreads { crate::bail("corrupt index: a sequence past the end"); }
+            if self.rtab.is_empty() { self.load(0); }
+            let start: u64 = self.rtab[..ri as usize].iter().map(|&x| x as u64).sum();
+            let n = self.rtab[ri as usize] as u64;
+            if start + n > self.rows { crate::bail("corrupt index: a sequence points outside the block table"); }
+            return (0, start, n);
+        }
         let want = ri / ICHUNK;
         if want != self.cur_chunk || ri < self.cur_ri { self.load_ichunk(want); }
         let mut nruns = 0u64;
@@ -948,7 +985,7 @@ impl Reader {
     }
 }
 
-fn skip(b: &[u8], mut i: usize) -> usize {
+pub(crate) fn skip(b: &[u8], mut i: usize) -> usize {
     while i < b.len() && b[i] >= 0x80 { i += 1; }
     i + 1
 }

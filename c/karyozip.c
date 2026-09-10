@@ -356,6 +356,11 @@ static size_t zc(buf *in, uint8_t **out) { return zcl(in, out, LEVEL); }
 #define SIDEFLAG (1ULL << 57)
 #define LENFLAG  (1ULL << 56)         /* lengths the reference implies are 0 */
 #define TAILFLAG (1ULL << 55)
+/* Every read's run count heads its own lengths, so the index blob holds
+   nothing. One frame models the count beside the lengths it counts, which
+   is smaller than a second frame of counts on its own. */
+#define RUNFLAG  (1ULL << 61)
+static int RUNHEAD = 0;               /* the writer is using that layout */
 
 static int NAMEMODE = 0;              /* 0 auto, 1 drop, 2 keep */
 static const char *NAMEFILE = NULL;
@@ -700,6 +705,27 @@ typedef struct ktw {
     uint64_t plen, pval; int phas, prev;
     uint64_t curnh;               /* fnv of cur, for the row hash */
 } ktw;
+
+/* the same lengths with each read's run count in front of its own */
+static size_t splice_heads(const uint8_t *lens, size_t nl, const uint8_t *ib,
+                           size_t ibn, uint8_t **out) {
+    *out = xmalloc(nl + ibn + 16);
+    const uint8_t *p = lens, *e = lens + nl, *q = ib, *qe = ib + ibn;
+    uint8_t *w = *out;
+    while (q < qe) {
+        uint64_t k = vgetb(&q, qe);
+        vput(&w, k);
+        for (uint64_t j = 0; j < k; j++) {
+            const uint8_t *s0 = p;
+            if (p >= e) { free(*out); *out = NULL; return 0; }
+            vgetb(&p, e);
+            size_t len = (size_t)(p - s0);
+            memcpy(w, s0, len); w += len;
+        }
+    }
+    if (p != e) { free(*out); *out = NULL; return 0; }
+    return (size_t)(w - *out);
+}
 
 static void rawput(int fd, off_t off, const void *p, size_t n) {
     while (n) {
@@ -2279,6 +2305,33 @@ static void namesunique(const buf *names, size_t n) {
     free(hs);
 }
 
+/* the index blob: chunk bounds first, then every chunk on its own thread */
+static uint64_t idxbuild(const buf *ib, buf *ichunks, buf *itab) {
+    uint64_t nichunk = 0;
+    const uint8_t *q = ib->d, *qe = ib->d + ib->n;
+    uint64_t cpend = 0, seen = 0, ncap = ib->n / ICHUNK + 2;
+    const uint8_t **cb = xmalloc(ncap * sizeof *cb); uint64_t *cpe = xmalloc(ncap * 8);
+    cb[0] = q; cpe[0] = 0;
+    while (q < qe) {
+        uint64_t nruns = vgetb(&q, qe);
+        cpend += nruns;
+        if (++seen % ICHUNK == 0 || q >= qe) { nichunk++; cb[nichunk] = q; cpe[nichunk] = cpend; }
+    }
+    uint8_t **cz = xcalloc(nichunk ? nichunk : 1, sizeof *cz);
+    size_t *cl = xcalloc(nichunk ? nichunk : 1, sizeof *cl);
+#pragma omp parallel for schedule(dynamic, 1) num_threads(nthreads())
+    for (uint64_t i = 0; i < nichunk; i++) {
+        buf one = { (uint8_t *)cb[i], (size_t)(cb[i + 1] - cb[i]), 0 };
+        cl[i] = zcl(&one, &cz[i], METALEVEL);
+    }
+    for (uint64_t i = 0; i < nichunk; i++) {
+        bput(ichunks, cz[i], cl[i]); free(cz[i]);
+        bvar(itab, cl[i]); bvar(itab, cpe[i]);
+    }
+    free(cz); free(cl); free(cb); free(cpe);
+    return nichunk;
+}
+
 static void ktw_close(ktw *w) {
     buf names = w->names, sizes = w->sizes;
     size_t nidx = w->nidx;
@@ -2297,6 +2350,29 @@ static void ktw_close(ktw *w) {
             if (bm[i].alen[v] + (bm[i].len - bm[i].lens) > maxraw) maxraw = bm[i].alen[v] + (bm[i].len - bm[i].lens);
     }
     size_t obound = ZSTD_compressBound(maxraw ? maxraw : 1);
+
+    /* The run count can head each read's lengths instead of living in the
+       index. One block only, since a split read has no count to head it, and
+       measured against the index it would replace: it wins on short reads,
+       where a read is a few runs, and loses where a read is thousands. */
+    uint8_t *headbuf = NULL; size_t headlen = 0;
+    if (nraw == 1 && !ALNPAF && w->ibx.n) {
+        uint8_t *rb0 = xmalloc(bm[0].len);
+        rawget(w->rawfd, (off_t)bm[0].off, rb0, bm[0].len);
+        headlen = splice_heads(rb0, bm[0].lens, w->ibx.d, w->ibx.n, &headbuf);
+        if (headlen) {
+            buf ib0 = w->ibx, ic = {0}, it = {0};
+            idxbuild(&ib0, &ic, &it);
+            uint8_t *f1 = NULL, *f2 = NULL; ZSTD_CCtx *mc = ZSTD_createCCtx();
+            size_t a1 = complens(mc, rb0, bm[0].lens, &f1, ZSTD_compressBound(bm[0].lens));
+            size_t a2 = complens(mc, headbuf, headlen, &f2, ZSTD_compressBound(headlen));
+            RUNHEAD = a1 && a2 && a2 < a1 + ic.n;
+            free(f1); free(f2); free(ic.d); free(it.d); ZSTD_freeCCtx(mc);
+        }
+        if (!RUNHEAD) { free(headbuf); headbuf = NULL; headlen = 0; }
+        free(rb0);
+    }
+    if (RUNHEAD) { free(w->ibx.d); w->ibx.d = NULL; w->ibx.n = 0; }
 
     {
         /* Parallel: compress apart, write in order. */
@@ -2324,6 +2400,7 @@ static void ktw_close(ktw *w) {
                 uint8_t *fa = NULL, *fb = NULL;
 
                 const uint8_t *vs[3] = { src, NULL, NULL }; size_t vn[3] = { nl, 0, 0 };
+                if (RUNHEAD) { vs[0] = headbuf; vn[0] = headlen; }
                 for (int v = 0; ALNPAF && v < 2; v++) {
                     size_t an = bm[i].alen[v]; const uint8_t *alt = w->rawalt[v].d + bm[i].aoff[v];
                     if (!an || (an == nl && !memcmp(alt, src, an))) continue;   /* same bytes as every-sentinel */
@@ -2492,29 +2569,7 @@ static void ktw_close(ktw *w) {
     PH_ADD(2, _tn);
     double _ti = nowsec();
     buf ichunks = {0}, itab = {0};
-    uint64_t nichunk = 0;
-    {   /* chunk bounds first, then every chunk compressed on its own thread */
-        const uint8_t *q = ib.d, *qe = ib.d + ib.n;
-        uint64_t cpend = 0, seen = 0, ncap = ib.n / ICHUNK + 2;
-        const uint8_t **cb = xmalloc(ncap * sizeof *cb); uint64_t *cpe = xmalloc(ncap * 8);
-        cb[0] = q; cpe[0] = 0;
-        while (q < qe) {
-            uint64_t nruns = vget(&q);
-            cpend += nruns;
-            if (++seen % ICHUNK == 0 || q >= qe) { nichunk++; cb[nichunk] = q; cpe[nichunk] = cpend; }
-        }
-        uint8_t **cz = xcalloc(nichunk, sizeof *cz); size_t *cl = xcalloc(nichunk, sizeof *cl);
-#pragma omp parallel for schedule(dynamic, 1) num_threads(nthreads())
-        for (uint64_t i = 0; i < nichunk; i++) {
-            buf one = { (uint8_t *)cb[i], (size_t)(cb[i + 1] - cb[i]), 0 };
-            cl[i] = zcl(&one, &cz[i], METALEVEL);
-        }
-        for (uint64_t i = 0; i < nichunk; i++) {
-            bput(&ichunks, cz[i], cl[i]); free(cz[i]);
-            bvar(&itab, cl[i]); bvar(&itab, cpe[i]);
-        }
-        free(cz); free(cl); free(cb); free(cpe);
-    }
+    uint64_t nichunk = idxbuild(&ib, &ichunks, &itab);
     PH_ADD(3, _ti);
     uint8_t *iz = NULL, *itz = NULL;
     size_t izl = ichunks.n, itl = zcl(&itab, &itz, METALEVEL);
@@ -2532,6 +2587,7 @@ static void ktw_close(ktw *w) {
     uint64_t h[16] = { nidx, (NAMES_OUT ? 0 : nzl) | (tokused ? TOKFLAG : 0) | (CARTUSED ? CARTFLAG : 0)
                              | (intused ? INTFLAG : 0) | (dropnames && !(w->ordok && nidx > 0) ? DROPPED : 0)
                              | (ALNPAF ? LENFLAG : 0) | (TAILON > 0 ? TAILFLAG : 0)
+                             | (RUNHEAD ? RUNFLAG : 0)
                              | (ALNPAF ? ALNFLAG : 0) | (DBFEATS ? DBFLAG : 0)
                              | (NAMES_OUT ? SIDEFLAG : 0)
                              | (npl || (PERMON && NAMEMODE == 1) ? PERMFLAG : 0)
@@ -2577,7 +2633,7 @@ static void ktw_close(ktw *w) {
             nzl, dropnames ? " (dropped, needs --names FILE)" : ordinal ? " (ordinal, not stored)" : tokused ? " (tokenised)" : intused ? " (int deltas)" : "", izl, szl,
             (unsigned long long)BYT_LENS, (unsigned long long)BYT_LABS, RAWHELD);
 
-    free(itab.d); free(ichunks.d);
+    free(itab.d); free(ichunks.d); free(headbuf);
     free(lz); free(nz); free(sz); free(itz); free(npz);
     free(names.d); free(sizes.d); free(labs.d);
     free(w->bm);
@@ -2671,6 +2727,7 @@ typedef struct {
     const uint8_t *payend;        /* the cached block's payload end, per reader */
     const uint8_t *curlp, *curip;
     uint64_t rowhash, tailpred, tailskip; int taildec;   /* for a track read as --ref */
+    int runhead, rfilled; uint32_t *rtab;   /* run counts lifted out of the lengths */
 } R;
 
 static void loadichunk(R *r, uint64_t c) {
@@ -2696,7 +2753,26 @@ static void loadichunk(R *r, uint64_t c) {
             die("corrupt index: an index chunk does not match its table entry"); }
 }
 
+static void loadblk(R *r, uint64_t b);
+
+/* the counts live in the lengths, so the first block load tabulates them */
+static rec runidx(R *r, uint64_t i) {
+    if (!r->rfilled) loadblk(r, 0);
+    if (r->cvalid && r->ci == i) return r->crec;
+    uint64_t off = 0, k0 = 0;
+    if (r->cvalid && r->ci < i) { k0 = r->ci + 1; off = (uint64_t)r->crec.off + r->crec.nruns; }
+    for (uint64_t k = k0; k < i; k++) off += r->rtab[k];
+    if (off > UINT32_MAX) die("corrupt index: a sequence offset past 32 bits");
+    rec out = { 0, (uint32_t)off, r->rtab[i] };
+    r->ci = i; r->crec = out; r->cvalid = 1;
+    if (out.off > r->b[0].rows || (uint64_t)out.off + out.nruns > r->rows)
+        die("corrupt index: a sequence points outside the block table");
+    return out;
+}
+
 static rec getidx(R *r, uint64_t i) {
+    if (r->runhead) { if (i >= r->nreads) die("corrupt index: a sequence past the end");
+                      return runidx(r, i); }
     if (r->cvalid && r->ci == i) return r->crec;
     uint64_t want = i / ICHUNK;
     if (!r->cvalid || i < r->ci || want != r->curchunk) {
@@ -2755,7 +2831,7 @@ static R *ropen(const char *path) {
     if (fseeko(r->f, 8 + 128, SEEK_SET)) die("seek");
     uint64_t nml = h[1] & ~(TOKFLAG | INTFLAG | DROPPED | ALNFLAG | DBFLAG
                             | SIDEFLAG | LENFLAG | TAILFLAG | PERMFLAG
-                            | PERMTOK | CARTFLAG);   /* h[1] also holds flags */
+                            | PERMTOK | CARTFLAG | RUNFLAG);   /* h[1] also holds flags */
 
     if (nml > fsz || h[2] > fsz || h[3] > fsz || h[6] > fsz || h[11] > fsz
         || h[14] > fsz || h[11] + h[14] > fsz
@@ -2821,15 +2897,18 @@ static R *ropen(const char *path) {
     r->lenfile = LENDEC = was_len && !RAW;
 
     TAILDEC = (h[1] & TAILFLAG) != 0;
+    int runhead = (h[1] & RUNFLAG) != 0;
     TAILPRED_R = h[12]; TAILSKIP_R = h[13] & 0xff;
     if (TAILDEC && TAILSKIP_R != TAILSKIP) die("corrupt file: tail skip is not the format constant");
     r->taildec = TAILDEC; r->tailpred = h[12]; r->tailskip = TAILSKIP_R; r->rowhash = was_aln ? 0 : h[13] >> 8;
     if (was_aln && ALNPAF && (h[13] >> 8) != (ALNHASH & ((1ull << 56) - 1)))
         die("this PAF, reference or name map is not the one the track was encoded with");
     r->cart = (h[1] & CARTFLAG) != 0;
+    r->runhead = runhead;
+    if (runhead) r->rtab = xmalloc(mul(h[0] ? h[0] : 1, sizeof *r->rtab));
     if (r->cart && !was_db) die("corrupt file: vocabulary featureIDs without --db");
     h[1] &= ~(TOKFLAG | INTFLAG | DROPPED | ALNFLAG | DBFLAG | SIDEFLAG | LENFLAG
-              | TAILFLAG | PERMFLAG | PERMTOK | CARTFLAG);
+              | TAILFLAG | PERMFLAG | PERMTOK | CARTFLAG | RUNFLAG);
     uint8_t *iz = xmalloc(h[2]), *sz = xmalloc(h[3]);
     uint8_t *nz = NULL;
     r->nz_off = ftello(r->f);
@@ -2926,7 +3005,7 @@ static R *ropen(const char *path) {
         }
         r->coff[r->nichunk] = acc;
         if (acc != h[2]) die("index chunk table does not match the index");
-        if (r->nichunk != (r->nreads + ICHUNK - 1) / ICHUNK) die("corrupt file: index chunks do not match the sequence count");
+        if (!r->runhead && r->nichunk != (r->nreads + ICHUNK - 1) / ICHUNK) die("corrupt file: index chunks do not match the sequence count");
         r->cpendv[r->nichunk] = r->rows;
         for (uint64_t c = 0; c < r->nichunk; c++)
             if (r->cpendv[c] > r->cpendv[c + 1] || (c == 0 && r->cpendv[0])) die("corrupt file: index chunk starts are not in order");
@@ -2962,6 +3041,8 @@ static R *ropen(const char *path) {
         r->b[n] = (blk){ acc, a + b2, a, c2, d2, e2, f2, g2, r->b[n].nos };
         acc += a + b2; n++; }
       r->nblk = n;
+      if (r->runhead && n != 1)
+          die("corrupt file: run counts head the lengths but the track has more than one block");
       uint64_t tot = 0;
       for (uint64_t i = 0; i < n; i++) {
           tot += r->b[i].rows;
@@ -3286,6 +3367,32 @@ static int64_t rfind(R *r, const char *nm) {
     return -1;
 }
 
+/* The run count heads every read on disk. Lift them into rtab and close the
+   gap, so every walk below sees the layout it always saw. */
+static size_t rmheads(R *r, uint8_t *b, size_t n) {
+    uint8_t *w = b; const uint8_t *p = b, *e = b + n;
+    uint64_t i = 0, seen = 0;
+    while (p < e) {
+        if (i >= r->nreads) die("corrupt block: more reads than the header claims");
+        uint64_t k = vget(&p);
+        if (p > e) die("corrupt block: a run count runs past the lengths");
+        if (!k || k > r->rows - seen) die("corrupt block: a run count is out of range");
+        r->rtab[i++] = (uint32_t)k; seen += k;
+        for (uint64_t j = 0; j < k; j++) {
+            const uint8_t *s0 = p;
+            if (p >= e) die("corrupt block: a read runs past its lengths");
+            vget(&p);
+            if (p > e) die("corrupt block: a length runs past the lengths");
+            size_t len = (size_t)(p - s0);
+            memmove(w, s0, len); w += len;
+        }
+    }
+    if (i != r->nreads || seen != r->rows)
+        die("corrupt block: the run counts do not add up to the row count");
+    r->rfilled = 1;
+    return (size_t)(w - b);
+}
+
 static void loadblk(R *r, uint64_t b) {
 
     if (b >= r->nblk) die("corrupt index: a block number is past the end");
@@ -3317,6 +3424,11 @@ static void loadblk(R *r, uint64_t b) {
     free(cb);
     if (g != r->b[b].lraw || h2 != r->b[b].raw)
         die("corrupt block: a stream decodes to a size the index does not claim");
+    if (r->runhead) {
+        size_t g2 = rmheads(r, r->blkbuf, g);
+        memmove(r->blkbuf + g2, r->blkbuf + g, h2);
+        g = g2;
+    }
     r->lp0 = r->blkbuf; r->ip0 = r->blkbuf + g;
     r->payend = PAYEND = r->blkbuf + g + h2;
     r->cached = b;
@@ -4120,7 +4232,7 @@ static void rclose(R *r) {
     if (r->lab) { free(r->lab[0]); free(r->lab); }
     free(r->blkbuf); free(r->b);
     free(r->nz_keep); free(r->pz); free(r->ibuf); free(r->ichunk);
-    free(r->coff); free(r->cpendv); free(r->htab);
+    free(r->coff); free(r->cpendv); free(r->htab); free(r->rtab);
     free(r->sst); free(r->sen); free(r->sfeat); free(r->snov);
     free(r);
 }

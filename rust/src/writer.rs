@@ -22,6 +22,7 @@ const LENFLAG: u64 = 1 << 56;
 const PERMFLAG: u64 = 1 << 54;
 const PERMTOK: u64 = 1 << 53;
 const TAILFLAG: u64 = 1 << 55;
+const RUNFLAG: u64 = 1 << 61;
 const ICHUNK: u64 = 65536;
 const TAILSKIP: usize = 64;
 
@@ -503,6 +504,24 @@ impl Writer {
         // Compress apart, write in order, a batch at a time. Holding every
         // compressed block would cost the whole file in memory; the C stages
         // them in a temp file for the same reason.
+        // The run count can head each read's lengths instead of living in the
+        // index. One block only, since a split read has no count to head it,
+        // and measured against the index it would replace.
+        let mut headbuf: Vec<u8> = Vec::new();
+        let mut runhead = false;
+        if self.bm.len() == 1 && !aln_on && !self.ibx.is_empty() {
+            let (lens0, _) = self.read_block(0).expect("staged block");
+            if let Some(h) = splice_heads(&lens0, &self.ibx) {
+                let idx = idxsize(&self.ibx, if level < 19 { level } else { 19 });
+                let a1 = comp_lens(&lens0, p.len, lvl_len).map(|v| v.len());
+                let a2 = comp_lens(&h, p.len, lvl_len).map(|v| v.len());
+                if let (Some(a1), Some(a2)) = (a1, a2) {
+                    if a2 < a1 + idx { runhead = true; headbuf = h; }
+                }
+            }
+        }
+        if runhead { self.ibx.clear(); }
+
         let _s = crate::prof::span(1);
         let mut sizes = Vec::new();
         let mut body = tmpfile(&self.tmpdir).map_err(io)?;
@@ -517,7 +536,8 @@ impl Writer {
                     // spellings: every sentinel, plus-strand sentinels only,
                     // or plain lengths. Zeros do not always compress better.
                     let m = &self.bm[i];
-                    let mut vs: [Option<&[u8]>; 3] = [Some(&lens), None, None];
+                    let mut vs: [Option<&[u8]>; 3] =
+                        [Some(if runhead { &headbuf } else { &lens }), None, None];
                     if aln_on {
                         for v in 0..2 {
                             let alt = &self.rawalt[v][m.aoff[v]..m.aoff[v] + m.alen[v]];
@@ -717,7 +737,8 @@ impl Writer {
              | if self.feathash.is_some() { DBFLAG } else { 0 }
              | if self.cart { CARTFLAG } else { 0 }
              | if aln_on { ALNFLAG | LENFLAG } else { 0 }
-             | if self.tailon == Some(true) { TAILFLAG } else { 0 };
+             | if self.tailon == Some(true) { TAILFLAG } else { 0 }
+             | if runhead { RUNFLAG } else { 0 };
         h[2] = ichunks.len() as u64;
         h[3] = sz.len() as u64;
         h[4] = self.rows;
@@ -1029,6 +1050,33 @@ fn verifies(src: &[u8], codec: i32) -> bool {
 /// Size alone does not qualify a codec, so the sample round trips it; under
 /// slow the whole-file pass round trips the winner and drops it on failure,
 /// so the sample only sizes.
+/// the same lengths with each read's run count in front of its own
+fn splice_heads(lens: &[u8], ibx: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(lens.len() + ibx.len() + 16);
+    let (mut p, mut q) = (0usize, 0usize);
+    while q < ibx.len() {
+        let (k, n) = vget(ibx, q); q = n;
+        kst::put(&mut out, k);
+        for _ in 0..k {
+            if p >= lens.len() { return None; }
+            let n2 = crate::reader::skip(lens, p);
+            out.extend_from_slice(&lens[p..n2]); p = n2;
+        }
+    }
+    if p != lens.len() { return None; } else { Some(out) }
+}
+
+/// what the index blob costs, so the two spellings can be compared
+fn idxsize(ibx: &[u8], meta: i32) -> usize {
+    let (mut q, mut seen) = (0usize, 0u64);
+    let mut cb = vec![0usize];
+    while q < ibx.len() {
+        let (_, next) = vget(ibx, q); q = next; seen += 1;
+        if seen % ICHUNK == 0 || q >= ibx.len() { cb.push(q); }
+    }
+    (0..cb.len() - 1).into_par_iter().map(|i| ffi::zstd(&ibx[cb[i]..cb[i + 1]], meta).len()).sum()
+}
+
 fn accumulate(acc: usize, src: &[u8], codec: i32, bad: usize, slow: bool) -> usize {
     if src.is_empty() { return bad; }
     if acc >= bad { return bad; }

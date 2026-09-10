@@ -6,8 +6,8 @@
 # CELLDIR holds <sample>.<db>.<set>.<kind>.bed.gz; REFDIR the reference
 # tracks named *.<set>.<kind>.bed.gz; PAF may be a packed alignment.
 # LEVEL high is every row; medium is the ratio matrix alone, C only, no
-# sweeps; low is high on cut cells, which the caller picks. KIND:PART runs
-# one node's share, a set or ALL for the --db rows; empty runs the lot.
+# sweeps; low is high on cut cells, which the caller picks. KIND:PART[:SEEK[:IMPL]]
+# runs one node's share, PART a set or ALL for the --db rows; empty runs the lot.
 set -u; BAD=0
 D=$1; PAF=$2; FEAT=$3; HIER=$4; REFD=$5
 C=${6:-$(dirname "$0")/../c/build/karyozip}; R=${7:-$(dirname "$0")/../rust/target/release/karyozip}
@@ -15,7 +15,10 @@ LEVEL=${8:-high}; PART=${9:-}
 T=8; NQ=50; NQ_ALN=50; REPS=1   # an aln-informed query parses the reference track
 BLOCKS="65536 1048576"; LEVELS="9 22"; IMPLS="C Rust"; EXTRA=1   # swept beside the 262144 and 17 defaults
 [ "$LEVEL" = medium ] && { BLOCKS=""; LEVELS=""; IMPLS=C; EXTRA=0; }
-KINDS="presmoothed smoothed"; ONLY=""; [ -n "$PART" ] && { KINDS=${PART%%:*}; ONLY=${PART#*:}; }
+KINDS="presmoothed smoothed"; ONLY=""; SEEKS="seekable non-seekable"
+if [ -n "$PART" ]; then IFS=: read -r KINDS ONLY sk im <<< "$PART"
+  [ -n "$sk" ] && SEEKS=$sk
+  [ -n "$im" ] && case " $IMPLS " in *" $im "*) IMPLS=$im;; *) IMPLS="";; esac; fi
 W=$(mktemp -d); trap 'rm -rf "$W"' EXIT; export TMPDIR=$W
 LASTIN=""; gz=0; plain=0; rows=0; seqs=0
 cell=$(basename "$D"); smp=${cell%%.*}; dbv=$(echo "$cell" | cut -d. -f2); backend=$(echo "$cell" | cut -d. -f3 | tr a-z A-Z)
@@ -132,7 +135,7 @@ for kind in $KINDS; do
   for set in $sets; do [ -n "$ONLY" ] && [ "$ONLY" != "$set" ] && continue
     q=$(ls "$D"/*."$set"."$kind".bed.gz 2>/dev/null | grep -v '/ref\.' | head -1); [ -n "$q" ] || { echo "bench: no $set $kind track in the cell" >&2; BAD=$((BAD+1)); continue; }
     ref=$(refof "$set" "$kind"); [ -s "$ref" ] && ref=$(kstref "$ref"); [ -s "$ref" ] || { echo "bench: no $set $kind reference track" >&2; BAD=$((BAD+1)); }
-    for seek in seekable non-seekable; do bf=""; [ $seek = seekable ] && bf="--queryable"
+    for seek in $SEEKS; do bf=""; [ $seek = seekable ] && bf="--queryable"
       for mode in default fast; do mf=""; [ $mode = fast ] && mf="--fast"
         for impl in $IMPLS; do bin=$C; [ $impl = Rust ] && bin=$R
           row "$set" "$kind" not-informed "$seek" "$mode" "$impl" "$bin" "$q" "$bf $mf" "" 0
@@ -158,7 +161,7 @@ for kind in $KINDS; do
   ins=""; for set in $sets; do f=$(ls "$D"/*."$set"."$kind".bed.gz 2>/dev/null | grep -v '/ref\.' | head -1); [ -n "$f" ] && ins="$ins $f"; done
   [ $(echo $ins | wc -w) = $(echo $sets | wc -w) ] || { echo "bench: not every set has a $kind track" >&2; BAD=$((BAD+1)); continue; }
   ref=$(refof chromosome "$kind"); [ -s "$ref" ] && ref=$(kstref "$ref"); [ -s "$ref" ] || { echo "bench: no chromosome $kind reference track" >&2; BAD=$((BAD+1)); }
-  for seek in seekable non-seekable; do bf=""; [ $seek = seekable ] && bf="--queryable"
+  for seek in $SEEKS; do bf=""; [ $seek = seekable ] && bf="--queryable"
     for mode in default fast; do mf=""; [ $mode = fast ] && mf="--fast"
       for impl in $IMPLS; do bin=$C; [ $impl = Rust ] && bin=$R
         row ALL "$kind" not-informed "$seek" "$mode" "$impl" "$bin" "$ins" "$bf $mf" "" 0

@@ -397,6 +397,7 @@ static char **ORD; static size_t nord;
 static uint64_t BYT_LENS = 0, BYT_LABS = 0;
 static int IDCODEC = -1, LENCODEC = -1;   /* -1 picks the winner on a sample */
 #define INTFLAG (1ULL << 62)
+#define FLDFLAG (1ULL << 50)   /* names as field deltas */
 
 static size_t intnames(buf *names, uint64_t n, uint8_t **out) {
     const char *p = (const char *)names->d, *end = p + names->n;
@@ -438,6 +439,130 @@ static char *intnamesd(const uint8_t *b, size_t n, uint64_t cnt, size_t *outn) {
     }
     if (q != qe) die("corrupt names: the integer stream has more than the count");
     free(v); o[w] = 0; *outn = w; return o;
+}
+
+static size_t paycomp(const uint8_t *src, size_t n, int codec, uint8_t **out);
+static size_t paydecomp(const uint8_t *src, size_t n, int codec, uint8_t *dst, size_t raw);
+
+/* Read names split on ':' into fields that are either the same in every name
+   or a plain integer. The integers go down as zigzag deltas, interleaved so a
+   read's fields sit together, and bzip3 takes the lot: on 3444234 Illumina
+   names that is 2301419 B against the tokeniser's 2818102. */
+#define FLDSEP ':'
+#define FLDMAX 16
+static size_t fldnames(buf *names, uint64_t n, uint8_t **out) {
+    if (!n) return 0;
+    const char *p = (const char *)names->d, *end = p + names->n;
+    const char *f0[FLDMAX]; size_t l0[FLDMAX]; int nf = 0, isnum[FLDMAX];
+    {   const char *q = p, *nl = memchr(q, '\n', (size_t)(end - q));
+        if (!nl) return 0;
+        while (q <= nl) {
+            const char *s = memchr(q, FLDSEP, (size_t)(nl - q));
+            const char *e2 = s ? s : nl;
+            if (nf == FLDMAX) return 0;
+            f0[nf] = q; l0[nf] = (size_t)(e2 - q); nf++;
+            if (!s) break;
+            q = s + 1;
+        }
+    }
+    for (int i = 0; i < nf; i++) isnum[i] = 1;
+    int *same = xmalloc((size_t)nf * sizeof *same);
+    for (int i = 0; i < nf; i++) same[i] = 1;
+    int64_t *prev = xcalloc((size_t)nf, sizeof *prev);
+    buf v = {0};
+    /* one pass: the fields of every name, checked and delta'd as we go */
+    const char *q = p;
+    for (uint64_t r = 0; r < n; r++) {
+        const char *nl = q < end ? memchr(q, '\n', (size_t)(end - q)) : NULL;
+        if (!nl) { free(v.d); free(same); free(prev); return 0; }
+        const char *c = q; int k = 0;
+        while (c <= nl && k < nf) {
+            const char *s = memchr(c, FLDSEP, (size_t)(nl - c));
+            const char *e2 = s ? s : nl;
+            size_t len = (size_t)(e2 - c);
+            if (same[k] && (len != l0[k] || memcmp(c, f0[k], len))) same[k] = 0;
+            if (isnum[k]) {
+                if (!len || len > 18 || (len > 1 && c[0] == '0')) isnum[k] = 0;
+                else for (size_t j = 0; j < len; j++)
+                         if (c[j] < '0' || c[j] > '9') { isnum[k] = 0; break; }
+            }
+            if (!same[k] && !isnum[k]) { free(v.d); free(same); free(prev); return 0; }
+            c = e2 + 1; k++;
+            if (!s) break;
+        }
+        if (k != nf || c != nl + 1) { free(v.d); free(same); free(prev); return 0; }
+        q = nl + 1;
+    }
+    /* the template, then a read's varying fields together */
+    bvar(&v, (uint64_t)nf);
+    for (int i = 0; i < nf; i++) {
+        bvar(&v, same[i] ? 0 : 1);
+        if (same[i]) { bvar(&v, l0[i]); bput(&v, f0[i], l0[i]); }
+    }
+    q = p;
+    for (uint64_t r = 0; r < n; r++) {
+        const char *nl = memchr(q, '\n', (size_t)(end - q));
+        const char *c = q; int k = 0;
+        while (k < nf) {
+            const char *s = memchr(c, FLDSEP, (size_t)(nl - c));
+            const char *e2 = s ? s : nl;
+            if (!same[k]) {
+                int64_t x = 0;
+                for (const char *j = c; j < e2; j++) x = x * 10 + (*j - '0');
+                int64_t d = x - prev[k]; prev[k] = x;
+                bvar(&v, ((uint64_t)d << 1) ^ (uint64_t)(d >> 63));
+            }
+            c = e2 + 1; k++;
+        }
+        q = nl + 1;
+    }
+    free(same); free(prev);
+    uint8_t *z = NULL; size_t zn = paycomp(v.d, v.n, CODEC_BZIP3 | 64, &z);
+    if (!zn) { free(v.d); free(z); return 0; }
+    uint8_t hdr[10], *hw = hdr; vput(&hw, v.n);   /* bzip3 needs the size back */
+    size_t hn = (size_t)(hw - hdr);
+    *out = xmalloc(hn + zn);
+    memcpy(*out, hdr, hn); memcpy(*out + hn, z, zn);
+    free(z); free(v.d);
+    return hn + zn;
+}
+
+static char *fldnamesd(const uint8_t *b, size_t n, uint64_t cnt, size_t *outn) {
+    const uint8_t *hp = b, *he = b + n;
+    size_t raw = (size_t)vgetb(&hp, he);
+    if (!raw || raw > (1ull << 40)) die("corrupt names: a bad field blob size");
+    uint8_t *v = xmalloc(raw + 16);
+    size_t got = paydecomp(hp, (size_t)(he - hp), CODEC_BZIP3 | 64, v, raw);
+    if (got != raw) die("field names decompress failed");
+    const uint8_t *q = v, *qe = v + got;
+    uint64_t nf = vgetb(&q, qe);
+    if (!nf || nf > FLDMAX) die("corrupt names: a bad field count");
+    const uint8_t *cf[FLDMAX]; size_t cl[FLDMAX]; int var[FLDMAX];
+    size_t fixed = 0; int nvar = 0;
+    for (uint64_t i = 0; i < nf; i++) {
+        var[i] = (int)vgetb(&q, qe);
+        if (var[i]) { nvar++; cf[i] = NULL; cl[i] = 0; }
+        else { cl[i] = (size_t)vgetb(&q, qe);
+               if ((size_t)(qe - q) < cl[i]) die("corrupt names: a field runs past the blob");
+               cf[i] = q; q += cl[i]; fixed += cl[i]; }
+    }
+    size_t per = fixed + nf + (size_t)nvar * 20;
+    char *o = xmalloc(mul(cnt, per) + 1); size_t w = 0;
+    int64_t *cur = xcalloc(nf, sizeof *cur);
+    for (uint64_t r = 0; r < cnt; r++) {
+        for (uint64_t i = 0; i < nf; i++) {
+            if (i) o[w++] = FLDSEP;
+            if (var[i]) {
+                uint64_t u = vgetb(&q, qe);
+                cur[i] += (int64_t)(u >> 1) ^ -(int64_t)(u & 1);
+                if (cur[i] < 0) die("corrupt names: a negative field");
+                w += (size_t)sprintf(o + w, "%lld", (long long)cur[i]);
+            } else { memcpy(o + w, cf[i], cl[i]); w += cl[i]; }
+        }
+        o[w++] = '\n';
+    }
+    if (q != qe) die("corrupt names: the field stream has more than the count");
+    free(cur); free(v); o[w] = 0; *outn = w; return o;
 }
 
 #define TOKMAX 9000000u
@@ -584,10 +709,13 @@ static size_t bestnames(buf *b, uint64_t n, uint8_t **out, int *kind) {
         { s3 = tokbest(&tb, &a3); }
     }
     free(tb.d);
+    uint8_t *a4 = NULL; size_t s4 = fldnames(b, n, &a4);
     if (PROF) fprintf(stderr, "  names %zu B: candidates %.3f s\n", b->n, nowsec() - _t0);
     size_t best = s1; *kind = 0; *out = a1;
     if (s2 && s2 < best) { best = s2; *kind = 1; *out = a2; }
     if (s3 && s3 < best) { best = s3; *kind = 2; *out = a3; }
+    if (s4 && s4 < best) { best = s4; *kind = 3; *out = a4; }
+    if (*out != a4) free(a4);
     if (*out != a1) free(a1);
     if (*out != a2) free(a2);
     if (*out != a3) free(a3);
@@ -2566,7 +2694,7 @@ static void ktw_close(ktw *w) {
     }
     if (ordinal) { names.n = 0; NAMES_OUT = NULL; }
 
-    size_t nzl = 0; int tokused = 0, intused = 0;
+    size_t nzl = 0; int tokused = 0, intused = 0, fldused = 0;
     double _tn = nowsec();
     if (!ordinal) {
         buf smp = { names.d, 0, 0 }; uint64_t smpn = 0;   /* a view, not a copy */
@@ -2581,13 +2709,14 @@ static void ktw_close(ktw *w) {
         if (smp.n == names.n) {                       /* the sample was the whole
                                                          buffer: the winner is done */
             nz = smpz; nzl = smpl;
-            intused = pick == 1; tokused = pick == 2;
+            intused = pick == 1; tokused = pick == 2; fldused = pick == 3;
         } else {
             free(smpz);
             if (pick == 1) { nzl = intnames(&names, nidx, &nz); intused = nzl != 0; }
             else if (pick == 2) { nzl = tokbest(&names, &nz); tokused = nzl != 0; }
+            else if (pick == 3) { nzl = fldnames(&names, nidx, &nz); fldused = nzl != 0; }
         }
-        if (!nzl) { nzl = zc(&names, &nz); tokused = intused = 0; }  /* refused */
+        if (!nzl) { nzl = zc(&names, &nz); tokused = intused = fldused = 0; }  /* refused */
         /* The rows carry a rank per record. */
         if (PERMON && NAMEMODE == 1) { free(natbuf.d); natbuf.n = 0; natbuf.d = NULL; }
         else if (PERMON && !NATORD && natbuf.n) {
@@ -2651,7 +2780,7 @@ static void ktw_close(ktw *w) {
     WR(MAGIC, 8);
     uint64_t fh = CARTUSED ? HIERHASH : FEATHASH;
     uint64_t h[16] = { nidx, (NAMES_OUT ? 0 : nzl) | (tokused ? TOKFLAG : 0) | (CARTUSED ? CARTFLAG : 0)
-                             | (intused ? INTFLAG : 0) | (dropnames && !(w->ordok && nidx > 0) ? DROPPED : 0)
+                             | (intused ? INTFLAG : 0) | (fldused ? FLDFLAG : 0) | (dropnames && !(w->ordok && nidx > 0) ? DROPPED : 0)
                              | (ALNPAF ? LENFLAG : 0) | (TAILON > 0 ? TAILFLAG : 0)
                              | (RUNHEAD ? RUNFLAG : 0) | (ILV ? ILVFLAG : 0)
                              | (ALNPAF ? ALNFLAG : 0) | (DBFEATS ? DBFLAG : 0)
@@ -2696,7 +2825,7 @@ static void ktw_close(ktw *w) {
     fprintf(stderr, "encoded rows=%llu reads=%zu blocks=%llu names=%zuB%s index=%zuB offs=%zuB "
             "lens=%lluB labs=%lluB raw=%zuB\n",
             (unsigned long long)rows, nidx, (unsigned long long)nblk,
-            nzl, dropnames ? " (dropped, needs --names FILE)" : ordinal ? " (ordinal, not stored)" : tokused ? " (tokenised)" : intused ? " (int deltas)" : "", izl, szl,
+            nzl, dropnames ? " (dropped, needs --names FILE)" : ordinal ? " (ordinal, not stored)" : tokused ? " (tokenised)" : intused ? " (int deltas)" : fldused ? " (field deltas)" : "", izl, szl,
             (unsigned long long)BYT_LENS, (unsigned long long)BYT_LABS, RAWHELD);
 
     free(itab.d); free(ichunks.d); free(altbuf);
@@ -2779,7 +2908,7 @@ typedef struct {
     ZSTD_DCtx *d; uint8_t *blkbuf; size_t blkcap;
     uint64_t cached;
     uint64_t curblk, curoff;      /* sequential cursor in the cached block */
-    uint8_t *nz_keep; size_t nzl_keep; int names_ready, names_tok, names_int, dropped;
+    uint8_t *nz_keep; size_t nzl_keep; int names_ready, names_tok, names_int, names_fld, dropped;
     uint8_t *ibuf; int idcodec, lencodec;
     const uint8_t *cp, *cpe;   /* cpe: end of the decoded index chunk */
     uint64_t ci, cpend; int cvalid; rec crec;
@@ -2895,9 +3024,9 @@ static R *ropen(const char *path) {
     r->fsz = fsz;
     ALLOCMAX = (size_t)1 << 38;
     if (fseeko(r->f, 8 + 128, SEEK_SET)) die("seek");
-    uint64_t nml = h[1] & ~(TOKFLAG | INTFLAG | DROPPED | ALNFLAG | DBFLAG
+    uint64_t nml = h[1] & ~(TOKFLAG | INTFLAG | FLDFLAG | DROPPED | ALNFLAG | DBFLAG
                             | SIDEFLAG | LENFLAG | TAILFLAG | PERMFLAG
-                            | PERMTOK | CARTFLAG | RUNFLAG | ILVFLAG);   /* h[1] also holds flags */
+                            | PERMTOK | CARTFLAG | RUNFLAG | ILVFLAG | FLDFLAG);   /* h[1] also holds flags */
 
     if (nml > fsz || h[2] > fsz || h[3] > fsz || h[6] > fsz || h[11] > fsz
         || h[14] > fsz || h[11] + h[14] > fsz
@@ -2930,7 +3059,8 @@ static R *ropen(const char *path) {
     } else if (r->nlab) die("corrupt file: a label count with no label table");
 
     int names_tok = (h[1] & TOKFLAG) != 0, names_int = (h[1] & INTFLAG) != 0;
-    if (names_tok && names_int) die("corrupt file: names flagged both tokenised and integer");
+    int names_fld = (h[1] & FLDFLAG) != 0;
+    if (names_tok + names_int + names_fld > 1) die("corrupt file: names flagged more than one way");
     int was_aln = (h[1] & ALNFLAG) != 0, was_db = (h[1] & DBFLAG) != 0;
     int was_side = (h[1] & SIDEFLAG) != 0, was_len = (h[1] & LENFLAG) != 0;
     if (NAMESARG) { if (was_side) NAMESIN = NAMESARG; else NAMEFILE = NAMESARG; }
@@ -2974,7 +3104,7 @@ static R *ropen(const char *path) {
     if (runhead) r->rtab = xmalloc(mul(h[0] ? h[0] : 1, sizeof *r->rtab));
     if (r->cart && !was_db) die("corrupt file: vocabulary featureIDs without --db");
     h[1] &= ~(TOKFLAG | INTFLAG | DROPPED | ALNFLAG | DBFLAG | SIDEFLAG | LENFLAG
-              | TAILFLAG | PERMFLAG | PERMTOK | CARTFLAG | RUNFLAG | ILVFLAG);
+              | TAILFLAG | PERMFLAG | PERMTOK | CARTFLAG | RUNFLAG | ILVFLAG | FLDFLAG);
     uint8_t *iz = xmalloc(h[2]), *sz = xmalloc(h[3]);
     uint8_t *nz = NULL;
     r->nz_off = ftello(r->f);
@@ -3040,7 +3170,7 @@ static R *ropen(const char *path) {
     }
     r->data0 = 8 + 128 + lzl + h[1] + h[2] + h[3] + h[11] + r->pzl;
 
-    r->nz_keep = sidebuf ? sidebuf : nz; r->nzl_keep = nzl_eff; r->names_ready = 0; r->names_tok = names_tok; r->names_int = names_int; r->dropped = dropped;
+    r->nz_keep = sidebuf ? sidebuf : nz; r->nzl_keep = nzl_eff; r->names_ready = 0; r->names_tok = names_tok; r->names_int = names_int; r->names_fld = names_fld; r->dropped = dropped;
     r->name = NULL;                    /* 160 MB, allocated by ensurenames */
 
     /* Walk varints with a cursor, allocate nothing. */
@@ -3244,7 +3374,9 @@ static void ensurenames(R *r) {
             w += (size_t)sprintf(names + w, "%llu\n", (unsigned long long)i);
         names[w] = 0;
     } else
-    if (r->names_int) {
+    if (r->names_fld) {
+        size_t nb; names = fldnamesd(r->nz_keep, r->nzl_keep, r->nreads, &nb);
+    } else if (r->names_int) {
         size_t nb; names = intnamesd(r->nz_keep, r->nzl_keep, r->nreads, &nb);
     } else if (r->names_tok) {
         size_t nb; names = tokd(r->nz_keep, r->nzl_keep, &nb);

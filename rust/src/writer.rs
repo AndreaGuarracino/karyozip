@@ -23,6 +23,7 @@ const PERMFLAG: u64 = 1 << 54;
 const PERMTOK: u64 = 1 << 53;
 const TAILFLAG: u64 = 1 << 55;
 const RUNFLAG: u64 = 1 << 61;
+const FLDFLAG: u64 = 1 << 50;
 const ILVFLAG: u64 = 1 << 51;
 const ICHUNK: u64 = 65536;
 const TAILSKIP: usize = 64;
@@ -647,8 +648,8 @@ impl Writer {
         // winner over the whole buffer. Running all three over every name is
         // three times the work: a level 17 zstd of 9.4M ONT read names is
         // 130 s on its own.
-        let (mut nz, mut tokused, mut intused) = if ordinal {
-            (Vec::new(), false, false)
+        let (mut nz, mut tokused, mut intused, mut fldused) = if ordinal {
+            (Vec::new(), false, false, false)
         } else {
             let (mut q, mut smpn) = (0usize, 0u64);
             while q < self.names.len() && smpn < 50_000 {
@@ -659,16 +660,17 @@ impl Writer {
             }
             let b = best_names(&self.names[..q], smpn, level, self.opt.slow, self.opt.tok_chunk);
             if q == self.names.len() {
-                (b.bytes, b.kind == 2, b.kind == 1)      // the sample was all of it
+                (b.bytes, b.kind == 2, b.kind == 1, b.kind == 3)   // the sample was all of it
             } else {
                 let whole = match b.kind {
                     1 => int_names(&self.names, self.nidx).map(|v| ffi::zstd(&v, level)),
                     2 => tok_best(&self.names, self.opt.slow, self.opt.tok_chunk),
+                    3 => fld_names(&self.names, self.nidx),
                     _ => None,
                 };
                 match whole {
-                    Some(v) if !v.is_empty() => (v, b.kind == 2, b.kind == 1),
-                    _ => (ffi::zstd(&self.names, level), false, false),   // refused
+                    Some(v) if !v.is_empty() => (v, b.kind == 2, b.kind == 1, b.kind == 3),
+                    _ => (ffi::zstd(&self.names, level), false, false, false),   // refused
                 }
             }
         };
@@ -705,6 +707,7 @@ impl Writer {
                 nz = b.bytes;
                 tokused = b.kind == 2;
                 intused = b.kind == 1;
+                fldused = b.kind == 3;
                 perm_on = false;
             } else {
                 permblob = pbest;
@@ -748,6 +751,7 @@ impl Writer {
              | if dropnames && !(self.ordok && self.nidx > 0) { DROPPED } else { 0 }
              | if self.opt.names_out.is_some() { SIDEFLAG } else { 0 }
              | if intused { INTFLAG } else { 0 }
+             | if fldused { FLDFLAG } else { 0 }
              | if npl > 0 || (perm_on && self.opt.drop_names) { PERMFLAG } else { 0 }
              | if permtok { PERMTOK } else { 0 }
              | if self.feathash.is_some() { DBFLAG } else { 0 }
@@ -1229,6 +1233,63 @@ fn tok_chunked(names: &[u8], chunk: usize) -> Option<Vec<u8>> {
 /// Smallest of zstd, integer deltas and the tokeniser. The losers are
 /// dropped. zstd and the tokeniser are independent and neither gains from
 /// threads on a buffer this size, so they run side by side.
+/// Read names split on ':' into fields that are either the same in every name
+/// or a plain integer. The integers go down as zigzag deltas, a read's fields
+/// together, and bzip3 takes the lot.
+const FLDSEP: u8 = b':';
+const FLDMAX: usize = 16;
+pub fn fld_names(names: &[u8], n: u64) -> Option<Vec<u8>> {
+    if n == 0 { return None; }
+    let first: Vec<&[u8]> = names.split(|&c| c == b'\n').next()?.split(|&c| c == FLDSEP).collect();
+    let nf = first.len();
+    if nf == 0 || nf > FLDMAX { return None; }
+    let (mut same, mut isnum) = (vec![true; nf], vec![true; nf]);
+    let mut seen = 0u64;
+    for line in names.split(|&c| c == b'\n') {          // one pass to decide
+        if seen == n { if line.is_empty() { break; } return None; }
+        let f: Vec<&[u8]> = line.split(|&c| c == FLDSEP).collect();
+        if f.len() != nf { return None; }
+        for k in 0..nf {
+            if same[k] && f[k] != first[k] { same[k] = false; }
+            if isnum[k] {
+                let g = f[k];
+                if g.is_empty() || g.len() > 18 || (g.len() > 1 && g[0] == b'0')
+                    || !g.iter().all(|c| c.is_ascii_digit()) { isnum[k] = false; }
+            }
+            if !same[k] && !isnum[k] { return None; }
+        }
+        seen += 1;
+    }
+    if seen != n { return None; }
+    let mut v = Vec::new();
+    kst::put(&mut v, nf as u64);
+    for k in 0..nf {
+        kst::put(&mut v, if same[k] { 0 } else { 1 });
+        if same[k] { kst::put(&mut v, first[k].len() as u64); v.extend_from_slice(first[k]); }
+    }
+    let mut prev = vec![0i64; nf];
+    let mut left = n;
+    for line in names.split(|&c| c == b'\n') {          // then one to write
+        if left == 0 { break; }
+        let mut k = 0usize;
+        for f in line.split(|&c| c == FLDSEP) {
+            if !same[k] {
+                let mut x: i64 = 0;
+                for &c in f { x = x * 10 + (c - b'0') as i64; }
+                let d = x - prev[k]; prev[k] = x;
+                kst::put(&mut v, ((d << 1) ^ (d >> 63)) as u64);
+            }
+            k += 1;
+        }
+        left -= 1;
+    }
+    let z = ffi::paycomp(&v, ffi::CODEC_BZIP3 | 64)?;
+    let mut out = Vec::with_capacity(z.len() + 10);
+    kst::put(&mut out, v.len() as u64);
+    out.extend_from_slice(&z);
+    Some(out)
+}
+
 pub fn best_names(names: &[u8], n: u64, level: i32, slow: bool, chunk: Option<usize>) -> BestNames {
     let (z, t) = rayon::join(
         || ffi::zstd(names, level),
@@ -1241,6 +1302,9 @@ pub fn best_names(names: &[u8], n: u64, level: i32, slow: bool, chunk: Option<us
     }
     if let Some(v) = t {
         if !v.is_empty() && v.len() < out.bytes.len() { out = BestNames { bytes: v, kind: 2 }; }
+    }
+    if let Some(v) = fld_names(names, n) {
+        if !v.is_empty() && v.len() < out.bytes.len() { out = BestNames { bytes: v, kind: 3 }; }
     }
     out
 }

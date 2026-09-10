@@ -8,6 +8,7 @@ use std::io::{Read, Seek, SeekFrom};
 
 const TOKFLAG: u64 = 1 << 63;
 const INTFLAG: u64 = 1 << 62;
+const FLDFLAG: u64 = 1 << 50;
 const DROPPED: u64 = 1 << 60;
 const ALNFLAG: u64 = 1 << 59;
 const DBFLAG: u64 = 1 << 58;
@@ -19,7 +20,7 @@ const ILVFLAG: u64 = 1 << 51;
 const PERMFLAG: u64 = 1 << 54;
 const PERMTOK: u64 = 1 << 53;
 const CARTFLAG: u64 = 1 << 52;
-const FLAGS: u64 = TOKFLAG | INTFLAG | DROPPED | ALNFLAG | DBFLAG | SIDEFLAG
+const FLAGS: u64 = TOKFLAG | INTFLAG | FLDFLAG | DROPPED | ALNFLAG | DBFLAG | SIDEFLAG
                  | LENFLAG | TAILFLAG | PERMFLAG | PERMTOK | CARTFLAG | RUNFLAG | ILVFLAG;
 const IDXMAGIC: u64 = 0x3130_5844_4954_534b;   // "KSTIDX01"
 const ICHUNK: u64 = 65536;
@@ -243,6 +244,7 @@ impl Reader {
 
         let names_tok = h[1] & TOKFLAG != 0;
         let names_int = h[1] & INTFLAG != 0;
+        let names_fld = h[1] & FLDFLAG != 0;
         if names_tok && names_int {
             crate::bail("corrupt file: names flagged both tokenised and integer");
         }
@@ -376,7 +378,7 @@ impl Reader {
         // The names are decoded on first use: a query through the index
         // never needs them, and a short-read track has 20 million.
         let mut nf = 0u8;
-        for (bit, on) in [(1, was_side), (2, perm_ext), (4, dropped), (8, names_int), (16, names_tok), (32, was_perm), (64, perm_tok)] {
+        for (bit, on) in [(1, was_side), (2, perm_ext), (4, dropped), (8, names_int), (16, names_tok), (32, was_perm), (64, perm_tok), (128, names_fld)] {
             if on { nf |= bit; }
         }
         let (lenc, idc) = (h[5] as u32 as i32, h[9] as u32 as i32);
@@ -594,6 +596,46 @@ fn zdec(src: &[u8], what: &str) -> Vec<u8> {
         .unwrap_or_else(|| crate::bail(&format!("{what} decompress failed")))
 }
 
+/// The field-delta names, as the C's fldnamesd rebuilds them.
+fn fld_names_d(b: &[u8], cnt: u64) -> Vec<u8> {
+    let (raw, hp) = vget(b, 0);
+    if raw == 0 || raw > 1 << 40 { crate::bail("corrupt names: a bad field blob size"); }
+    let v = match crate::ffi::paydecomp(&b[hp..], crate::ffi::CODEC_BZIP3 | 64, raw as usize) {
+        Some(v) => v, None => crate::bail("field names decompress failed"),
+    };
+    let (nf, mut q) = vget(&v, 0);
+    if nf == 0 || nf > 16 { crate::bail("corrupt names: a bad field count"); }
+    let (mut cf, mut var): (Vec<&[u8]>, Vec<bool>) = (Vec::new(), Vec::new());
+    for _ in 0..nf {
+        let (t, n2) = vget(&v, q); q = n2;
+        if t != 0 { var.push(true); cf.push(&[]); }
+        else {
+            let (l, n3) = vget(&v, q); q = n3;
+            if q + l as usize > v.len() { crate::bail("corrupt names: a field runs past the blob"); }
+            var.push(false); cf.push(&v[q..q + l as usize]); q += l as usize;
+        }
+    }
+    let nvar = var.iter().filter(|&&x| x).count();
+    let mut cur = vec![0i64; nvar];
+    let mut o = Vec::with_capacity(crate::ckalloc(cnt as usize * 32));
+    for _ in 0..cnt {
+        let mut k = 0usize;
+        for i in 0..nf as usize {
+            if i > 0 { o.push(b':'); }
+            if var[i] {
+                let (u, n2) = vget(&v, q); q = n2;
+                cur[k] = cur[k].wrapping_add(unzz(u) as i64);
+                if cur[k] < 0 { crate::bail("corrupt names: a negative field"); }
+                kst::putu64(&mut o, cur[k] as u64);
+                k += 1;
+            } else { o.extend_from_slice(cf[i]); }
+        }
+        o.push(b'\n');
+    }
+    if q != v.len() { crate::bail("corrupt names: the field stream has more than the count"); }
+    o
+}
+
 fn int_names_d(b: &[u8], cnt: u64) -> Vec<u8> {
     let v = zdec(b, "int names");
     let mut o = Vec::with_capacity(crate::ckalloc(cnt as usize * 8));
@@ -771,6 +813,7 @@ impl Reader {
     fn decode_names(&self) -> (Vec<u8>, Vec<u64>) {
         let (side, perm_ext, dropped) = (self.nf & 1 != 0, self.nf & 2 != 0, self.nf & 4 != 0);
         let (names_int, names_tok, was_perm, perm_tok) = (self.nf & 8 != 0, self.nf & 16 != 0, self.nf & 32 != 0, self.nf & 64 != 0);
+        let names_fld = self.nf & 128 != 0;
         let (nz, pz, n) = (&self.nz, &self.pz, self.nreads);
         let mut names = if let (Some(f), false) = (&self.names_file, side || perm_ext) {
             if !dropped && !nz.is_empty() {
@@ -784,6 +827,8 @@ impl Reader {
             ordinals(n)
         } else if nz.is_empty() {
             ordinals(n)
+        } else if names_fld {
+            fld_names_d(nz, n)
         } else if names_int {
             int_names_d(nz, n)
         } else if names_tok {

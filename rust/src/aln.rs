@@ -586,7 +586,7 @@ pub fn pack(a: &Aln, out: &str, refhash: u64) {
                 best = ffi::zstd(raw, 19);
                 bc = 0;
                 // read whole at every query: bzip3 decodes at 8 MB/s, so no
-                for c in crate::writer::CAND_FAST.into_iter().filter(|&c| c & ffi::CODEC_BZIP3 == 0) {
+                for c in crate::writer::candlist(false).into_iter().filter(|&c| c & ffi::CODEC_BZIP3 == 0) {
                     if let Some(t) = ffi::paycomp(raw, c) {
                         if t.len() < best.len() { best = t; bc = c as i64; }
                     }

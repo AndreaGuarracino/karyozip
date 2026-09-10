@@ -17,11 +17,12 @@ const LENFLAG: u64 = 1 << 56;
 const TAILFLAG: u64 = 1 << 55;
 const RUNFLAG: u64 = 1 << 61;
 const ILVFLAG: u64 = 1 << 51;
+const GRPFLAG: u64 = 1 << 49;
 const PERMFLAG: u64 = 1 << 54;
 const PERMTOK: u64 = 1 << 53;
 const CARTFLAG: u64 = 1 << 52;
 const FLAGS: u64 = TOKFLAG | INTFLAG | FLDFLAG | DROPPED | ALNFLAG | DBFLAG | SIDEFLAG
-                 | LENFLAG | TAILFLAG | PERMFLAG | PERMTOK | CARTFLAG | RUNFLAG | ILVFLAG;
+                 | LENFLAG | TAILFLAG | PERMFLAG | PERMTOK | CARTFLAG | RUNFLAG | ILVFLAG | GRPFLAG;
 const IDXMAGIC: u64 = 0x3130_5844_4954_534b;   // "KSTIDX01"
 const ICHUNK: u64 = 65536;
 
@@ -114,7 +115,7 @@ pub struct Reader {
     /// the sequence index: chunk frames, their offsets, the run count each
     /// starts at, and the one chunk decoded now, as the C's loadichunk
     iz: Vec<u8>, coff: Vec<u64>, cpend: Vec<u64>, ibx: Vec<u8>, cur_chunk: u64,
-    runhead: bool, ilv: bool, rtab: Vec<u32>,   // run counts lifted out of the lengths
+    runhead: bool, ilv: bool, grp: bool, rtab: Vec<u32>,   // run counts lifted out of the lengths
     hasidx: bool,
     mhash: u64,
     cur_ri: u64,
@@ -251,6 +252,8 @@ impl Reader {
         let taildec = h[1] & TAILFLAG != 0;
         let runhead = h[1] & RUNFLAG != 0;
         let ilv = h[1] & ILVFLAG != 0;
+        let grp = h[1] & GRPFLAG != 0;
+        if grp && (ilv || !runhead) { crate::bail("corrupt file: grouped lengths without their run counts"); }
         if taildec && h[13] & 0xff != 64 {
             crate::bail("corrupt file: tail skip is not the format constant");
         }
@@ -394,7 +397,7 @@ impl Reader {
             nameix: std::cell::OnceCell::new(),
             idcodec: idc, lencodec: lenc,
             taildec, tailpred: h[12], tailskip: h[13] & 0xff, iz, coff, cpend, ibx: Vec::new(), cur_chunk: u64::MAX,
-            runhead, ilv, rtab: Vec::new(),
+            runhead, ilv, grp, rtab: Vec::new(),
             names: std::cell::OnceCell::new(), nz, pz, names_file: o.names_file.clone(),
             ordnames: o.ordnames, nf, idx,
             hasidx, mhash: h[15], cur_ri: 0, cur_q: 0, cur_pend: 0, cached: None, sc: None,
@@ -555,6 +558,33 @@ impl Reader {
         out
     }
 
+    /// Undo grp_pack: the labels, still in their own order, say which group
+    /// each length came from. Runs after rmheads, so rtab holds the counts.
+    fn grp_unpack(&self, lens: &[u8], ids: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(lens.len());
+        let (mut p, mut q) = (0usize, 0usize);
+        let mut kv: Vec<u64> = Vec::new();
+        let mut gv: Vec<(usize, usize)> = Vec::new();
+        let mut lv: Vec<(usize, usize)> = Vec::new();
+        for i in 0..self.rtab.len() {
+            let k = self.rtab[i] as u64;
+            kv.clear(); gv.clear();
+            for j in 0..k {
+                if p >= lens.len() || q >= ids.len() { crate::bail("corrupt block: a grouped read runs past its frames"); }
+                let n2 = skip(lens, p); gv.push((p, n2)); p = n2;
+                let (id, n3) = vget(ids, q); q = n3;
+                if id >> 32 != 0 { crate::bail("corrupt block: a grouped label is out of range"); }
+                kv.push((id << 32) | j);
+            }
+            kv.sort_unstable();
+            lv.clear(); lv.resize(k as usize, (0, 0));
+            for (j, key) in kv.iter().enumerate() { lv[(key & 0xffff_ffff) as usize] = gv[j]; }
+            for (a, b) in lv.iter() { out.extend_from_slice(&lens[*a..*b]); }
+        }
+        if p != lens.len() || q != ids.len() { crate::bail("corrupt block: the grouped frames do not line up"); }
+        out
+    }
+
     fn load_raw(&mut self, b: usize) -> (Vec<u8>, usize, u64) {
         if b >= self.b.len() { crate::bail("corrupt index: a block number is past the end"); }
         let m = self.b[b].clone();
@@ -573,6 +603,7 @@ impl Reader {
             let mut l = lens; let t = l.split_off(m.lraw as usize); (l, t)
         } else { (lens, ids) };
         let lens = if self.runhead { self.rmheads(lens) } else { lens };
+        let lens = if self.grp { self.grp_unpack(&lens, &ids) } else { lens };
         let split = lens.len();
         let rows = m.rows;
         let mut data = lens;

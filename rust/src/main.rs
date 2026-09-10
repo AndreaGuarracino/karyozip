@@ -435,7 +435,7 @@ fn probe(path: &str) {
         let z = ffi::zstd(&src, lvl);
         writeln!(out, "zstd:{lvl}\t{}\t{:016x}", z.len(), kst::fnv(kst::FNV0, &z)).unwrap();
     }
-    for c in writer::CAND_FAST {
+    for c in writer::candlist(false) {
         match ffi::paycomp(&src, c) {
             Some(v) => {
                 let ok = ffi::paydecomp(&v, c, src.len()).as_deref() == Some(&src[..]);

@@ -25,6 +25,7 @@ const TAILFLAG: u64 = 1 << 55;
 const RUNFLAG: u64 = 1 << 61;
 const FLDFLAG: u64 = 1 << 50;
 const ILVFLAG: u64 = 1 << 51;
+const GRPFLAG: u64 = 1 << 49;
 const ICHUNK: u64 = 65536;
 const TAILSKIP: usize = 64;
 
@@ -510,7 +511,7 @@ impl Writer {
         // index. One block only, since a split read has no count to head it,
         // and measured against the index it would replace.
         let mut altbuf: Vec<u8> = Vec::new();
-        let (mut runhead, mut ilv, mut alt_lens) = (false, false, 0usize);
+        let (mut runhead, mut ilv, mut grp, mut alt_lens) = (false, false, false, 0usize);
         let mut ilvcodec = p.len;
         let mut altv: [Option<(Vec<u8>, usize)>; 3] = [None, None, None];
         if self.bm.len() == 1 && !self.ibx.is_empty() {
@@ -527,21 +528,23 @@ impl Writer {
                         }
                     }
                 }
+                // a sort a read on the way back, so the thorough default only
+                if let Some(g) = self.opt.slow.then(|| grp_pack(&lens0, &ids0, &self.ibx)).flatten() {
+                    if let (Some(a), Some(b)) = (lens_ok(&g, p.len, lvl_len), ids) {
+                        if a + b < bestsz {
+                            bestsz = a + b; runhead = true; grp = true;
+                            alt_lens = g.len(); altbuf = g;
+                        }
+                    }
+                }
                 if let Some(v) = ilv_pack(&lens0, &ids0, &self.ibx) {
                     // one frame, so whichever codec reads it back smaller is
                     // the file's length codec: the ids frame is gone either way
-                    let mut cd = p.len;
-                    let a = lens_ok(&v, p.len, lvl_len);
-                    let b = ids_ok(&v, p.id, lvl_id);
-                    let a = match (a, b) {
-                        (Some(x), Some(y)) => { if y < x { cd = p.id; Some(y) } else { Some(x) } }
-                        (Some(x), _) => Some(x),
-                        (_, Some(y)) => { cd = p.id; Some(y) }
-                        _ => None,
-                    };
+                    let r = ilv_best(&v, self.opt.slow, lvl_len);
+                    let (a, cd) = match r { Some((a, c)) => (Some(a), c), None => (None, 0) };
                     if let Some(a) = a {
                         if a < bestsz {
-                            ilv = true; runhead = true; ilvcodec = cd;
+                            ilv = true; runhead = true; grp = false; ilvcodec = cd;
                             alt_lens = lens0.len() + self.ibx.len();
                             altbuf = v;
                         }
@@ -555,7 +558,8 @@ impl Writer {
                     let m = &self.bm[0];
                     if m.alen[v] == 0 { continue; }
                     let alt = &self.rawalt[v][m.aoff[v]..m.aoff[v] + m.alen[v]];
-                    let Some(ah) = splice_heads(alt, &self.ibx) else { continue };
+                    let Some(ah) = (if grp { grp_pack(alt, &ids0, &self.ibx) }
+                                    else { splice_heads(alt, &self.ibx) }) else { continue };
                     let ahn = ah.len();
                     if !ilv { altv[v + 1] = Some((ah, ahn)); continue; }
                     if let Some(ai) = ilv_pack(alt, &ids0, &self.ibx) { altv[v + 1] = Some((ai, ahn)); }
@@ -792,7 +796,8 @@ impl Writer {
              | if aln_on { ALNFLAG | LENFLAG } else { 0 }
              | if self.tailon == Some(true) { TAILFLAG } else { 0 }
              | if runhead { RUNFLAG } else { 0 }
-             | if ilv { ILVFLAG } else { 0 };
+             | if ilv { ILVFLAG } else { 0 }
+             | if grp { GRPFLAG } else { 0 };
         h[2] = ichunks.len() as u64;
         h[3] = sz.len() as u64;
         h[4] = self.rows;
@@ -871,27 +876,44 @@ fn io(e: std::io::Error) -> String { e.to_string() }
 
 
 /* ------------------------------------------------- choosing a codec */
-/// The eight candidates the default search tries, beside zstd. Codec 0 means
-/// zstd, so bare rANS order 0 is spelled 0x100.
-pub const CAND_FAST: [i32; 8] = [
-    0x100, 1, 65, 521,
-    ffi::CODEC_ARITH, ffi::CODEC_ARITH | 1,
-    ffi::CODEC_BZIP3 | 16, ffi::CODEC_BZIP3 | 64,
+/// One list. The default tries all of it and spends whatever that costs;
+/// --fast is the subset marked true, the codecs whose encode and decode stay
+/// reasonable, so it can never reach a candidate the default did not.
+/// Codec 0 means zstd, so bare rANS order 0 is spelled 0x100.
+pub const KCAND: [(i32, bool); 51] = [
+    (0x100, true), (0x80, false), (0x40, false), (0xc0, false),
+    (0x8, false), (0x88, false), (0x48, false), (0xc8, false),
+    (0x4, false), (0x84, false), (0x44, false), (0xc4, false),
+    (0xc, false), (0x8c, false), (0x4c, false), (0xcc, false),
+    (0x1, true), (0x81, false), (0x41, true), (0xc1, false),
+    (0x9, false), (0x89, false), (0x49, false), (0xc9, false),
+    (0x5, false), (0x85, false), (0x45, false), (0xc5, false),
+    (0xd, false), (0x8d, false), (0x4d, false), (0xcd, false),
+    // STRIPE carries its stripe count in bits 8 and up
+    (0x208, false), (0x209, true), (0x408, false), (0x409, false),
+    (ffi::CODEC_ARITH, true), (ffi::CODEC_ARITH | 0x80, false),
+    (ffi::CODEC_ARITH | 0x40, false), (ffi::CODEC_ARITH | 0xc0, false),
+    (ffi::CODEC_ARITH | 1, true), (ffi::CODEC_ARITH | 0x81, false),
+    (ffi::CODEC_ARITH | 0x41, false), (ffi::CODEC_ARITH | 0xc1, false),
+    (ffi::CODEC_BZIP3 | 8, false), (ffi::CODEC_BZIP3 | 16, true), (ffi::CODEC_BZIP3 | 32, false),
+    (ffi::CODEC_BZIP3 | 64, true), (ffi::CODEC_BZIP3 | 128, false), (ffi::CODEC_BZIP3 | 256, false),
+    (ffi::CODEC_LZMA, false),
 ];
 
-/// --slow: rANS order 0/1 x {PACK,RLE,X32,STRIPE}, arith order 0/1 x
-/// {PACK,RLE}, bzip3 at six block sizes. A strict superset of the default.
-pub const CAND_SLOW: [i32; 47] = [
-    0x100, 0x80, 0x40, 0xc0, 0x8, 0x88, 0x48, 0xc8,
-    0x4, 0x84, 0x44, 0xc4, 0xc, 0x8c, 0x4c, 0xcc,
-    0x1, 0x81, 0x41, 0xc1, 0x9, 0x89, 0x49, 0xc9,
-    0x5, 0x85, 0x45, 0xc5, 0xd, 0x8d, 0x4d, 0xcd,
-    ffi::CODEC_ARITH, ffi::CODEC_ARITH | 0x80, ffi::CODEC_ARITH | 0x40, ffi::CODEC_ARITH | 0xc0,
-    ffi::CODEC_ARITH | 1, ffi::CODEC_ARITH | 0x81, ffi::CODEC_ARITH | 0x41, ffi::CODEC_ARITH | 0xc1,
-    ffi::CODEC_BZIP3 | 8, ffi::CODEC_BZIP3 | 16, ffi::CODEC_BZIP3 | 32,
-    ffi::CODEC_BZIP3 | 64, ffi::CODEC_BZIP3 | 128, ffi::CODEC_BZIP3 | 256,
-    ffi::CODEC_LZMA,
-];
+/// A bzip3 block bigger than the data is the same file as the smallest that
+/// covers it, so only that one is worth a try. The mode's own list decides.
+fn bz3_dup(c: i32, n: usize, cand: &[i32]) -> bool {
+    if c & ffi::CODEC_BZIP3 == 0 { return false; }
+    let mb = ((c & 0xffff) as usize) << 20;
+    let keep = cand.iter().copied().filter(|&o| o & ffi::CODEC_BZIP3 != 0)
+        .map(|o| ((o & 0xffff) as usize) << 20).filter(|&o| o >= n).min();
+    keep.is_some_and(|kp| mb > kp)
+}
+
+/// the mode's candidates
+pub fn candlist(slow: bool) -> Vec<i32> {
+    KCAND.iter().filter(|(_, f)| slow || *f).map(|(c, _)| *c).collect()
+}
 
 /// bzip3 decodes at about 8 MB/s against zstd's ~1000, so it is the wrong
 /// pick for a file a query will seek into.
@@ -925,7 +947,7 @@ pub fn pick(all: &dyn Fn(usize) -> (Vec<u8>, Vec<u8>), nraw: usize, rawtot: usiz
             maxstream: usize, mut level: i32, o: &Options) -> Pick {
     let (block, slow, levelset) = (o.block, o.slow, o.levelset);
     let (forced_id, forced_len) = (o.id_codec, o.len_codec);
-    let cand: &[i32] = if slow { &CAND_SLOW } else { &CAND_FAST };
+    let cv = candlist(slow); let cand: &[i32] = &cv;
     let nc = cand.len();
     if let (Some(i), Some(l)) = (forced_id, forced_len) {
         return Pick { id: i, len: l, lvl_id: -1, lvl_len: -1, level };
@@ -960,14 +982,7 @@ pub fn pick(all: &dyn Fn(usize) -> (Vec<u8>, Vec<u8>), nraw: usize, rawtot: usiz
         for &b in p { if !seen[b as usize] { seen[b as usize] = true; d += 1; if d > 16 { return true; } } }
         false
     };
-    let bz3dup = |c: i32, n: usize| -> bool {
-        if c & ffi::CODEC_BZIP3 == 0 { return false; }
-        let mb = ((c & 0xffff) as usize) << 20;
-        let keep = cand.iter().filter(|&&o| o & ffi::CODEC_BZIP3 != 0)
-            .map(|&o| ((o & 0xffff) as usize) << 20)
-            .filter(|&o| o >= n).min();
-        keep.is_some_and(|kp| mb > kp)
-    };
+    let bz3dup = |c: i32, n: usize| bz3_dup(c, n, &cand);
     let (mut zi, mut zl, mut z22i, mut z22l) = (0usize, 0usize, 0usize, 0usize);
     let mut ci = vec![0usize; nc];
     let mut cl = vec![0usize; nc];
@@ -1124,6 +1139,31 @@ fn ilv_pack(lens: &[u8], ids: &[u8], ibx: &[u8]) -> Option<Vec<u8>> {
     if p != lens.len() || q != ids.len() { None } else { Some(out) }
 }
 
+/// Each read's lengths in label order: all of label 0's, then label 1's. The
+/// label stream stays as it was, so it says where each one goes back.
+fn grp_pack(lens: &[u8], ids: &[u8], ibx: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(lens.len() + ibx.len() + 16);
+    let (mut p, mut q, mut r) = (0usize, 0usize, 0usize);
+    let mut kv: Vec<u64> = Vec::new();
+    let mut lv: Vec<(usize, usize)> = Vec::new();
+    while r < ibx.len() {
+        let (k, n) = vget(ibx, r); r = n;
+        kst::put(&mut out, k);
+        if k >> 32 != 0 { return None; }
+        kv.clear(); lv.clear();
+        for j in 0..k {
+            if p >= lens.len() || q >= ids.len() { return None; }
+            let n2 = crate::reader::skip(lens, p); lv.push((p, n2)); p = n2;
+            let (id, n3) = vget(ids, q); q = n3;
+            if id >> 32 != 0 { return None; }
+            kv.push((id << 32) | j);
+        }
+        kv.sort_unstable();
+        for key in &kv { let (a, b) = lv[(key & 0xffff_ffff) as usize]; out.extend_from_slice(&lens[a..b]); }
+    }
+    if p != lens.len() || q != ids.len() { None } else { Some(out) }
+}
+
 /// the same lengths with each read's run count in front of its own
 fn splice_heads(lens: &[u8], ibx: &[u8]) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(lens.len() + ibx.len() + 16);
@@ -1138,6 +1178,32 @@ fn splice_heads(lens: &[u8], ibx: &[u8]) -> Option<Vec<u8>> {
         }
     }
     if p != lens.len() { return None; } else { Some(out) }
+}
+
+/// The interleaved frame is neither of the two streams the search ranked, so
+/// rank it on its own: without this the thorough default could pick a
+/// spelling --fast beat, which it is meant never to do.
+fn ilv_best(src: &[u8], slow: bool, level: i32) -> Option<(usize, i32)> {
+    let cand = candlist(slow);
+    let mut best: Option<(usize, i32)> = None;
+    for &c in &cand {
+        if c & 0x80 != 0 && c & ffi::CODEC_BZIP3 == 0 {   /* PACK gives up past 16 bytes */
+            let mut seen = [false; 256]; let mut d = 0; let mut dup = false;
+            for &b in src { if !seen[b as usize] { seen[b as usize] = true; d += 1;
+                                                   if d > 16 { dup = true; break; } } }
+            if dup { continue; }
+        }
+        if bz3_dup(c, src.len(), &cand) { continue; }
+        if let Some(z) = ffi::paycomp(src, c) {
+            if best.is_none_or(|(b, _)| z.len() < b)
+                && ffi::paydecomp(&z, c, src.len()).as_deref() == Some(src) {
+                best = Some((z.len(), c));
+            }
+        }
+    }
+    let z = ffi::zstd(src, level);                 /* zstd is candidate zero */
+    if best.is_none_or(|(b, _)| z.len() < b) { best = Some((z.len(), 0)); }
+    best
 }
 
 /// A respelt block is a different stream from the one the codec was chosen

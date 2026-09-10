@@ -250,9 +250,10 @@ ls "$W"/fsz*.kt | xargs -P "$J" -I{} bash -c 'one_fsz "$@"' _ {} > "$W/fsz.out" 
 echo "fuzz: $g forged-sizes runs, none wrong"
 
 # 5. a forged index: chunk entries and the chunk table, re-signed. A shifted
-# entry once moved every later sequence with exit 0.
+# entry once moved every later sequence with exit 0. --block because a
+# one-block track puts the run counts in the lengths and stores no index.
 awk 'BEGIN{for(i=0;i<70000;i++){printf "s%d\t0\t7\tA\ns%d\t7\t9\tB\n",i,i}}' > "$W/t5.bed"
-$KT encode < "$W/t5.bed" > "$W/t5.kt" 2>/dev/null
+$KT encode --block 1000 < "$W/t5.bed" > "$W/t5.kt" 2>/dev/null
 python3 - "$W" "$D" <<'PY' || { echo "fuzz: stage 5 generator FAILED"; exit 1; }
 import struct, sys; sys.path.insert(0, sys.argv[2]); from kt import *
 W = sys.argv[1]

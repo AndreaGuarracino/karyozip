@@ -2446,6 +2446,42 @@ static size_t compids(ZSTD_CCtx *tc, const uint8_t *src, size_t n, uint8_t **out
     return a;
 }
 
+/* A respelt block is a different stream from the one the codec was chosen
+   on, so it counts only at the size it comes back at. */
+static size_t lensok(ZSTD_CCtx *tc, const uint8_t *src, size_t n) {
+    uint8_t *c = NULL; size_t z = complens(tc, src, n, &c, ZSTD_compressBound(n));
+    size_t ok = 0;
+    if (z) {
+        uint8_t *v = malloc(n ? n : 1); size_t g = 0;
+        if (v) {
+            if (LENCODEC) g = paydecomp(c, z, LENCODEC, v, n);
+            else { g = ZSTD_decompress(v, n, c, z);
+                   if (ZSTD_isError(g)) g = 0; }
+            if (g == n && !memcmp(v, src, n)) ok = z;
+        }
+        free(v);
+    }
+    free(c);
+    return ok;
+}
+
+static size_t idsok(ZSTD_CCtx *tc, const uint8_t *src, size_t n) {
+    uint8_t *c = NULL; size_t z = compids(tc, src, n, &c, ZSTD_compressBound(n));
+    size_t ok = 0;
+    if (z) {
+        uint8_t *v = malloc(n ? n : 1); size_t g = 0;
+        if (v) {
+            if (IDCODEC) g = paydecomp(c, z, IDCODEC, v, n);
+            else { g = ZSTD_decompress(v, n, c, z);
+                   if (ZSTD_isError(g)) g = 0; }
+            if (g == n && !memcmp(v, src, n)) ok = z;
+        }
+        free(v);
+    }
+    free(c);
+    return ok;
+}
+
 static int u64cmp(const void *a, const void *b) {
     uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b; return x < y ? -1 : x > y; }
 static void namesunique(const buf *names, size_t n) {
@@ -2528,7 +2564,8 @@ static void ktw_close(ktw *w) {
        repeated read pattern is a single string; and both. One block only,
        since a split read has no count to head it. */
     uint8_t *altbuf = NULL; size_t altlen = 0, alt_lens = 0;
-    if (nraw == 1 && !ALNPAF && w->ibx.n) {
+    uint8_t *altv[3] = {0}; size_t altvn[3] = {0}, altvl[3] = {0};
+    if (nraw == 1 && w->ibx.n) {
         size_t nl0 = bm[0].lens, ni0 = bm[0].len - nl0;
         uint8_t *rb0 = xmalloc(bm[0].len);
         rawget(w->rawfd, (off_t)bm[0].off, rb0, bm[0].len);
@@ -2536,21 +2573,21 @@ static void ktw_close(ktw *w) {
         buf ib0 = w->ibx, ic = {0}, it = {0};
         idxbuild(&ib0, &ic, &it);
         ZSTD_CCtx *mc = ZSTD_createCCtx();
-        uint8_t *f = NULL;
-        size_t base = complens(mc, rb0, nl0, &f, ZSTD_compressBound(nl0)); free(f); f = NULL;
-        size_t ids = compids(mc, rb0 + nl0, ni0, &f, ZSTD_compressBound(ni0)); free(f); f = NULL;
+
+        size_t base = lensok(mc, rb0, nl0);
+        size_t ids = idsok(mc, rb0 + nl0, ni0);
         size_t bestsz = base && ids ? base + ids + ic.n : 0;
         int bh = 0, bi = 0;
         if (hn) {                                  /* heads, index dropped */
-            size_t a = complens(mc, hb, hn, &f, ZSTD_compressBound(hn)); free(f); f = NULL;
+            size_t a = lensok(mc, hb, hn);
             if (a && ids && (!bestsz || a + ids < bestsz)) { bestsz = a + ids; bh = 1; bi = 0; }
         }
         {                                          /* interleaved: always headed */
             uint8_t *iv = NULL;
             size_t vn = ilv_pack(rb0, nl0, rb0 + nl0, ni0, w->ibx.d, w->ibx.n, &iv);
             if (vn) {
-                size_t a = complens(mc, iv, vn, &f, ZSTD_compressBound(vn)); free(f); f = NULL;
-                size_t b = compids(mc, iv, vn, &f, ZSTD_compressBound(vn)); free(f); f = NULL;
+                size_t a = lensok(mc, iv, vn);
+                size_t b = idsok(mc, iv, vn);
                 if (b && (!a || b < a)) a = b;
                 if (a && (!bestsz || a < bestsz)) {
                     bestsz = a; bh = 1; bi = 1;
@@ -2562,6 +2599,22 @@ static void ktw_close(ktw *w) {
         if (bi) { ILV = 1; RUNHEAD = 1; }
         else if (bh) { RUNHEAD = 1; free(altbuf); altbuf = hb; altlen = hn; alt_lens = hn; hb = NULL; }
         else { free(altbuf); altbuf = NULL; altlen = alt_lens = 0; }
+        /* --aln keeps three length spellings: respell every one the same way */
+        if (ILV || RUNHEAD) {
+            altv[0] = altbuf; altvn[0] = altlen; altvl[0] = alt_lens;
+            for (int v = 1; ALNPAF && v < 3; v++) {
+                size_t an = bm[0].alen[v - 1];
+                if (!an) continue;
+                const uint8_t *alt = w->rawalt[v - 1].d + bm[0].aoff[v - 1];
+                uint8_t *ah = NULL; size_t ahn = splice_heads(alt, an, w->ibx.d, w->ibx.n, &ah);
+                if (!ahn) { free(ah); continue; }
+                if (!ILV) { altv[v] = ah; altvn[v] = ahn; altvl[v] = ahn; continue; }
+                uint8_t *ai = NULL;
+                size_t ain = ilv_pack(alt, an, rb0 + nl0, ni0, w->ibx.d, w->ibx.n, &ai);
+                free(ah);
+                if (ain) { altv[v] = ai; altvn[v] = ain; altvl[v] = ahn; } else free(ai);
+            }
+        }
         free(hb); free(rb0);
         free(ic.d); free(it.d); ZSTD_freeCCtx(mc);
     }
@@ -2593,13 +2646,16 @@ static void ktw_close(ktw *w) {
                 uint8_t *fa = NULL, *fb = NULL;
 
                 const uint8_t *vs[3] = { src, NULL, NULL }; size_t vn[3] = { nl, 0, 0 };
-                if (RUNHEAD || ILV) { vs[0] = altbuf; vn[0] = altlen; }
                 for (int v = 0; ALNPAF && v < 2; v++) {
                     size_t an = bm[i].alen[v]; const uint8_t *alt = w->rawalt[v].d + bm[i].aoff[v];
                     if (!an || (an == nl && !memcmp(alt, src, an))) continue;   /* same bytes as every-sentinel */
                     if (v == 1 && vs[1] && an == vn[1] && !memcmp(alt, vs[1], an)) continue;   /* plus equals plain */
                     vs[v + 1] = alt; vn[v + 1] = an;
                 }
+                if (RUNHEAD || ILV)
+                    for (int v = 0; v < 3; v++)
+                        if (altv[v]) { vs[v] = altv[v]; vn[v] = altvn[v]; }
+                        else if (v) vs[v] = NULL;
                 static const int ORDER[3] = { 1, 2, 0 };
                 size_t best = 0; int bv = -1;
                 for (int k = 0; k < 3; k++) {
@@ -2617,7 +2673,7 @@ static void ktw_close(ktw *w) {
                 }
                 if (!failed && FASTMODE && ALNPAF) { best = complens(tc, vs[bv], vn[bv], &fa, ZSTD_compressBound(vn[bv])); if (!best) failed = 1; }
                 if (failed) { free(o); free(fa); continue; }
-                a = best; nl = ILV ? alt_lens : vn[bv]; nosent = (uint64_t)bv;
+                a = best; nl = ILV ? altvl[bv] : vn[bv]; nosent = (uint64_t)bv;
                 if (ILV) { b2 = 0; fb = NULL; o[0] = 0; }
                 else if (IDCODEC) { b2 = paycomp(idsrc, ni, IDCODEC, &fb);
                                if (!b2) { failed = 1; free(fa); free(o); continue; } }
@@ -2829,6 +2885,7 @@ static void ktw_close(ktw *w) {
             (unsigned long long)BYT_LENS, (unsigned long long)BYT_LABS, RAWHELD);
 
     free(itab.d); free(ichunks.d); free(altbuf);
+    for (int v = 1; v < 3; v++) free(altv[v]);
     free(lz); free(nz); free(sz); free(itz); free(npz);
     free(names.d); free(sizes.d); free(labs.d);
     free(w->bm);

@@ -511,22 +511,23 @@ impl Writer {
         // and measured against the index it would replace.
         let mut altbuf: Vec<u8> = Vec::new();
         let (mut runhead, mut ilv, mut alt_lens) = (false, false, 0usize);
-        if self.bm.len() == 1 && !aln_on && !self.ibx.is_empty() {
+        let mut altv: [Option<(Vec<u8>, usize)>; 3] = [None, None, None];
+        if self.bm.len() == 1 && !self.ibx.is_empty() {
             let (lens0, ids0) = self.read_block(0).expect("staged block");
             let idx = idxsize(&self.ibx, if level < 19 { level } else { 19 });
-            let base = comp_lens(&lens0, p.len, lvl_len).map(|v| v.len());
-            let ids = comp_ids(&ids0, p.id, lvl_id).map(|v| v.len());
+            let base = lens_ok(&lens0, p.len, lvl_len);
+            let ids = ids_ok(&ids0, p.id, lvl_id);
             let mut bestsz = match (base, ids) { (Some(a), Some(b)) => a + b + idx, _ => 0 };
             if let Some(h) = splice_heads(&lens0, &self.ibx) {
-                if let (Some(a), Some(b)) = (comp_lens(&h, p.len, lvl_len).map(|v| v.len()), ids) {
+                if let (Some(a), Some(b)) = (lens_ok(&h, p.len, lvl_len), ids) {
                     if bestsz == 0 || a + b < bestsz {
                         bestsz = a + b; runhead = true; alt_lens = h.len(); altbuf = h;
                     }
                 }
             }
             if let Some(v) = ilv_pack(&lens0, &ids0, &self.ibx) {
-                let a = comp_lens(&v, p.len, lvl_len).map(|x| x.len());
-                let b = comp_ids(&v, p.id, lvl_id).map(|x| x.len());
+                let a = lens_ok(&v, p.len, lvl_len);
+                let b = ids_ok(&v, p.id, lvl_id);
                 let a = match (a, b) { (Some(x), Some(y)) => Some(x.min(y)), (Some(x), _) => Some(x), (_, y) => y };
                 if let Some(a) = a {
                     if bestsz == 0 || a < bestsz {
@@ -534,6 +535,19 @@ impl Writer {
                         alt_lens = lens0.len() + self.ibx.len();
                         altbuf = v;
                     }
+                }
+            }
+            // --aln keeps three length spellings: respell every one the same way
+            if runhead || ilv {
+                altv[0] = Some((std::mem::take(&mut altbuf), alt_lens));
+                for v in 0..2 {
+                    let m = &self.bm[0];
+                    if m.alen[v] == 0 { continue; }
+                    let alt = &self.rawalt[v][m.aoff[v]..m.aoff[v] + m.alen[v]];
+                    let Some(ah) = splice_heads(alt, &self.ibx) else { continue };
+                    let ahn = ah.len();
+                    if !ilv { altv[v + 1] = Some((ah, ahn)); continue; }
+                    if let Some(ai) = ilv_pack(alt, &ids0, &self.ibx) { altv[v + 1] = Some((ai, ahn)); }
                 }
             }
         }
@@ -553,8 +567,7 @@ impl Writer {
                     // spellings: every sentinel, plus-strand sentinels only,
                     // or plain lengths. Zeros do not always compress better.
                     let m = &self.bm[i];
-                    let mut vs: [Option<&[u8]>; 3] =
-                        [Some(if runhead || ilv { &altbuf } else { &lens }), None, None];
+                    let mut vs: [Option<&[u8]>; 3] = [Some(&lens), None, None];
                     if aln_on {
                         for v in 0..2 {
                             let alt = &self.rawalt[v][m.aoff[v]..m.aoff[v] + m.alen[v]];
@@ -563,6 +576,14 @@ impl Writer {
                                 if let Some(x) = vs[1] { if x == alt { continue; } }
                             }
                             vs[v + 1] = Some(alt);
+                        }
+                    }
+                    if runhead || ilv {
+                        for v in 0..3 {
+                            match &altv[v] {
+                                Some((b, _)) => vs[v] = Some(b),
+                                None => if v > 0 { vs[v] = None; },
+                            }
                         }
                     }
                     const ORDER: [usize; 3] = [1, 2, 0];
@@ -583,7 +604,7 @@ impl Writer {
                         }
                     }
                     if fast_aln { fa = comp_lens(vs[bv].unwrap(), p.len, lvl_len).expect("lens frame"); }
-                    let nl = if ilv { alt_lens } else { vs[bv].unwrap().len() };
+                    let nl = if ilv { altv[bv].as_ref().unwrap().1 } else { vs[bv].unwrap().len() };
                     let b = if ilv { Vec::new() } else { comp_ids(&ids, p.id, lvl_id).expect("ids frame") };
                     (fa, b, nl, ids.len(), m.rows, m.bp, bv as u64)
                 })
@@ -1105,6 +1126,20 @@ fn splice_heads(lens: &[u8], ibx: &[u8]) -> Option<Vec<u8>> {
         }
     }
     if p != lens.len() { return None; } else { Some(out) }
+}
+
+/// A respelt block is a different stream from the one the codec was chosen
+/// on, so it counts only at the size it comes back at.
+fn lens_ok(src: &[u8], codec: i32, level: i32) -> Option<usize> {
+    let c = comp_lens(src, codec, level)?;
+    let v = if codec != 0 { ffi::paydecomp(&c, codec, src.len())? } else { ffi::zstd_decompress(&c, src.len())? };
+    if v == src { Some(c.len()) } else { None }
+}
+
+fn ids_ok(src: &[u8], codec: i32, level: i32) -> Option<usize> {
+    let c = comp_ids(src, codec, level)?;
+    let v = if codec != 0 { ffi::paydecomp(&c, codec, src.len())? } else { ffi::zstd_decompress(&c, src.len())? };
+    if v == src { Some(c.len()) } else { None }
 }
 
 /// what the index blob costs, so the two spellings can be compared

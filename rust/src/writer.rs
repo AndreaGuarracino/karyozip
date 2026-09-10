@@ -1067,6 +1067,10 @@ fn verifies(src: &[u8], codec: i32) -> bool {
 /// Size alone does not qualify a codec, so the sample round trips it; under
 /// slow the whole-file pass round trips the winner and drops it on failure,
 /// so the sample only sizes.
+/// Labels counted down from 127 so they do not share bytes with the small
+/// lengths beside them. Its own inverse, and the varint keeps its width.
+pub fn ilv_flip(v: u64) -> u64 { if v < 128 { 127 - v } else { v } }
+
 /// One stream a read: its run count, then a label beside its own length.
 fn ilv_pack(lens: &[u8], ids: &[u8], ibx: &[u8]) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(lens.len() + ids.len() + ibx.len() + 16);
@@ -1076,7 +1080,7 @@ fn ilv_pack(lens: &[u8], ids: &[u8], ibx: &[u8]) -> Option<Vec<u8>> {
         kst::put(&mut out, k);
         for _ in 0..k {
             if q >= ids.len() || p >= lens.len() { return None; }
-            let n2 = crate::reader::skip(ids, q); out.extend_from_slice(&ids[q..n2]); q = n2;
+            let (lb, n2) = vget(ids, q); kst::put(&mut out, ilv_flip(lb)); q = n2;
             let n2 = crate::reader::skip(lens, p); out.extend_from_slice(&lens[p..n2]); p = n2;
         }
     }

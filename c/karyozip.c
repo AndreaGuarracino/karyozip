@@ -734,6 +734,12 @@ static size_t splice_heads(const uint8_t *lens, size_t nl, const uint8_t *ib,
 /* One stream a read: its run count, then a label beside its own length.
    A read that repeats another is then one string, not two halves in two
    frames, and the count heads it so the index holds nothing. */
+/* Labels counted down from 127 so they do not share bytes with the small
+   lengths beside them: the BWT cannot see which side of a pair a byte is on,
+   and a byte that means one thing is worth more than one that means two.
+   Its own inverse, and the varint keeps its width. */
+static inline uint64_t ilv_flip(uint64_t v) { return v < 128 ? 127 - v : v; }
+
 static size_t ilv_pack(const uint8_t *lens, size_t nl, const uint8_t *ids, size_t ni,
                        const uint8_t *ib, size_t ibn, uint8_t **out) {
     *out = xmalloc(nl + ni + ibn + 16);
@@ -745,9 +751,8 @@ static size_t ilv_pack(const uint8_t *lens, size_t nl, const uint8_t *ids, size_
         vput(&w, k);
         for (uint64_t j = 0; j < k; j++) {
             if (q >= qe || p >= e) { free(*out); *out = NULL; return 0; }
-            const uint8_t *s0 = q; vgetb(&q, qe);
-            memcpy(w, s0, (size_t)(q - s0)); w += q - s0;
-            s0 = p; vgetb(&p, e);
+            vput(&w, ilv_flip(vgetb(&q, qe)));
+            const uint8_t *s0 = p; vgetb(&p, e);
             memcpy(w, s0, (size_t)(p - s0)); w += p - s0;
         }
     }
@@ -3481,7 +3486,16 @@ static size_t ilv_split(R *r, uint8_t *b, size_t n, size_t nl, size_t ni) {
         size_t hg = (size_t)(p - h0);
         if ((size_t)(wl - b) + hg > nl) die("corrupt block: the length region overflows");
         memmove(wl, h0, hg); wl += hg;
-        for (uint64_t j = 0; j < k; j++) { TAKE(wi, ni, tmp); TAKE(wl, nl, b); }
+        for (uint64_t j = 0; j < k; j++) {
+            if (p >= e) die("corrupt block: the interleaved frame is short");
+            uint64_t lb = vget(&p);
+            if (p > e) die("corrupt block: a label runs past the frame");
+            uint8_t lv[10], *lw = lv; vput(&lw, ilv_flip(lb));
+            size_t lg = (size_t)(lw - lv);
+            if ((size_t)(wi - tmp) + lg > ni) die("corrupt block: the label region overflows");
+            memcpy(wi, lv, lg); wi += lg;
+            TAKE(wl, nl, b);
+        }
         seen += k;
     }
     #undef TAKE

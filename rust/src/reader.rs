@@ -516,7 +516,8 @@ impl Reader {
             lens.extend_from_slice(&v[h0..i]);
             for _ in 0..k {
                 if i >= v.len() { crate::bail("corrupt block: the interleaved frame is short"); }
-                let n2 = skip(&v, i); ids.extend_from_slice(&v[i..n2]); i = n2;
+                let (lb, n2) = vget(&v, i);
+                kst::put(&mut ids, crate::writer::ilv_flip(lb)); i = n2;
                 if i >= v.len() { crate::bail("corrupt block: the interleaved frame is short"); }
                 let n2 = skip(&v, i); lens.extend_from_slice(&v[i..n2]); i = n2;
             }

@@ -360,7 +360,11 @@ static size_t zc(buf *in, uint8_t **out) { return zcl(in, out, LEVEL); }
    nothing. One frame models the count beside the lengths it counts, which
    is smaller than a second frame of counts on its own. */
 #define RUNFLAG  (1ULL << 61)
+/* One frame, the label of a run beside its length: a repeated read pattern
+   is one string the codec can match, not two halves in two frames. */
+#define ILVFLAG  (1ULL << 51)
 static int RUNHEAD = 0;               /* the writer is using that layout */
+static int ILV = 0;                   /* and whether the two frames are one */
 
 static int NAMEMODE = 0;              /* 0 auto, 1 drop, 2 keep */
 static const char *NAMEFILE = NULL;
@@ -724,6 +728,30 @@ static size_t splice_heads(const uint8_t *lens, size_t nl, const uint8_t *ib,
         }
     }
     if (p != e) { free(*out); *out = NULL; return 0; }
+    return (size_t)(w - *out);
+}
+
+/* One stream a read: its run count, then a label beside its own length.
+   A read that repeats another is then one string, not two halves in two
+   frames, and the count heads it so the index holds nothing. */
+static size_t ilv_pack(const uint8_t *lens, size_t nl, const uint8_t *ids, size_t ni,
+                       const uint8_t *ib, size_t ibn, uint8_t **out) {
+    *out = xmalloc(nl + ni + ibn + 16);
+    const uint8_t *p = lens, *e = lens + nl, *q = ids, *qe = ids + ni;
+    const uint8_t *r = ib, *re = ib + ibn;
+    uint8_t *w = *out;
+    while (r < re) {
+        uint64_t k = vgetb(&r, re);
+        vput(&w, k);
+        for (uint64_t j = 0; j < k; j++) {
+            if (q >= qe || p >= e) { free(*out); *out = NULL; return 0; }
+            const uint8_t *s0 = q; vgetb(&q, qe);
+            memcpy(w, s0, (size_t)(q - s0)); w += q - s0;
+            s0 = p; vgetb(&p, e);
+            memcpy(w, s0, (size_t)(p - s0)); w += p - s0;
+        }
+    }
+    if (p != e || q != qe) { free(*out); *out = NULL; return 0; }
     return (size_t)(w - *out);
 }
 
@@ -2275,6 +2303,16 @@ static size_t complens(ZSTD_CCtx *tc, const uint8_t *src, size_t n, uint8_t **ou
     return a;
 }
 
+/* the ids frame, the codec the search picked for it */
+static size_t compids(ZSTD_CCtx *tc, const uint8_t *src, size_t n, uint8_t **out, size_t bound) {
+    if (IDCODEC) return paycomp(src, n, IDCODEC, out);
+    *out = malloc(bound + 64);
+    if (!*out) return 0;
+    size_t a = ZSTD_compressCCtx(tc, *out, bound + 64, src, n, LEVEL_I < 0 ? LEVEL : LEVEL_I);
+    if (ZSTD_isError(a)) { free(*out); *out = NULL; return 0; }
+    return a;
+}
+
 static int u64cmp(const void *a, const void *b) {
     uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b; return x < y ? -1 : x > y; }
 static void namesunique(const buf *names, size_t n) {
@@ -2351,26 +2389,48 @@ static void ktw_close(ktw *w) {
     }
     size_t obound = ZSTD_compressBound(maxraw ? maxraw : 1);
 
-    /* The run count can head each read's lengths instead of living in the
-       index. One block only, since a split read has no count to head it, and
-       measured against the index it would replace: it wins on short reads,
-       where a read is a few runs, and loses where a read is thousands. */
-    uint8_t *headbuf = NULL; size_t headlen = 0;
+    /* Four spellings of one block, all measured, the smallest kept: the two
+       frames as they are; the run count heading each read's lengths, which
+       empties the index; the two frames interleaved into one, where a
+       repeated read pattern is a single string; and both. One block only,
+       since a split read has no count to head it. */
+    uint8_t *altbuf = NULL; size_t altlen = 0, alt_lens = 0;
     if (nraw == 1 && !ALNPAF && w->ibx.n) {
+        size_t nl0 = bm[0].lens, ni0 = bm[0].len - nl0;
         uint8_t *rb0 = xmalloc(bm[0].len);
         rawget(w->rawfd, (off_t)bm[0].off, rb0, bm[0].len);
-        headlen = splice_heads(rb0, bm[0].lens, w->ibx.d, w->ibx.n, &headbuf);
-        if (headlen) {
-            buf ib0 = w->ibx, ic = {0}, it = {0};
-            idxbuild(&ib0, &ic, &it);
-            uint8_t *f1 = NULL, *f2 = NULL; ZSTD_CCtx *mc = ZSTD_createCCtx();
-            size_t a1 = complens(mc, rb0, bm[0].lens, &f1, ZSTD_compressBound(bm[0].lens));
-            size_t a2 = complens(mc, headbuf, headlen, &f2, ZSTD_compressBound(headlen));
-            RUNHEAD = a1 && a2 && a2 < a1 + ic.n;
-            free(f1); free(f2); free(ic.d); free(it.d); ZSTD_freeCCtx(mc);
+        uint8_t *hb = NULL; size_t hn = splice_heads(rb0, nl0, w->ibx.d, w->ibx.n, &hb);
+        buf ib0 = w->ibx, ic = {0}, it = {0};
+        idxbuild(&ib0, &ic, &it);
+        ZSTD_CCtx *mc = ZSTD_createCCtx();
+        uint8_t *f = NULL;
+        size_t base = complens(mc, rb0, nl0, &f, ZSTD_compressBound(nl0)); free(f); f = NULL;
+        size_t ids = compids(mc, rb0 + nl0, ni0, &f, ZSTD_compressBound(ni0)); free(f); f = NULL;
+        size_t bestsz = base && ids ? base + ids + ic.n : 0;
+        int bh = 0, bi = 0;
+        if (hn) {                                  /* heads, index dropped */
+            size_t a = complens(mc, hb, hn, &f, ZSTD_compressBound(hn)); free(f); f = NULL;
+            if (a && ids && (!bestsz || a + ids < bestsz)) { bestsz = a + ids; bh = 1; bi = 0; }
         }
-        if (!RUNHEAD) { free(headbuf); headbuf = NULL; headlen = 0; }
-        free(rb0);
+        {                                          /* interleaved: always headed */
+            uint8_t *iv = NULL;
+            size_t vn = ilv_pack(rb0, nl0, rb0 + nl0, ni0, w->ibx.d, w->ibx.n, &iv);
+            if (vn) {
+                size_t a = complens(mc, iv, vn, &f, ZSTD_compressBound(vn)); free(f); f = NULL;
+                size_t b = compids(mc, iv, vn, &f, ZSTD_compressBound(vn)); free(f); f = NULL;
+                if (b && (!a || b < a)) a = b;
+                if (a && (!bestsz || a < bestsz)) {
+                    bestsz = a; bh = 1; bi = 1;
+                    free(altbuf); altbuf = iv; altlen = vn; alt_lens = hn; iv = NULL;
+                }
+            }
+            free(iv);
+        }
+        if (bi) { ILV = 1; RUNHEAD = 1; }
+        else if (bh) { RUNHEAD = 1; free(altbuf); altbuf = hb; altlen = hn; alt_lens = hn; hb = NULL; }
+        else { free(altbuf); altbuf = NULL; altlen = alt_lens = 0; }
+        free(hb); free(rb0);
+        free(ic.d); free(it.d); ZSTD_freeCCtx(mc);
     }
     if (RUNHEAD) { free(w->ibx.d); w->ibx.d = NULL; w->ibx.n = 0; }
 
@@ -2400,7 +2460,7 @@ static void ktw_close(ktw *w) {
                 uint8_t *fa = NULL, *fb = NULL;
 
                 const uint8_t *vs[3] = { src, NULL, NULL }; size_t vn[3] = { nl, 0, 0 };
-                if (RUNHEAD) { vs[0] = headbuf; vn[0] = headlen; }
+                if (RUNHEAD || ILV) { vs[0] = altbuf; vn[0] = altlen; }
                 for (int v = 0; ALNPAF && v < 2; v++) {
                     size_t an = bm[i].alen[v]; const uint8_t *alt = w->rawalt[v].d + bm[i].aoff[v];
                     if (!an || (an == nl && !memcmp(alt, src, an))) continue;   /* same bytes as every-sentinel */
@@ -2424,8 +2484,9 @@ static void ktw_close(ktw *w) {
                 }
                 if (!failed && FASTMODE && ALNPAF) { best = complens(tc, vs[bv], vn[bv], &fa, ZSTD_compressBound(vn[bv])); if (!best) failed = 1; }
                 if (failed) { free(o); free(fa); continue; }
-                a = best; nl = vn[bv]; nosent = (uint64_t)bv;
-                if (IDCODEC) { b2 = paycomp(idsrc, ni, IDCODEC, &fb);
+                a = best; nl = ILV ? alt_lens : vn[bv]; nosent = (uint64_t)bv;
+                if (ILV) { b2 = 0; fb = NULL; o[0] = 0; }
+                else if (IDCODEC) { b2 = paycomp(idsrc, ni, IDCODEC, &fb);
                                if (!b2) { failed = 1; free(fa); free(o); continue; } }
                 else
                 { b2 = ZSTD_compressCCtx(tc, o, obound, idsrc, ni, LEVEL_I < 0 ? LEVEL : LEVEL_I);
@@ -2587,7 +2648,7 @@ static void ktw_close(ktw *w) {
     uint64_t h[16] = { nidx, (NAMES_OUT ? 0 : nzl) | (tokused ? TOKFLAG : 0) | (CARTUSED ? CARTFLAG : 0)
                              | (intused ? INTFLAG : 0) | (dropnames && !(w->ordok && nidx > 0) ? DROPPED : 0)
                              | (ALNPAF ? LENFLAG : 0) | (TAILON > 0 ? TAILFLAG : 0)
-                             | (RUNHEAD ? RUNFLAG : 0)
+                             | (RUNHEAD ? RUNFLAG : 0) | (ILV ? ILVFLAG : 0)
                              | (ALNPAF ? ALNFLAG : 0) | (DBFEATS ? DBFLAG : 0)
                              | (NAMES_OUT ? SIDEFLAG : 0)
                              | (npl || (PERMON && NAMEMODE == 1) ? PERMFLAG : 0)
@@ -2633,7 +2694,7 @@ static void ktw_close(ktw *w) {
             nzl, dropnames ? " (dropped, needs --names FILE)" : ordinal ? " (ordinal, not stored)" : tokused ? " (tokenised)" : intused ? " (int deltas)" : "", izl, szl,
             (unsigned long long)BYT_LENS, (unsigned long long)BYT_LABS, RAWHELD);
 
-    free(itab.d); free(ichunks.d); free(headbuf);
+    free(itab.d); free(ichunks.d); free(altbuf);
     free(lz); free(nz); free(sz); free(itz); free(npz);
     free(names.d); free(sizes.d); free(labs.d);
     free(w->bm);
@@ -2727,7 +2788,7 @@ typedef struct {
     const uint8_t *payend;        /* the cached block's payload end, per reader */
     const uint8_t *curlp, *curip;
     uint64_t rowhash, tailpred, tailskip; int taildec;   /* for a track read as --ref */
-    int runhead, rfilled; uint32_t *rtab;   /* run counts lifted out of the lengths */
+    int runhead, ilv, rfilled; uint32_t *rtab;   /* run counts lifted out of the lengths */
 } R;
 
 static void loadichunk(R *r, uint64_t c) {
@@ -2831,7 +2892,7 @@ static R *ropen(const char *path) {
     if (fseeko(r->f, 8 + 128, SEEK_SET)) die("seek");
     uint64_t nml = h[1] & ~(TOKFLAG | INTFLAG | DROPPED | ALNFLAG | DBFLAG
                             | SIDEFLAG | LENFLAG | TAILFLAG | PERMFLAG
-                            | PERMTOK | CARTFLAG | RUNFLAG);   /* h[1] also holds flags */
+                            | PERMTOK | CARTFLAG | RUNFLAG | ILVFLAG);   /* h[1] also holds flags */
 
     if (nml > fsz || h[2] > fsz || h[3] > fsz || h[6] > fsz || h[11] > fsz
         || h[14] > fsz || h[11] + h[14] > fsz
@@ -2897,18 +2958,18 @@ static R *ropen(const char *path) {
     r->lenfile = LENDEC = was_len && !RAW;
 
     TAILDEC = (h[1] & TAILFLAG) != 0;
-    int runhead = (h[1] & RUNFLAG) != 0;
+    int runhead = (h[1] & RUNFLAG) != 0, ilv = (h[1] & ILVFLAG) != 0;
     TAILPRED_R = h[12]; TAILSKIP_R = h[13] & 0xff;
     if (TAILDEC && TAILSKIP_R != TAILSKIP) die("corrupt file: tail skip is not the format constant");
     r->taildec = TAILDEC; r->tailpred = h[12]; r->tailskip = TAILSKIP_R; r->rowhash = was_aln ? 0 : h[13] >> 8;
     if (was_aln && ALNPAF && (h[13] >> 8) != (ALNHASH & ((1ull << 56) - 1)))
         die("this PAF, reference or name map is not the one the track was encoded with");
     r->cart = (h[1] & CARTFLAG) != 0;
-    r->runhead = runhead;
+    r->runhead = runhead; r->ilv = ilv;
     if (runhead) r->rtab = xmalloc(mul(h[0] ? h[0] : 1, sizeof *r->rtab));
     if (r->cart && !was_db) die("corrupt file: vocabulary featureIDs without --db");
     h[1] &= ~(TOKFLAG | INTFLAG | DROPPED | ALNFLAG | DBFLAG | SIDEFLAG | LENFLAG
-              | TAILFLAG | PERMFLAG | PERMTOK | CARTFLAG | RUNFLAG);
+              | TAILFLAG | PERMFLAG | PERMTOK | CARTFLAG | RUNFLAG | ILVFLAG);
     uint8_t *iz = xmalloc(h[2]), *sz = xmalloc(h[3]);
     uint8_t *nz = NULL;
     r->nz_off = ftello(r->f);
@@ -3393,6 +3454,44 @@ static size_t rmheads(R *r, uint8_t *b, size_t n) {
     return (size_t)(w - b);
 }
 
+/* One stream a read, its run count then a label beside its own length. Split
+   it back into the two regions the walks expect; the counts stay in front of
+   the lengths for rmheads to lift out. */
+static size_t ilv_split(R *r, uint8_t *b, size_t n, size_t nl, size_t ni) {
+    uint8_t *tmp = xmalloc(ni ? ni : 1);
+    const uint8_t *p = b, *e = b + n;
+    uint8_t *wl = b, *wi = tmp;
+    uint64_t seen = 0;
+    #define TAKE(dst, cap, base) do {                                        \
+        const uint8_t *s0 = p;                                               \
+        if (p >= e) die("corrupt block: the interleaved frame is short");     \
+        vget(&p);                                                            \
+        if (p > e) die("corrupt block: a value runs past the frame");         \
+        size_t g = (size_t)(p - s0);                                         \
+        if ((size_t)((dst) - (base)) + g > (cap))                            \
+            die("corrupt block: the interleaved frame does not fit its regions"); \
+        memmove((dst), s0, g); (dst) += g;                                   \
+    } while (0)
+    while (p < e) {
+        const uint8_t *h0 = p;
+        if (p >= e) break;
+        uint64_t k = vget(&p);
+        if (p > e) die("corrupt block: a run count runs past the frame");
+        if (!k || k > r->rows - seen) die("corrupt block: a run count is out of range");
+        size_t hg = (size_t)(p - h0);
+        if ((size_t)(wl - b) + hg > nl) die("corrupt block: the length region overflows");
+        memmove(wl, h0, hg); wl += hg;
+        for (uint64_t j = 0; j < k; j++) { TAKE(wi, ni, tmp); TAKE(wl, nl, b); }
+        seen += k;
+    }
+    #undef TAKE
+    if (seen != r->rows || (size_t)(wl - b) != nl || (size_t)(wi - tmp) != ni)
+        die("corrupt block: the interleaved frame does not split into its two regions");
+    memcpy(b + nl, tmp, ni);
+    free(tmp);
+    return nl;
+}
+
 static void loadblk(R *r, uint64_t b) {
 
     if (b >= r->nblk) die("corrupt index: a block number is past the end");
@@ -3411,18 +3510,26 @@ static void loadblk(R *r, uint64_t b) {
     uint64_t la = r->b[b].l, lb = r->b[b].size - la;
     size_t g, h2;
     PAYEND = NULL;                    /* not valid until this block decodes */
-    if (r->lencodec) { g = paydecomp(cb, la, r->lencodec, r->blkbuf, r->b[b].lraw);
-                       if (!g && r->b[b].lraw) die("frame decode failed"); }
+    uint64_t want = r->ilv ? r->b[b].lraw + r->b[b].raw : r->b[b].lraw;
+    if (r->lencodec) { g = paydecomp(cb, la, r->lencodec, r->blkbuf, want);
+                       if (!g && want) die("frame decode failed"); }
     else
     { g = ZSTD_decompressDCtx(r->d, r->blkbuf, r->blkcap, cb, la);
       if (ZSTD_isError(g)) die(ZSTD_getErrorName(g)); }
-    if (r->idcodec) { h2 = paydecomp(cb + la, lb, r->idcodec, r->blkbuf + g, r->b[b].raw);
+    (void)want;
+    if (r->ilv) h2 = 0;                     /* the one frame carried both */
+    else if (r->idcodec) { h2 = paydecomp(cb + la, lb, r->idcodec, r->blkbuf + g, r->b[b].raw);
                       if (!h2 && r->b[b].raw) die("frame decode failed"); }
     else
     { h2 = ZSTD_decompressDCtx(r->d, r->blkbuf + g, r->blkcap - g, cb + la, lb);
       if (ZSTD_isError(h2)) die(ZSTD_getErrorName(h2)); }
     free(cb);
-    if (g != r->b[b].lraw || h2 != r->b[b].raw)
+    if (r->ilv) {
+        if (g != r->b[b].lraw + r->b[b].raw || h2)
+            die("corrupt block: a stream decodes to a size the index does not claim");
+        g = ilv_split(r, r->blkbuf, g, r->b[b].lraw, r->b[b].raw);
+        h2 = r->b[b].raw;
+    } else if (g != r->b[b].lraw || h2 != r->b[b].raw)
         die("corrupt block: a stream decodes to a size the index does not claim");
     if (r->runhead) {
         size_t g2 = rmheads(r, r->blkbuf, g);

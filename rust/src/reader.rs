@@ -15,11 +15,12 @@ const SIDEFLAG: u64 = 1 << 57;
 const LENFLAG: u64 = 1 << 56;
 const TAILFLAG: u64 = 1 << 55;
 const RUNFLAG: u64 = 1 << 61;
+const ILVFLAG: u64 = 1 << 51;
 const PERMFLAG: u64 = 1 << 54;
 const PERMTOK: u64 = 1 << 53;
 const CARTFLAG: u64 = 1 << 52;
 const FLAGS: u64 = TOKFLAG | INTFLAG | DROPPED | ALNFLAG | DBFLAG | SIDEFLAG
-                 | LENFLAG | TAILFLAG | PERMFLAG | PERMTOK | CARTFLAG | RUNFLAG;
+                 | LENFLAG | TAILFLAG | PERMFLAG | PERMTOK | CARTFLAG | RUNFLAG | ILVFLAG;
 const IDXMAGIC: u64 = 0x3130_5844_4954_534b;   // "KSTIDX01"
 const ICHUNK: u64 = 65536;
 
@@ -112,7 +113,7 @@ pub struct Reader {
     /// the sequence index: chunk frames, their offsets, the run count each
     /// starts at, and the one chunk decoded now, as the C's loadichunk
     iz: Vec<u8>, coff: Vec<u64>, cpend: Vec<u64>, ibx: Vec<u8>, cur_chunk: u64,
-    runhead: bool, rtab: Vec<u32>,   // run counts lifted out of the lengths
+    runhead: bool, ilv: bool, rtab: Vec<u32>,   // run counts lifted out of the lengths
     hasidx: bool,
     mhash: u64,
     cur_ri: u64,
@@ -247,6 +248,7 @@ impl Reader {
         }
         let taildec = h[1] & TAILFLAG != 0;
         let runhead = h[1] & RUNFLAG != 0;
+        let ilv = h[1] & ILVFLAG != 0;
         if taildec && h[13] & 0xff != 64 {
             crate::bail("corrupt file: tail skip is not the format constant");
         }
@@ -390,7 +392,7 @@ impl Reader {
             nameix: std::cell::OnceCell::new(),
             idcodec: idc, lencodec: lenc,
             taildec, tailpred: h[12], tailskip: h[13] & 0xff, iz, coff, cpend, ibx: Vec::new(), cur_chunk: u64::MAX,
-            runhead, rtab: Vec::new(),
+            runhead, ilv, rtab: Vec::new(),
             names: std::cell::OnceCell::new(), nz, pz, names_file: o.names_file.clone(),
             ordnames: o.ordnames, nf, idx,
             hasidx, mhash: h[15], cur_ri: 0, cur_q: 0, cur_pend: 0, cached: None, sc: None,
@@ -501,6 +503,32 @@ impl Reader {
         (d, sp, r)
     }
 
+    /// One stream a read, its run count then a label beside its own length.
+    /// Split it back into the two regions the walks expect; the counts stay
+    /// in front of the lengths for rmheads to lift out.
+    fn ilv_split(&self, v: Vec<u8>, nl: usize, ni: usize) -> Vec<u8> {
+        let (mut lens, mut ids) = (Vec::with_capacity(nl), Vec::with_capacity(ni));
+        let (mut i, mut seen) = (0usize, 0u64);
+        while i < v.len() {
+            let h0 = i;
+            let (k, n) = vget(&v, i); i = n;
+            if k == 0 || k > self.rows - seen { crate::bail("corrupt block: a run count is out of range"); }
+            lens.extend_from_slice(&v[h0..i]);
+            for _ in 0..k {
+                if i >= v.len() { crate::bail("corrupt block: the interleaved frame is short"); }
+                let n2 = skip(&v, i); ids.extend_from_slice(&v[i..n2]); i = n2;
+                if i >= v.len() { crate::bail("corrupt block: the interleaved frame is short"); }
+                let n2 = skip(&v, i); lens.extend_from_slice(&v[i..n2]); i = n2;
+            }
+            seen += k;
+        }
+        if seen != self.rows || lens.len() != nl || ids.len() != ni {
+            crate::bail("corrupt block: the interleaved frame does not split into its two regions");
+        }
+        lens.extend_from_slice(&ids);
+        lens
+    }
+
     /// The run count heads every read on disk. Lift them into rtab and close
     /// the gap, so every walk below sees the layout it always saw.
     fn rmheads(&mut self, lens: Vec<u8>) -> Vec<u8> {
@@ -534,8 +562,13 @@ impl Reader {
             crate::bail("corrupt block: its bytes do not match the stored hash");
         }
         let (la, lb) = (m.l as usize, (m.size - m.l) as usize);
-        let lens = frame(&cb[..la], self.lencodec, m.lraw as usize);
-        let ids = frame(&cb[la..la + lb], self.idcodec, m.raw as usize);
+        let want = if self.ilv { (m.lraw + m.raw) as usize } else { m.lraw as usize };
+        let lens = frame(&cb[..la], self.lencodec, want);
+        let ids = if self.ilv { Vec::new() } else { frame(&cb[la..la + lb], self.idcodec, m.raw as usize) };
+        let lens = if self.ilv { self.ilv_split(lens, m.lraw as usize, m.raw as usize) } else { lens };
+        let (lens, ids) = if self.ilv {
+            let mut l = lens; let t = l.split_off(m.lraw as usize); (l, t)
+        } else { (lens, ids) };
         let lens = if self.runhead { self.rmheads(lens) } else { lens };
         let split = lens.len();
         let rows = m.rows;

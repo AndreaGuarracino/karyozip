@@ -23,6 +23,7 @@ const PERMFLAG: u64 = 1 << 54;
 const PERMTOK: u64 = 1 << 53;
 const TAILFLAG: u64 = 1 << 55;
 const RUNFLAG: u64 = 1 << 61;
+const ILVFLAG: u64 = 1 << 51;
 const ICHUNK: u64 = 65536;
 const TAILSKIP: usize = 64;
 
@@ -507,16 +508,31 @@ impl Writer {
         // The run count can head each read's lengths instead of living in the
         // index. One block only, since a split read has no count to head it,
         // and measured against the index it would replace.
-        let mut headbuf: Vec<u8> = Vec::new();
-        let mut runhead = false;
+        let mut altbuf: Vec<u8> = Vec::new();
+        let (mut runhead, mut ilv, mut alt_lens) = (false, false, 0usize);
         if self.bm.len() == 1 && !aln_on && !self.ibx.is_empty() {
-            let (lens0, _) = self.read_block(0).expect("staged block");
+            let (lens0, ids0) = self.read_block(0).expect("staged block");
+            let idx = idxsize(&self.ibx, if level < 19 { level } else { 19 });
+            let base = comp_lens(&lens0, p.len, lvl_len).map(|v| v.len());
+            let ids = comp_ids(&ids0, p.id, lvl_id).map(|v| v.len());
+            let mut bestsz = match (base, ids) { (Some(a), Some(b)) => a + b + idx, _ => 0 };
             if let Some(h) = splice_heads(&lens0, &self.ibx) {
-                let idx = idxsize(&self.ibx, if level < 19 { level } else { 19 });
-                let a1 = comp_lens(&lens0, p.len, lvl_len).map(|v| v.len());
-                let a2 = comp_lens(&h, p.len, lvl_len).map(|v| v.len());
-                if let (Some(a1), Some(a2)) = (a1, a2) {
-                    if a2 < a1 + idx { runhead = true; headbuf = h; }
+                if let (Some(a), Some(b)) = (comp_lens(&h, p.len, lvl_len).map(|v| v.len()), ids) {
+                    if bestsz == 0 || a + b < bestsz {
+                        bestsz = a + b; runhead = true; alt_lens = h.len(); altbuf = h;
+                    }
+                }
+            }
+            if let Some(v) = ilv_pack(&lens0, &ids0, &self.ibx) {
+                let a = comp_lens(&v, p.len, lvl_len).map(|x| x.len());
+                let b = comp_ids(&v, p.id, lvl_id).map(|x| x.len());
+                let a = match (a, b) { (Some(x), Some(y)) => Some(x.min(y)), (Some(x), _) => Some(x), (_, y) => y };
+                if let Some(a) = a {
+                    if bestsz == 0 || a < bestsz {
+                        ilv = true; runhead = true;
+                        alt_lens = lens0.len() + self.ibx.len();
+                        altbuf = v;
+                    }
                 }
             }
         }
@@ -537,7 +553,7 @@ impl Writer {
                     // or plain lengths. Zeros do not always compress better.
                     let m = &self.bm[i];
                     let mut vs: [Option<&[u8]>; 3] =
-                        [Some(if runhead { &headbuf } else { &lens }), None, None];
+                        [Some(if runhead || ilv { &altbuf } else { &lens }), None, None];
                     if aln_on {
                         for v in 0..2 {
                             let alt = &self.rawalt[v][m.aoff[v]..m.aoff[v] + m.alen[v]];
@@ -566,8 +582,8 @@ impl Writer {
                         }
                     }
                     if fast_aln { fa = comp_lens(vs[bv].unwrap(), p.len, lvl_len).expect("lens frame"); }
-                    let nl = vs[bv].unwrap().len();
-                    let b = comp_ids(&ids, p.id, lvl_id).expect("ids frame");
+                    let nl = if ilv { alt_lens } else { vs[bv].unwrap().len() };
+                    let b = if ilv { Vec::new() } else { comp_ids(&ids, p.id, lvl_id).expect("ids frame") };
                     (fa, b, nl, ids.len(), m.rows, m.bp, bv as u64)
                 })
                 .collect();
@@ -738,7 +754,8 @@ impl Writer {
              | if self.cart { CARTFLAG } else { 0 }
              | if aln_on { ALNFLAG | LENFLAG } else { 0 }
              | if self.tailon == Some(true) { TAILFLAG } else { 0 }
-             | if runhead { RUNFLAG } else { 0 };
+             | if runhead { RUNFLAG } else { 0 }
+             | if ilv { ILVFLAG } else { 0 };
         h[2] = ichunks.len() as u64;
         h[3] = sz.len() as u64;
         h[4] = self.rows;
@@ -1050,6 +1067,22 @@ fn verifies(src: &[u8], codec: i32) -> bool {
 /// Size alone does not qualify a codec, so the sample round trips it; under
 /// slow the whole-file pass round trips the winner and drops it on failure,
 /// so the sample only sizes.
+/// One stream a read: its run count, then a label beside its own length.
+fn ilv_pack(lens: &[u8], ids: &[u8], ibx: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(lens.len() + ids.len() + ibx.len() + 16);
+    let (mut p, mut q, mut r) = (0usize, 0usize, 0usize);
+    while r < ibx.len() {
+        let (k, n) = vget(ibx, r); r = n;
+        kst::put(&mut out, k);
+        for _ in 0..k {
+            if q >= ids.len() || p >= lens.len() { return None; }
+            let n2 = crate::reader::skip(ids, q); out.extend_from_slice(&ids[q..n2]); q = n2;
+            let n2 = crate::reader::skip(lens, p); out.extend_from_slice(&lens[p..n2]); p = n2;
+        }
+    }
+    if p != lens.len() || q != ids.len() { None } else { Some(out) }
+}
+
 /// the same lengths with each read's run count in front of its own
 fn splice_heads(lens: &[u8], ibx: &[u8]) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(lens.len() + ibx.len() + 16);

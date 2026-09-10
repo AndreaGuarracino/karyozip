@@ -448,9 +448,20 @@ static size_t paydecomp(const uint8_t *src, size_t n, int codec, uint8_t *dst, s
    or a plain integer. The integers go down as zigzag deltas, interleaved so a
    read's fields sit together, and bzip3 takes the lot: on 3444234 Illumina
    names that is 2301419 B against the tokeniser's 2818102. */
-#define FLDSEP ':'
+static char FLDSEP = ':';   /* ':' or '-', whichever splits every name alike */
 #define FLDMAX 16
+static size_t fldnames1(buf *names, uint64_t n, uint8_t **out);
+
+/* ':' splits an Illumina name, '-' a UUID: try both, keep the smaller */
 static size_t fldnames(buf *names, uint64_t n, uint8_t **out) {
+    uint8_t *a = NULL, *b = NULL;
+    FLDSEP = ':'; size_t za = fldnames1(names, n, &a);
+    FLDSEP = '-'; size_t zb = fldnames1(names, n, &b);
+    if (zb && (!za || zb < za)) { free(a); *out = b; return zb; }
+    free(b); *out = a; return za;
+}
+
+static size_t fldnames1(buf *names, uint64_t n, uint8_t **out) {
     if (!n) return 0;
     const char *p = (const char *)names->d, *end = p + names->n;
     const char *f0[FLDMAX]; size_t l0[FLDMAX]; int nf = 0, isnum[FLDMAX];
@@ -465,7 +476,8 @@ static size_t fldnames(buf *names, uint64_t n, uint8_t **out) {
             q = s + 1;
         }
     }
-    for (int i = 0; i < nf; i++) isnum[i] = 1;
+    int ishex[FLDMAX];
+    for (int i = 0; i < nf; i++) { isnum[i] = 1; ishex[i] = !(l0[i] & 1) && l0[i] > 0; }
     int *same = xmalloc((size_t)nf * sizeof *same);
     for (int i = 0; i < nf; i++) same[i] = 1;
     int64_t *prev = xcalloc((size_t)nf, sizeof *prev);
@@ -486,7 +498,13 @@ static size_t fldnames(buf *names, uint64_t n, uint8_t **out) {
                 else for (size_t j = 0; j < len; j++)
                          if (c[j] < '0' || c[j] > '9') { isnum[k] = 0; break; }
             }
-            if (!same[k] && !isnum[k]) { free(v.d); free(same); free(prev); return 0; }
+            if (ishex[k]) {
+                if (len != l0[k]) ishex[k] = 0;
+                else for (size_t j = 0; j < len; j++)
+                         if (!((c[j] >= '0' && c[j] <= '9') || (c[j] >= 'a' && c[j] <= 'f')))
+                             { ishex[k] = 0; break; }
+            }
+            if (!same[k] && !isnum[k] && !ishex[k]) { free(v.d); free(same); free(prev); return 0; }
             c = e2 + 1; k++;
             if (!s) break;
         }
@@ -495,9 +513,12 @@ static size_t fldnames(buf *names, uint64_t n, uint8_t **out) {
     }
     /* the template, then a read's varying fields together */
     bvar(&v, (uint64_t)nf);
+    bvar(&v, (uint64_t)(unsigned char)FLDSEP);
     for (int i = 0; i < nf; i++) {
-        bvar(&v, same[i] ? 0 : 1);
-        if (same[i]) { bvar(&v, l0[i]); bput(&v, f0[i], l0[i]); }
+        int ty = same[i] ? 0 : isnum[i] ? 1 : 2;      /* constant, integer, hex */
+        bvar(&v, (uint64_t)ty);
+        if (ty == 0) { bvar(&v, l0[i]); bput(&v, f0[i], l0[i]); }
+        else if (ty == 2) bvar(&v, l0[i]);
     }
     q = p;
     for (uint64_t r = 0; r < n; r++) {
@@ -506,11 +527,17 @@ static size_t fldnames(buf *names, uint64_t n, uint8_t **out) {
         while (k < nf) {
             const char *s = memchr(c, FLDSEP, (size_t)(nl - c));
             const char *e2 = s ? s : nl;
-            if (!same[k]) {
+            if (!same[k] && isnum[k]) {
                 int64_t x = 0;
                 for (const char *j = c; j < e2; j++) x = x * 10 + (*j - '0');
                 int64_t d = x - prev[k]; prev[k] = x;
                 bvar(&v, ((uint64_t)d << 1) ^ (uint64_t)(d >> 63));
+            } else if (!same[k]) {                     /* hex, two nibbles a byte */
+                for (size_t j = 0; j + 1 < l0[k]; j += 2) {
+                    int hi = c[j] <= '9' ? c[j] - '0' : c[j] - 'a' + 10;
+                    int lo = c[j + 1] <= '9' ? c[j + 1] - '0' : c[j + 1] - 'a' + 10;
+                    uint8_t b8 = (uint8_t)(hi << 4 | lo); bput(&v, &b8, 1);
+                }
             }
             c = e2 + 1; k++;
         }
@@ -537,11 +564,17 @@ static char *fldnamesd(const uint8_t *b, size_t n, uint64_t cnt, size_t *outn) {
     const uint8_t *q = v, *qe = v + got;
     uint64_t nf = vgetb(&q, qe);
     if (!nf || nf > FLDMAX) die("corrupt names: a bad field count");
+    char sep = (char)vgetb(&q, qe);
     const uint8_t *cf[FLDMAX]; size_t cl[FLDMAX]; int var[FLDMAX];
     size_t fixed = 0; int nvar = 0;
     for (uint64_t i = 0; i < nf; i++) {
         var[i] = (int)vgetb(&q, qe);
-        if (var[i]) { nvar++; cf[i] = NULL; cl[i] = 0; }
+        if (var[i] > 2) die("corrupt names: a bad field type");
+        if (var[i] == 1) { nvar++; cf[i] = NULL; cl[i] = 0; }
+        else if (var[i] == 2) { cl[i] = (size_t)vgetb(&q, qe); cf[i] = NULL;
+                                if (cl[i] & 1 || !cl[i] || cl[i] > 64)
+                                    die("corrupt names: a bad hex field width");
+                                fixed += cl[i]; }
         else { cl[i] = (size_t)vgetb(&q, qe);
                if ((size_t)(qe - q) < cl[i]) die("corrupt names: a field runs past the blob");
                cf[i] = q; q += cl[i]; fixed += cl[i]; }
@@ -551,12 +584,18 @@ static char *fldnamesd(const uint8_t *b, size_t n, uint64_t cnt, size_t *outn) {
     int64_t *cur = xcalloc(nf, sizeof *cur);
     for (uint64_t r = 0; r < cnt; r++) {
         for (uint64_t i = 0; i < nf; i++) {
-            if (i) o[w++] = FLDSEP;
-            if (var[i]) {
+            if (i) o[w++] = sep;
+            if (var[i] == 1) {
                 uint64_t u = vgetb(&q, qe);
                 cur[i] += (int64_t)(u >> 1) ^ -(int64_t)(u & 1);
                 if (cur[i] < 0) die("corrupt names: a negative field");
                 w += (size_t)sprintf(o + w, "%lld", (long long)cur[i]);
+            } else if (var[i] == 2) {
+                static const char HEX[] = "0123456789abcdef";
+                for (size_t j = 0; j < cl[i] / 2; j++) {
+                    if (q >= qe) die("corrupt names: a hex field runs past the blob");
+                    o[w++] = HEX[*q >> 4]; o[w++] = HEX[*q & 15]; q++;
+                }
             } else { memcpy(o + w, cf[i], cl[i]); w += cl[i]; }
         }
         o[w++] = '\n';
@@ -2577,26 +2616,28 @@ static void ktw_close(ktw *w) {
         size_t base = lensok(mc, rb0, nl0);
         size_t ids = idsok(mc, rb0 + nl0, ni0);
         size_t bestsz = base && ids ? base + ids + ic.n : 0;
-        int bh = 0, bi = 0;
-        if (hn) {                                  /* heads, index dropped */
+        int bh = 0, bi = 0, ilvcodec = LENCODEC;
+        if (hn && bestsz) {                        /* heads, index dropped */
             size_t a = lensok(mc, hb, hn);
-            if (a && ids && (!bestsz || a + ids < bestsz)) { bestsz = a + ids; bh = 1; bi = 0; }
+            if (a && a + ids < bestsz) { bestsz = a + ids; bh = 1; bi = 0; }
         }
-        {                                          /* interleaved: always headed */
+        if (bestsz) {                              /* interleaved: always headed */
             uint8_t *iv = NULL;
             size_t vn = ilv_pack(rb0, nl0, rb0 + nl0, ni0, w->ibx.d, w->ibx.n, &iv);
             if (vn) {
-                size_t a = lensok(mc, iv, vn);
+                /* one frame, so whichever codec reads it back smaller is the
+                   file's length codec: the ids frame is gone either way */
+                size_t a = lensok(mc, iv, vn); int cd = LENCODEC;
                 size_t b = idsok(mc, iv, vn);
-                if (b && (!a || b < a)) a = b;
-                if (a && (!bestsz || a < bestsz)) {
-                    bestsz = a; bh = 1; bi = 1;
+                if (b && (!a || b < a)) { a = b; cd = IDCODEC; }
+                if (a && a < bestsz) {
+                    bestsz = a; bh = 1; bi = 1; ilvcodec = cd;
                     free(altbuf); altbuf = iv; altlen = vn; alt_lens = hn; iv = NULL;
                 }
             }
             free(iv);
         }
-        if (bi) { ILV = 1; RUNHEAD = 1; }
+        if (bi) { ILV = 1; RUNHEAD = 1; LENCODEC = ilvcodec; }
         else if (bh) { RUNHEAD = 1; free(altbuf); altbuf = hb; altlen = hn; alt_lens = hn; hb = NULL; }
         else { free(altbuf); altbuf = NULL; altlen = alt_lens = 0; }
         /* --aln keeps three length spellings: respell every one the same way */

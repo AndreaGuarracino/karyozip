@@ -605,29 +605,43 @@ fn fld_names_d(b: &[u8], cnt: u64) -> Vec<u8> {
     };
     let (nf, mut q) = vget(&v, 0);
     if nf == 0 || nf > 16 { crate::bail("corrupt names: a bad field count"); }
-    let (mut cf, mut var): (Vec<&[u8]>, Vec<bool>) = (Vec::new(), Vec::new());
+    let (sep, n1) = vget(&v, q); q = n1;
+    let sep = sep as u8;
+    let (mut cf, mut var, mut hw): (Vec<&[u8]>, Vec<u64>, Vec<usize>) = (Vec::new(), Vec::new(), Vec::new());
     for _ in 0..nf {
         let (t, n2) = vget(&v, q); q = n2;
-        if t != 0 { var.push(true); cf.push(&[]); }
-        else {
+        if t > 2 { crate::bail("corrupt names: a bad field type"); }
+        var.push(t);
+        if t == 1 { cf.push(&[]); hw.push(0); }
+        else if t == 2 {
+            let (l, n3) = vget(&v, q); q = n3;
+            if l == 0 || l % 2 == 1 || l > 64 { crate::bail("corrupt names: a bad hex field width"); }
+            cf.push(&[]); hw.push(l as usize);
+        } else {
             let (l, n3) = vget(&v, q); q = n3;
             if q + l as usize > v.len() { crate::bail("corrupt names: a field runs past the blob"); }
-            var.push(false); cf.push(&v[q..q + l as usize]); q += l as usize;
+            cf.push(&v[q..q + l as usize]); hw.push(0); q += l as usize;
         }
     }
-    let nvar = var.iter().filter(|&&x| x).count();
+    let nvar = var.iter().filter(|&&x| x == 1).count();
     let mut cur = vec![0i64; nvar];
     let mut o = Vec::with_capacity(crate::ckalloc(cnt as usize * 32));
     for _ in 0..cnt {
         let mut k = 0usize;
         for i in 0..nf as usize {
-            if i > 0 { o.push(b':'); }
-            if var[i] {
+            if i > 0 { o.push(sep); }
+            if var[i] == 1 {
                 let (u, n2) = vget(&v, q); q = n2;
                 cur[k] = cur[k].wrapping_add(unzz(u) as i64);
                 if cur[k] < 0 { crate::bail("corrupt names: a negative field"); }
                 kst::putu64(&mut o, cur[k] as u64);
                 k += 1;
+            } else if var[i] == 2 {
+                const HEX: &[u8; 16] = b"0123456789abcdef";
+                for _ in 0..hw[i] / 2 {
+                    if q >= v.len() { crate::bail("corrupt names: a hex field runs past the blob"); }
+                    o.push(HEX[(v[q] >> 4) as usize]); o.push(HEX[(v[q] & 15) as usize]); q += 1;
+                }
             } else { o.extend_from_slice(cf[i]); }
         }
         o.push(b'\n');

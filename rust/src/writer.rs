@@ -511,6 +511,7 @@ impl Writer {
         // and measured against the index it would replace.
         let mut altbuf: Vec<u8> = Vec::new();
         let (mut runhead, mut ilv, mut alt_lens) = (false, false, 0usize);
+        let mut ilvcodec = p.len;
         let mut altv: [Option<(Vec<u8>, usize)>; 3] = [None, None, None];
         if self.bm.len() == 1 && !self.ibx.is_empty() {
             let (lens0, ids0) = self.read_block(0).expect("staged block");
@@ -518,22 +519,32 @@ impl Writer {
             let base = lens_ok(&lens0, p.len, lvl_len);
             let ids = ids_ok(&ids0, p.id, lvl_id);
             let mut bestsz = match (base, ids) { (Some(a), Some(b)) => a + b + idx, _ => 0 };
-            if let Some(h) = splice_heads(&lens0, &self.ibx) {
-                if let (Some(a), Some(b)) = (lens_ok(&h, p.len, lvl_len), ids) {
-                    if bestsz == 0 || a + b < bestsz {
-                        bestsz = a + b; runhead = true; alt_lens = h.len(); altbuf = h;
+            if bestsz > 0 {
+                if let Some(h) = splice_heads(&lens0, &self.ibx) {
+                    if let (Some(a), Some(b)) = (lens_ok(&h, p.len, lvl_len), ids) {
+                        if a + b < bestsz {
+                            bestsz = a + b; runhead = true; alt_lens = h.len(); altbuf = h;
+                        }
                     }
                 }
-            }
-            if let Some(v) = ilv_pack(&lens0, &ids0, &self.ibx) {
-                let a = lens_ok(&v, p.len, lvl_len);
-                let b = ids_ok(&v, p.id, lvl_id);
-                let a = match (a, b) { (Some(x), Some(y)) => Some(x.min(y)), (Some(x), _) => Some(x), (_, y) => y };
-                if let Some(a) = a {
-                    if bestsz == 0 || a < bestsz {
-                        ilv = true; runhead = true;
-                        alt_lens = lens0.len() + self.ibx.len();
-                        altbuf = v;
+                if let Some(v) = ilv_pack(&lens0, &ids0, &self.ibx) {
+                    // one frame, so whichever codec reads it back smaller is
+                    // the file's length codec: the ids frame is gone either way
+                    let mut cd = p.len;
+                    let a = lens_ok(&v, p.len, lvl_len);
+                    let b = ids_ok(&v, p.id, lvl_id);
+                    let a = match (a, b) {
+                        (Some(x), Some(y)) => { if y < x { cd = p.id; Some(y) } else { Some(x) } }
+                        (Some(x), _) => Some(x),
+                        (_, Some(y)) => { cd = p.id; Some(y) }
+                        _ => None,
+                    };
+                    if let Some(a) = a {
+                        if a < bestsz {
+                            ilv = true; runhead = true; ilvcodec = cd;
+                            alt_lens = lens0.len() + self.ibx.len();
+                            altbuf = v;
+                        }
                     }
                 }
             }
@@ -551,6 +562,7 @@ impl Writer {
                 }
             }
         }
+        let lencodec = if ilv { ilvcodec } else { p.len };
         if runhead { self.ibx.clear(); }
 
         let _s = crate::prof::span(1);
@@ -596,14 +608,14 @@ impl Writer {
                         let (a2, f2) = if fast_aln {
                             (ffi::zstd(src, 1).len(), Vec::new())
                         } else {
-                            let f = comp_lens(src, p.len, lvl_len).expect("lens frame");
+                            let f = comp_lens(src, lencodec, lvl_len).expect("lens frame");
                             (f.len(), f)
                         };
                         if bv == usize::MAX || a2 + if fast_aln { a2 / 100 } else { 0 } < best {
                             best = a2; bv = v; fa = f2;
                         }
                     }
-                    if fast_aln { fa = comp_lens(vs[bv].unwrap(), p.len, lvl_len).expect("lens frame"); }
+                    if fast_aln { fa = comp_lens(vs[bv].unwrap(), lencodec, lvl_len).expect("lens frame"); }
                     let nl = if ilv { altv[bv].as_ref().unwrap().1 } else { vs[bv].unwrap().len() };
                     let b = if ilv { Vec::new() } else { comp_ids(&ids, p.id, lvl_id).expect("ids frame") };
                     (fa, b, nl, ids.len(), m.rows, m.bp, bv as u64)
@@ -784,7 +796,7 @@ impl Writer {
         h[2] = ichunks.len() as u64;
         h[3] = sz.len() as u64;
         h[4] = self.rows;
-        h[5] = p.len as u32 as u64 | self.feathash.map_or(0, |f| (f & 0xffff_ffff) << 32);
+        h[5] = lencodec as u32 as u64 | self.feathash.map_or(0, |f| (f & 0xffff_ffff) << 32);
         h[6] = lz.len() as u64;
         h[7] = self.labtab.len() as u64;
         h[8] = self.opt.block;
@@ -1271,18 +1283,29 @@ fn tok_chunked(names: &[u8], chunk: usize) -> Option<Vec<u8>> {
 /// Read names split on ':' into fields that are either the same in every name
 /// or a plain integer. The integers go down as zigzag deltas, a read's fields
 /// together, and bzip3 takes the lot.
-const FLDSEP: u8 = b':';
+
 const FLDMAX: usize = 16;
+/// ':' splits an Illumina name, '-' a UUID: try both, keep the smaller
 pub fn fld_names(names: &[u8], n: u64) -> Option<Vec<u8>> {
+    let a = fld_names1(names, n, b':');
+    let b = fld_names1(names, n, b'-');
+    match (a, b) {
+        (Some(x), Some(y)) => Some(if y.len() < x.len() { y } else { x }),
+        (x, y) => x.or(y),
+    }
+}
+
+fn fld_names1(names: &[u8], n: u64, sep: u8) -> Option<Vec<u8>> {
     if n == 0 { return None; }
-    let first: Vec<&[u8]> = names.split(|&c| c == b'\n').next()?.split(|&c| c == FLDSEP).collect();
+    let first: Vec<&[u8]> = names.split(|&c| c == b'\n').next()?.split(|&c| c == sep).collect();
     let nf = first.len();
     if nf == 0 || nf > FLDMAX { return None; }
     let (mut same, mut isnum) = (vec![true; nf], vec![true; nf]);
+    let mut ishex: Vec<bool> = first.iter().map(|f| !f.is_empty() && f.len() % 2 == 0).collect();
     let mut seen = 0u64;
     for line in names.split(|&c| c == b'\n') {          // one pass to decide
         if seen == n { if line.is_empty() { break; } return None; }
-        let f: Vec<&[u8]> = line.split(|&c| c == FLDSEP).collect();
+        let f: Vec<&[u8]> = line.split(|&c| c == sep).collect();
         if f.len() != nf { return None; }
         for k in 0..nf {
             if same[k] && f[k] != first[k] { same[k] = false; }
@@ -1291,28 +1314,39 @@ pub fn fld_names(names: &[u8], n: u64) -> Option<Vec<u8>> {
                 if g.is_empty() || g.len() > 18 || (g.len() > 1 && g[0] == b'0')
                     || !g.iter().all(|c| c.is_ascii_digit()) { isnum[k] = false; }
             }
-            if !same[k] && !isnum[k] { return None; }
+            if ishex[k] {
+                let g = f[k];
+                if g.len() != first[k].len()
+                    || !g.iter().all(|c| c.is_ascii_digit() || (*c >= b'a' && *c <= b'f')) { ishex[k] = false; }
+            }
+            if !same[k] && !isnum[k] && !ishex[k] { return None; }
         }
         seen += 1;
     }
     if seen != n { return None; }
     let mut v = Vec::new();
     kst::put(&mut v, nf as u64);
+    kst::put(&mut v, sep as u64);
     for k in 0..nf {
-        kst::put(&mut v, if same[k] { 0 } else { 1 });
-        if same[k] { kst::put(&mut v, first[k].len() as u64); v.extend_from_slice(first[k]); }
+        let ty: u64 = if same[k] { 0 } else if isnum[k] { 1 } else { 2 };
+        kst::put(&mut v, ty);
+        if ty == 0 { kst::put(&mut v, first[k].len() as u64); v.extend_from_slice(first[k]); }
+        else if ty == 2 { kst::put(&mut v, first[k].len() as u64); }
     }
     let mut prev = vec![0i64; nf];
     let mut left = n;
     for line in names.split(|&c| c == b'\n') {          // then one to write
         if left == 0 { break; }
         let mut k = 0usize;
-        for f in line.split(|&c| c == FLDSEP) {
-            if !same[k] {
+        for f in line.split(|&c| c == sep) {
+            if !same[k] && isnum[k] {
                 let mut x: i64 = 0;
                 for &c in f { x = x * 10 + (c - b'0') as i64; }
                 let d = x - prev[k]; prev[k] = x;
                 kst::put(&mut v, ((d << 1) ^ (d >> 63)) as u64);
+            } else if !same[k] {
+                let hx = |c: u8| if c <= b'9' { c - b'0' } else { c - b'a' + 10 };
+                for j in (0..f.len() - 1).step_by(2) { v.push(hx(f[j]) << 4 | hx(f[j + 1])); }
             }
             k += 1;
         }

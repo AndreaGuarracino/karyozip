@@ -849,7 +849,7 @@ impl Writer {
             rows: self.rows, reads: self.nidx, blocks: self.nblk,
             names: nz.len(), index: ichunks.len(), offs: sz.len(),
             lens: byt_lens, labs: byt_labs, raw: rawtot,
-            tokused, intused, ordinal, dropped: dropnames,
+            tokused, intused, fldused, ordinal, dropped: dropnames,
         })
     }
 
@@ -867,7 +867,7 @@ pub struct Stats {
     pub rows: u64, pub reads: u64, pub blocks: u64,
     pub names: usize, pub index: usize, pub offs: usize,
     pub lens: u64, pub labs: u64, pub raw: usize,
-    pub tokused: bool, pub intused: bool, pub ordinal: bool, pub dropped: bool,
+    pub tokused: bool, pub intused: bool, pub fldused: bool, pub ordinal: bool, pub dropped: bool,
 }
 
 use crate::kst::vget;

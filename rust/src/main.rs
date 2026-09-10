@@ -373,7 +373,8 @@ fn report(st: &writer::Stats) {
               if st.dropped { " (dropped, needs --names FILE)" }
               else if st.ordinal { " (ordinal, not stored)" }
               else if st.tokused { " (tokenised)" }
-              else if st.intused { " (int deltas)" } else { "" },
+              else if st.intused { " (int deltas)" }
+              else if st.fldused { " (field deltas)" } else { "" },
               st.index, st.offs, st.lens, st.labs, st.raw);
 }
 

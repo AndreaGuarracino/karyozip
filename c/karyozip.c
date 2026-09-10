@@ -2940,7 +2940,7 @@ static void ktw_close(ktw *w) {
             if (p2 && p2 < pbest) { pbest = p2; pp = nb2; ptok = 1; }
             if (best && best <= nzl + pbest) {     /* sorted names win: no rank */
                 free(nz); nz = bp; nzl = best;
-                tokused = bpick == 2; intused = bpick == 1;
+                tokused = bpick == 2; intused = bpick == 1; fldused = bpick == 3;
                 free(na); free(nb2); free(natbuf.d); natbuf.n = 0; natbuf.d = NULL;
                 PERMON = 0;
             } else {
@@ -2970,6 +2970,7 @@ static void ktw_close(ktw *w) {
     int permtok = PERMBLOBTOK;
     WR(MAGIC, 8);
     uint64_t fh = CARTUSED ? HIERHASH : FEATHASH;
+    if (tokused + intused + fldused > 1) die("internal: names flagged more than one way");
     uint64_t h[16] = { nidx, (NAMES_OUT ? 0 : nzl) | (tokused ? TOKFLAG : 0) | (CARTUSED ? CARTFLAG : 0)
                              | (intused ? INTFLAG : 0) | (fldused ? FLDFLAG : 0) | (dropnames && !(w->ordok && nidx > 0) ? DROPPED : 0)
                              | (ALNPAF ? LENFLAG : 0) | (TAILON > 0 ? TAILFLAG : 0)

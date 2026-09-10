@@ -3,29 +3,26 @@
 all:
 	$(MAKE) -C c
 
-test:
-	$(MAKE) -C c test
-
 rust:
 	cd rust && cargo build --release
 
-# The same suite the C answers to. It found 13 divergences that diff.sh,
-# which only compares outputs, could not see.
-rust-test: all rust
-	cd rust && cargo test --release
+# Every local check, one target, 6 minutes: the hand-computed cases, leaks
+# and fuzz on the C, the same on the Rust (they found 13 divergences diff.sh
+# could not see), and C against Rust on generated inputs. The matrix takes 18
+# minutes a cell and runs on gemini, tests/matrix.sbatch.
+test: all rust
+	$(MAKE) -C c test
 	KT=$(CURDIR)/rust/target/release/karyozip LT=$(CURDIR)/c/build/libtest bash c/tests/run.sh
 	bash tests/diff.sh
 
-diff: all rust
-	bash tests/diff.sh
-
-# The wide check: every real fixture cell under tests/fixtures, every set,
-# smoothing, strategy, flag and reader, through both binaries.
-matrix: all rust
-	@for d in tests/fixtures/*/; do bash tests/matrix.sh "$$d" || exit 1; done
+# The real-data gate: every track of a corpus, both binaries, both modes;
+# BASE=old/karyozip also fails on any track the change made bigger.
+CORPUS ?= $(HOME)/karyoscope-realdata/kstracks
+sweep: all rust
+	bash tests/sweep.sh $(CORPUS) c/build/karyozip rust/target/release/karyozip $(BASE)
 
 clean:
 	$(MAKE) -C c clean
 	cd rust && cargo clean 2>/dev/null || true
 
-.PHONY: all test rust rust-test diff matrix clean
+.PHONY: all rust test sweep clean

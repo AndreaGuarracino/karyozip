@@ -18,11 +18,12 @@ const TAILFLAG: u64 = 1 << 55;
 const RUNFLAG: u64 = 1 << 61;
 const ILVFLAG: u64 = 1 << 51;
 const GRPFLAG: u64 = 1 << 49;
+const ZTFLAG: u64 = 1 << 48;
 const PERMFLAG: u64 = 1 << 54;
 const PERMTOK: u64 = 1 << 53;
 const CARTFLAG: u64 = 1 << 52;
 const FLAGS: u64 = TOKFLAG | INTFLAG | FLDFLAG | DROPPED | ALNFLAG | DBFLAG | SIDEFLAG
-                 | LENFLAG | TAILFLAG | PERMFLAG | PERMTOK | CARTFLAG | RUNFLAG | ILVFLAG | GRPFLAG;
+                 | LENFLAG | TAILFLAG | PERMFLAG | PERMTOK | CARTFLAG | RUNFLAG | ILVFLAG | GRPFLAG | ZTFLAG;
 const IDXMAGIC: u64 = 0x3130_5844_4954_534b;   // "KSTIDX01"
 const ICHUNK: u64 = 65536;
 
@@ -115,7 +116,7 @@ pub struct Reader {
     /// the sequence index: chunk frames, their offsets, the run count each
     /// starts at, and the one chunk decoded now, as the C's loadichunk
     iz: Vec<u8>, coff: Vec<u64>, cpend: Vec<u64>, ibx: Vec<u8>, cur_chunk: u64,
-    runhead: bool, ilv: bool, grp: bool, rtab: Vec<u32>,   // run counts lifted out of the lengths
+    runhead: bool, ilv: bool, grp: bool, zt: bool, rtab: Vec<u32>,   // run counts lifted out of the lengths
     hasidx: bool,
     mhash: u64,
     cur_ri: u64,
@@ -253,6 +254,8 @@ impl Reader {
         let runhead = h[1] & RUNFLAG != 0;
         let ilv = h[1] & ILVFLAG != 0;
         let grp = h[1] & GRPFLAG != 0;
+        let zt = h[1] & ZTFLAG != 0;
+        if zt && (grp || !runhead) { crate::bail("corrupt file: a folded zero tail without plain run counts"); }
         if grp && (ilv || !runhead) { crate::bail("corrupt file: grouped lengths without their run counts"); }
         if taildec && h[13] & 0xff != 64 {
             crate::bail("corrupt file: tail skip is not the format constant");
@@ -397,7 +400,7 @@ impl Reader {
             nameix: std::cell::OnceCell::new(),
             idcodec: idc, lencodec: lenc,
             taildec, tailpred: h[12], tailskip: h[13] & 0xff, iz, coff, cpend, ibx: Vec::new(), cur_chunk: u64::MAX,
-            runhead, ilv, grp, rtab: Vec::new(),
+            runhead, ilv, grp, zt, rtab: Vec::new(),
             names: std::cell::OnceCell::new(), nz, pz, names_file: o.names_file.clone(),
             ordnames: o.ordnames, nf, idx,
             hasidx, mhash: h[15], cur_ri: 0, cur_q: 0, cur_pend: 0, cached: None, sc: None,
@@ -516,13 +519,15 @@ impl Reader {
         let (mut i, mut seen) = (0usize, 0u64);
         while i < v.len() {
             let h0 = i;
-            let (k, n) = vget(&v, i); i = n;
+            let (h, n) = vget(&v, i); i = n;
+            let (k, zz) = if self.zt { (h >> 1, h & 1 == 1) } else { (h, false) };
             if k == 0 || k > self.rows - seen { crate::bail("corrupt block: a run count is out of range"); }
             lens.extend_from_slice(&v[h0..i]);
-            for _ in 0..k {
+            for j in 0..k {
                 if i >= v.len() { crate::bail("corrupt block: the interleaved frame is short"); }
                 let (lb, n2) = vget(&v, i);
                 kst::put(&mut ids, crate::writer::ilv_flip(lb)); i = n2;
+                if zz && j + 1 == k { continue; }
                 if i >= v.len() { crate::bail("corrupt block: the interleaved frame is short"); }
                 let n2 = skip(&v, i); lens.extend_from_slice(&v[i..n2]); i = n2;
             }
@@ -542,14 +547,16 @@ impl Reader {
         let mut tab: Vec<u32> = Vec::with_capacity(self.nreads as usize);
         while i < lens.len() {
             if tab.len() as u64 >= self.nreads { crate::bail("corrupt block: more reads than the header claims"); }
-            let (k, n) = vget(&lens, i); i = n;
+            let (h, n) = vget(&lens, i); i = n;
+            let (k, zz) = if self.zt { (h >> 1, h & 1) } else { (h, 0) };
             if k == 0 || k > self.rows - seen { crate::bail("corrupt block: a run count is out of range"); }
             tab.push(k as u32); seen += k;
-            for _ in 0..k {
+            for _ in 0..k - zz {
                 if i >= lens.len() { crate::bail("corrupt block: a read runs past its lengths"); }
                 let n2 = skip(&lens, i);
                 out.extend_from_slice(&lens[i..n2]); i = n2;
             }
+            if zz == 1 { out.push(0); }                 // the folded zero tail, back
         }
         if tab.len() as u64 != self.nreads || seen != self.rows {
             crate::bail("corrupt block: the run counts do not add up to the row count");

@@ -10,8 +10,8 @@ static NS: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
 static HW: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
 static THR: AtomicU64 = AtomicU64::new(0);
 static T0: OnceLock<Instant> = OnceLock::new();
-static NAME: [&str; 9] = ["parse", "compress", "names", "index", "smooth",
-                          "parse:lines", "parse:append", "write", "codec search"];
+static NAME: [&str; 10] = ["parse", "compress", "names", "index", "smooth",
+                          "parse:lines", "parse:append", "write", "codec search", "layout search"];
 
 pub fn start(on: bool, threads: usize) {
     ON.store(on, Relaxed);
@@ -22,7 +22,7 @@ pub fn start(on: bool, threads: usize) {
 /// Charges its phase for as long as it lives.
 pub struct Span(usize, Instant);
 pub fn span(i: usize) -> Option<Span> {
-    (ON.load(Relaxed) && i < NAME.len()).then(|| Span(i, Instant::now()))   // 9 is "not this phase"
+    (ON.load(Relaxed) && i < NAME.len()).then(|| Span(i, Instant::now()))   // 10 is "not this phase"
 }
 /// The high-water mark is read from /proc at most every 10 ms, as the C.
 static LAST: AtomicU64 = AtomicU64::new(0);
@@ -58,7 +58,7 @@ fn cpu() -> f64 {
 pub fn dump() {
     if !ON.load(Relaxed) { return; }
     let tot: f64 = NS.iter().map(|n| n.load(Relaxed) as f64).sum::<f64>() / 1e9;
-    for i in 0..9 {
+    for i in 0..NAME.len() {
         let s = NS[i].load(Relaxed) as f64 / 1e9;
         if s > 0.0 {
             eprintln!("  phase {:<12} {:8.3} s  {:5.1}%   hwm {:5} MB",

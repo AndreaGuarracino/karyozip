@@ -21,6 +21,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include "libsais.h"
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 #if defined(__GNUC__) || defined(__clang__)
     #define LIKELY(x)   __builtin_expect(!!(x), 1)
@@ -907,28 +910,37 @@ BZIP3_API int bz3_compress(u32 block_size, const u8 * const in, u8 * out, size_t
     write_neutral_s32(out + 9, n_blocks);
     *out_size += 13;
 
-    // Compress and write the blocks.
-    size_t in_offset = 0;
+    // karyozip: the blocks are independent, each with its own state, so they
+    // are encoded side by side and written in order: the same bytes.
+    bz3_free(state); state = NULL;
+    free(compression_buf); compression_buf = NULL;
+    u8 ** bufs = calloc(n_blocks, sizeof *bufs);
+    s32 * osz = calloc(n_blocks, sizeof *osz);
+    s8 err = bufs && osz ? BZ3_OK : BZ3_ERR_INIT;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic, 1) if (n_blocks > 1 && !omp_in_parallel())
+#endif
     for (u32 i = 0; i < n_blocks; i++) {
-        s32 size = (s32)(i == n_blocks - 1 ? in_size - in_offset : block_size);
-        memcpy(compression_buf, in + in_offset, size);
-        s32 out_size_block = bz3_encode_block(state, compression_buf, size);
-        if (bz3_last_error(state) != BZ3_OK) {
-            s8 last_error = state->last_error;
-            bz3_free(state);
-            free(compression_buf);
-            return last_error;
-        }
-        memcpy(out + *out_size + 8, compression_buf, out_size_block);
-        write_neutral_s32(out + *out_size, out_size_block);
-        write_neutral_s32(out + *out_size + 4, size);
-        *out_size += out_size_block + 8;
-        in_offset += size;
+        if (err != BZ3_OK) continue;
+        s32 size = (s32)(i == n_blocks - 1 ? in_size - (size_t)i * block_size : block_size);
+        struct bz3_state * st = bz3_new(block_size);
+        bufs[i] = malloc(bz3_bound(block_size));
+        if (!st || !bufs[i]) { err = BZ3_ERR_INIT; bz3_free(st); continue; }
+        memcpy(bufs[i], in + (size_t)i * block_size, size);
+        osz[i] = bz3_encode_block(st, bufs[i], size);
+        if (bz3_last_error(st) != BZ3_OK) err = st->last_error;
+        bz3_free(st);
     }
-
-    bz3_free(state);
-    free(compression_buf);
-    return BZ3_OK;
+    for (u32 i = 0; err == BZ3_OK && i < n_blocks; i++) {
+        s32 size = (s32)(i == n_blocks - 1 ? in_size - (size_t)i * block_size : block_size);
+        memcpy(out + *out_size + 8, bufs[i], osz[i]);
+        write_neutral_s32(out + *out_size, osz[i]);
+        write_neutral_s32(out + *out_size + 4, size);
+        *out_size += osz[i] + 8;
+    }
+    for (u32 i = 0; bufs && i < n_blocks; i++) free(bufs[i]);
+    free(bufs); free(osz);
+    return err;
 }
 
 BZIP3_API int bz3_decompress(const uint8_t * in, uint8_t * out, size_t in_size, size_t * out_size) {
@@ -941,58 +953,39 @@ BZIP3_API int bz3_decompress(const uint8_t * in, uint8_t * out, size_t in_size, 
     in_size -= 13;
     in += 13;
 
-    struct bz3_state * state = bz3_new(block_size);
-    if (!state) return BZ3_ERR_INIT;
-
-    size_t compression_buf_size = bz3_bound(block_size);
-    u8 * compression_buf = malloc(compression_buf_size);
-    if (!compression_buf) {
-        bz3_free(state);
-        return BZ3_ERR_INIT;
-    }
-
-    size_t buf_max = *out_size;
+    // karyozip: every block header is checked first, then the blocks decode
+    // side by side, each with its own state, into their place in out.
+    size_t buf_max = *out_size, cap = bz3_bound(block_size);
     *out_size = 0;
-
-    for (u32 i = 0; i < n_blocks; i++) {
-        if (in_size < 8) {
-        malformed_header:
-            bz3_free(state);
-            free(compression_buf);
-            return BZ3_ERR_MALFORMED_HEADER;
-        }
-        s32 size = read_neutral_s32(in);
-        if (size < 0 || size > (s32)bz3_bound(block_size)) goto malformed_header;
-        if (in_size < size + 8) {
-            bz3_free(state);
-            free(compression_buf);
-            return BZ3_ERR_TRUNCATED_DATA;
-        }
-        s32 orig_size = read_neutral_s32(in + 4);
-        if (orig_size < 0) goto malformed_header;
-        if (buf_max < *out_size + orig_size) {
-            bz3_free(state);
-            free(compression_buf);
-            return BZ3_ERR_DATA_TOO_BIG;
-        }
-        memcpy(compression_buf, in + 8, size);
-        bz3_decode_block(state, compression_buf, compression_buf_size, size, orig_size);
-        if (bz3_last_error(state) != BZ3_OK) {
-            s8 last_error = state->last_error;
-            bz3_free(state);
-            free(compression_buf);
-            return last_error;
-        }
-        memcpy(out + *out_size, compression_buf, orig_size);
-        *out_size += orig_size;
-        in += size + 8;
-        in_size -= size + 8;
+    const u8 ** src = malloc(((size_t)n_blocks + 1) * sizeof *src);
+    s32 * csz = malloc(((size_t)n_blocks + 1) * sizeof *csz), * osz = malloc(((size_t)n_blocks + 1) * sizeof *osz);
+    size_t * off = malloc(((size_t)n_blocks + 1) * sizeof *off);
+    s8 err = src && csz && osz && off ? BZ3_OK : BZ3_ERR_INIT;
+    for (u32 i = 0; err == BZ3_OK && i < n_blocks; i++) {
+        if (in_size < 8) { err = BZ3_ERR_MALFORMED_HEADER; break; }
+        s32 size = read_neutral_s32(in), orig_size = read_neutral_s32(in + 4);
+        if (size < 0 || size > (s32)cap || orig_size < 0) { err = BZ3_ERR_MALFORMED_HEADER; break; }
+        if (in_size < (size_t)size + 8) { err = BZ3_ERR_TRUNCATED_DATA; break; }
+        if (buf_max < *out_size + orig_size) { err = BZ3_ERR_DATA_TOO_BIG; break; }
+        src[i] = in + 8; csz[i] = size; osz[i] = orig_size; off[i] = *out_size;
+        *out_size += orig_size; in += size + 8; in_size -= size + 8;
     }
-
-    bz3_free(state);
-    free(compression_buf);
-
-    return BZ3_OK;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic, 1) if (n_blocks > 1 && !omp_in_parallel())
+#endif
+    for (u32 i = 0; i < n_blocks; i++) {
+        if (err != BZ3_OK) continue;
+        struct bz3_state * st = bz3_new(block_size);
+        u8 * b = malloc(cap);
+        if (!st || !b) { err = BZ3_ERR_INIT; bz3_free(st); free(b); continue; }
+        memcpy(b, src[i], csz[i]);
+        bz3_decode_block(st, b, cap, csz[i], osz[i]);
+        if (bz3_last_error(st) != BZ3_OK) err = st->last_error;
+        else memcpy(out + off[i], b, osz[i]);
+        bz3_free(st); free(b);
+    }
+    free(src); free(csz); free(osz); free(off);
+    return err;
 }
 
 BZIP3_API size_t bz3_min_memory_needed(int32_t block_size) {

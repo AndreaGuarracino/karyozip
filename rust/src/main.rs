@@ -56,6 +56,7 @@ fn main() {
         opt.levelset = true;
     }
     opt.slow = !c.fast;
+    opt.whole = c.slow;
     if c.queryable && c.block.is_none() { opt.block = 262144; }
     if let Some(m) = &c.sort {
         opt.sort = true;

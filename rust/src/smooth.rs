@@ -244,15 +244,15 @@ pub fn run(path: &str, hier: &str, fs: &[u8], seq: Option<&[u8]>,
     // The phases are the C's serial ones; its threaded path records none.
     let one = |r: &mut Reader, ri: u64, sr: &mut crate::reader::SeqRows,
                buf: &mut Vec<u8>, prof: bool| {
-        let s = crate::prof::span(if prof { 6 } else { 9 });
+        let s = crate::prof::span(if prof { 6 } else { 10 });
         r.seq_rows(ri, &labmap, &novelid, h.root, sr);
         drop(s);
         if hi > 0 && sr.en.last().is_none_or(|&e| lo >= e) { return; }
-        let s = crate::prof::span(if prof { 4 } else { 9 });
+        let s = crate::prof::span(if prof { 4 } else { 10 });
         smooth_one(&h, &sr.st, &sr.en, &mut sr.feat, maxgap);
         drop(s);
         let name = r.name_at(ri).to_vec();
-        let _s = crate::prof::span(if prof { 5 } else { 9 });
+        let _s = crate::prof::span(if prof { 5 } else { 10 });
         emit(&h, buf, &name, &sr.st, &sr.en, &sr.feat, &sr.nov, lo, hi, v1);
     };
     let wr = |out: &mut dyn Write, b: &[u8]| out.write_all(b).unwrap_or_else(|_| crate::bail("write failed"));

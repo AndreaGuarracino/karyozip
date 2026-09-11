@@ -25,8 +25,10 @@ fn main() {
         .include(c)
         .define("VERSION", format!("{bz3:?}").as_str())
         .opt_level(3)
+        .flag("-fopenmp")                        // libbz3's blocks, side by side
         .warnings(false)
         .compile("kzcodecs");
+    println!("cargo:rustc-link-lib=gomp");
 }
 
 /// The quoted or trailing word on the one line naming `key`.

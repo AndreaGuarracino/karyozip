@@ -34,6 +34,7 @@ pub struct Options {
     pub level: i32,
     pub levelset: bool,
     pub slow: bool,
+    pub whole: bool,       // --slow: decide on the whole file
     pub keep_names: bool,
     pub drop_names: bool,
     pub names_out: Option<String>,
@@ -48,7 +49,7 @@ pub struct Options {
 
 impl Default for Options {
     fn default() -> Self {
-        Options { block: u64::MAX, level: 17, levelset: false, slow: true, sortmem: 0,
+        Options { block: u64::MAX, level: 17, levelset: false, slow: true, whole: false, sortmem: 0,
                   keep_names: false, drop_names: false, names_out: None,
                   tail: None, tok_chunk: None, sort: false,
                   id_codec: None, len_codec: None }
@@ -502,7 +503,6 @@ impl Writer {
         let (lvl_id, lvl_len) = (if p.lvl_id < 0 { level } else { p.lvl_id },
                                  if p.lvl_len < 0 { level } else { p.lvl_len });
         let aln_on = self.aln.is_some();
-        let fast_aln = aln_on && !self.opt.slow;
 
         // Compress apart, write in order, a batch at a time. Holding every
         // compressed block would cost the whole file in memory; the C stages
@@ -514,50 +514,55 @@ impl Writer {
         let (mut runhead, mut ilv, mut grp, mut alt_lens) = (false, false, false, 0usize);
         let mut ilvcodec = p.len;
         let mut altv: [Option<(Vec<u8>, usize)>; 3] = [None, None, None];
+        let _l = crate::prof::span(9);
         if self.bm.len() == 1 && !self.ibx.is_empty() {
             let (lens0, ids0) = self.read_block(0).expect("staged block");
-            let idx = idxsize(&self.ibx, if level < 19 { level } else { 19 });
-            let base = lens_ok(&lens0, p.len, lvl_len);
-            let ids = ids_ok(&ids0, p.id, lvl_id);
-            let mut bestsz = match (base, ids) { (Some(a), Some(b)) => a + b + idx, _ => 0 };
-            if bestsz > 0 {
-                if let Some(h) = splice_heads(&lens0, &self.ibx) {
-                    if let (Some(a), Some(b)) = (lens_ok(&h, p.len, lvl_len), ids) {
-                        if a + b < bestsz {
-                            bestsz = a + b; runhead = true; alt_lens = h.len(); altbuf = h;
-                        }
-                    }
+            // The layout is decided on the mode's sample, as the codec is: whole
+            // reads up to 4 MB of lengths --fast, DEFSAMPLE MB the default, all
+            // of them --slow. Each layout gets its own best codec there; only
+            // the winner is built whole, compressed once and read back.
+            let (slow, whole) = (self.opt.slow, self.opt.whole);
+            let cap = if whole { usize::MAX } else { (if slow { DEFSAMPLE } else { 4 }) << 20 };
+            let (mut pl, mut pi, mut pb, mut x, mut y, mut z) = (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
+            while z < self.ibx.len() {
+                let (k, n) = vget(&self.ibx, z); z = n;
+                let mut j = 0;
+                while j < k && x < lens0.len() && y < ids0.len() {
+                    x = crate::reader::skip(&lens0, x); y = crate::reader::skip(&ids0, y); j += 1;
                 }
-                // a sort a read on the way back, so the thorough default only
-                if let Some(g) = self.opt.slow.then(|| grp_pack(&lens0, &ids0, &self.ibx)).flatten() {
-                    if let (Some(a), Some(b)) = (lens_ok(&g, p.len, lvl_len), ids) {
-                        if a + b < bestsz {
-                            bestsz = a + b; runhead = true; grp = true;
-                            alt_lens = g.len(); altbuf = g;
-                        }
-                    }
-                }
-                if let Some(v) = ilv_pack(&lens0, &ids0, &self.ibx) {
-                    // one frame, so whichever codec reads it back smaller is
-                    // the file's length codec: the ids frame is gone either way
-                    let r = ilv_best(&v, self.opt.slow, lvl_len);
-                    let (a, cd) = match r { Some((a, c)) => (Some(a), c), None => (None, 0) };
-                    if let Some(a) = a {
-                        if a < bestsz {
-                            ilv = true; runhead = true; grp = false; ilvcodec = cd;
-                            alt_lens = lens0.len() + self.ibx.len();
-                            altbuf = v;
-                        }
-                    }
+                if x > cap && pl > 0 { break; }         // at least one read
+                pl = x; pi = y; pb = z;
+            }
+            let (ls, is, bs) = (&lens0[..pl], &ids0[..pi], &self.ibx[..pb]);
+            let idx = idxsize(bs, if level < 19 { level } else { 19 });
+            let ids = ids_ok(is, p.id, lvl_id);
+            let lay = [None, splice_heads(ls, bs), if slow { grp_pack(ls, is, bs) } else { None }, ilv_pack(ls, is, bs)];
+            let (mut sz, mut cd) = ([0usize; 4], [0i32; 4]);
+            if let Some((a, c)) = ilv_best(ls, slow, whole, lvl_len) {
+                cd[0] = c; if let Some(i) = ids { sz[0] = a + i + idx; }   // plain pays its index
+            }
+            for l in 1..4 {
+                let Some(b) = lay[l].as_ref().filter(|b| !b.is_empty()) else { continue };
+                if let Some((a, c)) = ilv_best(b, slow, whole, lvl_len) {
+                    cd[l] = c;
+                    if l == 3 { sz[l] = a; } else if let Some(i) = ids { sz[l] = a + i; }   // interleaved: no ids frame
                 }
             }
-            // the codec was chosen on the plain lengths: rank again on the
-            // spelling that won, or --fast's sample can beat it
-            if runhead && !ilv {
-                if let Some((a, cd)) = ilv_best(&altbuf, self.opt.slow, lvl_len) {
-                    if lens_ok(&altbuf, p.len, lvl_len).is_none_or(|c| a < c) { ilvcodec = cd; }
-                }
+            let mut l = 0;
+            for k in 1..4 { if sz[k] > 0 && (sz[l] == 0 || sz[k] < sz[l]) { l = k; } }
+            ilvcodec = cd[l];
+            let hb = if l > 0 { splice_heads(&lens0, &self.ibx) } else { None };
+            match l {
+                1 => { altbuf = hb.unwrap_or_default(); alt_lens = altbuf.len(); }
+                2 => { altbuf = grp_pack(&lens0, &ids0, &self.ibx).unwrap_or_default(); alt_lens = altbuf.len(); grp = true; }
+                3 => { altbuf = ilv_pack(&lens0, &ids0, &self.ibx).unwrap_or_default(); alt_lens = hb.map_or(0, |h| h.len()); ilv = true; }
+                _ => {}
             }
+            runhead = l > 0;
+            if l > 0 && lens_ok(&altbuf, ilvcodec, lvl_len).is_none() { ilvcodec = 0; }   // zstd comes back
+            let labels = if l == 3 { String::new() } else { format!(", labels {}", cname(p.id)) };
+            eprintln!("layout: {}, lengths {}{labels}, decided on {pl} of {} B of lengths",
+                      ["plain", "headed", "grouped", "interleaved"][l], cname(ilvcodec), lens0.len());
             // --aln keeps three length spellings: respell every one the same way
             if runhead || ilv {
                 altv[0] = Some((std::mem::take(&mut altbuf), alt_lens));
@@ -573,6 +578,10 @@ impl Writer {
                 }
             }
         }
+        if !(self.bm.len() == 1 && !self.ibx.is_empty()) {   // blocks: no layout search, the codec search's pick
+            eprintln!("layout: plain, lengths {}, labels {}, decided on the codec search's sample", cname(p.len), cname(p.id));
+        }
+        drop(_l);
         let lencodec = ilvcodec;
         if runhead { self.ibx.clear(); }
 
@@ -611,22 +620,11 @@ impl Writer {
                     }
                     const ORDER: [usize; 3] = [1, 2, 0];
                     let (mut best, mut bv, mut fa) = (0usize, usize::MAX, Vec::new());
-                    // Fast mode ranks the spellings by a level 1 zstd, then
-                    // compresses only the winner; --slow ranks by the real
-                    // frame. Two rulers, and they disagree on real data.
                     for &v in &ORDER {
                         let Some(src) = vs[v] else { continue };
-                        let (a2, f2) = if fast_aln {
-                            (ffi::zstd(src, 1).len(), Vec::new())
-                        } else {
-                            let f = comp_lens(src, lencodec, lvl_len).expect("lens frame");
-                            (f.len(), f)
-                        };
-                        if bv == usize::MAX || a2 + if fast_aln { a2 / 100 } else { 0 } < best {
-                            best = a2; bv = v; fa = f2;
-                        }
+                        let f = comp_lens(src, lencodec, lvl_len).expect("lens frame");
+                        if bv == usize::MAX || f.len() < best { best = f.len(); bv = v; fa = f; }
                     }
-                    if fast_aln { fa = comp_lens(vs[bv].unwrap(), lencodec, lvl_len).expect("lens frame"); }
                     let nl = if ilv { altv[bv].as_ref().unwrap().1 } else { vs[bv].unwrap().len() };
                     let b = if ilv { Vec::new() } else { comp_ids(&ids, p.id, lvl_id).expect("ids frame") };
                     (fa, b, nl, ids.len(), m.rows, m.bp, bv as u64)
@@ -909,15 +907,27 @@ pub const KCAND: [(i32, bool); 51] = [
 
 /// A bzip3 block bigger than the data is the same file as the smallest that
 /// covers it, so only that one is worth a try. The mode's own list decides.
-fn bz3_dup(c: i32, n: usize, cand: &[i32]) -> bool {
+fn bz3_dup(c: i32, m: usize, n: usize, cand: &[i32]) -> bool {
     if c & ffi::CODEC_BZIP3 == 0 { return false; }
     let mb = ((c & 0xffff) as usize) << 20;
-    let keep = cand.iter().copied().filter(|&o| o & ffi::CODEC_BZIP3 != 0)
-        .map(|o| ((o & 0xffff) as usize) << 20).filter(|&o| o >= n).min();
-    keep.is_some_and(|kp| mb > kp)
+    let blocks = cand.iter().filter(|&&o| o & ffi::CODEC_BZIP3 != 0).map(|&o| ((o & 0xffff) as usize) << 20);
+    let keep = blocks.clone().filter(|&o| o >= n).min().or_else(|| blocks.max()).unwrap_or(0);
+    mb >= m && mb != keep
+}
+
+/// a codec id as a word, for the diagnostics
+fn cname(c: i32) -> String {
+    if c == 0 { return "zstd".into(); }
+    if c & ffi::CODEC_LZMA != 0 { return "lzma".into(); }
+    if c & ffi::CODEC_BZIP3 != 0 { return format!("bzip3-{}MB", c & 0xffff); }
+    format!("{}-o{}{}{}", if c & ffi::CODEC_ARITH != 0 { "arith" } else { "rans" }, c & 1,
+            if c & 0x80 != 0 { "+pack" } else { "" }, if c & 0x40 != 0 { "+rle" } else { "" })
 }
 
 /// the mode's candidates
+/// MB the default ranks every codec on
+pub const DEFSAMPLE: usize = 64;
+
 pub fn candlist(slow: bool) -> Vec<i32> {
     KCAND.iter().filter(|(_, f)| slow || *f).map(|(c, _)| *c).collect()
 }
@@ -951,8 +961,8 @@ pub struct Pick { pub id: i32, pub len: i32, pub lvl_id: i32, pub lvl_len: i32, 
 /// `blocks` yields every block as (lens, ids); the default search reads three
 /// of them, --slow reads them all, twice.
 pub fn pick(all: &dyn Fn(usize) -> (Vec<u8>, Vec<u8>), nraw: usize, rawtot: usize,
-            maxstream: usize, mut level: i32, o: &Options) -> Pick {
-    let (block, slow, levelset) = (o.block, o.slow, o.levelset);
+            maxstream: usize, level: i32, o: &Options) -> Pick {
+    let (block, slow, whole, levelset) = (o.block, o.slow, o.whole, o.levelset);
     let (forced_id, forced_len) = (o.id_codec, o.len_codec);
     let cv = candlist(slow); let cand: &[i32] = &cv;
     let nc = cand.len();
@@ -966,10 +976,10 @@ pub fn pick(all: &dyn Fn(usize) -> (Vec<u8>, Vec<u8>), nraw: usize, rawtot: usiz
         if nraw > 2 { picks.push(nraw / 2); }
         if nraw > 1 { picks.push(nraw - 1); }
     }
-    // 4 MB per block when seekable; --slow uses whole blocks, since a 4 MB
-    // sample cannot show what a BWT codec does to a 100 MB stream.
-    let mut scap = if seekable { 4usize << 20 } else { 96 << 20 };
-    if slow { scap = maxstream.clamp(4 << 20, 2048 << 20); }
+    // one rule, three samples: --fast its codecs on 4 MB, the default all of
+    // them on DEFSAMPLE MB, --slow all of them on the whole file
+    let mut scap = if slow { DEFSAMPLE << 20 } else { 4usize << 20 };
+    if whole { scap = maxstream.clamp(4 << 20, 2048 << 20); }
     let big = maxstream >= 0x7fff_ffff;
 
     // A candidate the selection cannot take is not worth compressing. On a
@@ -989,7 +999,7 @@ pub fn pick(all: &dyn Fn(usize) -> (Vec<u8>, Vec<u8>), nraw: usize, rawtot: usiz
         for &b in p { if !seen[b as usize] { seen[b as usize] = true; d += 1; if d > 16 { return true; } } }
         false
     };
-    let bz3dup = |c: i32, n: usize| bz3_dup(c, n, &cand);
+    let bz3dup = |c: i32, n: usize| bz3_dup(c, n, maxstream, &cand);
     let (mut zi, mut zl, mut z22i, mut z22l) = (0usize, 0usize, 0usize, 0usize);
     let mut ci = vec![0usize; nc];
     let mut cl = vec![0usize; nc];
@@ -1003,9 +1013,9 @@ pub fn pick(all: &dyn Fn(usize) -> (Vec<u8>, Vec<u8>), nraw: usize, rawtot: usiz
             .map(|k| match k {
                 _ if k < nc => if usable(cand[k]) && !bz3dup(cand[k], ni.max(nl)) {
                         (if packdup(cand[k], &ids[..ni]) { BAD }
-                         else { accumulate(0, &ids[..ni], cand[k], BAD, slow) },
+                         else { accumulate(0, &ids[..ni], cand[k], BAD) },
                          if packdup(cand[k], &lens[..nl]) { BAD }
-                         else { accumulate(0, &lens[..nl], cand[k], BAD, slow) })
+                         else { accumulate(0, &lens[..nl], cand[k], BAD) })
                     } else { (BAD, BAD) },
                 _ if k == nc => (if ni > 0 { ffi::zstd(&ids[..ni], level).len() } else { 0 },
                                  if nl > 0 { ffi::zstd(&lens[..nl], level).len() } else { 0 }),
@@ -1021,30 +1031,9 @@ pub fn pick(all: &dyn Fn(usize) -> (Vec<u8>, Vec<u8>), nraw: usize, rawtot: usiz
         }
     }
 
-    let (mut wi, mut wl) = (0i32, 0i32);
-    let (mut bi, mut bl) = (zi, zl);
-    if slow && !levelset && z22i < bi { bi = z22i; }
-    if slow && !levelset && z22l < bl { bl = z22l; }
-    let lvl_i = if slow && !levelset && z22i < zi { 22 } else { level };
-    let lvl_l = if slow && !levelset && z22l < zl { 22 } else { level };
-    for (k, &c) in cand.iter().enumerate() {
-        let ok = (!seekable || fast_enough(c)) && (!big || c & (ffi::CODEC_BZIP3 | ffi::CODEC_LZMA) != 0);
-        let need_i = if slow { bi } else { (0.995_f64 * zi as f64) as usize };
-        let need_l = if slow { bl } else { (0.995_f64 * zl as f64) as usize };
-        let m = usize::from(slow);
-        if zi > 0 && ci[k] < bi && ci[k] < need_i + m && ok { bi = ci[k]; wi = c; }
-        if zl > 0 && cl[k] < bl && cl[k] < need_l + m && ok { bl = cl[k]; wl = c; }
-    }
-    if slow && !levelset && wi == 0 && wl == 0 {
-        level = if lvl_i == 22 || lvl_l == 22 { 22 } else { level };
-    } else if slow && !levelset && (wi == 0 || wl == 0) {
-        level = if wi == 0 { lvl_i } else { lvl_l };
-    }
-
+    let (wi, wl);
     let (mut lvl_id, mut lvl_len) = (-1i32, -1i32);
-    if slow {
-        // Decide on the whole file, and drop any candidate that fails to
-        // decode a block back.
+    {   // every mode: the smallest that round trips on what it was ranked on
         let mut ti = vec![0usize; nc + 2];
         let mut tl = vec![0usize; nc + 2];
         // a candidate lives per stream: one that does not round-trip the
@@ -1052,13 +1041,13 @@ pub fn pick(all: &dyn Fn(usize) -> (Vec<u8>, Vec<u8>), nraw: usize, rawtot: usiz
         let ok = |k: usize| !big || cand[k] & (ffi::CODEC_BZIP3 | ffi::CODEC_LZMA) != 0;
         let mut live_i: Vec<bool> = (0..nc + 2).map(|k| if k < nc {
             ci[k] < usize::MAX / 4 && ok(k)
-        } else { k == nc || !levelset }).collect();
+        } else { k == nc || (!levelset && slow) }).collect();
         let mut live_l: Vec<bool> = (0..nc + 2).map(|k| if k < nc {
             cl[k] < usize::MAX / 4 && ok(k)
-        } else { k == nc || !levelset }).collect();
+        } else { k == nc || (!levelset && slow) }).collect();
         // one block whose streams fit the sample: the sample already
         // compressed exactly this, so its sizes are the file's
-        let reuse = nraw == 1 && scap >= maxstream;
+        let reuse = !whole || (nraw == 1 && scap >= maxstream);
         if reuse {
             for k in 0..nc { ti[k] = ci[k]; tl[k] = cl[k]; }
             ti[nc] = zi; tl[nc] = zl;
@@ -1092,11 +1081,14 @@ pub fn pick(all: &dyn Fn(usize) -> (Vec<u8>, Vec<u8>), nraw: usize, rawtot: usiz
                 if live_l[k] && tl[k] < tl[ql] { ql = k; }
             }
             let (mut bad_i, mut bad_l) = (false, false);
-            for b in 0..nraw {
+            let over: Vec<usize> = if whole { (0..nraw).collect() } else { picks.clone() };
+            for &b in &over {
                 if bad_i && bad_l { break; }
                 let (lens, ids) = all(b);
-                if qi < nc && !ids.is_empty() && !bad_i && !verifies(&ids, cand[qi]) { bad_i = true; }
-                if ql < nc && !lens.is_empty() && !bad_l && !verifies(&lens, cand[ql]) { bad_l = true; }
+                let cap = if whole { usize::MAX } else { scap };   // the sample it was ranked on
+                let (lens, ids) = (&lens[..lens.len().min(cap)], &ids[..ids.len().min(cap)]);
+                if qi < nc && !ids.is_empty() && !bad_i && !verifies(ids, cand[qi]) { bad_i = true; }
+                if ql < nc && !lens.is_empty() && !bad_l && !verifies(lens, cand[ql]) { bad_l = true; }
             }
             if !bad_i && !bad_l { break; }
             if bad_i { live_i[qi] = false; }
@@ -1106,7 +1098,8 @@ pub fn pick(all: &dyn Fn(usize) -> (Vec<u8>, Vec<u8>), nraw: usize, rawtot: usiz
         wl = if ql < nc { cand[ql] } else { 0 };
         if wi == 0 { lvl_id = if qi == nc + 1 { 22 } else { level }; }
         if wl == 0 { lvl_len = if ql == nc + 1 { 22 } else { level }; }
-        eprintln!("codec: --slow ran {} live candidates over {nraw} blocks whole", nc + 2);
+        eprintln!("codec: {} ranked {} candidates on {}", if !slow { "--fast" } else if whole { "--slow" } else { "the default" },
+                  nc + 2, if whole { "the whole file" } else { "the sample" });
     }
     eprintln!("codec: len=0x{:x} id=0x{:x} from {} sample blocks, {}",
               forced_len.unwrap_or(wl), forced_id.unwrap_or(wi), picks.len(),
@@ -1190,25 +1183,25 @@ fn splice_heads(lens: &[u8], ibx: &[u8]) -> Option<Vec<u8>> {
 /// The interleaved frame is neither of the two streams the search ranked, so
 /// rank it on its own: without this the thorough default could pick a
 /// spelling --fast beat, which it is meant never to do.
-fn ilv_best(src: &[u8], slow: bool, level: i32) -> Option<(usize, i32)> {
+fn ilv_best(src: &[u8], slow: bool, whole: bool, level: i32) -> Option<(usize, i32)> {
+    // the mode's codecs ranked on the mode's sample, all at once; the smallest
+    // that round trips on the whole stream wins, at its whole size
     let cand = candlist(slow);
-    let mut best: Option<(usize, i32)> = None;
-    for &c in &cand {
-        if c & 0x80 != 0 && c & ffi::CODEC_BZIP3 == 0 {   /* PACK gives up past 16 bytes */
-            let mut seen = [false; 256]; let mut d = 0; let mut dup = false;
-            for &b in src { if !seen[b as usize] { seen[b as usize] = true; d += 1;
-                                                   if d > 16 { dup = true; break; } } }
-            if dup { continue; }
+    let m = if whole { src.len() } else { src.len().min((if slow { DEFSAMPLE } else { 4 }) << 20) };
+    let many = |c: i32| c & 0x80 != 0 && c & ffi::CODEC_BZIP3 == 0 && {   // PACK gives up past 16 bytes
+        let mut seen = [false; 256]; let mut d = 0;
+        src.iter().any(|&b| { if !seen[b as usize] { seen[b as usize] = true; d += 1; } d > 16 })
+    };
+    let mut sz: Vec<usize> = cand.par_iter().map(|&c|
+        if many(c) || bz3_dup(c, m, src.len(), &cand) { 0 } else { ffi::paycomp(&src[..m], c).map_or(0, |t| t.len()) }).collect();
+    let mut best = None;
+    while let Some(q) = (0..cand.len()).filter(|&k| sz[k] > 0).min_by_key(|&k| (sz[k], k)) {
+        if let Some(t) = ffi::paycomp(src, cand[q]) {
+            if ffi::paydecomp(&t, cand[q], src.len()).as_deref() == Some(src) { best = Some((t.len(), cand[q])); break; }
         }
-        if bz3_dup(c, src.len(), &cand) { continue; }
-        if let Some(z) = ffi::paycomp(src, c) {
-            if best.is_none_or(|(b, _)| z.len() < b)
-                && ffi::paydecomp(&z, c, src.len()).as_deref() == Some(src) {
-                best = Some((z.len(), c));
-            }
-        }
+        sz[q] = 0;                                 // it does not come back: the next
     }
-    let z = ffi::zstd(src, level);                 /* zstd is candidate zero */
+    let z = ffi::zstd(src, level);                 // zstd is candidate zero
     if best.is_none_or(|(b, _)| z.len() < b) { best = Some((z.len(), 0)); }
     best
 }
@@ -1238,17 +1231,9 @@ fn idxsize(ibx: &[u8], meta: i32) -> usize {
     (0..cb.len() - 1).into_par_iter().map(|i| ffi::zstd(&ibx[cb[i]..cb[i + 1]], meta).len()).sum()
 }
 
-fn accumulate(acc: usize, src: &[u8], codec: i32, bad: usize, slow: bool) -> usize {
-    if src.is_empty() { return bad; }
-    if acc >= bad { return bad; }
-    match ffi::paycomp(src, codec) {
-        Some(t) if slow => acc + t.len(),
-        Some(t) => match ffi::paydecomp(&t, codec, src.len()) {
-            Some(v) if v == src => acc + t.len(),
-            _ => bad,
-        },
-        None => bad,
-    }
+fn accumulate(acc: usize, src: &[u8], codec: i32, bad: usize) -> usize {
+    if src.is_empty() || acc >= bad { return bad; }
+    ffi::paycomp(src, codec).map_or(bad, |t| acc + t.len())
 }
 
 /// The lengths frame: a forced codec, else zstd.

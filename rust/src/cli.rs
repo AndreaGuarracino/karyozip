@@ -32,6 +32,9 @@ pub struct Cli {
     /// the sampled codec search: quicker, larger
     #[arg(long, global = true)]
     pub fast: bool,
+    /// every codec decided on the whole file
+    #[arg(long, global = true)]
+    pub slow: bool,
     /// blocks and an index, for random access
     #[arg(long, global = true)]
     pub queryable: bool,
@@ -169,6 +172,8 @@ impl Cli {
         if self.block.is_some() && !enc { bad("--block")?; }
         if self.level.is_some() && !enc { bad("--level")?; }
         if self.fast && !enc { bad("--fast")?; }
+        if self.slow && !enc { bad("--slow")?; }
+        if self.fast && self.slow { return Err("encode takes --fast or --slow, not both".into()); }
         if self.queryable && !enc { bad("--queryable")?; }
         if self.sort.is_some() && !enc { bad("--sort")?; }
         if self.tail.is_some() && !enc { bad("--tail")?; }

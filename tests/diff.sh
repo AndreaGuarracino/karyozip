@@ -49,7 +49,7 @@ dok=0; dbad=0
 for f in "$D"/*.bed; do
   for fl in "" "--block 4" "--queryable" "--level 3" "--names keep"; do
     "$C" $fl encode < "$f" > "$W/t.kst" 2>/dev/null
-    "$R" decode "$W/t.kst" 2>/dev/null | cmp -s - "$f" && dok=$((dok+1)) \
+    "$R" decode -i "$W/t.kst" 2>/dev/null | cmp -s - "$f" && dok=$((dok+1)) \
       || { dbad=$((dbad+1)); echo "  decode differs: $(basename "$f") [$fl]"; }
   done
 done
@@ -59,7 +59,7 @@ done
 # 4. the C must read what the Rust wrote.
 for f in "$D"/ls.bed "$D"/db.rall.bed; do
   "$R" encode < "$f" > "$W/r.kst" 2>/dev/null
-  "$C" decode "$W/r.kst" 2>/dev/null | cmp -s - "$f" \
+  "$C" decode -i "$W/r.kst" 2>/dev/null | cmp -s - "$f" \
     || { echo "  the C cannot decode the Rust's $(basename "$f")"; fail=1; }
 done
 echo "cross-decode: the C reads the Rust's files"
@@ -69,8 +69,8 @@ for f in ls.bed s.bed db.rall.bed ord.bed; do
   for bl in "" "--block 4"; do
     "$C" $bl encode < "$D/$f" > "$W/t.kst" 2>/dev/null
     for seq in $(awk -F'\t' '{print $1}' "$D/$f" | uniq | head -3); do
-      for q in "$seq" "$seq 50" "$seq 0 100" "$seq 0 100 2" "$seq 999999"; do
-        both "region $f [$bl] [$q]" region "$W/t.kst" $q
+      for q in "-s $seq" "-s $seq -p 50" "-s $seq --start 0 --end 100" "-s $seq --start 0 --end 100 --halo 2" "-s $seq -p 999999"; do
+        both "region $f [$bl] [$q]" region $q -i "$W/t.kst"
       done
     done
   done
@@ -80,32 +80,32 @@ tally region
 # 6. index: the same trailer, and each reads the other's.
 "$C" encode < "$D/db.rall.bed" > "$W/ci.kst" 2>/dev/null
 cp "$W/ci.kst" "$W/ri.kst"
-"$C" index "$W/ci.kst" >/dev/null 2>&1; irc=$?
-"$R" index "$W/ri.kst" >/dev/null 2>&1; irr=$?
+"$C" index -i "$W/ci.kst" >/dev/null 2>&1; irc=$?
+"$R" index -i "$W/ri.kst" >/dev/null 2>&1; irr=$?
 if [ $irc = 0 ] && [ $irr = 0 ] && cmp -s "$W/ci.kst" "$W/ri.kst"; then echo "index: byte-identical trailer"
 else echo "index: TRAILERS DIFFER (rc $irc/$irr)"; fail=1; fi
-both "index cross-read" region "$W/ci.kst" seq0005; tally "index cross-read"
+both "index cross-read" region -i "$W/ci.kst" -s seq0005; tally "index cross-read"
 
 # 6b. a sorted track: the Rust must resolve the ranks the same way.
 for f in ls.bed s.bed db.rall.bed ord.bed; do
   for fl in "--sort" "--sort --names keep"; do
     "$C" $fl encode < "$D/$f" > "$W/t.kst" 2>/dev/null
-    both "sorted decode $f [$fl]" decode "$W/t.kst"
+    both "sorted decode $f [$fl]" decode -i "$W/t.kst"
   done
   "$C" --sort --names drop encode < "$D/$f" > "$W/t.kst" 2>/dev/null
-  both "sorted+drop $f" --names ordinal decode "$W/t.kst"
+  both "sorted+drop $f" --names ordinal decode -i "$W/t.kst"
 done
 tally "sorted decode"
 
 # 7. the reader's flags: dropped names, a sidecar, --raw.
 for f in ls.bed s.bed db.rall.bed ord.bed; do
   "$C" encode --names drop < "$D/$f" > "$W/d.kst" 2>/dev/null
-  for dfl in "--names ordinal" "--raw"; do both "decode $dfl on $f" $dfl decode "$W/d.kst"; done
+  for dfl in "--names ordinal" "--raw"; do both "decode $dfl on $f" $dfl decode -i "$W/d.kst"; done
   # an ordinal-named input has no names to put beside the track: refused by design
-  if "$C" encode --names "drop:$W/side" < "$D/$f" > "$W/s.kst" 2>/dev/null; then both "sidecar $f" --names "$W/side" decode "$W/s.kst"
+  if "$C" encode --names "drop:$W/side" < "$D/$f" > "$W/s.kst" 2>/dev/null; then both "sidecar $f" --names "$W/side" decode -i "$W/s.kst"
   else EXPECT=fail both "sidecar $f refused" encode --names "drop:$W/side2" < "$D/$f"; EXPECT=ok; fi
   "$C" encode < "$D/$f" > "$W/p.kst" 2>/dev/null
-  both "--raw $f" --raw decode "$W/p.kst"
+  both "--raw $f" --raw decode -i "$W/p.kst"
 done
 tally "reader flags"
 
@@ -113,22 +113,22 @@ tally "reader flags"
 printf 'feature_set\tchild\tparent\nfs\tA\tcategorized\nfs\tB\tcategorized\nfs\tC\tcategorized\nfs\tD\tcategorized\n' > "$W/h.tsv"
 for f in ls.bed s.bed db.rall.bed; do
   "$C" encode < "$D/$f" > "$W/t.kst" 2>/dev/null
-  for q in "" "--v1" "--max-gap 5" "--max-gap 100000"; do both "smooth $f [$q]" $q smooth "$W/t.kst" "$W/h.tsv" fs; done
+  for q in "" "--v1" "--max-gap 5" "--max-gap 100000"; do both "smooth $f [$q]" $q smooth -i "$W/t.kst" --hier "$W/h.tsv" -f fs; done
   for seq in $(awk -F'\t' '{print $1}' "$D/$f" | uniq | head -2); do
-    for q in "$seq" "$seq 0 100"; do both "smooth $f [$q]" smooth "$W/t.kst" "$W/h.tsv" fs $q; done
+    for q in "-s $seq" "-s $seq --start 0 --end 100"; do both "smooth $f [$q]" smooth -i "$W/t.kst" --hier "$W/h.tsv" -f fs $q; done
   done
 done
 tally smooth
 
 # 9. --db, both directions.
-DB="$D/db.acrocentric.bed $D/db.chromosome.bed $D/db.gene.bed $D/db.region.bed $D/db.repeat.bed $D/db.subtelomeric.bed"
+DB="-i $D/db.acrocentric.bed -i $D/db.chromosome.bed -i $D/db.gene.bed -i $D/db.region.bed -i $D/db.repeat.bed -i $D/db.subtelomeric.bed"
 "$C" encode --db "$D/db.features.tsv" $DB > "$W/cdb.kst" 2>/dev/null
 "$R" encode --db "$D/db.features.tsv" $DB > "$W/rdb.kst" 2>/dev/null
 if cmp -s "$W/cdb.kst" "$W/rdb.kst"; then echo "--db encode: identical"
 else echo "--db encode: DIFFERS"; fail=1; fi
 rm -rf "$W/co" "$W/ro"; mkdir -p "$W/co" "$W/ro"
-"$C" decode --db "$D/db.features.tsv" --out "$W/co" "$W/cdb.kst" >/dev/null 2>&1
-"$R" decode --db "$D/db.features.tsv" --out "$W/ro" "$W/cdb.kst" >/dev/null 2>&1
+"$C" decode --db "$D/db.features.tsv" --out-dir "$W/co" -i "$W/cdb.kst" >/dev/null 2>&1
+"$R" decode --db "$D/db.features.tsv" --out-dir "$W/ro" -i "$W/cdb.kst" >/dev/null 2>&1
 if diff -r "$W/co" "$W/ro" >/dev/null 2>&1; then echo "--db decode: identical"
 else echo "--db decode: DIFFERS"; fail=1; fi
 # a tuple outside features.tsv, given the hierarchy: 2^26 + its rank, on both
@@ -136,9 +136,9 @@ else echo "--db decode: DIFFERS"; fail=1; fi
 awk -F'\t' 'NR==5{$4="repeat"} {print}' OFS='\t' "$D/db.repeat.bed" > "$W/hv.repeat.bed"
 HV=${DB/$D\/db.repeat.bed/$W\/hv.repeat.bed}
 both "--db --hier" encode --db "$D/db.features.tsv" --hier "$W/hv.tsv" $HV; cp "$W/c.out" "$W/hv.kst"
-both "--db --hier decode" --db "$D/db.features.tsv" --hier "$W/hv.tsv" --set repeat decode "$W/hv.kst"; tally "--db --hier"
+both "--db --hier decode" --db "$D/db.features.tsv" --hier "$W/hv.tsv" --set repeat decode -i "$W/hv.kst"; tally "--db --hier"
 dn=0
-for b in $DB; do
+for b in $DB; do [ "$b" = -i ] && continue;
   n=$(basename "$b" .bed); n=${n#db.}
   cmp -s "$W/ro/$n.bed" "$b" || dn=$((dn+1))
 done
@@ -156,22 +156,22 @@ for pair in "s.bed p.paf ref.bed" "ls.bed lp.paf lref.bed"; do
     else abad=$((abad+1)); echo "  --aln encode differs: $1 [$fl]"; fi
   done
   "$C" encode --aln "$D/$2" --ref "$D/$3" < "$D/$1" > "$W/a.kst" 2>/dev/null
-  "$C" decode --aln "$D/$2" --ref "$D/$3" "$W/a.kst" > "$W/c.out" 2>/dev/null; c1=$?
-  "$R" decode --aln "$D/$2" --ref "$D/$3" "$W/a.kst" > "$W/r.out" 2>/dev/null; c2=$?
+  "$C" decode --aln "$D/$2" --ref "$D/$3" -i "$W/a.kst" > "$W/c.out" 2>/dev/null; c1=$?
+  "$R" decode --aln "$D/$2" --ref "$D/$3" -i "$W/a.kst" > "$W/r.out" 2>/dev/null; c2=$?
   if cmp -s "$W/c.out" "$W/r.out" && [ $c1 = $c2 ] && cmp -s "$W/r.out" "$D/$1"; then aok=$((aok+1))
   else abad=$((abad+1)); echo "  --aln decode differs: $1"; fi
   # the reference as a track, from either binary: the same bytes and rows as the text gives
   "$C" encode < "$D/$3" > "$W/c.ref.kst" 2>/dev/null; "$R" encode < "$D/$3" > "$W/r.ref.kst" 2>/dev/null
   "$C" encode --aln "$D/$2" --ref "$W/r.ref.kst" < "$D/$1" > "$W/c.kst" 2>/dev/null; c1=$?
   "$R" encode --aln "$D/$2" --ref "$W/c.ref.kst" < "$D/$1" > "$W/r.kst" 2>/dev/null; c2=$?
-  "$R" decode --aln "$D/$2" --ref "$W/c.ref.kst" "$W/a.kst" > "$W/r.out" 2>/dev/null; c3=$?
+  "$R" decode --aln "$D/$2" --ref "$W/c.ref.kst" -i "$W/a.kst" > "$W/r.out" 2>/dev/null; c3=$?
   if cmp -s "$W/c.ref.kst" "$W/r.ref.kst" && cmp -s "$W/c.kst" "$W/a.kst" && cmp -s "$W/r.kst" "$W/a.kst" && [ $c1 = 0 ] && [ $c2 = 0 ] && [ $c3 = 0 ] && cmp -s "$W/r.out" "$D/$1"; then aok=$((aok+1))
   else abad=$((abad+1)); echo "  .kst reference differs: $1"; fi
 done
 for pair in "p.paf ref.bed" "lp.paf lref.bed" "db.self.paf db.rall.bed"; do
   set -- $pair
-  "$C" aln-pack "$D/$1" "$D/$2" "$W/c.pk" >/dev/null 2>&1; c1=$?
-  "$R" aln-pack "$D/$1" "$D/$2" "$W/r.pk" >/dev/null 2>&1; c2=$?
+  "$C" aln-pack -a "$D/$1" -r "$D/$2" -o "$W/c.pk" >/dev/null 2>&1; c1=$?
+  "$R" aln-pack -a "$D/$1" -r "$D/$2" -o "$W/r.pk" >/dev/null 2>&1; c2=$?
   if cmp -s "$W/c.pk" "$W/r.pk" && [ $c1 = $c2 ]; then aok=$((aok+1))
   else abad=$((abad+1)); echo "  aln-pack differs: $1"; fi
 done
@@ -187,9 +187,9 @@ for bad_in in 'r1\t0\t10' 'r1\t5\t10\tA' 'r1\t0\t0\tA' '\t0\t10\tA' 'r1\tx\t10\t
 done
 # the same refusals on companions: a blank --aln-names line, a cut .gz reference, a packed alignment with a byte over
 printf 'q1\n\nq2\n' > "$W/blank"; gzip -c "$D/ref.bed" | head -c 40 > "$W/cut.gz"
-"$C" aln-pack "$D/p.paf" "$D/ref.bed" "$W/over.pk" >/dev/null 2>&1; printf '\0' >> "$W/over.pk"
+"$C" aln-pack -a "$D/p.paf" -r "$D/ref.bed" -o "$W/over.pk" >/dev/null 2>&1; printf '\0' >> "$W/over.pk"
 "$C" encode --aln "$D/p.paf" --ref "$D/ref.bed" < "$D/s.bed" > "$W/a.kst" 2>/dev/null
-for form in "encode --aln $D/p.paf --ref $D/ref.bed --aln-names $W/blank" "encode --aln $D/p.paf --ref $W/cut.gz" "decode --aln $W/over.pk --ref $D/ref.bed $W/a.kst"; do
+for form in "encode --aln $D/p.paf --ref $D/ref.bed --aln-names $W/blank" "encode --aln $D/p.paf --ref $W/cut.gz" "decode --aln $W/over.pk --ref $D/ref.bed -i $W/a.kst"; do
   "$C" $form < "$D/s.bed" 2> "$W/ce" >/dev/null; c1=$?; cm=$(tail -1 "$W/ce")
   "$R" $form < "$D/s.bed" 2> "$W/re" >/dev/null; r1=$?; rm2=$(tail -1 "$W/re")
   [ "$cm" = "$rm2" ] && [ "$c1" = 1 ] && [ "$r1" = 1 ] || { echo "  refusal differs on [$form]: c=[$cm] rc $c1, rust=[$rm2] rc $r1"; fail=1; }
@@ -247,17 +247,17 @@ cli() {
 }
 cli; cli --help; cli -h; cli --version; cli --bogus; cli --bogus encode
 cli decode; cli encode extra; cli --profile; cli --threads; cli --threads 4
-cli badcmd; cli region; cli region f; cli index; cli smooth f; cli aln-pack
+cli badcmd; cli region; cli region -i f; cli index; cli smooth -i f; cli aln-pack
 cli encode --names ordinal; cli decode --tail 1; cli index --fast
 cli encode --block; cli encode --level 99; cli encode --block 0
 cli -t; cli -t 0; cli -t 99999; cli --tmp-dir; cli decode --raw x --raw
-cli index --block 0; cli aln-pack a b; cli smooth f h; cli region f s 1 2 3 4
+cli index --block 0; cli aln-pack -a a -r b; cli smooth -i f --hier h; cli region -i f -s s -p 1 --start 2 --end 3
 cli encode --sort=0; cli encode --names foo; cli decode --names keep
-cli aln-pack --names foo a b c; cli encode --db; cli --version encode
-cli index f x; cli decode f x; cli smooth f h fs a b c d; cli aln-pack a b c d
-cli smooth f h fs a b; cli smooth f h fs a b c; cli region f s 1
-cli encode --tok-chunk 0; cli encode --id-codec zz; cli smooth --max-gap x f h fs
-cli decode --out D; cli region --halo 3 f s; cli encode --tail 2; cli region f s +1
+cli aln-pack --names foo -a a -r b -o c; cli encode --db; cli --version encode
+cli index -i f x; cli decode -i f x; cli smooth -i f --hier h -f fs --start 1; cli aln-pack -a a -r b -o c d
+cli smooth -i f --hier h -f fs --start 1 --end 2; cli region -i f -s s --halo 3; cli region -i f -s s -p 1
+cli encode --tok-chunk 0; cli encode --id-codec zz; cli smooth --max-gap x -i f --hier h -f fs
+cli decode --out-dir D; cli region -i f -s s --start 1; cli encode --tail 2; cli region -i f -s s -p +1
 cli encode --tail 01; cli encode --id-codec +5; cli encode --id-codec 0X100; cli encode --block +5
 cli encode --id-codec 0x10; cli encode --id-codec 999999; cli encode --len-codec 0x10004
 cli encode --id-codec 0x10 --len-codec 999999; cli encode --aln p; cli encode --ref r
@@ -266,6 +266,7 @@ cli decode --aln p; cli decode --ref r; cli decode --aln p --ref r
 cli encode --names drop --aln p --ref r; cli decode --db f; cli encode --db f
 cli encode --names drop --names drop:x; cli encode --names drop:
 cli encode --sort --names drop --aln p --ref r --aln-names q
+cli decode -i a -i b; cli encode -i nosuch; cli index -i f -o x; cli region -i f -s s --start 2 --end 1
 [ $cbad = 0 ] && echo "cli: $cok forms give the same words and code" \
   || { echo "cli: $cbad of $((cok+cbad)) DIFFER"; fail=1; }
 

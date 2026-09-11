@@ -103,11 +103,19 @@ fn main() {
         }
     }
 
+    // every argument is a flag: what clap left positional is refused
+    let rest = match cmd { Cmd::Encode { rest } | Cmd::Decode { rest } | Cmd::Region { rest }
+                         | Cmd::Smooth { rest } | Cmd::Index { rest } | Cmd::AlnPack { rest } => &rest[..],
+                           Cmd::Codecs { .. } => &[] };
+    if let Some(a) = rest.first() { die(&format!("unexpected argument {a}")); }
+    let name = c.name();
+    let pack = name == "aln-pack";
+    if c.input.len() > 1 && !(name == "encode" && c.db.is_some()) { die("give one -i"); }
+    if let (Some(o), false) = (&c.output, pack) { ffi::redirect(o, 1); }
+    let track = || c.input.first().map(|s| s.as_str())
+        .unwrap_or_else(|| die(&format!("{name} needs -i TRACK")));
     match cmd {
-        Cmd::Encode { files } => {
-            if c.db.is_none() && !files.is_empty() {
-                die("without --db, encode reads one BED on stdin");
-            }
+        Cmd::Encode { .. } => {
             if opt.drop_names && opt.names_out.is_some() {
                 die("--names drop and --names drop:FILE are exclusive");
             }
@@ -120,30 +128,28 @@ fn main() {
                 die("--aln with --sort and --names drop cannot be decoded: sorting \
                      reorders the records, so the ordinal name map is invalid");
             }
-            if c.db.is_some() && files.is_empty() { die("--db: give one BED per feature set"); }
+            if c.db.is_some() && c.input.is_empty() { die("--db: give one -i BED per feature set"); }
             let a = load_aln(&c.aln, &c.refbed, &c.aln_names, "", aln::Lazy::No);
             match &c.db {
                 Some(fp) => {
-                    if c.hier.is_some() && c.db.is_none() { die("--hier does nothing without --db"); }
                     let feats = load_feats(fp, c.hier.as_deref());
                     let mut w = writer::Writer::new(opt, std::path::Path::new(&tmpdir))
                         .unwrap_or_else(|e| die(&e.to_string()));
                     let aln_on = a.is_some();
                     if let Some(x) = a { w.set_aln(x); }
-                    let files: Vec<String> = if files.is_empty() { vec!["-".into()] } else { files.clone() };
-                    let used = db::encode(&files, &feats, &mut w);
+                    let used = db::encode(&c.input, &feats, &mut w);
                     w.set_feathash(if used { feats.hierhash } else { feats.hash }, used);
                     finish(w, aln_on);
                 }
                 None => {
-                    if !files.is_empty() { die("without --db, encode reads one BED on stdin"); }
+                    if c.hier.is_some() { die("--hier does nothing without --db"); }
+                    if let Some(i) = c.input.first() { ffi::redirect(i, 0); }
                     encode(opt, std::path::Path::new(&tmpdir), a)
                 }
             }
         }
-        Cmd::Decode { track, rest } => {
-            if !rest.is_empty() { die("decode takes one track"); }
-            let track = need(track);
+        Cmd::Decode { .. } => {
+            let track = track();
             let feats = informed(&c, &mut ro, "decode ", None, aln::Lazy::Contig);
             let mut r = reader::Reader::open_with(track, &ro);
             if let Some(f) = &feats { f.check_hash(&r); }
@@ -157,22 +163,26 @@ fn main() {
                 }
             }
         }
-        Cmd::Region { track, seq, a, b, hl, rest: _ } => {
-            let (track, seq) = (need(track), need(seq));
-            let p = |v: &Option<String>, w: &'static str| -> u64 {
-                karyozip::bedcoord(v.as_ref().unwrap().as_bytes(), w)
-            };
-            let (lo, hi, hlo) = match (a, b) {
-                (None, _) => (0, 0, 0),
-                (Some(_), None) => { let x = p(a, "region: start is not a number");
-                                     if x == u64::MAX { die("region: start is not a number"); } (x, x + 1, 0) }
-                (Some(_), Some(_)) => {
-                    let x = p(a, "region: start is not a number");
-                    let y = p(b, "region: end is not a number");
-                    if x >= y { die("region: give START END with END past START"); }
-                    (x, y, hl.as_ref().map_or(0, |_| p(hl, "region: halo is not a number")))
-                }
-            };
+        Cmd::Region { .. } => {
+            let track = track();
+            let seq = c.seq.as_deref().unwrap_or_else(|| die("region needs -s SEQ"));
+            if c.pos.is_some() && (c.start.is_some() || c.end.is_some()) { die("region: give -p POS, or --start and --end"); }
+            if c.start.is_some() != c.end.is_some() { die("region: give --start and --end together"); }
+            if c.halo.is_some() && c.start.is_none() { die("region: --halo needs --start and --end"); }
+            let p = |v: &Option<String>, w: &'static str| karyozip::bedcoord(v.as_ref().unwrap().as_bytes(), w);
+            let (mut lo, mut hi) = (0, 0);
+            if c.pos.is_some() {
+                lo = p(&c.pos, "region: -p is not a number");
+                if lo == u64::MAX { die("region: -p is not a number"); }
+                hi = lo + 1;
+            }
+            if c.start.is_some() {
+                lo = p(&c.start, "region: --start is not a number");
+                if lo == u64::MAX { die("region: --start is not a number"); }
+                hi = p(&c.end, "region: --end is not a number");
+                if lo >= hi { die("region: --end must be past --start"); }
+            }
+            let hlo = c.halo.as_ref().map_or(0, |_| p(&c.halo, "region: --halo is not a number"));
             let feats = informed(&c, &mut ro, "region ", None, aln::Lazy::OneSeq);
             let mut r = reader::Reader::open_with(track, &ro);
             if let Some(f) = &feats { f.check_hash(&r); }
@@ -182,37 +192,37 @@ fn main() {
             r.region(seq.as_bytes(), lo, hi, hlo, feats.as_ref(), &cols, &mut o);
             o.flush().unwrap_or_else(|e| die(&e.to_string()));
         }
-        Cmd::Smooth { track, hpath, fs, seq, start, end, rest } => {
-            let (track, hier, fs) = (need(track), need(hpath), need(fs));
-            if !rest.is_empty() { die("smooth: give SEQ, or SEQ START END"); }
+        Cmd::Smooth { .. } => {
+            let track = track();
+            let (Some(hier), Some(fs)) = (c.hier.as_deref(), c.feature_set.as_deref())
+                else { die("smooth needs --hier HIER and -f FEATURE_SET") };
+            if c.start.is_some() != c.end.is_some() { die("smooth: give --start and --end together"); }
+            if c.start.is_some() && c.seq.is_none() { die("smooth: --start and --end need -s SEQ"); }
             let maxgap = num(&c.max_gap, 0, u64::MAX, "--max-gap needs a number").unwrap_or(1000);
-            let (lo, hi) = match (start, end) {
+            let (lo, hi) = match (&c.start, &c.end) {
                 (Some(a), Some(b)) => (
-                    karyozip::bedcoord(a.as_bytes(), "smooth: start is not a number"),
-                    karyozip::bedcoord(b.as_bytes(), "smooth: end is not a number")),
-                (None, None) => (0, 0),
-                _ => die("smooth: give SEQ, or SEQ START END"),
+                    karyozip::bedcoord(a.as_bytes(), "smooth: --start is not a number"),
+                    karyozip::bedcoord(b.as_bytes(), "smooth: --end is not a number")),
+                _ => (0, 0),
             };
-            if start.is_some() && lo >= hi { die("smooth: end must be past start"); }
+            if c.start.is_some() && lo >= hi { die("smooth: --end must be past --start"); }
             let feats = informed(&c, &mut ro, "smooth ", Some(hier), aln::Lazy::Contig);
             // not stdout().lock(): a lock guard cannot cross to the smooth
             // workers, and they are serialized by turn anyway
             let mut o = BufWriter::new(std::io::stdout());
-            smooth::run(track, hier, fs.as_bytes(), seq.as_ref().map(|s| s.as_bytes()),
+            smooth::run(track, hier, fs.as_bytes(), c.seq.as_ref().map(|s| s.as_bytes()),
                         lo, hi, c.v1, maxgap, &ro, feats.as_ref(), &mut o);
             o.flush().unwrap_or_else(|e| die(&e.to_string()));
         }
-        Cmd::Index { track, rest: _ } => {
-            let track = need(track);
+        Cmd::Index { .. } => {
+            let track = track();
             ro.index = true;
             reader::Reader::open_with(track, &ro).build_index(track)
         }
         Cmd::Codecs { file } => probe(need(file)),
-        Cmd::AlnPack { paf, rbed, dest, rest } => {
-            let (paf, rbed, dest) = match (paf, rbed, dest) {
-                (Some(p), Some(r), Some(o)) if rest.is_empty() => (p, r, o),
-                _ => die("usage: karyozip aln-pack P.paf REF.bed|REF.kst OUT"),
-            };
+        Cmd::AlnPack { .. } => {
+            let (Some(paf), Some(rbed), Some(dest)) = (&c.aln, &c.refbed, &c.output)
+                else { die("usage: karyozip aln-pack -a P.paf -r REF.bed|REF.kst -o OUT") };
             let mut a = aln::Aln::default();
             a.load_ref(rbed, aln::Lazy::No);
             let rh = aln::refhash(&a);
@@ -284,8 +294,8 @@ fn parse_codec(s: &str, flag: &str) -> i32 {
 fn informed(c: &cli::Cli, ro: &mut reader::ReadOpts, who: &str, hier: Option<&str>,
             lazy: aln::Lazy) -> Option<db::Feats> {
     if c.set.is_some() && c.db.is_none() { die("--set needs --db"); }
-    if c.hier.is_some() && c.db.is_none() { die("--hier does nothing without --db"); }
-    let feats = c.db.as_deref().map(|fp| load_feats(fp, c.hier.as_deref().or(hier)));
+    if c.hier.is_some() && c.db.is_none() && hier.is_none() { die("--hier does nothing without --db"); }
+    let feats = c.db.as_deref().map(|fp| load_feats(fp, c.hier.as_deref()));
     ro.aln = load_aln(&c.aln, &c.refbed, &c.aln_names, who, lazy).map(std::sync::Arc::new);
     feats
 }

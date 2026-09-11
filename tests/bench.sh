@@ -52,7 +52,7 @@ ratio() { awk -v a=$1 -v b=$2 'BEGIN{ if (b > 0) printf "%.2f", a/b; else print 
 queries() {  # queries BIN "FLAGS" KST NAMEFILE : NQ random point queries, ms stats; NA unless every one answered
   local b=$1 fl=$2 k=$3 nf=$4; : > "$W/q"; : > "$W/qbad"
   shuf -r -n $NQ --random-source=<(yes) "$nf" | while read -r nm; do   # with replacement: a cut cell may hold 10 sequences
-    s=$(date +%s%N); "$b" $fl region "$k" "$nm" 100 > "$W/qo" 2>/dev/null || echo x >> "$W/qbad"; e=$(date +%s%N)
+    s=$(date +%s%N); "$b" $fl region -i "$k" -s "$nm" -p 100 > "$W/qo" 2>/dev/null || echo x >> "$W/qbad"; e=$(date +%s%N)
     [ -s "$W/qo" ] || echo x >> "$W/qbad"
     echo $(( (e - s) / 1000 )) >> "$W/q"
   done
@@ -82,7 +82,7 @@ row() {  # row SET KIND INFORMED SEEK MODE IMPL BIN INPUT(s) ENCFLAGS DECFLAGS C
       tb=$((tb + $(stat -c%s "$W/k.$n.kst")))
     done
     set -- $ts $tm
-  elif [ "$set" = ALL ]; then set -- $(timed "$W/k.kst" /dev/null "$bin" -t $T --profile $ef encode $in)
+  elif [ "$set" = ALL ]; then set -- $(timed "$W/k.kst" /dev/null "$bin" -t $T --profile $ef encode $(printf -- "-i %s " $in))
   else set -- $(timed "$W/k.kst" "$in" "$bin" -t $T --profile $ef encode); fi
   local es=$1 em=$2 ch=$(choice)
   if [ "$es" = refused ]; then
@@ -97,15 +97,15 @@ row() {  # row SET KIND INFORMED SEEK MODE IMPL BIN INPUT(s) ENCFLAGS DECFLAGS C
   if [ "$set" = ALL ] && [ "$inf" = not-informed ]; then
     kst=$tb; ds=0; dm=0; rt=exact; n=0
     for f in $in; do n=$((n+1))
-      set -- $(timed "$W/back.bed" /dev/null "$bin" -t $T $df decode "$W/k.$n.kst")
+      set -- $(timed "$W/back.bed" /dev/null "$bin" -t $T $df decode -i "$W/k.$n.kst")
       ds=$(awk -v a=$ds -v b=$1 'BEGIN{printf "%.2f", a+b}'); [ $2 -gt $dm ] && dm=$2
       zcat "$f" | cmp -s - "$W/back.bed" || rt=DIFFERS
     done
     rm -f "$W"/k.*.kst
   elif [ "$set" = ALL ]; then mkdir -p "$W/o"; rm -f "$W/o"/*
-    set -- $(timed /dev/null /dev/null "$bin" -t $T $df --out "$W/o" decode "$W/k.kst"); ds=$1; dm=$2
+    set -- $(timed /dev/null /dev/null "$bin" -t $T $df --out-dir "$W/o" decode -i "$W/k.kst"); ds=$1; dm=$2
     rt=exact; for f in $in; do s2=$(basename "$f" | sed -E 's/.*\.([a-z_]+)\.(pre)?smoothed\.bed\.gz/\1/'); zcat "$f" | cmp -s - "$W/o/$s2.bed" || rt=DIFFERS; done
-  else set -- $(timed "$W/back.bed" /dev/null "$bin" -t $T $df decode "$W/k.kst"); ds=$1; dm=$2
+  else set -- $(timed "$W/back.bed" /dev/null "$bin" -t $T $df decode -i "$W/k.kst"); ds=$1; dm=$2
     cmp -s "$W/plain.bed" "$W/back.bed" && rt=exact || rt=DIFFERS
   fi
   # sorting permutes whole records, so both sides are sorted before the
@@ -122,8 +122,8 @@ row() {  # row SET KIND INFORMED SEEK MODE IMPL BIN INPUT(s) ENCFLAGS DECFLAGS C
       echo "bench: C and Rust bytes differ on $set $kind $inf $seek $mode" >&2; BAD=$((BAD+1))
     elif [ -s "$kc" ] && [ "$set" != ALL ]; then     # and both readers answer alike on it
       local sq=$(head -1 "$W/plain.bed" | cut -f1) rd
-      for rd in "decode --raw" "region $sq 100" "region $sq 100 5000 50"; do
-        "$C" $df $rd "$kc" > "$W/rc" 2>&1; "$R" $df $rd "$kc" > "$W/rr" 2>&1
+      for rd in "decode --raw" "region -s $sq -p 100" "region -s $sq --start 100 --end 5000 --halo 50"; do
+        "$C" $df $rd -i "$kc" > "$W/rc" 2>&1; "$R" $df $rd -i "$kc" > "$W/rr" 2>&1
         cmp -s "$W/rc" "$W/rr" || { echo "bench: C and Rust readers differ on $rd, $set $kind $inf $seek $mode" >&2; BAD=$((BAD+1)); }
       done
     fi
@@ -131,7 +131,7 @@ row() {  # row SET KIND INFORMED SEEK MODE IMPL BIN INPUT(s) ENCFLAGS DECFLAGS C
   # an unsmoothed track is also smoothed, timed: what the tool replaces
   local sm="NA NA"
   if [ "$kind" = presmoothed ] && [ "$set" != ALL ] && [ -s "$HIER" ]; then
-    set -- $(timed "$W/sm.bed" /dev/null "$bin" -t $T $df smooth "$W/k.kst" "$HIER" "$set"); sm="$1 $2"
+    set -- $(timed "$W/sm.bed" /dev/null "$bin" -t $T $df smooth -i "$W/k.kst" --hier "$HIER" -f "$set"); sm="$1 $2"
     # and must give KaryoScope's own smoothed track
     local smo=$(ls "$D"/*."$set".smoothed.bed.gz 2>/dev/null | grep -v '/ref\.' | head -1)
     if [ "$inf" = not-informed ] && [ -s "$smo" ] && ! zcat "$smo" | cmp -s - "$W/sm.bed"; then
@@ -143,7 +143,7 @@ row() {  # row SET KIND INFORMED SEEK MODE IMPL BIN INPUT(s) ENCFLAGS DECFLAGS C
     # a track whose names are in a sidecar indexes from that sidecar, and
     # only that flag: index takes no --aln or --db
     local ixf=""; case "$df" in "--names "*) ixf="$df";; esac
-    if "$bin" $ixf index "$W/ki.kst" >/dev/null 2>&1; then ix=$(( $(stat -c%s "$W/ki.kst") - kst ))
+    if "$bin" $ixf index -i "$W/ki.kst" >/dev/null 2>&1; then ix=$(( $(stat -c%s "$W/ki.kst") - kst ))
       q=$(NQ=$(case "$inf" in not-informed|db-informed|names-dropped|sorted*|block-*|level-*|tail-*) echo $NQ;; *) echo $NQ_ALN;; esac) queries "$bin" "$df" "$W/ki.kst" "$W/names")
     else echo "index refused on $set $kind $inf $mode $impl" >&2; ix=NA; fi
   fi

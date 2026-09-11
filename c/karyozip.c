@@ -5157,6 +5157,13 @@ static void decode_db(const char *path, const char *dir) {
 }
 
 #ifndef KARYOZIP_LIB
+/* -i and -o: the file takes the place of stdin or stdout */
+static void redirect(const char *path, int fd) {
+    int f = fd ? open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644) : open(path, O_RDONLY);
+    if (f < 0 || dup2(f, fd) < 0) { fprintf(stderr, "karyozip: cannot open %s\n", path); exit(1); }
+    close(f);
+}
+
 int main(int argc, char **argv) {
     /* glibc raises its mmap threshold to the first large mapped chunk it
        frees, after which every big buffer comes from a per-thread heap and
@@ -5167,33 +5174,29 @@ int main(int argc, char **argv) {
     atexit(profdump);
     atexit(emitflush);
     static const char *const USAGE = "usage:\n"
-            "  karyozip encode [--queryable: random access] [--fast: quicker, larger] [--slow: every codec on the whole file]\n"
-            "                  [--block N|all] [--level N]\n"
-            "                  [--names keep|drop|drop:FILE]\n"
-            "                  [--sort | --sort=MEM]\n"
-            "                  [--db features.tsv [--hier H]] [--aln P.paf --ref R.bed|R.kst [--aln-names F]]\n"
-            "  karyozip decode F | --db features.tsv [--hier H] [--out DIR] [--set A,B] F | --aln P.paf --ref R F\n"
-            "                  --names F reads the names, from drop:FILE or a FASTA, FASTQ or list\n"
-            "                  --names ordinal accepts a track whose names were dropped\n"
-            "                  --raw shows what is stored, reversing no transform\n"
-            "  karyozip aln-pack P.paf REF.bed|REF.kst OUT   only what --aln reads\n"
-            "  karyozip region F SEQ                 the whole sequence\n"
-            "  karyozip region F SEQ POS             the run covering POS\n"
-            "  karyozip region F SEQ START END [HALO]\n"
-            "  karyozip smooth F HIER FS [SEQ [START END]]\n"
-            "  karyozip index  F                     appends an index to the track itself\n"
-            "  any command: --threads N, -t N  --profile  --tmp-dir DIR  --help, -h\n"
+            "  karyozip encode [-i IN.bed[.gz]] [-o OUT.kst] [--fast | --slow] [--queryable]\n"
+            "                  [-b N|all] [-l N] [-n keep|drop|drop:FILE] [--sort[=MEM]]\n"
+            "                  [-d features.tsv [--hier H] -i SET.bed ...] [-a P.paf -r R.bed|R.kst [--aln-names F]]\n"
+            "  karyozip decode -i F [-o OUT.bed] [-n FILE|ordinal] [--raw]\n"
+            "                  [-d features.tsv [--hier H] [--set A,B] [--out-dir DIR]] [-a P.paf -r R]\n"
+            "  karyozip region -i F -s SEQ [-p POS | --start N --end N [--halo N]] [-o OUT]\n"
+            "  karyozip smooth -i F --hier H -f FEATURE_SET [-s SEQ [--start N --end N]] [-o OUT]\n"
+            "  karyozip index  -i F                  appends a name index to the track itself\n"
+            "  karyozip aln-pack -a P.paf -r REF.bed|REF.kst -o OUT   only what -a reads\n"
+            "  encode reads stdin without -i; every command but index writes stdout without -o\n"
+            "  any command: -t N, --threads N  --profile  --tmp-dir DIR  -h, --help\n"
             "               --version prints the zstd, libbz3 and htscodecs versions\n"
-            "  encode:      --queryable  --fast  --slow  --block N|all  --level N  --sort[=MEM]\n"
-            "               --names keep|drop|drop:FILE  --db F  --aln P --ref R\n"
-            "               --tail 0|1  --tok-chunk N  --id-codec N  --len-codec N\n"
-            "  decode:      --raw  --out DIR\n"
-            "  readers:     --names FILE|ordinal  --db F  --aln P --ref R, as encode was given;\n"
-            "               --db: --set A,B picks feature sets, default all; decode without --out and\n"
-            "               region print the picked labels as columns, merged where they all agree\n"
-            "  with --aln:  --aln-names FILE, on encode and decode, when the track\n"
-            "               names rows by ordinal\n"
+            "  encode:      --queryable asks for blocks and an index, for random access\n"
+            "               --tail 0|1  --tok-chunk N  --id-codec N  --len-codec N pin what the search picks\n"
+            "  readers:     -n, -d, --hier, -a, -r as encode was given; -n FILE takes the names from\n"
+            "               drop:FILE, a FASTA, FASTQ or list; -n ordinal accepts dropped names\n"
+            "               --set A,B picks feature sets of a -d track, default all; decode without\n"
+            "               --out-dir and region print them as columns, merged where they all agree\n"
+            "               --raw shows what is stored, reversing no transform\n"
+            "  with -a:     --aln-names FILE, on encode and decode, when the track names rows by ordinal\n"
             "  smooth:      --max-gap N  --v1\n"
+            "  long forms:  -i --input  -o --output  -s --seq  -p --pos  -f --feature-set  -b --block\n"
+            "               -l --level  -n --names  -d --db  -a --aln  -r --ref\n"
             "  Two variables are read, and neither changes the stored bytes:\n"
             "    TMPDIR         where temp files go, when --tmp-dir is not given\n"
             "    OMP_NUM_THREADS  the thread count, when --threads is not given";
@@ -5209,16 +5212,27 @@ int main(int argc, char **argv) {
         }
     }
     if (argc < 2) die(USAGE);
+    const char *INS[64]; int NIN = 0;
+    const char *OUTPUT = NULL, *SEQA = NULL, *POSA = NULL, *STA = NULL, *ENA = NULL, *HALOA = NULL,
+               *FSA = NULL, *HIERA = NULL;
     static const struct { const char *f; int nv; } FLAGS[] = {
         {"--version",0},{"--threads",1},{"-t",1},{"--profile",0},{"--tmp-dir",1},{"--names",1},
         {"--tok-chunk",1},{"--tail",1},{"--id-codec",1},{"--len-codec",1},
         {"--max-gap",1},{"--v1",0},{"--aln-names",1},{"--sort",0},
         {"--fast",0},{"--slow",0},{"--queryable",0},
         {"--block",1},{"--level",1},{"--db",1},{"--aln",1},
-        {"--ref",1},{"--out",1},{"--set",1},{"--raw",0},{"--hier",1},
+        {"--ref",1},{"--out-dir",1},{"--set",1},{"--raw",0},{"--hier",1},
+        {"--input",1},{"--output",1},{"--seq",1},{"--pos",1},{"--start",1},{"--end",1},
+        {"--halo",1},{"--feature-set",1},
+    };
+    static const char *const SHORT[][2] = {   /* each short form is its long one */
+        {"-i","--input"},{"-o","--output"},{"-s","--seq"},{"-p","--pos"},{"-f","--feature-set"},
+        {"-b","--block"},{"-l","--level"},{"-n","--names"},{"-d","--db"},{"-a","--aln"},{"-r","--ref"},
     };
     const char *cmd = "";   /* the first word that is not a flag or its value */
     for (int i = 1; i < argc; i++) {
+        for (size_t k = 0; k < sizeof SHORT / sizeof *SHORT; k++)
+            if (!strcmp(argv[i], SHORT[k][0])) { argv[i] = (char *)SHORT[k][1]; break; }
         const char *a = argv[i];
         if (a[0] != '-' || !a[1]) { cmd = a; break; }
         int nv = -1;
@@ -5228,6 +5242,9 @@ int main(int argc, char **argv) {
         if (nv < 0) { fprintf(stderr, "karyozip: unknown flag %s\n", a); exit(1); }
         i += nv;
     }
+    for (int i = 1; i < argc; i++)   /* short forms past the command too */
+        for (size_t k = 0; k < sizeof SHORT / sizeof *SHORT; k++)
+            if (!strcmp(argv[i], SHORT[k][0])) { argv[i] = (char *)SHORT[k][1]; break; }
     int enc = !strcmp(cmd, "encode");
     int sm = !strcmp(cmd, "smooth");
     int dec = !strcmp(cmd, "decode");
@@ -5235,6 +5252,7 @@ int main(int argc, char **argv) {
     ONESEQ = !strcmp(cmd, "region");       /* decode and smooth walk every sequence */
     int inf = enc || rd;                   /* --db and --aln: every reader but index */
     if (!strcmp(cmd, "index")) inf = 0;
+    int pack = !strcmp(cmd, "aln-pack");
     for (int i = 1; i < argc; i++) {
         int take = 0, ok = 1; const char *a = argv[i], *v = i + 1 < argc ? argv[i + 1] : NULL;
         for (size_t k = 0; k < sizeof FLAGS / sizeof *FLAGS; k++)   /* a value is required */
@@ -5282,18 +5300,31 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--level")) { ok = enc;
             LEVEL = (int)int_arg(v, 1, 22, "--level is a zstd level, 1 to 22"); LEVELSET = 1; take = 2; }
         else if (!strcmp(a, "--db")) { ok = inf; DBFEATS = v; take = 2; }
-        else if (!strcmp(a, "--hier")) { ok = inf; HIERTAB = v; take = 2; }
-        else if (!strcmp(a, "--aln")) { ok = inf; ALNPAF = v; take = 2; }
-        else if (!strcmp(a, "--ref")) { ok = inf; ALNREF = v; take = 2; }
-        else if (!strcmp(a, "--out")) { ok = dec; OUTDIR = v; take = 2; }
+        else if (!strcmp(a, "--hier")) { ok = inf; HIERA = v; take = 2; }
+        else if (!strcmp(a, "--aln")) { ok = inf || pack; ALNPAF = v; take = 2; }
+        else if (!strcmp(a, "--ref")) { ok = inf || pack; ALNREF = v; take = 2; }
+        else if (!strcmp(a, "--out-dir")) { ok = dec; OUTDIR = v; take = 2; }
+        else if (!strcmp(a, "--input")) { ok = !pack;
+            if (NIN == 64) die("too many input files");
+            INS[NIN++] = v; take = 2; }
+        else if (!strcmp(a, "--output")) { ok = strcmp(cmd, "index") != 0; OUTPUT = v; take = 2; }
+        else if (!strcmp(a, "--seq")) { ok = sm || ONESEQ; SEQA = v; take = 2; }
+        else if (!strcmp(a, "--pos")) { ok = ONESEQ; POSA = v; take = 2; }
+        else if (!strcmp(a, "--start")) { ok = sm || ONESEQ; STA = v; take = 2; }
+        else if (!strcmp(a, "--end")) { ok = sm || ONESEQ; ENA = v; take = 2; }
+        else if (!strcmp(a, "--halo")) { ok = ONESEQ; HALOA = v; take = 2; }
+        else if (!strcmp(a, "--feature-set")) { ok = sm; FSA = v; take = 2; }
         else if (!strcmp(a, "--set")) { ok = dec || !strcmp(cmd, "region"); SETNAME = v; take = 2; }
         else if (!strcmp(a, "--raw")) { ok = dec; RAW = 1; take = 1; }
         if (take && !ok) { fprintf(stderr, "karyozip: %s does not apply to %s\n", a, cmd); exit(1); }
         if (take) { for (int j = i; j + take <= argc; j++) argv[j] = argv[j + take]; argc -= take; i--; }
     }
     if (!*cmd) die(USAGE);   /* flags but no command: argv[1] is now past the end */
-    for (int i = 2; i < argc; i++)   /* what the loop left is positional; "-" alone is stdin */
-        if (argv[i][0] == '-' && argv[i][1]) { fprintf(stderr, "karyozip: unknown flag %s\n", argv[i]); exit(1); }
+    if (!enc && !rd && !pack) die("bad command or missing arguments");
+    for (int i = 2; i < argc; i++) {   /* every argument is a flag now */
+        if (argv[i][0] == '-' && argv[i][1]) fprintf(stderr, "karyozip: unknown flag %s\n", argv[i]);
+        else fprintf(stderr, "karyozip: unexpected argument %s\n", argv[i]);
+        exit(1); }
     if ((IDCODEC >= 0 && badcodec(IDCODEC)) || (LENCODEC >= 0 && badcodec(LENCODEC))) die("--id-codec and --len-codec take a codec id, not any number");
     if (nosz(IDCODEC) || nosz(LENCODEC)) die("a NOSZ codec (0x10) stores no size and is not accepted");
     if (noext(IDCODEC) || noext(LENCODEC)) die("arith X_EXT (0x04) needs libbz2 and is not accepted");
@@ -5305,24 +5336,16 @@ int main(int argc, char **argv) {
 
     WALL0 = nowsec();
 
-    if (!strcmp(argv[1], "aln-pack")) {
-
-        if (argc != 5 || argv[2][0] == '-' || argv[3][0] == '-' || argv[4][0] == '-')
-            die("usage: karyozip aln-pack P.paf REF.bed|REF.kst OUT");
-        loadref(argv[3]);
-        alnpack(argv[2], argv[4]);
+    if (sm) { HIERTAB = DBFEATS ? HIERA : NULL; } else HIERTAB = HIERA;   /* smooth's own, and --db's */
+    if (NIN > 1 && !(enc && DBFEATS)) die("give one -i");
+    if (OUTPUT && !pack) redirect(OUTPUT, 1);
+    if (pack) {
+        if (!ALNPAF || !ALNREF || !OUTPUT) die("usage: karyozip aln-pack -a P.paf -r REF.bed|REF.kst -o OUT");
+        loadref(ALNREF);
+        alnpack(ALNPAF, OUTPUT);
         return 0;
     }
-    if (!strcmp(argv[1], "encode")) {
-
-        char *freearg[64]; int nfree = 0;
-        for (int i = 2; i < argc; i++) {
-            if (nfree == 64) die("too many input files");
-            freearg[nfree++] = argv[i];
-        }
-        if (!DBFEATS) {                 /* --db takes its BEDs positionally */
-            if (nfree) die("without --db, encode reads one BED on stdin");
-        }
+    if (enc) {
         if (NAMEMODE == 1 && NAMES_OUT) die("--names drop and --names drop:FILE are exclusive");
         if (ALNPAF && !ALNREF) die("--aln needs --ref");
         if (ALNREF && !ALNPAF) die("--ref does nothing without --aln");
@@ -5341,41 +5364,40 @@ int main(int argc, char **argv) {
                       loadref(ALNREF); loadaln(ALNPAF); }
 
         if (DBFEATS) {
-            if (!nfree) die("--db: give one BED per feature set");
-            encode_db(nfree, freearg);
-        } else encode();
+            if (!NIN) die("--db: give one -i BED per feature set");
+            encode_db(NIN, (char **)INS);
+        } else { if (NIN) redirect(INS[0], 0); encode(); }
     }
-
-    else if (!strcmp(argv[1], "decode") && argc > 2) {
-        const char *f = NULL;
-        for (int i = 2; i < argc; i++) {
-            if (f) die("decode takes one track");
-            f = argv[i];
-        }
-        if (!f) die("decode needs a track");
+    else if (!NIN) { fprintf(stderr, "karyozip: %s needs -i TRACK\n", cmd); exit(1); }
+    else if (dec) {
         loadinformed("decode ");
-        if (DBFEATS) decode_db(f, OUTDIR); else dump(f);
+        if (DBFEATS) decode_db(INS[0], OUTDIR); else dump(INS[0]);
     }
-
-    /* one reader: SEQ alone is the whole sequence, SEQ POS the run covering
-       POS, SEQ START END the overlap, plus an optional halo. */
-    else if (!strcmp(argv[1], "region") && argc > 3) {
-        uint64_t rlo = argc > 4 ? num_arg(argv[4], UINT64_MAX - 1, "region: start is not a number") : 0;
-        uint64_t rhi = argc > 5 ? num_arg(argv[5], UINT64_MAX, "region: end is not a number") : 0;
-        if (argc == 5) rhi = rlo + 1;                  /* one position */
-        if (argc > 5 && rlo >= rhi) die("region: give START END with END past START");
+    /* one reader: -s alone is the whole sequence, -p the run covering a
+       position, --start --end the overlap, plus an optional halo. */
+    else if (ONESEQ) {
+        if (!SEQA) die("region needs -s SEQ");
+        if (POSA && (STA || ENA)) die("region: give -p POS, or --start and --end");
+        if (!STA != !ENA) die("region: give --start and --end together");
+        if (HALOA && !STA) die("region: --halo needs --start and --end");
+        uint64_t rlo = 0, rhi = 0;
+        if (POSA) { rlo = num_arg(POSA, UINT64_MAX - 1, "region: -p is not a number"); rhi = rlo + 1; }
+        if (STA) { rlo = num_arg(STA, UINT64_MAX - 1, "region: --start is not a number");
+                   rhi = num_arg(ENA, UINT64_MAX, "region: --end is not a number");
+                   if (rlo >= rhi) die("region: --end must be past --start"); }
         loadinformed("region ");
-        region(argv[2], argv[3], rlo, rhi, argc > 6 ? num_arg(argv[6], UINT64_MAX, "region: halo is not a number") : 0);
+        region(INS[0], SEQA, rlo, rhi, HALOA ? num_arg(HALOA, UINT64_MAX, "region: --halo is not a number") : 0);
     }
-    else if (!strcmp(argv[1], "index") && argc > 2) { INDEXING = 1; buildindex(argv[2]); }
-    else if (!strcmp(argv[1], "smooth") && argc > 4) {
-        if (argc == 7 || argc > 8) die("smooth: give SEQ, or SEQ START END");
-        uint64_t slo = argc > 6 ? num_arg(argv[6], UINT64_MAX, "smooth: start is not a number") : 0;
-        uint64_t shi = argc > 7 ? num_arg(argv[7], UINT64_MAX, "smooth: end is not a number") : 0;
-        if (argc > 7 && slo >= shi) die("smooth: end must be past start");
-        if (DBFEATS && !HIERTAB) HIERTAB = argv[3];   /* the hierarchy it smooths with */
+    else if (!strcmp(cmd, "index")) { INDEXING = 1; buildindex(INS[0]); }
+    else if (sm) {
+        if (!HIERA || !FSA) die("smooth needs --hier HIER and -f FEATURE_SET");
+        if (!STA != !ENA) die("smooth: give --start and --end together");
+        if (STA && !SEQA) die("smooth: --start and --end need -s SEQ");
+        uint64_t slo = STA ? num_arg(STA, UINT64_MAX, "smooth: --start is not a number") : 0;
+        uint64_t shi = ENA ? num_arg(ENA, UINT64_MAX, "smooth: --end is not a number") : 0;
+        if (STA && slo >= shi) die("smooth: --end must be past --start");
         loadinformed("smooth ");
-        smoothcmd(argv[2], argv[3], argv[4], argc > 5 ? argv[5] : NULL, slo, shi, V1);
+        smoothcmd(INS[0], HIERA, FSA, SEQA, slo, shi, V1);
     }
     else die("bad command or missing arguments");
     return 0;

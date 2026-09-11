@@ -15,35 +15,35 @@ W=$(mktemp -d); trap 'rm -rf "$W"' EXIT
 fail=0
 
 $KT encode --aln "$D/p.paf" --ref "$D/ref.bed" < "$D/s.bed" > "$W/d.kt" 2>/dev/null
-$KT decode --raw "$W/d.kt" 2>/dev/null | cut -f2,3,4 > "$W/got"
+$KT decode --raw -i "$W/d.kt" 2>/dev/null | cut -f2,3,4 > "$W/got"
 cut -f2,3,4 "$D/aln.expected" > "$W/want"
 cmp -s "$W/got" "$W/want" && echo "aln delta: correct" || { echo "aln delta: WRONG"; diff "$W/got" "$W/want" | head; fail=1; }
 
-$KT decode --aln "$D/p.paf" --ref "$D/ref.bed" "$W/d.kt" 2>/dev/null > "$W/rt"
+$KT decode --aln "$D/p.paf" --ref "$D/ref.bed" -i "$W/d.kt" 2>/dev/null > "$W/rt"
 cmp -s "$W/rt" "$D/s.bed" && echo "aln restore: byte-identical" || { echo "aln restore: WRONG"; fail=1; }
 # the reference as a track: the same bytes written, the same rows read
 $KT encode < "$D/ref.bed" > "$W/ref.kst" 2>/dev/null
 $KT encode --aln "$D/p.paf" --ref "$W/ref.kst" < "$D/s.bed" 2>/dev/null | cmp -s - "$W/d.kt" && echo "aln with a .kst reference: same bytes" || { echo "aln with a .kst reference: WRONG"; fail=1; }
-$KT decode --aln "$D/p.paf" --ref "$W/ref.kst" "$W/d.kt" 2>/dev/null | cmp -s - "$D/s.bed" && echo "aln restore from a .kst reference: byte-identical" || { echo "aln restore from a .kst reference: WRONG"; fail=1; }
+$KT decode --aln "$D/p.paf" --ref "$W/ref.kst" -i "$W/d.kt" 2>/dev/null | cmp -s - "$D/s.bed" && echo "aln restore from a .kst reference: byte-identical" || { echo "aln restore from a .kst reference: WRONG"; fail=1; }
 # Two readers interleave under --ref R.kst, and the payload bound and the
 # length mode are thread-globals: a reference contig taken from a block the
 # reference reader already held left the track's bound in place and decode
 # died with "a run reads past the payload". Many contigs, many blocks.
 $KT encode --block 4 < "$D/db.rall.bed" > "$W/rall.kst" 2>/dev/null
 $KT encode --block 4 --aln "$D/db.self.paf" --ref "$D/db.rall.bed" < "$D/db.rall.bed" > "$W/rall.aln.kst" 2>/dev/null
-$KT decode --aln "$D/db.self.paf" --ref "$D/db.rall.bed" "$W/rall.aln.kst" > "$W/rall.want" 2>/dev/null
-$KT decode --aln "$D/db.self.paf" --ref "$W/rall.kst" "$W/rall.aln.kst" 2>/dev/null | cmp -s - "$W/rall.want" \
+$KT decode --aln "$D/db.self.paf" --ref "$D/db.rall.bed" -i "$W/rall.aln.kst" > "$W/rall.want" 2>/dev/null
+$KT decode --aln "$D/db.self.paf" --ref "$W/rall.kst" -i "$W/rall.aln.kst" 2>/dev/null | cmp -s - "$W/rall.want" \
   && echo "a .kst reference read across contigs: same rows" || { echo "a .kst reference read across contigs: WRONG"; fail=1; }
-$KT decode --aln "$D/p.paf" --ref "$W/d.kt" "$W/d.kt" >/dev/null 2>&1 && { echo "an --aln track as reference: ACCEPTED"; fail=1; } || echo "an --aln track as reference: refused, as it should"
+$KT decode --aln "$D/p.paf" --ref "$W/d.kt" -i "$W/d.kt" >/dev/null 2>&1 && { echo "an --aln track as reference: ACCEPTED"; fail=1; } || echo "an --aln track as reference: refused, as it should"
 # Eight readers on one track at once, plain and with a .kst reference whose
 # contigs are filled lazily: nothing a reader mutates may be shared.
-$KT decode "$W/rall.kst" > "$W/conc.want" 2>/dev/null
+$KT decode -i "$W/rall.kst" > "$W/conc.want" 2>/dev/null
 seq=$(head -1 "$D/db.rall.bed" | cut -f1)
-$KT region "$W/rall.kst" "$seq" > "$W/conc.rwant" 2>/dev/null
+$KT region -i "$W/rall.kst" -s "$seq" > "$W/conc.rwant" 2>/dev/null
 for i in 1 2 3 4 5 6 7 8; do
-  ( $KT decode "$W/rall.kst" > "$W/c.d.$i" 2>/dev/null
-    $KT region "$W/rall.kst" "$seq" > "$W/c.r.$i" 2>/dev/null
-    $KT decode --aln "$D/db.self.paf" --ref "$W/rall.kst" "$W/rall.aln.kst" > "$W/c.a.$i" 2>/dev/null ) &
+  ( $KT decode -i "$W/rall.kst" > "$W/c.d.$i" 2>/dev/null
+    $KT region -i "$W/rall.kst" -s "$seq" > "$W/c.r.$i" 2>/dev/null
+    $KT decode --aln "$D/db.self.paf" --ref "$W/rall.kst" -i "$W/rall.aln.kst" > "$W/c.a.$i" 2>/dev/null ) &
 done
 wait
 bad=0
@@ -64,19 +64,19 @@ open(W + "/rv1.bed", "w").write("s1\t0\t10\tx\ns1\t10\t20\t%s\n" % L); open(W + 
 open(W + "/rv.many", "w").write("".join("s\t%d\t%d\tlab%d\n" % (i, i + 1, i) for i in range(70000)))
 open(W + "/rv.big", "w").write("1125899906842625\t0\t10\tx\n"); open(W + "/rv.names", "w").write("q1\n\nq2\n")
 PY
-$KT --db "$W/rv.tsv" encode "$W/rv1.bed" "$W/rv2.bed" > "$W/rv.kt" 2>/dev/null
-[ "$($KT --db "$W/rv.tsv" region "$W/rv.kt" s1 12 13 2>/dev/null | wc -c)" = 2100012 ] && echo "region --db, a 2100000-byte label: printed" || { echo "region --db, a 2100000-byte label: WRONG"; fail=1; }
+$KT --db "$W/rv.tsv" encode -i "$W/rv1.bed" -i "$W/rv2.bed" > "$W/rv.kt" 2>/dev/null
+[ "$($KT --db "$W/rv.tsv" region -i "$W/rv.kt" -s s1 --start 12 --end 13 2>/dev/null | wc -c)" = 2100012 ] && echo "region --db, a 2100000-byte label: printed" || { echo "region --db, a 2100000-byte label: WRONG"; fail=1; }
 $KT encode < "$W/rv.many" > /dev/null 2>&1 && echo "70000 labels: encoded" || { echo "70000 labels: WRONG"; fail=1; }
-$KT encode < "$W/rv.big" > "$W/rv.big.kt" 2>/dev/null; $KT decode "$W/rv.big.kt" 2>/dev/null | cmp -s - "$W/rv.big" && echo "a name past 2^50: round trip" || { echo "a name past 2^50: WRONG"; fail=1; }
+$KT encode < "$W/rv.big" > "$W/rv.big.kt" 2>/dev/null; $KT decode -i "$W/rv.big.kt" 2>/dev/null | cmp -s - "$W/rv.big" && echo "a name past 2^50: round trip" || { echo "a name past 2^50: WRONG"; fail=1; }
 $KT encode --aln "$D/p.paf" --ref "$D/ref.bed" --aln-names "$W/rv.names" < "$D/s.bed" >/dev/null 2>&1 && { echo "a blank --aln-names line: ACCEPTED"; fail=1; } || echo "a blank --aln-names line: refused, as it should"
 gzip -c "$D/ref.bed" | head -c 40 > "$W/rv.gz"
 $KT encode --aln "$D/p.paf" --ref "$W/rv.gz" < "$D/s.bed" >/dev/null 2>&1 && { echo "a cut .gz reference: ACCEPTED"; fail=1; } || echo "a cut .gz reference: refused, as it should"
-$KT aln-pack "$D/p.paf" "$D/ref.bed" "$W/rv.pk" >/dev/null 2>&1; printf '\0' >> "$W/rv.pk"
-$KT decode --aln "$W/rv.pk" --ref "$D/ref.bed" "$W/d.kt" >/dev/null 2>&1 && { echo "a packed alignment with a byte over: ACCEPTED"; fail=1; } || echo "a packed alignment with a byte over: refused, as it should"
+$KT aln-pack -a "$D/p.paf" -r "$D/ref.bed" -o "$W/rv.pk" >/dev/null 2>&1; printf '\0' >> "$W/rv.pk"
+$KT decode --aln "$W/rv.pk" --ref "$D/ref.bed" -i "$W/d.kt" >/dev/null 2>&1 && { echo "a packed alignment with a byte over: ACCEPTED"; fail=1; } || echo "a packed alignment with a byte over: refused, as it should"
 
 $KT encode < "$D/s.bed" > "$W/p.kt" 2>/dev/null
 $KT encode < "$D/db.rall.bed" > "$W/omp.ref" 2>/dev/null
-$KT decode "$W/p.kt" 2>/dev/null | cmp -s - "$D/s.bed" && echo "plain: byte-identical" || { echo "plain: WRONG"; fail=1; }
+$KT decode -i "$W/p.kt" 2>/dev/null | cmp -s - "$D/s.bed" && echo "plain: byte-identical" || { echo "plain: WRONG"; fail=1; }
 
 for f in --sort "--sort --names drop" "--queryable" "--block 4"; do
   ofl=""
@@ -86,21 +86,21 @@ for f in --sort "--sort --names drop" "--queryable" "--block 4"; do
     # not names, so asking for them is explicit
     *"--names drop"*|*--sort*)
       case "$f" in *"--names drop"*) ofl="--names ordinal" ;; esac
-      $KT decode ${ofl:-} "$W/f.kt" 2>/dev/null | sort -k2 > "$W/a"
+      $KT decode ${ofl:-} -i "$W/f.kt" 2>/dev/null | sort -k2 > "$W/a"
                            sort -k2 "$D/s.bed" | cut -f2,3,4 > "$W/b"
                            cut -f2,3,4 "$W/a" > "$W/a2"
                            cmp -s "$W/a2" "$W/b" && echo "$f: same rows" || { echo "$f: WRONG"; fail=1; } ;;
-    *) $KT decode "$W/f.kt" 2>/dev/null | cmp -s - "$D/s.bed" && echo "$f: byte-identical" || { echo "$f: WRONG"; fail=1; } ;;
+    *) $KT decode -i "$W/f.kt" 2>/dev/null | cmp -s - "$D/s.bed" && echo "$f: byte-identical" || { echo "$f: WRONG"; fail=1; } ;;
   esac
 done
 # --db: 6 BEDs in, one featureID track, 6 BEDs out, each byte compared. Two
 # featureIDs can carry the same label in one set, so the merge on decode must
 # compare the label TEXT; comparing pointers silently stopped merging.
 sets="acrocentric chromosome gene region repeat subtelomeric"
-in=""; for f in $sets; do in="$in $D/db.$f.bed"; done
+in=""; for f in $sets; do in="$in -i $D/db.$f.bed"; done
 $KT encode --db "$D/db.features.tsv" $in > "$W/f.kt" 2>/dev/null
 mkdir -p "$W/o"
-$KT decode --db "$D/db.features.tsv" --out "$W/o" "$W/f.kt" 2>/dev/null
+$KT decode --db "$D/db.features.tsv" --out-dir "$W/o" -i "$W/f.kt" 2>/dev/null
 n=0; for f in $sets; do cmp -s "$W/o/$f.bed" "$D/db.$f.bed" && n=$((n+1)); done
 [ "$n" = 6 ] && echo "db: 6/6 identical" || { echo "db: only $n/6 identical"; fail=1; }
 
@@ -118,10 +118,10 @@ cmp -s "$W/mem.kt" "$W/ext.kt" && echo "external sort: identical to in-memory" \
 # length behind a pointer compare against a fixed buffer, so it froze on the
 # first sequence and every later name was truncated or overran. The original
 # db fixture used one name length and never caught it.
-in2=""; for f in $sets; do in2="$in2 $D/db2.$f.bed"; done
+in2=""; for f in $sets; do in2="$in2 -i $D/db2.$f.bed"; done
 $KT encode --db "$D/db2.features.tsv" $in2 > "$W/f2.kt" 2>/dev/null
 mkdir -p "$W/o2"
-$KT decode --db "$D/db2.features.tsv" --out "$W/o2" "$W/f2.kt" 2>/dev/null
+$KT decode --db "$D/db2.features.tsv" --out-dir "$W/o2" -i "$W/f2.kt" 2>/dev/null
 n=0; for f in $sets; do cmp -s "$W/o2/$f.bed" "$D/db2.$f.bed" && n=$((n+1)); done
 [ "$n" = 6 ] && echo "db mixed name lengths: 6/6 identical" \
  || { echo "db mixed name lengths: only $n/6"; fail=1; }
@@ -134,21 +134,21 @@ must_fail() {  # description, then the command
   if "$@" >/dev/null 2>&1; then echo "$what: ACCEPTED, should have failed"; fail=1
   else echo "$what: refused, as it should"; fi
 }
-must_fail "decode --aln track without --aln" $KT decode "$W/d.kt"
-must_fail "decode plain track with --aln" $KT decode --aln "$D/p.paf" --ref "$D/ref.bed" "$W/p.kt"
-must_fail "decode --db track without --db" $KT decode "$W/f.kt"
+must_fail "decode --aln track without --aln" $KT decode -i "$W/d.kt"
+must_fail "decode plain track with --aln" $KT decode --aln "$D/p.paf" --ref "$D/ref.bed" -i "$W/p.kt"
+must_fail "decode --db track without --db" $KT decode -i "$W/f.kt"
 must_fail "encode --ref without --aln" $KT encode --ref "$D/ref.bed"
 must_fail "--aln-names without --aln" $KT encode --aln-names "$D/ord.names.txt" < "$D/s.bed"
 must_fail "a name file given to encode as --names" $KT encode --names "$D/ord.names.txt" < "$D/s.bed"
 must_fail "--sort= with no size" $KT encode --sort=
-must_fail "the retired --sort-tmp-dir" $KT encode --sort-tmp-dir "$W"
+must_fail "the retired --sort-tmp-dir" $KT encode --sort-tmp-dir -i "$W"
 
 # the sidecar --names drop:writes must be the one --names reads
 $KT encode --names drop:"$W/side.bin" < "$D/s.bed" > "$W/sc.kt" 2>/dev/null
-$KT decode --names "$W/side.bin" "$W/sc.kt" 2>/dev/null | cmp -s - "$D/s.bed" \
+$KT decode --names "$W/side.bin" -i "$W/sc.kt" 2>/dev/null | cmp -s - "$D/s.bed" \
   && echo "sidecar: round-trips byte-identical" \
  || { echo "sidecar: WRONG"; fail=1; }
-must_fail "decode a sidecar track without --names" $KT decode "$W/sc.kt"
+must_fail "decode a sidecar track without --names" $KT decode -i "$W/sc.kt"
 # the delta is computed from the names, so a nameless aln track cannot be read
 must_fail "encode --aln with --names drop and no name list" \
   $KT encode --aln "$D/p.paf" --ref "$D/ref.bed" --names drop
@@ -162,8 +162,7 @@ must_fail "encode --aln --sort --names drop even with a name list" \
 $KT encode --db "$D/db.features.tsv" --aln "$D/db.self.paf" --ref "$D/db.rall.bed" $in \
   > "$W/da.kt" 2>/dev/null
 mkdir -p "$W/dao"
-$KT decode --db "$D/db.features.tsv" --aln "$D/db.self.paf" --ref "$D/db.rall.bed" \
-  --out "$W/dao" "$W/da.kt" 2>/dev/null
+$KT decode --db "$D/db.features.tsv" --aln "$D/db.self.paf" --ref "$D/db.rall.bed" --out-dir "$W/dao" -i "$W/da.kt" 2>/dev/null
 n=0; for f in $sets; do cmp -s "$W/dao/$f.bed" "$D/db.$f.bed" && n=$((n+1)); done
 [ "$n" = 6 ] && echo "db+aln: 6/6 identical" || { echo "db+aln: only $n/6"; fail=1; }
 # smooth and region read every informed form, given what encode was given,
@@ -171,80 +170,78 @@ n=0; for f in $sets; do cmp -s "$W/dao/$f.bed" "$D/db.$f.bed" && n=$((n+1)); don
 # whole label tuple, one column per set.
 { printf 'feature_set\tchild\tparent\n'; for l in $(cut -f4 "$D/db.acrocentric.bed" "$D/s.bed" | sort -u); do printf 'acrocentric\t%s\tcategorized\n' "$l"; done; } > "$W/inf.tsv"
 $KT encode < "$D/db.acrocentric.bed" > "$W/pa.kt" 2>/dev/null
-$KT smooth "$W/pa.kt" "$W/inf.tsv" acrocentric > "$W/inf.want" 2>/dev/null
-$KT smooth "$W/p.kt" "$W/inf.tsv" acrocentric > "$W/inf.wants" 2>/dev/null
-$KT --db "$D/db.features.tsv" smooth "$W/f.kt" "$W/inf.tsv" acrocentric 2>/dev/null | cmp -s - "$W/inf.want" && echo "smooth --db: same as plain" || { echo "smooth --db: DIFFERS"; fail=1; }
-$KT --db "$D/db.features.tsv" --aln "$D/db.self.paf" --ref "$D/db.rall.bed" -t 4 smooth "$W/da.kt" "$W/inf.tsv" acrocentric 2>/dev/null | cmp -s - "$W/inf.want" && echo "smooth --db --aln, 4 threads: same as plain" || { echo "smooth --db --aln: DIFFERS"; fail=1; }
-$KT --aln "$D/p.paf" --ref "$D/ref.bed" smooth "$W/d.kt" "$W/inf.tsv" acrocentric 2>/dev/null | cmp -s - "$W/inf.wants" && echo "smooth --aln: same as plain" || { echo "smooth --aln: DIFFERS"; fail=1; }
+$KT smooth -i "$W/pa.kt" --hier "$W/inf.tsv" -f acrocentric > "$W/inf.want" 2>/dev/null
+$KT smooth -i "$W/p.kt" --hier "$W/inf.tsv" -f acrocentric > "$W/inf.wants" 2>/dev/null
+$KT --db "$D/db.features.tsv" smooth -i "$W/f.kt" --hier "$W/inf.tsv" -f acrocentric 2>/dev/null | cmp -s - "$W/inf.want" && echo "smooth --db: same as plain" || { echo "smooth --db: DIFFERS"; fail=1; }
+$KT --db "$D/db.features.tsv" --aln "$D/db.self.paf" --ref "$D/db.rall.bed" -t 4 smooth -i "$W/da.kt" --hier "$W/inf.tsv" -f acrocentric 2>/dev/null | cmp -s - "$W/inf.want" && echo "smooth --db --aln, 4 threads: same as plain" || { echo "smooth --db --aln: DIFFERS"; fail=1; }
+$KT --aln "$D/p.paf" --ref "$D/ref.bed" smooth -i "$W/d.kt" --hier "$W/inf.tsv" -f acrocentric 2>/dev/null | cmp -s - "$W/inf.wants" && echo "smooth --aln: same as plain" || { echo "smooth --aln: DIFFERS"; fail=1; }
 sq=$(head -1 "$D/db.acrocentric.bed" | cut -f1)
-$KT region "$W/pa.kt" "$sq" 0 100000 > "$W/inf.want" 2>/dev/null
-$KT --db "$D/db.features.tsv" region "$W/f.kt" "$sq" 0 100000 2>/dev/null > "$W/inf.got"
+$KT region -i "$W/pa.kt" -s "$sq" --start 0 --end 100000 > "$W/inf.want" 2>/dev/null
+$KT --db "$D/db.features.tsv" region -i "$W/f.kt" -s "$sq" --start 0 --end 100000 2>/dev/null > "$W/inf.got"
 [ "$(awk -F'\t' '{print NF}' "$W/inf.got" | sort -u)" = 9 ] && echo "region --db: 6 label columns" || { echo "region --db: wrong column count"; fail=1; }
 awk -F'\t' 'NR>1 && $1==p && $2==e && $4==l {e=$3; next} NR>1 {print p"\t"s"\t"e"\t"l} {p=$1; s=$2; e=$3; l=$4} END{print p"\t"s"\t"e"\t"l}' <(cut -f1-4 "$W/inf.got") | cmp -s - "$W/inf.want" && echo "region --db: acrocentric column, merged, same as plain" || { echo "region --db: DIFFERS"; fail=1; }
-$KT --db "$D/db.features.tsv" --aln "$D/db.self.paf" --ref "$D/db.rall.bed" region "$W/da.kt" "$sq" 0 100000 2>/dev/null | cmp -s - "$W/inf.got" && echo "region --db --aln: same as --db" || { echo "region --db --aln: DIFFERS"; fail=1; }
-$KT --aln "$D/p.paf" --ref "$D/ref.bed" region "$W/d.kt" q1 2>/dev/null | cmp -s <($KT region "$W/p.kt" q1 2>/dev/null) && echo "region --aln: same as plain" || { echo "region --aln: DIFFERS"; fail=1; }
+$KT --db "$D/db.features.tsv" --aln "$D/db.self.paf" --ref "$D/db.rall.bed" region -i "$W/da.kt" -s "$sq" --start 0 --end 100000 2>/dev/null | cmp -s - "$W/inf.got" && echo "region --db --aln: same as --db" || { echo "region --db --aln: DIFFERS"; fail=1; }
+$KT --aln "$D/p.paf" --ref "$D/ref.bed" region -i "$W/d.kt" -s q1 2>/dev/null | cmp -s <($KT region -i "$W/p.kt" -s q1 2>/dev/null) && echo "region --aln: same as plain" || { echo "region --aln: DIFFERS"; fail=1; }
 # --set: one set of a --db track, on stdout, equal to the set's own track
-n=0; for f in $sets; do $KT --db "$D/db.features.tsv" --set $f decode "$W/f.kt" 2>/dev/null | cmp -s - "$D/db.$f.bed" && n=$((n+1)); done
+n=0; for f in $sets; do $KT --db "$D/db.features.tsv" --set $f decode -i "$W/f.kt" 2>/dev/null | cmp -s - "$D/db.$f.bed" && n=$((n+1)); done
 [ "$n" = 6 ] && echo "decode --set: 6/6 equal to the set's track" || { echo "decode --set: only $n/6"; fail=1; }
-$KT --db "$D/db.features.tsv" --aln "$D/db.self.paf" --ref "$D/db.rall.bed" --set gene decode "$W/da.kt" 2>/dev/null | cmp -s - "$D/db.gene.bed" && echo "decode --set on db+aln: same" || { echo "decode --set on db+aln: DIFFERS"; fail=1; }
-n=0; for r in "$sq" "$sq 100" "$sq 0 100000" "$sq 50 400 2"; do $KT --db "$D/db.features.tsv" --set acrocentric region "$W/f.kt" $r 2>/dev/null | cmp -s - <($KT region "$W/pa.kt" $r 2>/dev/null) && n=$((n+1)); done
+$KT --db "$D/db.features.tsv" --aln "$D/db.self.paf" --ref "$D/db.rall.bed" --set gene decode -i "$W/da.kt" 2>/dev/null | cmp -s - "$D/db.gene.bed" && echo "decode --set on db+aln: same" || { echo "decode --set on db+aln: DIFFERS"; fail=1; }
+n=0; for r in "-s $sq" "-s $sq -p 100" "-s $sq --start 0 --end 100000" "-s $sq --start 50 --end 400 --halo 2"; do $KT --db "$D/db.features.tsv" --set acrocentric region $r -i "$W/f.kt" 2>/dev/null | cmp -s - <($KT region $r -i "$W/pa.kt" 2>/dev/null) && n=$((n+1)); done
 [ "$n" = 4 ] && echo "region --set: 4/4 forms equal the set's track" || { echo "region --set: only $n/4"; fail=1; }
-$KT --db "$D/db.features.tsv" --set gene,acrocentric decode "$W/f.kt" 2>/dev/null > "$W/ga.bed"
+$KT --db "$D/db.features.tsv" --set gene,acrocentric decode -i "$W/f.kt" 2>/dev/null > "$W/ga.bed"
 [ "$(awk -F'\t' '{print NF}' "$W/ga.bed" | sort -u)" = 5 ] && awk -F'\t' 'NR>1 && $1==p && $2==e && $5==l {e=$3; next} NR>1 {print p"\t"s"\t"e"\t"l} {p=$1; s=$2; e=$3; l=$5} END{print p"\t"s"\t"e"\t"l}' "$W/ga.bed" | cmp -s - "$D/db.acrocentric.bed" && echo "decode --set gene,acrocentric: two columns, merged jointly" || { echo "decode --set gene,acrocentric: WRONG"; fail=1; }
-$KT --db "$D/db.features.tsv" decode "$W/f.kt" 2>/dev/null | cmp -s - <($KT --db "$D/db.features.tsv" --set all decode "$W/f.kt" 2>/dev/null) && echo "decode --db on stdout: all sets, same as --set all" || { echo "decode --db on stdout: DIFFERS from --set all"; fail=1; }
+$KT --db "$D/db.features.tsv" decode -i "$W/f.kt" 2>/dev/null | cmp -s - <($KT --db "$D/db.features.tsv" --set all decode -i "$W/f.kt" 2>/dev/null) && echo "decode --db on stdout: all sets, same as --set all" || { echo "decode --db on stdout: DIFFERS from --set all"; fail=1; }
 # --hier: a tuple outside features.tsv (a smoothed track's ancestor label)
 # gets 2^26 + its rank in the sorted vocabulary, the same in every file.
 # Without --hier it stays refused; with it a presmoothed track is unchanged.
 { printf 'feature_set\tchild\tparent\n'; for f in $sets; do for l in $(cut -f4 "$D/db.$f.bed" | sort -u | grep -v '^novel$'); do printf '%s\t%s\tcategorized\n' "$f" "$l"; done; done; printf 'repeat\tLINE\trepeat\nrepeat\trepeat\tcategorized\n'; } | awk -F'\t' '!s[$1 FS $2]++' > "$W/hv.tsv"
 mkdir -p "$W/hv"; for f in $sets; do cp "$D/db.$f.bed" "$W/hv/$f.bed"; done
 awk -F'\t' 'NR==5{$4="repeat"} {print}' OFS='\t' "$D/db.repeat.bed" > "$W/hv/repeat.bed"
-hin=$(for f in $sets; do echo "$W/hv/$f.bed"; done)
+hin=$(for f in $sets; do echo "-i $W/hv/$f.bed"; done)
 must_fail "a tuple outside features.tsv without --hier" $KT encode --db "$D/db.features.tsv" $hin
 $KT encode --db "$D/db.features.tsv" --hier "$W/hv.tsv" $hin > "$W/hv.kt" 2>/dev/null
-$KT --raw decode "$W/hv.kt" 2>/dev/null | awk -F'\t' '$4>=67108864' | grep -q . && echo "--hier: a vocabulary featureID stored" || { echo "--hier: NO vocabulary featureID"; fail=1; }
+$KT --raw decode -i "$W/hv.kt" 2>/dev/null | awk -F'\t' '$4>=67108864' | grep -q . && echo "--hier: a vocabulary featureID stored" || { echo "--hier: NO vocabulary featureID"; fail=1; }
 # A featureID one below 2^26 must round trip, and 2^26 must be refused: above
 # it the ids are vocabulary ranks and a wrap would name another tuple.
 printf 'featureID\tacrocentric\tchromosome\n67108863\tacro\tchr1\n' > "$W/big.tsv"
 printf 'a\t0\t10\t67108863\n' > "$W/big.bed"
-$KT encode --db "$W/big.tsv" "$W/big.bed" > "$W/big.kt" 2>/dev/null \
-  && $KT decode --db "$W/big.tsv" --set acrocentric "$W/big.kt" 2>/dev/null | grep -q acro \
+$KT encode --db "$W/big.tsv" -i "$W/big.bed" > "$W/big.kt" 2>/dev/null \
+  && $KT decode --db "$W/big.tsv" --set acrocentric -i "$W/big.kt" 2>/dev/null | grep -q acro \
   && echo "featureID 2^26-1: round trip" || { echo "featureID 2^26-1: WRONG"; fail=1; }
 printf 'featureID\tacrocentric\tchromosome\n67108864\tacro\tchr1\n' > "$W/over.tsv"
-$KT encode --db "$W/over.tsv" "$W/big.bed" > /dev/null 2>&1 \
+$KT encode --db "$W/over.tsv" -i "$W/big.bed" > /dev/null 2>&1 \
   && { echo "featureID 2^26: ACCEPTED"; fail=1; } || echo "featureID 2^26: refused, as it should"
-mkdir -p "$W/hvo"; $KT decode --db "$D/db.features.tsv" --hier "$W/hv.tsv" --out "$W/hvo" "$W/hv.kt" 2>/dev/null
+mkdir -p "$W/hvo"; $KT decode --db "$D/db.features.tsv" --hier "$W/hv.tsv" --out-dir "$W/hvo" -i "$W/hv.kt" 2>/dev/null
 n=0; for f in $sets; do cmp -s "$W/hvo/$f.bed" "$W/hv/$f.bed" && n=$((n+1)); done
 [ "$n" = 6 ] && echo "--hier: 6/6 restored" || { echo "--hier: only $n/6 restored"; fail=1; }
 $KT encode --db "$D/db.features.tsv" --hier "$W/hv.tsv" $in 2>/dev/null | cmp -s - "$W/f.kt" && echo "--hier: a presmoothed track is byte-identical" || { echo "--hier: presmoothed track CHANGED"; fail=1; }
-must_fail "a vocabulary track decoded without --hier" $KT decode --db "$D/db.features.tsv" --out "$W/hvo" "$W/hv.kt"
+must_fail "a vocabulary track decoded without --hier" $KT decode --db "$D/db.features.tsv" --out-dir "$W/hvo" -i "$W/hv.kt"
 sed '$d' "$W/hv.tsv" > "$W/hv2.tsv"
-must_fail "a vocabulary track with another hierarchy" $KT decode --db "$D/db.features.tsv" --hier "$W/hv2.tsv" --out "$W/hvo" "$W/hv.kt"
-must_fail "--hier without --db" $KT --hier "$W/hv.tsv" decode "$W/hv.kt"
+must_fail "a vocabulary track with another hierarchy" $KT decode --db "$D/db.features.tsv" --hier "$W/hv2.tsv" --out-dir "$W/hvo" -i "$W/hv.kt"
+must_fail "--hier without --db" $KT --hier "$W/hv.tsv" decode -i "$W/hv.kt"
 $KT encode < "$W/hv/repeat.bed" > "$W/hvp.kt" 2>/dev/null
-$KT --db "$D/db.features.tsv" smooth "$W/hv.kt" "$W/hv.tsv" repeat 2>/dev/null | cmp -s - <($KT smooth "$W/hvp.kt" "$W/hv.tsv" repeat 2>/dev/null) && echo "--hier: smooth --db same as the plain track" || { echo "--hier: smooth --db DIFFERS"; fail=1; }
-$KT --db "$D/db.features.tsv" --hier "$W/hv.tsv" --set repeat decode "$W/hv.kt" 2>/dev/null | cmp -s - "$W/hv/repeat.bed" && echo "--hier: --set repeat gives the input" || { echo "--hier: --set repeat DIFFERS"; fail=1; }
-mkdir -p "$W/so"; $KT --db "$D/db.features.tsv" --set repeat,gene --out "$W/so/new" decode "$W/f.kt" 2>/dev/null; [ "$(ls "$W/so/new" | tr '\n' ' ')" = "gene.bed repeat.bed " ] && cmp -s "$W/so/new/gene.bed" "$D/db.gene.bed" && echo "decode --set --out: only the picked sets, directory created" || { echo "decode --set --out: WRONG"; fail=1; }
+$KT --db "$D/db.features.tsv" smooth -i "$W/hv.kt" --hier "$W/hv.tsv" -f repeat 2>/dev/null | cmp -s - <($KT smooth -i "$W/hvp.kt" --hier "$W/hv.tsv" -f repeat 2>/dev/null) && echo "--hier: smooth --db same as the plain track" || { echo "--hier: smooth --db DIFFERS"; fail=1; }
+$KT --db "$D/db.features.tsv" --hier "$W/hv.tsv" --set repeat decode -i "$W/hv.kt" 2>/dev/null | cmp -s - "$W/hv/repeat.bed" && echo "--hier: --set repeat gives the input" || { echo "--hier: --set repeat DIFFERS"; fail=1; }
+mkdir -p "$W/so"; $KT --db "$D/db.features.tsv" --set repeat,gene --out-dir "$W/so/new" decode -i "$W/f.kt" 2>/dev/null; [ "$(ls "$W/so/new" | tr '\n' ' ')" = "gene.bed repeat.bed " ] && cmp -s "$W/so/new/gene.bed" "$D/db.gene.bed" && echo "decode --set --out: only the picked sets, directory created" || { echo "decode --set --out: WRONG"; fail=1; }
 # index reads names only: an --aln or --db track is indexed without its companions
 cp "$W/d.kt" "$W/di.kt"; cp "$W/f.kt" "$W/fi.kt"
-$KT index "$W/di.kt" >/dev/null 2>&1 && $KT index "$W/fi.kt" >/dev/null 2>&1 && $KT --aln "$D/p.paf" --ref "$D/ref.bed" region "$W/di.kt" q1 2>/dev/null | cmp -s - <($KT --aln "$D/p.paf" --ref "$D/ref.bed" region "$W/d.kt" q1 2>/dev/null) && echo "index on --aln and --db tracks: built, same answers" || { echo "index on --aln and --db tracks: FAILED"; fail=1; }
-must_fail "--set without --db" $KT --set gene decode "$W/pa.kt"
-must_fail "--set not in features.tsv" $KT --db "$D/db.features.tsv" --set gene,nosuch decode "$W/f.kt"
-must_fail "--set names a set twice" $KT --db "$D/db.features.tsv" --set gene,gene decode "$W/f.kt"
-must_fail "--set all with a name" $KT --db "$D/db.features.tsv" --set all,gene decode "$W/f.kt"
-must_fail "--set on smooth" $KT --db "$D/db.features.tsv" --set gene smooth "$W/f.kt" "$W/inf.tsv" acrocentric
-must_fail "smooth an --aln track without --aln" $KT smooth "$W/d.kt" "$W/inf.tsv" acrocentric
-must_fail "smooth a --db track without --db" $KT smooth "$W/f.kt" "$W/inf.tsv" acrocentric
-must_fail "smooth --db a set not in features.tsv" $KT --db "$D/db.features.tsv" smooth "$W/f.kt" "$W/sm.tsv" nosuch
-must_fail "region --db on a plain track" $KT --db "$D/db.features.tsv" region "$W/p.kt" q1
-must_fail "smooth --aln without --ref" $KT --aln "$D/p.paf" smooth "$W/d.kt" "$W/inf.tsv" acrocentric
-must_fail "index --aln" $KT --aln "$D/p.paf" --ref "$D/ref.bed" index "$W/d.kt"
+$KT index -i "$W/di.kt" >/dev/null 2>&1 && $KT index -i "$W/fi.kt" >/dev/null 2>&1 && $KT --aln "$D/p.paf" --ref "$D/ref.bed" region -i "$W/di.kt" -s q1 2>/dev/null | cmp -s - <($KT --aln "$D/p.paf" --ref "$D/ref.bed" region -i "$W/d.kt" -s q1 2>/dev/null) && echo "index on --aln and --db tracks: built, same answers" || { echo "index on --aln and --db tracks: FAILED"; fail=1; }
+must_fail "--set without --db" $KT --set gene decode -i "$W/pa.kt"
+must_fail "--set not in features.tsv" $KT --db "$D/db.features.tsv" --set gene,nosuch decode -i "$W/f.kt"
+must_fail "--set names a set twice" $KT --db "$D/db.features.tsv" --set gene,gene decode -i "$W/f.kt"
+must_fail "--set all with a name" $KT --db "$D/db.features.tsv" --set all,gene decode -i "$W/f.kt"
+must_fail "--set on smooth" $KT --db "$D/db.features.tsv" --set gene smooth -i "$W/f.kt" --hier "$W/inf.tsv" -f acrocentric
+must_fail "smooth an --aln track without --aln" $KT smooth -i "$W/d.kt" --hier "$W/inf.tsv" -f acrocentric
+must_fail "smooth a --db track without --db" $KT smooth -i "$W/f.kt" --hier "$W/inf.tsv" -f acrocentric
+must_fail "smooth --db a set not in features.tsv" $KT --db "$D/db.features.tsv" smooth -i "$W/f.kt" --hier "$W/sm.tsv" -f nosuch
+must_fail "region --db on a plain track" $KT --db "$D/db.features.tsv" region -i "$W/p.kt" -s q1
+must_fail "smooth --aln without --ref" $KT --aln "$D/p.paf" smooth -i "$W/d.kt" --hier "$W/inf.tsv" -f acrocentric
+must_fail "index --aln" $KT --aln "$D/p.paf" --ref "$D/ref.bed" index -i "$W/d.kt"
 
 # HKS tracks name sequences by ordinal, so --aln reaches the PAF only through
 # --names FILE. Dropping the names is legal here and must still round-trip.
-$KT encode --aln "$D/p.paf" --ref "$D/ref.bed" --aln-names "$D/ord.names.txt" \
-  --names drop < "$D/ord.bed" > "$W/ord.kt" 2>/dev/null
-$KT decode --aln "$D/p.paf" --ref "$D/ref.bed" --aln-names "$D/ord.names.txt" \
-  "$W/ord.kt" 2>/dev/null > "$W/ord.out"
+$KT encode --aln "$D/p.paf" --ref "$D/ref.bed" --aln-names "$D/ord.names.txt" --names drop < "$D/ord.bed" > "$W/ord.kt" 2>/dev/null
+$KT decode --aln "$D/p.paf" --ref "$D/ref.bed" --aln-names "$D/ord.names.txt" -i "$W/ord.kt" 2>/dev/null > "$W/ord.out"
 cmp -s "$D/ord.bed" "$W/ord.out" \
   && echo "aln --names drop with an ordinal map: round-trips" \
  || { echo "aln --names drop with an ordinal map: DIFFERS"; fail=1; }
@@ -252,10 +249,8 @@ cmp -s "$D/ord.bed" "$W/ord.out" \
 # A read that hit no k-mer leaves no rows, so the ordinals in the track have
 # gaps and the rank no longer equals the ordinal. Dropping the names then
 # pointed --aln at the wrong read and decode failed on real ONT data.
-$KT encode --aln "$D/p.paf" --ref "$D/ref.bed" --aln-names "$D/ord2.names.txt" \
-  --names drop < "$D/ord2.bed" > "$W/ord2.kt" 2>/dev/null
-$KT decode --aln "$D/p.paf" --ref "$D/ref.bed" --aln-names "$D/ord2.names.txt" \
-  "$W/ord2.kt" 2>/dev/null > "$W/ord2.out"
+$KT encode --aln "$D/p.paf" --ref "$D/ref.bed" --aln-names "$D/ord2.names.txt" --names drop < "$D/ord2.bed" > "$W/ord2.kt" 2>/dev/null
+$KT decode --aln "$D/p.paf" --ref "$D/ref.bed" --aln-names "$D/ord2.names.txt" -i "$W/ord2.kt" 2>/dev/null > "$W/ord2.out"
 cmp -s "$D/ord2.bed" "$W/ord2.out" \
   && echo "aln --names drop with gaps in the ordinals: round-trips" \
  || { echo "aln --names drop with gaps in the ordinals: DIFFERS"; fail=1; }
@@ -264,11 +259,11 @@ cmp -s "$D/ord2.bed" "$W/ord2.out" \
 # fixture is built so 6 of its 8 rows do, which the s.bed fixture never did.
 $KT encode --aln "$D/lp.paf" --ref "$D/lref.bed" --names keep < "$D/ls.bed" \
   > "$W/ls.kt" 2>/dev/null
-$KT decode --aln "$D/lp.paf" --ref "$D/lref.bed" "$W/ls.kt" 2>/dev/null > "$W/ls.out"
+$KT decode --aln "$D/lp.paf" --ref "$D/lref.bed" -i "$W/ls.kt" 2>/dev/null > "$W/ls.out"
 cmp -s "$D/ls.bed" "$W/ls.out" \
   && echo "lengths the reference implies: round-trip" \
  || { echo "lengths the reference implies: DIFFERS"; fail=1; }
-must_fail "decode a length-delta track without --aln" $KT decode "$W/ls.kt"
+must_fail "decode a length-delta track without --aln" $KT decode -i "$W/ls.kt"
 # Each block keeps the sentinel only where it shrinks the stream, so an 8-row
 # file may store plain lengths. This one cannot: 3000 runs of random length
 # that all end on a reference run end, so the sentinel column is all zeros.
@@ -276,15 +271,15 @@ awk 'BEGIN{srand(5);p=0;for(i=0;i<3000;i++){c=p+int(rand()*900)+1;printf "chrA\t
 L=$(cat "$W/len"); sed 's/^chrA/q/' "$W/big.ref" > "$W/big.q"
 printf "q\t$L\t0\t$L\t+\tchrA\t$L\t0\t$L\t$L\t$L\t60\tcg:Z:${L}M\n" > "$W/big.paf"
 $KT encode --aln "$W/big.paf" --ref "$W/big.ref" < "$W/big.q" > "$W/big.kt" 2>/dev/null
-n=$($KT decode --raw "$W/big.kt" 2>/dev/null | awk -F'\t' '$2==$3' | wc -l)
+n=$($KT decode --raw -i "$W/big.kt" 2>/dev/null | awk -F'\t' '$2==$3' | wc -l)
 [ "$n" = 3000 ] && echo "lengths left out: 3000 of 3000 rows" \
  || { echo "lengths left out: $n of 3000, expected 3000"; fail=1; }
-$KT decode --aln "$W/big.paf" --ref "$W/big.ref" "$W/big.kt" 2>/dev/null | cmp -s - "$W/big.q" \
+$KT decode --aln "$W/big.paf" --ref "$W/big.ref" -i "$W/big.kt" 2>/dev/null | cmp -s - "$W/big.q" \
   && echo "sentinel block: round-trip" || { echo "sentinel block: DIFFERS"; fail=1; }
 # and a block where plain lengths win keeps them, flagged in the sizes table
 awk 'BEGIN{srand(6);p=0;for(i=0;i<3000;i++){c=p+int(rand()*900)+1;printf "q\t%d\t%d\tL%d\n",p,c,i%4;p=c}}' > "$W/off.q"
 $KT encode --aln "$W/big.paf" --ref "$W/big.ref" < "$W/off.q" > "$W/off.kt" 2>/dev/null
-$KT decode --aln "$W/big.paf" --ref "$W/big.ref" "$W/off.kt" 2>/dev/null | cmp -s - "$W/off.q" \
+$KT decode --aln "$W/big.paf" --ref "$W/big.ref" -i "$W/off.kt" 2>/dev/null | cmp -s - "$W/off.q" \
   && echo "plain-length block under --aln: round-trip" || { echo "plain-length block under --aln: DIFFERS"; fail=1; }
 
 # Reads are all one length, so the last run of each is the total minus the
@@ -300,14 +295,14 @@ PY
 a=$($KT --tail 0 encode --block 4096 < "$W/tail.bed" 2>/dev/null | wc -c)
 b=$($KT --tail 1 encode --block 4096 < "$W/tail.bed" 2>/dev/null | wc -c)
 $KT encode --block 4096 < "$W/tail.bed" > "$W/tail.kt" 2>/dev/null
-$KT decode "$W/tail.kt" 2>/dev/null > "$W/tail.out"
+$KT decode -i "$W/tail.kt" 2>/dev/null > "$W/tail.out"
 cmp -s "$W/tail.bed" "$W/tail.out" \
   && echo "constant-length reads: round-trip" \
  || { echo "constant-length reads: DIFFERS"; fail=1; }
 [ "$b" -lt "$a" ] && echo "constant-length reads: $a -> $b bytes" \
  || { echo "constant-length reads: no gain, $a -> $b"; fail=1; }
 # random access must still land on the right rows
-$KT region "$W/tail.kt" r2000 2>/dev/null > "$W/tq.out"
+$KT region -i "$W/tail.kt" -s r2000 2>/dev/null > "$W/tq.out"
 grep "^r2000	" "$W/tail.bed" > "$W/tq.exp"
 cmp -s "$W/tq.out" "$W/tq.exp" && echo "constant-length reads: query exact" \
  || { echo "constant-length reads: query WRONG"; fail=1; }
@@ -328,7 +323,7 @@ b=$($KT encode --block 4096 < "$W/vlen.bed" 2>/dev/null | wc -c)
 [ "$a" = "$b" ] && echo "reads of mixed length: left alone, $a bytes" \
  || { echo "reads of mixed length: changed $a -> $b, gate is wrong"; fail=1; }
 $KT encode --block 4096 < "$W/vlen.bed" > "$W/vlen.kt" 2>/dev/null
-$KT decode "$W/vlen.kt" 2>/dev/null | cmp -s - "$W/vlen.bed" \
+$KT decode -i "$W/vlen.kt" 2>/dev/null | cmp -s - "$W/vlen.bed" \
   && echo "reads of mixed length: round-trip" \
  || { echo "reads of mixed length: DIFFERS"; fail=1; }
 
@@ -348,7 +343,7 @@ b=$($KT encode --block 4096 < "$W/out.bed" 2>/dev/null | wc -c)
 [ "$b" -lt "$a" ] && echo "uniform reads with stray lengths: $a -> $b bytes" \
  || { echo "uniform reads with stray lengths: gate gave up, $a -> $b"; fail=1; }
 $KT encode --block 4096 < "$W/out.bed" > "$W/out.kt" 2>/dev/null
-$KT decode "$W/out.kt" 2>/dev/null | cmp -s - "$W/out.bed" \
+$KT decode -i "$W/out.kt" 2>/dev/null | cmp -s - "$W/out.bed" \
   && echo "uniform reads with stray lengths: round-trip" \
  || { echo "uniform reads with stray lengths: DIFFERS"; fail=1; }
 
@@ -379,7 +374,7 @@ done
 # --names keep on names that are already 0,1,2,... wrote a file it refused to read
 printf '0\t0\t10\tA\n1\t0\t10\tB\n2\t0\t10\tC\n' > "$W/ord2.bed"
 $KT encode --block 4 --names keep < "$W/ord2.bed" > "$W/ord2.kt" 2>/dev/null
-$KT decode "$W/ord2.kt" 2>/dev/null | cmp -s - "$W/ord2.bed" \
+$KT decode -i "$W/ord2.kt" 2>/dev/null | cmp -s - "$W/ord2.bed" \
   && echo "--names keep on ordinals: round-trips" \
  || { echo "--names keep on ordinals: DIFFERS"; fail=1; }
 
@@ -397,7 +392,7 @@ timeout 20 $KT --tok-chunk 0 encode --block 4 < "$W/ord2.bed" > /dev/null 2>&1 \
 # and a reverse interval as valid, while the plain parser rejected all three.
 for bad in 'a\tx\t10\t1' '\t0\t10\t1' 'a\t0\t18446744073709551616\t1' 'a\t0\t20\t1\na\t20\t10\t2'; do
   printf "$bad\n" > "$W/dbbad.bed"
-  $KT encode --db "$D/db.features.tsv" "$W/dbbad.bed" > /dev/null 2>&1 \
+  $KT encode --db "$D/db.features.tsv" -i "$W/dbbad.bed" > /dev/null 2>&1 \
     && { echo "--db malformed input: ACCEPTED"; fail=1; } \
  || echo "--db malformed input: refused, as it should"
 done
@@ -413,9 +408,9 @@ for i in range(10000):
 PY
 printf 'feature_set\tchild\tparent\nacrocentric\tacro\tcategorized\nacrocentric\tnovel\tcategorized\n' > "$W/sm.tsv"
 $KT encode --block 32 < "$W/sm.bed" > "$W/sm.kt" 2>/dev/null
-$KT --threads 1 smooth "$W/sm.kt" "$W/sm.tsv" acrocentric > "$W/sm.1" 2>/dev/null || { echo "smooth, serial: FAILED"; fail=1; }
+$KT --threads 1 smooth -i "$W/sm.kt" --hier "$W/sm.tsv" -f acrocentric > "$W/sm.1" 2>/dev/null || { echo "smooth, serial: FAILED"; fail=1; }
 for t in 2 4 8; do
-  $KT --threads $t smooth "$W/sm.kt" "$W/sm.tsv" acrocentric > "$W/sm.$t" 2>/dev/null \
+  $KT --threads $t smooth -i "$W/sm.kt" --hier "$W/sm.tsv" -f acrocentric > "$W/sm.$t" 2>/dev/null \
  || { echo "smooth, $t threads: FAILED"; fail=1; continue; }
   cmp -s "$W/sm.1" "$W/sm.$t" && echo "smooth, $t threads: identical to serial" \
  || { echo "smooth, $t threads: DIFFERS from serial"; fail=1; }
@@ -440,9 +435,9 @@ $KT encode --aln "$W/cg.paf" --ref "$D/ref.bed" < "$W/cg.bed" > /dev/null 2>&1 \
 # ordinal track; a label longer than 255 bytes overflowed the emit buffer.
 awk 'BEGIN{for(i=0;i<20000;i++)printf "s\t%d\t%d\tA\n",i*10,i*10+10}' > "$W/rep.bed"
 $KT encode < "$W/rep.bed" > "$W/rep.kt" 2>/dev/null
-$KT decode "$W/rep.kt" 2>/dev/null | cmp -s - "$W/rep.bed" && echo "repetitive track: byte-identical" \
+$KT decode -i "$W/rep.kt" 2>/dev/null | cmp -s - "$W/rep.bed" && echo "repetitive track: byte-identical" \
  || { echo "repetitive track: WRONG"; fail=1; }
-$KT smooth "$W/rep.kt" "$W/sm.tsv" acrocentric > /dev/null 2>&1 && echo "repetitive smooth: ok" \
+$KT smooth -i "$W/rep.kt" --hier "$W/sm.tsv" -f acrocentric > /dev/null 2>&1 && echo "repetitive smooth: ok" \
  || { echo "repetitive smooth: FAILED"; fail=1; }
 { head -1 "$D/db.features.tsv"; printf '0\tacro\tchr1\tintergenic\tarm\tLINE\tITS\n'; tail -n +2 "$D/db.features.tsv"; } > "$W/id0.tsv"
 must_fail "features.tsv defining id 0" $KT encode --db "$W/id0.tsv" $in
@@ -450,16 +445,16 @@ LR=$(head -c 70000 /dev/zero | tr '\0' A)
 printf 'long\t0\t10\tA\nnext\t0\t10\tB\n' > "$W/lr.bed"
 printf '@long\n%s\n+\n%s\n@next\nACGT\n+\nIIII\n' "$LR" "$LR" > "$W/lr.fq"
 $KT encode --sort --names drop < "$W/lr.bed" > "$W/lr.kt" 2>/dev/null
-$KT --names "$W/lr.fq" decode "$W/lr.kt" 2>/dev/null | cmp -s - "$W/lr.bed" \
+$KT --names "$W/lr.fq" decode -i "$W/lr.kt" 2>/dev/null | cmp -s - "$W/lr.bed" \
   && echo "long FASTQ read: names restored" || { echo "long FASTQ read: WRONG"; fail=1; }
 printf '0\t0\t10\tA\n1\t0\t10\tB\n' > "$W/ord.bed"
 $KT encode < "$W/ord.bed" > "$W/ord.kt" 2>/dev/null; printf 'x\ny\n' > "$W/ord.kt.names"
-$KT decode "$W/ord.kt" 2>/dev/null | cmp -s - "$W/ord.bed" && echo "stray sidecar: ignored" \
+$KT decode -i "$W/ord.kt" 2>/dev/null | cmp -s - "$W/ord.bed" && echo "stray sidecar: ignored" \
  || { echo "stray sidecar: RENAMED"; fail=1; }
 LL=$(head -c 300 /dev/zero | tr '\0' L)_specific
 printf 's\t0\t10\t%s\n' "$LL" > "$W/ll.bed"
 $KT encode < "$W/ll.bed" > "$W/ll.kt" 2>/dev/null
-$KT decode "$W/ll.kt" > /dev/null 2>&1 && echo "long label v1: ok" || { echo "long label v1: CRASHED"; fail=1; }
+$KT decode -i "$W/ll.kt" > /dev/null 2>&1 && echo "long label v1: ok" || { echo "long label v1: CRASHED"; fail=1; }
 
 # A second audit. --sort --aln looked up the PAF by rank, not name; a short
 # features.tsv row left NULL labels that decode dereferenced; a wrong sidecar
@@ -469,20 +464,20 @@ printf 'chr1\t0\t100\tA\nchr1\t100\t200\tB\nchr1\t200\t300\tC\nchr1\t300\t400\tD
 printf '1\t500\t0\t500\t+\tchr1\t600\t0\t550\t500\t550\t60\tcg:Z:100M50D400M\n0\t500\t0\t500\t+\tchr1\t600\t0\t500\t500\t500\t60\tcg:Z:500M\n' > "$W/sa.paf"
 printf '1\t0\t100\tA\n1\t100\t200\tB\n1\t200\t300\tC\n1\t300\t400\tD\n1\t400\t500\tE\n0\t0\t100\tA\n0\t100\t200\tB\n0\t200\t300\tC\n0\t300\t400\tD\n0\t400\t500\tE\n' > "$W/sa.bed"
 $KT encode --sort --aln "$W/sa.paf" --ref "$W/sa.ref" < "$W/sa.bed" > "$W/sa.kt" 2>/dev/null
-$KT decode --aln "$W/sa.paf" --ref "$W/sa.ref" "$W/sa.kt" 2>/dev/null | sort | cmp -s - <(sort "$W/sa.bed") \
+$KT decode --aln "$W/sa.paf" --ref "$W/sa.ref" -i "$W/sa.kt" 2>/dev/null | sort | cmp -s - <(sort "$W/sa.bed") \
   && echo "sort with aln: same rows" || { echo "sort with aln: WRONG"; fail=1; }
 printf 'featureID\tacrocentric\tchromosome\n1\tacro\tchr1\n2\tacro\n' > "$W/short.tsv"
 printf 's\t0\t10\t1\ns\t10\t20\t2\n' > "$W/ids.bed"
-must_fail "features.tsv row with a missing label" $KT encode --db "$W/short.tsv" "$W/ids.bed"
+must_fail "features.tsv row with a missing label" $KT encode --db "$W/short.tsv" -i "$W/ids.bed"
 printf 'x1\t0\t10\tA\nx2\t0\t10\tB\n' > "$W/t1.bed"; printf 'y1\t0\t10\tA\ny2\t0\t10\tB\n' > "$W/t2.bed"
 $KT encode --names drop:"$W/t1.names" < "$W/t1.bed" > "$W/t1.kt" 2>/dev/null
 $KT encode --names drop:"$W/t2.names" < "$W/t2.bed" > "$W/t2.kt" 2>/dev/null
-must_fail "sidecar from another track" $KT decode --names "$W/t2.names" "$W/t1.kt"
-$KT decode --names "$W/t1.names" "$W/t1.kt" 2>/dev/null | cmp -s - "$W/t1.bed" \
+must_fail "sidecar from another track" $KT decode --names "$W/t2.names" -i "$W/t1.kt"
+$KT decode --names "$W/t1.names" -i "$W/t1.kt" 2>/dev/null | cmp -s - "$W/t1.bed" \
   && echo "own sidecar: byte-identical" || { echo "own sidecar: WRONG"; fail=1; }
 printf 'read one\t0\t10\tA\nread two\t0\t10\tB\n' > "$W/sp.bed"; printf 'read one\nread two\n' > "$W/sp.names.txt"
 $KT encode --names drop < "$W/sp.bed" > "$W/sp.kt" 2>/dev/null
-$KT --names "$W/sp.names.txt" decode "$W/sp.kt" 2>/dev/null | cmp -s - "$W/sp.bed" \
+$KT --names "$W/sp.names.txt" decode -i "$W/sp.kt" 2>/dev/null | cmp -s - "$W/sp.bed" \
   && echo "name list with spaces: restored" || { echo "name list with spaces: WRONG"; fail=1; }
 cp "$D/s.bed" "$W/keep.bed"; $KT encode "$W/keep.bed" < /dev/null > /dev/null 2>&1 && { echo "encode FILE: ACCEPTED"; fail=1; }
 cmp -s "$W/keep.bed" "$D/s.bed" && echo "encode FILE: refused, input intact" || { echo "encode FILE: INPUT DESTROYED"; fail=1; }
@@ -495,15 +490,15 @@ cmp -s "$W/keep.bed" "$D/s.bed" && echo "encode FILE: refused, input intact" || 
 # decode wrote wrong BEDs.
 awk 'BEGIN{for(i=0;i<12;i++)printf "s\t%d\t%d\tL%d\n",i*10,i*10+10,i}' > "$W/halo.bed"
 $KT encode --block 4 < "$W/halo.bed" > "$W/halo4.kt" 2>/dev/null; $KT encode < "$W/halo.bed" > "$W/halo1.kt" 2>/dev/null
-$KT region "$W/halo4.kt" s 45 46 3 2>/dev/null | cmp -s - <($KT region "$W/halo1.kt" s 45 46 3 2>/dev/null) \
-  && [ "$($KT region "$W/halo4.kt" s 45 46 3 2>/dev/null | wc -l)" = 7 ] \
+$KT region -i "$W/halo4.kt" -s s --start 45 --end 46 --halo 3 2>/dev/null | cmp -s - <($KT region -i "$W/halo1.kt" -s s --start 45 --end 46 --halo 3 2>/dev/null) \
+  && [ "$($KT region -i "$W/halo4.kt" -s s --start 45 --end 46 --halo 3 2>/dev/null | wc -l)" = 7 ] \
   && echo "halo across blocks: 7 rows" || { echo "halo across blocks: WRONG"; fail=1; }
 awk 'BEGIN{for(i=0;i<20;i++)printf "r%d\t0\t%d\tL%d\n",i,50+i,i%5}' > "$W/idx.bed"
-$KT encode < "$W/idx.bed" > "$W/idx.kt" 2>/dev/null; $KT index "$W/idx.kt" >/dev/null 2>&1
+$KT encode < "$W/idx.bed" > "$W/idx.kt" 2>/dev/null; $KT index -i "$W/idx.kt" >/dev/null 2>&1
 $KT encode --sort --names keep < "$W/idx.bed" > "$W/idx.kt" 2>/dev/null
-$KT region "$W/idx.kt" r7 2>/dev/null | cmp -s - <(grep -P '^r7\t' "$W/idx.bed") \
+$KT region -i "$W/idx.kt" -s r7 2>/dev/null | cmp -s - <(grep -P '^r7\t' "$W/idx.bed") \
   && echo "stale idx: ignored" || { echo "stale idx: WRONG ROWS"; fail=1; }
-$KT index "$W/idx.kt" >/dev/null 2>&1; $KT region "$W/idx.kt" r7 2>/dev/null | cmp -s - <(grep -P '^r7\t' "$W/idx.bed") \
+$KT index -i "$W/idx.kt" >/dev/null 2>&1; $KT region -i "$W/idx.kt" -s r7 2>/dev/null | cmp -s - <(grep -P '^r7\t' "$W/idx.bed") \
   && echo "fresh idx: correct" || { echo "fresh idx: WRONG ROWS"; fail=1; }
 T1=$(cut -f1 "$D/ref.bed" | head -1)
 printf 'a\t0\t5\t=\na\t5\t10\tZ\n' > "$W/eq.bed"
@@ -512,12 +507,12 @@ must_fail "label = under --aln" $KT encode --aln "$W/eq.paf" --ref "$D/ref.bed" 
 python3 -c "
 for i in range(70): print(f's{i}\t0\t100\tA'); print(f's{i}\t100\t{2**63+100}\tB')" > "$W/t63.bed"
 $KT encode < "$W/t63.bed" > "$W/t63.kt" 2>/dev/null
-$KT decode "$W/t63.kt" 2>/dev/null | cmp -s - "$W/t63.bed" && echo "total past 2^63: byte-identical" \
+$KT decode -i "$W/t63.kt" 2>/dev/null | cmp -s - "$W/t63.bed" && echo "total past 2^63: byte-identical" \
  || { echo "total past 2^63: WRONG"; fail=1; }
 printf 'feature_set\tchild\tparent\nacrocentric\tacro\tx\nacrocentric\tx\tacro\n' > "$W/cyc.tsv"
-rc=0; timeout 10 $KT smooth "$W/p.kt" "$W/cyc.tsv" acrocentric >/dev/null 2>&1 || rc=$?
+rc=0; timeout 10 $KT smooth -i "$W/p.kt" --hier "$W/cyc.tsv" -f acrocentric >/dev/null 2>&1 || rc=$?
 [ $rc = 1 ] && echo "cyclic hierarchy: refused" || { echo "cyclic hierarchy: rc=$rc"; fail=1; }
-for c in "decode $W/p.kt" "region $W/p.kt q1" "smooth $W/sm.kt $W/sm.tsv acrocentric" "decode --raw $W/p.kt"; do
+for c in "decode -i $W/p.kt" "region -i $W/p.kt -s q1" "smooth -i $W/sm.kt --hier $W/sm.tsv -f acrocentric" "decode --raw -i $W/p.kt"; do
   $KT $c > /dev/full 2>/dev/null && { echo "$c to /dev/full: EXIT 0"; fail=1; } || echo "${c%% *} to /dev/full: exit 1"
 done
 printf 'a\t0\t10\tA\0B\nc\t0\t10\tB\n' > "$W/nul.bed"
@@ -527,7 +522,7 @@ $KT encode --tmp-dir "$W/sptmp" --sort=1M < "$W/splate.bed" > /dev/null 2> "$W/s
 grep -qi spill "$W/sp.err" || { echo "late overlap: NEVER SPILLED"; fail=1; }
 [ "$(ls "$W/sptmp" | wc -l)" = 0 ] && echo "spill files after a failure: none" || { echo "spill files after a failure: $(ls "$W/sptmp" | wc -l) LEFT"; fail=1; }
 sed '2s/acro/ACRO/' "$D/db.features.tsv" > "$W/other.tsv"
-mkdir -p "$W/o2"; must_fail "decode --db with another features.tsv" $KT decode --db "$W/other.tsv" --out "$W/o2" "$W/f.kt"
+mkdir -p "$W/o2"; must_fail "decode --db with another features.tsv" $KT decode --db "$W/other.tsv" --out-dir "$W/o2" -i "$W/f.kt"
 
 # A block that keeps plain lengths compressed its ids from the wrong offset:
 # every label in the block landed on another row, exit 0. These inputs make
@@ -551,7 +546,7 @@ for k in range(6):
 open(W + "/mx.paf", "w").write("".join(paf)); open(W + "/mx.bed", "w").write("".join(bed))
 PY
 $KT encode --aln "$W/mx.paf" --ref "$W/mx.ref" --block 3000 < "$W/mx.bed" > "$W/mx.kt" 2>/dev/null
-$KT decode --aln "$W/mx.paf" --ref "$W/mx.ref" "$W/mx.kt" 2>/dev/null | cmp -s - "$W/mx.bed" \
+$KT decode --aln "$W/mx.paf" --ref "$W/mx.ref" -i "$W/mx.kt" 2>/dev/null | cmp -s - "$W/mx.bed" \
   && echo "mixed sentinel blocks, seed $seed: byte-identical" || { echo "mixed sentinel blocks, seed $seed: WRONG"; fail=1; }
 done
 # On the minus strand a run end maps to a reference run start; the sentinel
@@ -560,8 +555,8 @@ printf 'chrB\t0\t100\tA\nchrB\t100\t250\tB\nchrB\t250\t400\tC\n' > "$W/mn.ref"
 printf 'm\t400\t0\t400\t-\tchrB\t400\t0\t400\t400\t400\t60\tcg:Z:400M\n' > "$W/mn.paf"
 printf 'm\t0\t150\tX\nm\t150\t300\tY\nm\t300\t400\tZ\n' > "$W/mn.bed"
 $KT encode --aln "$W/mn.paf" --ref "$W/mn.ref" < "$W/mn.bed" > "$W/mn.kt" 2>/dev/null
-n=$($KT decode --raw "$W/mn.kt" 2>/dev/null | awk -F'\t' '$2==$3' | wc -l)
-$KT decode --aln "$W/mn.paf" --ref "$W/mn.ref" "$W/mn.kt" 2>/dev/null | cmp -s - "$W/mn.bed" && [ "$n" = 3 ] \
+n=$($KT decode --raw -i "$W/mn.kt" 2>/dev/null | awk -F'\t' '$2==$3' | wc -l)
+$KT decode --aln "$W/mn.paf" --ref "$W/mn.ref" -i "$W/mn.kt" 2>/dev/null | cmp -s - "$W/mn.bed" && [ "$n" = 3 ] \
   && echo "minus-strand sentinel: 3 of 3 rows, round-trip" || { echo "minus-strand sentinel: $n of 3, WRONG"; fail=1; }
 
 # A NOSZ codec carries no size, so a forged index could not be caught: refused
@@ -579,7 +574,7 @@ $KT --profile 2>&1 | grep -q '^karyozip: usage:' \
   && echo "flags with no command: usage, not a crash" \
   || { echo "flags with no command: WRONG"; fail=1; }
 python3 "$D/kt.py" "$W/p.kt" "$W/nosz.kt" lo9 0x10
-must_fail "a header naming a NOSZ codec" $KT decode "$W/nosz.kt"
+must_fail "a header naming a NOSZ codec" $KT decode -i "$W/nosz.kt"
 
 #  ranked the plain length spelling in a scratch buffer sized for the
 # sentinel one, which is up to 5 bytes a row shorter: with every run ending on
@@ -594,45 +589,45 @@ open(W + "/huge.q", "w").write("".join("h\t%d\t%d\tL%d\n" % (a, b, i % 3) for i,
 cg = "".join("%dM" % (b - a) for a, b in ref)   # one op per run: an op stays under 4 GB
 open(W + "/huge.paf", "w").write("h\t%d\t0\t%d\t+\tchrH\t%d\t0\t%d\t%d\t%d\t60\tcg:Z:%s\n" % ((p,) * 6 + (cg,)))
 PY
-$KT encode  --aln "$W/huge.paf" --ref "$W/huge.ref" < "$W/huge.q" > "$W/huge.kt" 2>/dev/null \
-  && $KT decode --aln "$W/huge.paf" --ref "$W/huge.ref" "$W/huge.kt" 2>/dev/null | cmp -s - "$W/huge.q" \
+$KT encode --aln "$W/huge.paf" --ref "$W/huge.ref" < "$W/huge.q" > "$W/huge.kt" 2>/dev/null \
+  && $KT decode --aln "$W/huge.paf" --ref "$W/huge.ref" -i "$W/huge.kt" 2>/dev/null | cmp -s - "$W/huge.q" \
   && echo "fast with long plain lengths: byte-identical" || { echo "fast with long plain lengths: FAILED"; fail=1; }
 # a codec id with bit 31 set slipped past the NOSZ gate as a negative int
 python3 "$D/kt.py" "$W/p.kt" "$W/neg.kt" lo9 0x80010010
-must_fail "a codec id with bit 31 set" $KT decode "$W/neg.kt"
+must_fail "a codec id with bit 31 set" $KT decode -i "$W/neg.kt"
 
 # a packed alignment indexes the reference by row order: another order or
 # another reference is refused rather than mislabelling every row
-$KT aln-pack "$D/p.paf" "$D/ref.bed" "$W/p.kta" >/dev/null 2>&1
+$KT aln-pack -a "$D/p.paf" -r "$D/ref.bed" -o "$W/p.kta" >/dev/null 2>&1
 tac "$D/ref.bed" | awk -F'\t' '{print}' > "$W/ref.rev"
 $KT encode --aln "$W/p.kta" --ref "$D/ref.bed" < "$D/s.bed" > "$W/pk.kt" 2>/dev/null \
-  && $KT decode --aln "$W/p.kta" --ref "$D/ref.bed" "$W/pk.kt" 2>/dev/null | cmp -s - "$D/s.bed" \
+  && $KT decode --aln "$W/p.kta" --ref "$D/ref.bed" -i "$W/pk.kt" 2>/dev/null | cmp -s - "$D/s.bed" \
   && echo "packed alignment: round-trip" || { echo "packed alignment: WRONG"; fail=1; }
-must_fail "packed alignment with a reordered reference" $KT decode --aln "$W/p.kta" --ref "$W/ref.rev" "$W/pk.kt"
+must_fail "packed alignment with a reordered reference" $KT decode --aln "$W/p.kta" --ref "$W/ref.rev" -i "$W/pk.kt"
 
 # a label count with no label table skipped the count check, and smooth then
 # wrote a map sized by a wrapped multiply
 $KT encode < /dev/null > "$W/mt.kt" 2>/dev/null
 python3 "$D/kt.py" "$W/mt.kt" "$W/mt2.kt" 7 0x4000000000000000
-must_fail "a label count with no label table" $KT smooth "$W/mt2.kt" "$W/sm.tsv" acrocentric
+must_fail "a label count with no label table" $KT smooth -i "$W/mt2.kt" --hier "$W/sm.tsv" -f acrocentric
 
 # Input-side findings: a featureID or set named twice, a name list whose names
 # start with '>', a sort temp dir past 511 bytes, a closed stdout, a read error
 # on stdin, a name that repeats later in the file, a 512-byte name under --sort.
 printf 'featureID\tacrocentric\tchromosome\n1\tA\tX\n1\tB\tY\n' > "$W/dupid.tsv"
 printf 's\t0\t10\tA\n' > "$W/d1.bed"; printf 's\t0\t10\tX\n' > "$W/d2.bed"
-must_fail "features.tsv with a featureID twice" $KT encode --db "$W/dupid.tsv" "$W/d1.bed" "$W/d2.bed"
+must_fail "features.tsv with a featureID twice" $KT encode --db "$W/dupid.tsv" -i "$W/d1.bed" -i "$W/d2.bed"
 printf 'featureID\tx\tx\n1\tA\tX\n' > "$W/dupset.tsv"
-must_fail "features.tsv with a set named twice" $KT encode --db "$W/dupset.tsv" "$W/d1.bed" "$W/d2.bed"
+must_fail "features.tsv with a set named twice" $KT encode --db "$W/dupset.tsv" -i "$W/d1.bed" -i "$W/d2.bed"
 printf '>r1 extra\t0\t10\tA\n>r2\t0\t10\tB\n' > "$W/gt.bed"; printf '>r1 extra\n>r2\n' > "$W/gt.names"
 $KT encode --names drop < "$W/gt.bed" > "$W/gt.kt" 2>/dev/null
-$KT --names "$W/gt.names" decode "$W/gt.kt" 2>/dev/null | cmp -s - "$W/gt.bed" \
+$KT --names "$W/gt.names" decode -i "$W/gt.kt" 2>/dev/null | cmp -s - "$W/gt.bed" \
   && echo "name list starting with >: restored" || { echo "name list starting with >: WRONG"; fail=1; }
 L="$W"; for i in 1 2 3 4 5; do L="$L/$(printf 'd%.0s' $(seq 1 120))"; done; mkdir -p "$L"
 echo keep > "${L:0:511}" 2>/dev/null || true
 awk 'BEGIN{for(i=0;i<80000;i++)printf "s%d\t0\t10\tA\n",i}' > "$W/long.bed"
 $KT encode --tmp-dir "$L" --sort=1M --names drop < "$W/long.bed" > "$W/long.kt" 2>/dev/null \
-  && $KT decode --names ordinal "$W/long.kt" 2>/dev/null | cut -f2,3,4 | cmp -s - <(cut -f2,3,4 "$W/long.bed") \
+  && $KT decode --names ordinal -i "$W/long.kt" 2>/dev/null | cut -f2,3,4 | cmp -s - <(cut -f2,3,4 "$W/long.bed") \
   && [ "$(cat "${L:0:511}" 2>/dev/null)" = keep ] \
   && echo "long sort temp dir: round-trip, bystander intact" || { echo "long sort temp dir: WRONG"; fail=1; }
 $KT encode < "$D/s.bed" >&- 2>/dev/null && { echo "encode with stdout closed: EXIT 0"; fail=1; } || echo "encode with stdout closed: refused"
@@ -650,42 +645,42 @@ printf 'FQ6SH1h576F\t0\t10\tL\nOyHUvXChfZK\t0\t10\tL\nzz\t0\t10\tL\nOyHUvXChfZK\
 must_fail "a repeat behind a hash collision" $KT encode < "$W/coll.bed"
 must_fail "a repeat behind a hash collision, sorted" $KT encode --sort < "$W/coll.bed"
 printf 'FQ6SH1h576F\t0\t10\tL\nOyHUvXChfZK\t0\t10\tL\n' > "$W/coll2.bed"
-$KT encode < "$W/coll2.bed" > "$W/coll2.kt" 2>/dev/null; $KT decode "$W/coll2.kt" 2>/dev/null | cmp -s - "$W/coll2.bed" \
+$KT encode < "$W/coll2.bed" > "$W/coll2.kt" 2>/dev/null; $KT decode -i "$W/coll2.kt" 2>/dev/null | cmp -s - "$W/coll2.bed" \
   && echo "two names with one hash: accepted" || { echo "two names with one hash: WRONG"; fail=1; }
 mkdir -p "$W/spfull"; (trap "" XFSZ; ulimit -f 32; $KT encode --tmp-dir "$W/spfull" --sort=1M < "$W/long.bed" > /dev/null 2>&1) || true
   [ "$(ls "$W/spfull" | wc -l)" = 0 ] && echo "spill on a full disk: removed" || { echo "spill on a full disk: LEFT"; fail=1; }
 printf 'r1\r\nr2\r\n' > "$W/crlf.txt"; printf 'r1\t0\t10\tA\nr2\t0\t10\tB\n' > "$W/n2.bed"
 $KT encode --names drop < "$W/n2.bed" > "$W/n2.kt" 2>/dev/null
-$KT --names "$W/crlf.txt" decode "$W/n2.kt" 2>/dev/null | cmp -s - "$W/n2.bed" \
+$KT --names "$W/crlf.txt" decode -i "$W/n2.kt" 2>/dev/null | cmp -s - "$W/n2.bed" \
   && echo "CRLF name list: restored" || { echo "CRLF name list: WRONG"; fail=1; }
 printf '>r1 extra\t0\t10\tA\n' > "$W/gt1.bed"; printf '>r1 extra\n' > "$W/gt1.txt"
 $KT encode --names drop < "$W/gt1.bed" > "$W/gt1.kt" 2>/dev/null
-$KT --names "$W/gt1.txt" decode "$W/gt1.kt" 2>/dev/null | cmp -s - "$W/gt1.bed" \
+$KT --names "$W/gt1.txt" decode -i "$W/gt1.kt" 2>/dev/null | cmp -s - "$W/gt1.bed" \
   && echo "one-line name list starting with >: restored" || { echo "one-line name list starting with >: WRONG"; fail=1; }
 printf 'r1\n' > "$W/dupn.txt"; printf 'r1\nr1\n' > "$W/dupn2.txt"
-must_fail "a name file with a repeat, on query" $KT --names "$W/dupn2.txt" region "$W/n2.kt" r1
+must_fail "a name file with a repeat, on query" $KT --names "$W/dupn2.txt" region -i "$W/n2.kt" -s r1
 printf 'featureID acrocentric chromosome\n1\tA\tX\n' > "$W/notab.tsv"; printf 's\t0\t10\t1\n' > "$W/ids1.bed"
-must_fail "features.tsv whose first line has no tab" $KT encode --db "$W/notab.tsv" "$W/ids1.bed"
+must_fail "features.tsv whose first line has no tab" $KT encode --db "$W/notab.tsv" -i "$W/ids1.bed"
 
 # Round 15: an index answered an absent name whose 64-bit hash matched a
 # stored one, and one built under a name file answered under another.
 printf 'aaa\t0\t10\tA\nYo5P2GphlrB\t0\t10\tB\nYo5P2GphlrB\t10\t30\tC\nzzz\t0\t10\tD\n' > "$W/hc.bed"
-$KT encode < "$W/hc.bed" > "$W/hc.kt" 2>/dev/null; $KT index "$W/hc.kt" >/dev/null 2>&1
-must_fail "indexed query of a colliding absent name" $KT region "$W/hc.kt" TQyOn5lCDT5
-$KT region "$W/hc.kt" Yo5P2GphlrB 2>/dev/null | cmp -s - <(grep -P '^Yo5P2GphlrB\t' "$W/hc.bed") \
+$KT encode < "$W/hc.bed" > "$W/hc.kt" 2>/dev/null; $KT index -i "$W/hc.kt" >/dev/null 2>&1
+must_fail "indexed query of a colliding absent name" $KT region -i "$W/hc.kt" -s TQyOn5lCDT5
+$KT region -i "$W/hc.kt" -s Yo5P2GphlrB 2>/dev/null | cmp -s - <(grep -P '^Yo5P2GphlrB\t' "$W/hc.bed") \
   && echo "indexed query of the stored name: correct" || { echo "indexed query of the stored name: WRONG"; fail=1; }
 printf 'r0\t0\t10\tA\nr1\t0\t10\tB\nr2\t0\t10\tC\nr3\t0\t10\tD\n' > "$W/nx.bed"
 $KT encode --names drop < "$W/nx.bed" > "$W/nx.kt" 2>/dev/null
 printf 'r0\nr1\nr2\nr3\n' > "$W/A.txt"; printf 'r3\nr2\nr1\nr0\n' > "$W/B.txt"
-$KT --names "$W/A.txt" index "$W/nx.kt" >/dev/null 2>&1
-[ "$($KT --names "$W/B.txt" region "$W/nx.kt" r0 2>/dev/null | cut -f4)" = D ] \
+$KT --names "$W/A.txt" index -i "$W/nx.kt" >/dev/null 2>&1
+[ "$($KT --names "$W/B.txt" region -i "$W/nx.kt" -s r0 2>/dev/null | cut -f4)" = D ] \
   && echo "index under another name file: ignored" || { echo "index under another name file: WRONG"; fail=1; }
 
 # Round 16: a name file rewritten in place, an index entry with its ordinal
 # edited, a 5 MB label through smooth, query and decode, and --names ordinal
 # on query.
 cp "$W/B.txt" "$W/A.txt"
-[ "$($KT --names "$W/A.txt" region "$W/nx.kt" r0 2>/dev/null | cut -f4)" = D ] \
+[ "$($KT --names "$W/A.txt" region -i "$W/nx.kt" -s r0 2>/dev/null | cut -f4)" = D ] \
   && echo "index after the name file changed: ignored" || { echo "index after the name file changed: WRONG"; fail=1; }
 python3 - "$W" <<'PY'
 import struct, sys
@@ -701,27 +696,27 @@ put = lambda e, i, v: (e & ~(((1 << w) - 1) << (i * (32 + w) + 32))) | (v << (i 
 a, z = get(0), get(n - 1); ent = put(put(ent, 0, z), n - 1, a)
 d[base:len(d) - 48] = ent.to_bytes(len(d) - 48 - base, "little"); open(W + "/hc.kt", "wb").write(d)
 PY
-$KT region "$W/hc.kt" aaa 2>/dev/null | cmp -s - <(grep -P '^aaa\t' "$W/hc.bed") \
+$KT region -i "$W/hc.kt" -s aaa 2>/dev/null | cmp -s - <(grep -P '^aaa\t' "$W/hc.bed") \
   && echo "index with edited ordinals: not trusted" || { echo "index with edited ordinals: WRONG"; fail=1; }
 python3 -c "open('$W/five.bed', 'w').write('s\t0\t10\t%s\n' % ('z' * (5 << 20)))"
 $KT encode < "$W/five.bed" > "$W/five.kt" 2>/dev/null
 printf 'feature_set\tchild\tparent\nfs\t%s\tcategorized\n' "$(head -c $((5 << 20)) /dev/zero | tr '\0' z)" > "$W/five.tsv"
-$KT smooth "$W/five.kt" "$W/five.tsv" fs 2>/dev/null | cmp -s - "$W/five.bed" && $KT decode "$W/five.kt" 2>/dev/null | cmp -s - "$W/five.bed" \
-  && $KT region "$W/five.kt" s 2>/dev/null | cmp -s - "$W/five.bed" \
+$KT smooth -i "$W/five.kt" --hier "$W/five.tsv" -f fs 2>/dev/null | cmp -s - "$W/five.bed" && $KT decode -i "$W/five.kt" 2>/dev/null | cmp -s - "$W/five.bed" \
+  && $KT region -i "$W/five.kt" -s s 2>/dev/null | cmp -s - "$W/five.bed" \
   && echo "5 MB label: smooth, decode, query" || { echo "5 MB label: WRONG"; fail=1; }
 $KT encode --names drop < "$D/s.bed" > "$W/nn.kt" 2>/dev/null
-$KT region --names ordinal "$W/nn.kt" 0 2>/dev/null | cut -f2,3,4 | cmp -s - <(grep -P '^q1\t' "$D/s.bed" | cut -f2,3,4) \
+$KT region --names ordinal -i "$W/nn.kt" -s 0 2>/dev/null | cut -f2,3,4 | cmp -s - <(grep -P '^q1\t' "$D/s.bed" | cut -f2,3,4) \
   && echo "query --names ordinal: correct" || { echo "query --names ordinal: WRONG"; fail=1; }
 
 # Round 17: a 5 MB label with a long name overflowed decode's buffer, and a
 # features.tsv label past 1 MB overflowed the per-set writer.
 N300=$(head -c 300 /dev/zero | tr '\0' n); python3 -c "open('$W/fivename.bed', 'w').write('$N300\t0\t10\t%s\n' % ('z' * (5 << 20)))"
 $KT encode < "$W/fivename.bed" > "$W/fivename.kt" 2>/dev/null
-$KT decode "$W/fivename.kt" 2>/dev/null | cmp -s - "$W/fivename.bed" && echo "5 MB label, long name: decode" || { echo "5 MB label, long name: WRONG"; fail=1; }
+$KT decode -i "$W/fivename.kt" 2>/dev/null | cmp -s - "$W/fivename.bed" && echo "5 MB label, long name: decode" || { echo "5 MB label, long name: WRONG"; fail=1; }
 python3 -c "open('$W/biglab.tsv', 'w').write('featureID\tacrocentric\tchromosome\n1\t%s\tX\n2\tB\tY\n' % ('L' * (2 << 20)))"
 printf 's\t0\t10\t1\ns\t10\t20\t2\ns\t20\t30\t1\n' > "$W/bigids.bed"
-$KT encode --db "$W/biglab.tsv" "$W/bigids.bed" > "$W/biglab.kt" 2>/dev/null; mkdir -p "$W/bl"
-$KT decode --db "$W/biglab.tsv" --out "$W/bl" "$W/biglab.kt" 2>/dev/null && [ "$(wc -l < "$W/bl/acrocentric.bed")" = 3 ] \
+$KT encode --db "$W/biglab.tsv" -i "$W/bigids.bed" > "$W/biglab.kt" 2>/dev/null; mkdir -p "$W/bl"
+$KT decode --db "$W/biglab.tsv" --out-dir "$W/bl" -i "$W/biglab.kt" 2>/dev/null && [ "$(wc -l < "$W/bl/acrocentric.bed")" = 3 ] \
   && echo "2 MB features label: decode --db" || { echo "2 MB features label: WRONG"; fail=1; }
 must_fail "encode with a reader flag" $KT encode --names ordinal < "$D/s.bed"
 
@@ -730,10 +725,10 @@ must_fail "encode with a reader flag" $KT encode --names ordinal < "$D/s.bed"
 python3 -c "open('$W/L.bed', 'w').write('0\t0\t10\t' + 'z' * (42 << 17) + '\n')"
 $KT encode --names drop < "$W/L.bed" > "$W/L.kt" 2>/dev/null
 printf '%s\n' "$(head -c 500 /dev/zero | tr '\0' n)" > "$W/n500.names"
-$KT --names "$W/n500.names" decode "$W/L.kt" 2>/dev/null | cut -f1 | cmp -s - <(cut -f1 "$W/n500.names") \
+$KT --names "$W/n500.names" decode -i "$W/L.kt" 2>/dev/null | cut -f1 | cmp -s - <(cut -f1 "$W/n500.names") \
   && echo "4.5 MB label with a 500-byte name: decode" || { echo "4.5 MB label with a 500-byte name: WRONG"; fail=1; }
 printf '%s\n' "$(head -c 1000 /dev/zero | tr '\0' n)" > "$W/n1000.names"
-must_fail "a name file name past 511 bytes" $KT --names "$W/n1000.names" decode "$W/L.kt"
+must_fail "a name file name past 511 bytes" $KT --names "$W/n1000.names" decode -i "$W/L.kt"
 
 # On-the-fly: the encoder must take rows as a producer writes them, from a
 # pipe and from a slow writer, and give the same bytes as a file encode.
@@ -746,8 +741,8 @@ awk 'BEGIN{srand(3);for(i=0;i<20000;i++){p=0;for(j=0;j<5;j++){c=p+int(rand()*300
 cat "$W/pbig.bed" | $KT encode --tmp-dir "$W" --sort=1M > "$W/pipesort.kt" 2>/dev/null
 $KT encode --tmp-dir "$W" --sort=1M < "$W/pbig.bed" > "$W/filesort.kt" 2>/dev/null
 cmp -s "$W/pipesort.kt" "$W/filesort.kt" && echo "sorted encode from a pipe: byte-identical" || { echo "sorted encode from a pipe: WRONG"; fail=1; }
-$KT decode --raw "$W/f.kt" 2>/dev/null | $KT encode --db "$D/db.features.tsv" - > "$W/pipedb.kt" 2>/dev/null
-$KT decode --raw "$W/f.kt" 2>/dev/null > "$W/merged.bed"; $KT encode --db "$D/db.features.tsv" "$W/merged.bed" > "$W/filedb.kt" 2>/dev/null
+$KT decode --raw -i "$W/f.kt" 2>/dev/null | $KT encode --db "$D/db.features.tsv" -i - > "$W/pipedb.kt" 2>/dev/null
+$KT decode --raw -i "$W/f.kt" 2>/dev/null > "$W/merged.bed"; $KT encode --db "$D/db.features.tsv" -i "$W/merged.bed" > "$W/filedb.kt" 2>/dev/null
 cmp -s "$W/pipedb.kt" "$W/filedb.kt" && echo "db encode from a pipe: byte-identical" || { echo "db encode from a pipe: WRONG"; fail=1; }
 
 # Round 19: an all-gap PAF record desynchronised the packed alignment; an
@@ -757,16 +752,16 @@ printf 'chrA\t0\t100\tA\nchrA\t100\t200\tB\nchrB\t0\t100\tC\nchrB\t100\t200\tD\n
 printf 'q0\t0\t0\t0\t+\tchrA\t200\t0\t100\t0\t100\t60\tcg:Z:100D\nq1\t200\t0\t200\t-\tchrB\t200\t0\t200\t200\t200\t60\tcg:Z:200M\n' > "$W/r19.paf"
 printf 'q1\t0\t100\tD\nq1\t100\t200\tC\n' > "$W/r19.bed"
 $KT encode --aln "$W/r19.paf" --ref "$W/r19.ref" < "$W/r19.bed" > "$W/r19p.kt" 2>/dev/null
-$KT aln-pack "$W/r19.paf" "$W/r19.ref" "$W/r19.kta" >/dev/null 2>&1
+$KT aln-pack -a "$W/r19.paf" -r "$W/r19.ref" -o "$W/r19.kta" >/dev/null 2>&1
 $KT encode --aln "$W/r19.kta" --ref "$W/r19.ref" < "$W/r19.bed" > "$W/r19k.kt" 2>/dev/null
-cmp -s "$W/r19p.kt" "$W/r19k.kt" && $KT decode --aln "$W/r19.kta" --ref "$W/r19.ref" "$W/r19p.kt" 2>/dev/null | cmp -s - "$W/r19.bed" \
+cmp -s "$W/r19p.kt" "$W/r19k.kt" && $KT decode --aln "$W/r19.kta" --ref "$W/r19.ref" -i "$W/r19p.kt" 2>/dev/null | cmp -s - "$W/r19.bed" \
   && echo "all-gap PAF record with a packed alignment: byte-identical" || { echo "all-gap PAF record: WRONG"; fail=1; }
 printf 'chrA\t100\t200\tB\nchrA\t0\t100\tA\n' > "$W/unsorted.ref"
 must_fail "an unsorted reference" $KT encode --aln "$W/r19.paf" --ref "$W/unsorted.ref" < "$W/r19.bed"
 sed 's/\tD$/\tE/' "$W/r19.ref" > "$W/other.ref"
-must_fail "decode with another reference" $KT decode --aln "$W/r19.paf" --ref "$W/other.ref" "$W/r19p.kt"
+must_fail "decode with another reference" $KT decode --aln "$W/r19.paf" --ref "$W/other.ref" -i "$W/r19p.kt"
 sed 's/200M/100M100M/' "$W/r19.paf" > "$W/other.paf"
-must_fail "decode with another PAF" $KT decode --aln "$W/other.paf" --ref "$W/r19.ref" "$W/r19p.kt"
+must_fail "decode with another PAF" $KT decode --aln "$W/other.paf" --ref "$W/r19.ref" -i "$W/r19p.kt"
 sed 's/\t-\t/\t*\t/' "$W/r19.paf" > "$W/star.paf"
 must_fail "a PAF strand of *" $KT encode --aln "$W/star.paf" --ref "$W/r19.ref" < "$W/r19.bed"
 
@@ -780,33 +775,33 @@ printf "$N300\t0\t100\tA\n$N300\t100\t200\tB\n" > "$W/n300.ref"
 printf "x\t200\t0\t200\t+\t$N300\t200\t0\t200\t200\t200\t60\tcg:Z:200M\n" > "$W/n300.paf"
 printf 'x\t0\t100\tA\nx\t100\t200\tB\n' > "$W/n300.bed"
 $KT encode --aln "$W/n300.paf" --ref "$W/n300.ref" < "$W/n300.bed" > "$W/n300.kt" 2>/dev/null \
-  && $KT decode --aln "$W/n300.paf" --ref "$W/n300.ref" "$W/n300.kt" 2>/dev/null | cmp -s - "$W/n300.bed" \
+  && $KT decode --aln "$W/n300.paf" --ref "$W/n300.ref" -i "$W/n300.kt" 2>/dev/null | cmp -s - "$W/n300.bed" \
   && echo "300-byte reference contig name: round-trip" || { echo "300-byte reference contig name: WRONG"; fail=1; }
 tac "$D/p.paf" > "$W/rev.paf"
-$KT decode --aln "$W/rev.paf" --ref "$D/ref.bed" "$W/d.kt" 2>/dev/null | cmp -s - "$D/s.bed" \
+$KT decode --aln "$W/rev.paf" --ref "$D/ref.bed" -i "$W/d.kt" 2>/dev/null | cmp -s - "$D/s.bed" \
   && echo "PAF in another record order: accepted" || { echo "PAF in another record order: WRONG"; fail=1; }
-must_fail "aln-pack with a flag as output" $KT aln-pack "$D/p.paf" "$D/ref.bed" --names "$W/x.kta"
+must_fail "aln-pack with a flag as output" $KT aln-pack --names "$W/x.kta" -a "$D/p.paf" -r "$D/ref.bed"
 
 # Round 21: a CRLF hierarchy, a four-column row, a child listed twice, a
 # root other than categorized, smooth region arguments, a halo that wraps,
 # and the V1 suffix on a long label.
 printf 'feature_set\tchild\tparent\r\nacrocentric\tacro\tcategorized\r\nacrocentric\tnovel\tcategorized\r\n' > "$W/crlf.tsv"
-$KT smooth "$W/sm.kt" "$W/crlf.tsv" acrocentric 2>/dev/null | cmp -s - "$W/sm.1" \
+$KT smooth -i "$W/sm.kt" --hier "$W/crlf.tsv" -f acrocentric 2>/dev/null | cmp -s - "$W/sm.1" \
   && echo "CRLF hierarchy: same rows" || { echo "CRLF hierarchy: WRONG"; fail=1; }
 printf 'feature_set\tchild\tparent\nacrocentric\tacro\tcategorized\tx\n' > "$W/four.tsv"
-must_fail "hierarchy row with four columns" $KT smooth "$W/sm.kt" "$W/four.tsv" acrocentric
+must_fail "hierarchy row with four columns" $KT smooth -i "$W/sm.kt" --hier "$W/four.tsv" -f acrocentric
 printf 'feature_set\tchild\tparent\nacrocentric\tacro\tcategorized\nacrocentric\tacro\tnovel\n' > "$W/dupc.tsv"
-must_fail "hierarchy child listed twice" $KT smooth "$W/sm.kt" "$W/dupc.tsv" acrocentric
+must_fail "hierarchy child listed twice" $KT smooth -i "$W/sm.kt" --hier "$W/dupc.tsv" -f acrocentric
 printf 'feature_set\tchild\tparent\nacrocentric\tacro\troot\n' > "$W/root.tsv"
-must_fail "hierarchy root that is not categorized" $KT smooth "$W/sm.kt" "$W/root.tsv" acrocentric
-must_fail "smooth region with a junk start" $KT smooth "$W/sm.kt" "$W/sm.tsv" acrocentric r0 1e2 3e2
-must_fail "smooth region with end before start" $KT smooth "$W/sm.kt" "$W/sm.tsv" acrocentric r0 300 100
-$KT region "$W/halo1.kt" s 45 46 18446744073709551614 2>/dev/null | cmp -s - <($KT region "$W/halo1.kt" s 45 46 100 2>/dev/null) \
+must_fail "hierarchy root that is not categorized" $KT smooth -i "$W/sm.kt" --hier "$W/root.tsv" -f acrocentric
+must_fail "smooth region with a junk start" $KT smooth -i "$W/sm.kt" --hier "$W/sm.tsv" -f acrocentric -s r0 --start 1e2 --end 3e2
+must_fail "smooth region with end before start" $KT smooth -i "$W/sm.kt" --hier "$W/sm.tsv" -f acrocentric -s r0 --start 300 --end 100
+$KT region -i "$W/halo1.kt" -s s --start 45 --end 46 --halo 18446744073709551614 2>/dev/null | cmp -s - <($KT region -i "$W/halo1.kt" -s s --start 45 --end 46 --halo 100 2>/dev/null) \
   && echo "halo of 2^64-2: whole sequence" || { echo "halo of 2^64-2: WRONG"; fail=1; }
 L309=$(head -c 300 /dev/zero | tr '\0' L)_specific
 printf 's\t0\t10\t%s\n' "$L309" > "$W/l309.bed"; $KT encode < "$W/l309.bed" > "$W/l309.kt" 2>/dev/null
 printf 'feature_set\tchild\tparent\nfs\t%s\tcategorized\n' "$L309" > "$W/l309.tsv"
-[ "$($KT --v1 smooth "$W/l309.kt" "$W/l309.tsv" fs 2>/dev/null | cut -f4 | wc -c)" = 301 ] \
+[ "$($KT --v1 smooth -i "$W/l309.kt" --hier "$W/l309.tsv" -f fs 2>/dev/null | cut -f4 | wc -c)" = 301 ] \
   && echo "V1 strip on a 309-byte label: stripped" || { echo "V1 strip on a 309-byte label: WRONG"; fail=1; }
 
 # Round 22: a refused decode --db truncated the old per-set BEDs; touching
@@ -814,35 +809,35 @@ printf 'feature_set\tchild\tparent\nfs\t%s\tcategorized\n' "$L309" > "$W/l309.ts
 # 33 sets with long labels and a 300-byte label were refused; a last line
 # without a newline was taken.
 mkdir -p "$W/keepdir"; printf 'PRECIOUS\n' > "$W/keepdir/acrocentric.bed"
-$KT decode --db "$D/db.features.tsv" --out "$W/keepdir" "$W/p.kt" >/dev/null 2>&1 && { echo "decode --db of a plain track: EXIT 0"; fail=1; }
+$KT decode --db "$D/db.features.tsv" --out-dir "$W/keepdir" -i "$W/p.kt" >/dev/null 2>&1 && { echo "decode --db of a plain track: EXIT 0"; fail=1; }
 [ "$(cat "$W/keepdir/acrocentric.bed")" = PRECIOUS ] && echo "refused decode --db: old BEDs intact" || { echo "refused decode --db: OLD BEDS DESTROYED"; fail=1; }
 printf 'featureID\ts1\ts2\n1\tx\tp\n2\ty\tp\n' > "$W/two.tsv"
 printf 's\t0\t10\tx\ns\t10\t20\ty\n' > "$W/n1.s1.bed"; printf 's\t0\t10\tp\ns\t10\t20\tp\n' > "$W/n1.s2.bed"
-must_fail "touching same-label runs in one set" $KT encode --db "$W/two.tsv" "$W/n1.s1.bed" "$W/n1.s2.bed"
+must_fail "touching same-label runs in one set" $KT encode --db "$W/two.tsv" -i "$W/n1.s1.bed" -i "$W/n1.s2.bed"
 printf 's\t0\t10\t+1\ns\t10\t20\t2\n' > "$W/plus.bed"
-must_fail "featureID +1 in a merged track" $KT encode --db "$W/two.tsv" "$W/plus.bed"
+must_fail "featureID +1 in a merged track" $KT encode --db "$W/two.tsv" -i "$W/plus.bed"
 L201=$(head -c 201 /dev/zero | tr '\0' L); { printf 'featureID'; for i in $(seq 33); do printf '\ts%d' $i; done; printf '\n1'; for i in $(seq 33); do printf '\t%s%d' "$L201" $i; done; printf '\n'; } > "$W/t33.tsv"
-f33=""; for i in $(seq 33); do printf 's\t0\t10\t%s%d\n' "$L201" $i > "$W/t33.$i.bed"; f33="$f33 $W/t33.$i.bed"; done
+f33=""; for i in $(seq 33); do printf 's\t0\t10\t%s%d\n' "$L201" $i > "$W/t33.$i.bed"; f33="$f33 -i $W/t33.$i.bed"; done
 $KT encode --db "$W/t33.tsv" $f33 > "$W/t33.kt" 2>/dev/null && echo "33 sets with 201-byte labels: encoded" || { echo "33 sets with 201-byte labels: REFUSED"; fail=1; }
 L300=$(head -c 300 /dev/zero | tr '\0' L); printf "featureID\ts1\ts2\n1\t$L300\tp\n" > "$W/l300.tsv"
 printf "s\t0\t10\t$L300\n" > "$W/l300.s1.bed"; printf 's\t0\t10\tp\n' > "$W/l300.s2.bed"; mkdir -p "$W/l300o"
-$KT encode --db "$W/l300.tsv" "$W/l300.s1.bed" "$W/l300.s2.bed" > "$W/l300.kt" 2>/dev/null \
-  && $KT decode --db "$W/l300.tsv" --out "$W/l300o" "$W/l300.kt" 2>/dev/null && cmp -s "$W/l300o/s1.bed" "$W/l300.s1.bed" \
+$KT encode --db "$W/l300.tsv" -i "$W/l300.s1.bed" -i "$W/l300.s2.bed" > "$W/l300.kt" 2>/dev/null \
+  && $KT decode --db "$W/l300.tsv" --out-dir "$W/l300o" -i "$W/l300.kt" 2>/dev/null && cmp -s "$W/l300o/s1.bed" "$W/l300.s1.bed" \
   && echo "300-byte label in a set: round-trip" || { echo "300-byte label in a set: WRONG"; fail=1; }
 head -c -1 "$D/db.gene.bed" > "$W/nonl.gene.bed"
-must_fail "a set BED without a final newline" $KT encode --db "$D/db.features.tsv" "$D/db.acrocentric.bed" "$D/db.chromosome.bed" "$W/nonl.gene.bed" "$D/db.region.bed" "$D/db.repeat.bed" "$D/db.subtelomeric.bed"
+must_fail "a set BED without a final newline" $KT encode --db "$D/db.features.tsv" -i "$D/db.acrocentric.bed" -i "$D/db.chromosome.bed" -i "$W/nonl.gene.bed" -i "$D/db.region.bed" -i "$D/db.repeat.bed" -i "$D/db.subtelomeric.bed"
 
 # Round 23: a first sequence named \x01 matched the "no sequence yet"
 # sentinel of --db; a long --out path was truncated silently; MAXGAP near 2^64
 # wrapped; region with END before START printed nothing.
 printf '\001\t0\t10\t1\n\001\t10\t20\t2\nb\t0\t10\t1\n' > "$W/c3.bed"
-$KT encode --db "$W/two.tsv" "$W/c3.bed" > "$W/c3.kt" 2>/dev/null && $KT decode --raw "$W/c3.kt" 2>/dev/null | cmp -s - "$W/c3.bed" \
+$KT encode --db "$W/two.tsv" -i "$W/c3.bed" > "$W/c3.kt" 2>/dev/null && $KT decode --raw -i "$W/c3.kt" 2>/dev/null | cmp -s - "$W/c3.bed" \
   && echo "first sequence named 0x01 under --db: round-trip" || { echo "first sequence named 0x01 under --db: WRONG"; fail=1; }
 LD="$W"; while [ ${#LD} -lt 4080 ]; do LD="$LD/$(printf 'd%.0s' $(seq 1 100))"; done; mkdir -p "$LD" 2>/dev/null
-must_fail "decode --db --out with a 4080-byte path" $KT decode --db "$D/db.features.tsv" --out "$LD" "$W/f.kt"
-$KT --max-gap 18446744073709551615 smooth "$W/sm.kt" "$W/sm.tsv" acrocentric 2>/dev/null | cmp -s - "$W/sm.1" \
+must_fail "decode --db --out with a 4080-byte path" $KT decode --db "$D/db.features.tsv" --out-dir "$LD" -i "$W/f.kt"
+$KT --max-gap 18446744073709551615 smooth -i "$W/sm.kt" --hier "$W/sm.tsv" -f acrocentric 2>/dev/null | cmp -s - "$W/sm.1" \
   && echo "MAXGAP of 2^64-1: same as default" || { echo "MAXGAP of 2^64-1: WRONG"; fail=1; }
-must_fail "region with END before START" $KT region "$W/p.kt" q1 150 20
+must_fail "region with END before START" $KT region -i "$W/p.kt" -s q1 --start 150 --end 20
 
 # Round 24: 100,000 threads crashed in libgomp; a file-size limit killed
 # encode by signal; --fast used zstd-22 over an explicit --level; the block
@@ -887,12 +882,12 @@ done
 # Round 26: an index built while its name file was replaced answered from the
 # new file; a failed decode --db destroyed the previous output; a signal left
 # spill files; junk after the unit.
-cp "$W/A.txt" "$W/A2.txt"; $KT --names "$W/A2.txt" index "$W/nx.kt" >/dev/null 2>&1; cp "$W/B.txt" "$W/A2.tmp"; mv -f "$W/A2.tmp" "$W/A2.txt"
-[ "$($KT --names "$W/A2.txt" region "$W/nx.kt" r0 2>/dev/null | cut -f4)" = D ] \
+cp "$W/A.txt" "$W/A2.txt"; $KT --names "$W/A2.txt" index -i "$W/nx.kt" >/dev/null 2>&1; cp "$W/B.txt" "$W/A2.tmp"; mv -f "$W/A2.tmp" "$W/A2.txt"
+[ "$($KT --names "$W/A2.txt" region -i "$W/nx.kt" -s r0 2>/dev/null | cut -f4)" = D ] \
   && echo "index built before a name file swap: ignored" || { echo "index built before a name file swap: WRONG"; fail=1; }
-mkdir -p "$W/good"; $KT decode --db "$D/db.features.tsv" --out "$W/good" "$W/f.kt" >/dev/null 2>&1; m1=$(cat "$W/good"/*.bed | md5sum)
+mkdir -p "$W/good"; $KT decode --db "$D/db.features.tsv" --out-dir "$W/good" -i "$W/f.kt" >/dev/null 2>&1; m1=$(cat "$W/good"/*.bed | md5sum)
 cp "$W/f.kt" "$W/fbad.kt"; sz=$(stat -c%s "$W/fbad.kt"); printf '\xff' | dd of="$W/fbad.kt" bs=1 seek=$((sz-100)) conv=notrunc status=none
-$KT decode --db "$D/db.features.tsv" --out "$W/good" "$W/fbad.kt" >/dev/null 2>&1 && { echo "decode of a damaged db track: EXIT 0"; fail=1; }
+$KT decode --db "$D/db.features.tsv" --out-dir "$W/good" -i "$W/fbad.kt" >/dev/null 2>&1 && { echo "decode of a damaged db track: EXIT 0"; fail=1; }
 [ "$(cat "$W/good"/*.bed | md5sum)" = "$m1" ] && [ -z "$(ls "$W/good" | grep tmp)" ] \
   && echo "failed decode --db: previous output intact, no temporaries" || { echo "failed decode --db: OUTPUT DAMAGED"; fail=1; }
 mkdir -p "$W/sigspill"; ( (awk '{print; if (NR % 2000 == 0) system("sleep 0.05")}' "$W/long.bed"; sleep 3) | $KT encode --tmp-dir "$W/sigspill" --sort=1M > /dev/null 2>&1 & p=$!; sleep 1.5; kill -INT $p 2>/dev/null; wait $p ) 2>/dev/null || true
@@ -903,18 +898,18 @@ must_fail "--sort=1M2" $KT encode --tmp-dir "$W" --sort=1M2 < "$D/s.bed"
 # failed rename left the db output half-updated; a signal left db temporaries;
 # its cast.
 printf 'r0\nr1\nr2\nr3\n' > "$W/pn.txt"
-$KT decode --names ordinal "$W/nx.kt" 2>/dev/null | cut -f2,3,4 > "$W/pn.want"
-$KT --names <(cat "$W/pn.txt") decode "$W/nx.kt" 2>/dev/null | cmp -s - "$W/nx.bed" \
+$KT decode --names ordinal -i "$W/nx.kt" 2>/dev/null | cut -f2,3,4 > "$W/pn.want"
+$KT --names <(cat "$W/pn.txt") decode -i "$W/nx.kt" 2>/dev/null | cmp -s - "$W/nx.bed" \
   && echo "name file from a pipe: restored" || { echo "name file from a pipe: WRONG"; fail=1; }
 printf '@r0\nACGT\n+\nIIII\n@r1\nACGT\n+\nIIII\n@r2\nACGT\n+\nIIII\n@r3\nACGT\n+\nIIII\n' > "$W/pn.fq"
-$KT --names <(cat "$W/pn.fq") decode "$W/nx.kt" 2>/dev/null | cmp -s - "$W/nx.bed" \
+$KT --names <(cat "$W/pn.fq") decode -i "$W/nx.kt" 2>/dev/null | cmp -s - "$W/nx.bed" \
   && echo "FASTQ from a pipe: restored" || { echo "FASTQ from a pipe: WRONG"; fail=1; }
 mkdir -p "$W/mix"; for f in acrocentric chromosome gene region repeat subtelomeric; do echo "OLD_$f" > "$W/mix/$f.bed"; done
 mkdir -p "$W/mix/gene.bed.blocked" && mv "$W/mix/gene.bed" "$W/mix/gene.keep" && mkdir "$W/mix/gene.bed"
-must_fail "decode --db over a directory in --out" $KT decode --db "$D/db.features.tsv" --out "$W/mix" "$W/f.kt"
+must_fail "decode --db over a directory in --out" $KT decode --db "$D/db.features.tsv" --out-dir "$W/mix" -i "$W/f.kt"
 [ "$(cat "$W/mix/acrocentric.bed")" = OLD_acrocentric ] && [ -z "$(ls "$W/mix" | grep -E 'tmp|old')" ] \
   && echo "refused db decode: all old files kept, no leftovers" || { echo "refused db decode: HALF UPDATED"; fail=1; }
-mkdir -p "$W/dbsig"; ( $KT decode --db "$D/db.features.tsv" --out "$W/dbsig" "$W/f.kt" >/dev/null 2>&1 & p=$!; sleep 0.02; kill -INT $p 2>/dev/null; wait $p ) 2>/dev/null || true
+mkdir -p "$W/dbsig"; ( $KT decode --db "$D/db.features.tsv" --out-dir "$W/dbsig" -i "$W/f.kt" >/dev/null 2>&1 & p=$!; sleep 0.02; kill -INT $p 2>/dev/null; wait $p ) 2>/dev/null || true
 [ -z "$(ls "$W/dbsig" | grep tmp)" ] && echo "SIGINT during decode --db: no temporaries left" || { echo "SIGINT during decode --db: TEMPORARIES LEFT"; fail=1; }
 must_fail "--sort=1e18T" $KT encode --tmp-dir "$W" --sort=1e18T < "$D/s.bed"
 
@@ -938,39 +933,39 @@ cmp -s "$W/side1.kt" "$W/side2.kt" && echo "a flag before the command: same byte
 # a corrupt track.
 $KT encode --names "drop:$W/side.names" < "$D/s.bed" > "$W/side.kt" 2>/dev/null
 awk '{print $1}' "$D/s.bed" | uniq | sed 's/^/>/' > "$W/side.fa"
-$KT decode --names "$W/side.fa" "$W/side.kt" 2>&1 | grep -q "does not belong to this track" \
+$KT decode --names "$W/side.fa" -i "$W/side.kt" 2>&1 | grep -q "does not belong to this track" \
   && echo "a foreign names file: named as such" || { echo "a foreign names file: WRONG MESSAGE"; fail=1; }
-$KT decode --names "$W/side.names" "$W/side.kt" 2>/dev/null | cmp -s - "$D/s.bed" \
+$KT decode --names "$W/side.names" -i "$W/side.kt" 2>/dev/null | cmp -s - "$D/s.bed" \
   && echo "the sidecar it wrote: round trips" || { echo "the sidecar it wrote: BROKEN"; fail=1; }
 
 must_fail "--len-codec 999999" $KT encode --len-codec 999999 < "$D/s.bed"
 must_fail "--id-codec 999999" $KT encode --id-codec 999999 < "$D/s.bed"
 # A sorted track decodes in sorted order, never the input order.
 $KT encode --sort < "$D/s.bed" > "$W/so.kt" 2>/dev/null
-$KT decode "$W/so.kt" 2>/dev/null | cmp -s - "$D/s.bed" \
+$KT decode -i "$W/so.kt" 2>/dev/null | cmp -s - "$D/s.bed" \
   && { echo "sorted decode: CLAIMS INPUT ORDER"; fail=1; } || echo "sorted decode: sorted order, as documented"
-$KT decode "$W/so.kt" 2>/dev/null | sort | cmp -s - <(sort "$D/s.bed") \
+$KT decode -i "$W/so.kt" 2>/dev/null | sort | cmp -s - <(sort "$D/s.bed") \
   && echo "sorted decode: same rows" || { echo "sorted decode: ROWS DIFFER"; fail=1; }
 
-must_fail "--preset, a flag that was removed" $KT encode --preset illumina
+must_fail "--preset, a flag that was removed" $KT encode --preset -i illumina
 # A file that is not KST is named as such, and a future version is told apart
 # from a foreign file.
 printf 'KTRACK02rest' > "$W/old.kst"
-$KT decode "$W/old.kst" 2>&1 | grep -q 'not "KST00001"' \
+$KT decode -i "$W/old.kst" 2>&1 | grep -q 'not "KST00001"' \
   && echo "a foreign magic: named" || { echo "a foreign magic: WRONG MESSAGE"; fail=1; }
 printf 'KST00099rest' > "$W/v99.kst"
-$KT decode "$W/v99.kst" 2>&1 | grep -q "KST version 00099" \
+$KT decode -i "$W/v99.kst" 2>&1 | grep -q "KST version 00099" \
   && echo "a future KST version: named" || { echo "a future KST version: WRONG MESSAGE"; fail=1; }
 
 must_fail "unknown flag" $KT --bogus encode
 $KT --help > "$W/help.txt" 2>/dev/null && [ -s "$W/help.txt" ] \
   && echo "--help: on stdout, exit 0" || { echo "--help: WRONG"; fail=1; }
-must_fail "query --db" $KT region "$W/side1.kt" --db x
-must_fail "encode --out" $KT encode --out "$W" < "$D/s.bed"
+must_fail "query --db" $KT region --db x -i "$W/side1.kt"
+must_fail "encode --out" $KT encode --out-dir "$W" < "$D/s.bed"
 must_fail "encode --names ordinal" $KT encode --names ordinal < "$D/s.bed"
-must_fail "decode --tail" $KT decode --tail 1 "$W/side1.kt"
-must_fail "decode two tracks" $KT decode "$W/side1.kt" "$W/side2.kt"
-must_fail "the retired --sort-mem" $KT encode --sort-mem 1M
+must_fail "decode --tail" $KT decode --tail 1 -i "$W/side1.kt"
+must_fail "decode two tracks" $KT decode -i "$W/side1.kt" -i "$W/side2.kt"
+must_fail "the retired --sort-mem" $KT encode --sort-mem -i 1M
 
 # htscodecs wrote "compiled without libbz2" for 32 candidates that were never
 # meant to reach arith: nothing from htscodecs may reach stderr.
@@ -1021,7 +1016,7 @@ fi
 # boundaries are the cases that would break it.
 printf 'r1\t0\t10\tabcXYZ\nr1\t10\t20\tabqXYZ\nr1\t20\t30\tabcXYZ\n' > "$W/coll.bed"
 $KT encode < "$W/coll.bed" > "$W/coll.kt" 2>/dev/null
-$KT decode "$W/coll.kt" 2>/dev/null | cmp -s - "$W/coll.bed" \
+$KT decode -i "$W/coll.kt" 2>/dev/null | cmp -s - "$W/coll.bed" \
   && echo "label cache: colliding keys round-trip" \
   || { echo "label cache: COLLIDING KEYS WRONG"; fail=1; }
 python3 -c "
@@ -1031,12 +1026,12 @@ for i in range(60000):
     f.write('r1\t%d\t%d\ta%04dz\n' % (p, p+10, i % 20000)); p += 10
 "
 $KT encode < "$W/many.bed" > "$W/many.kt" 2>/dev/null
-$KT decode "$W/many.kt" 2>/dev/null | cmp -s - "$W/many.bed" \
+$KT decode -i "$W/many.kt" 2>/dev/null | cmp -s - "$W/many.bed" \
   && echo "label cache: 20000 labels round-trip" \
   || { echo "label cache: 20000 labels WRONG"; fail=1; }
 printf 'r1\t0\t10\tA\nr11\t0\t10\tB\nr111\t0\t10\tC\n' > "$W/pre.bed"
 $KT encode < "$W/pre.bed" > "$W/pre.kt" 2>/dev/null
-$KT decode "$W/pre.kt" 2>/dev/null | cmp -s - "$W/pre.bed" \
+$KT decode -i "$W/pre.kt" 2>/dev/null | cmp -s - "$W/pre.bed" \
   && echo "prefix sequence names: round-trip" \
   || { echo "prefix sequence names: WRONG"; fail=1; }
 python3 -c "
@@ -1044,7 +1039,7 @@ f=open('$W/chunk.bed','w')
 for s in range(200000): f.write('seq%06d\t0\t10\tA\n' % s)
 "
 $KT -t 8 encode < "$W/chunk.bed" > "$W/chunk.kt" 2>/dev/null
-$KT decode "$W/chunk.kt" 2>/dev/null | cmp -s - "$W/chunk.bed" \
+$KT decode -i "$W/chunk.kt" 2>/dev/null | cmp -s - "$W/chunk.bed" \
   && echo "200000 one-row sequences at 8 threads: round-trip" \
   || { echo "200000 one-row sequences: WRONG"; fail=1; }
 # The staging file is new: a full temp filesystem must be fatal, not silent.

@@ -1,7 +1,6 @@
 # karyozip
 
 Compresses KaryoScope annotation tracks losslessly, and reads them back without decompressing the whole file.
-A `.bed.gz` track becomes one `.kst` file, several times smaller; `decode` returns the original BED byte for byte.
 
 ## Install
 
@@ -9,32 +8,31 @@ A `.bed.gz` track becomes one `.kst` file, several times smaller; `decode` retur
 make            # builds c/build/karyozip and rust/target/release/karyozip
 ```
 
-Either binary works; they write and read the same files.
 The C needs zstd, liblzma, zlib and an OpenMP compiler; the Rust needs cargo, liblzma and libgomp.
 
 ## Quick start
 
 ```
-karyozip encode < sample.chromosome.presmoothed.bed.gz > sample.kst
-karyozip decode sample.kst > sample.bed                  # the original BED, byte for byte
-karyozip region sample.kst chr1_hap1 1000000 1200000     # the runs overlapping a range
-karyozip smooth sample.kst hierarchy.tsv chromosome      # KaryoScope's smoothing, from the presmoothed track
+karyozip encode -i sample.chromosome.presmoothed.bed.gz -o sample.kst
+karyozip decode -i sample.kst -o sample.bed                               # the original BED, byte for byte
+karyozip region -i sample.kst -s chr1_hap1 --start 1000000 --end 1200000  # the runs overlapping a range
+karyozip smooth -i sample.kst --hier hierarchy.tsv -f chromosome          # KaryoScope's smoothing, from the presmoothed track
 ```
 
-`encode` reads plain or gzipped BED from stdin, so it can sit behind `karyoscope annotate` in a pipe.
-Every other text input may be plain or gzipped too.
+Without `-i`, `encode` reads stdin, so it can sit behind `karyoscope annotate` in a pipe; without `-o`, every command writes stdout.
+Every text input may be plain or gzipped.
 
 ## Commands
 
 ```
-karyozip encode [flags] < in.bed[.gz] > out.kst
-karyozip decode F                               the whole track as BED
-karyozip region F SEQ                           one sequence
-karyozip region F SEQ POS                       the run covering POS
-karyozip region F SEQ START END [HALO]          the runs overlapping START..END, plus HALO runs each side
-karyozip smooth F HIER FS [SEQ [START END]]     KaryoScope's hierarchy smoothing of feature set FS
-karyozip index F                                adds a name index, so region finds a read fast on tracks with many reads
-karyozip aln-pack P.paf REF.bed|REF.kst OUT     cuts a PAF to what --aln needs
+karyozip encode -i IN.bed[.gz] -o OUT.kst [flags]
+karyozip decode -i F                                  the whole track as BED
+karyozip region -i F -s SEQ                           one sequence
+karyozip region -i F -s SEQ -p POS                    the run covering POS
+karyozip region -i F -s SEQ --start N --end N [--halo N]   the runs overlapping a range, plus N runs each side
+karyozip smooth -i F --hier HIER -f FS [-s SEQ [--start N --end N]]   KaryoScope's smoothing of feature set FS
+karyozip index  -i F                                  adds a name index, so region finds a read fast on tracks with many reads
+karyozip aln-pack -a P.paf -r REF.bed|REF.kst -o OUT  cuts a PAF to what -a needs
 ```
 
 ## Size or speed
@@ -55,15 +53,15 @@ On our four biggest test tracks, up to 84,741,909 rows, `--slow` took 4.5 to 6.6
 A KaryoScope run writes one BED per feature set, presmoothed and smoothed.
 
 - **Smoothed tracks need not be stored.** `karyozip smooth` rebuilds a smoothed track from the presmoothed one, row for row as KaryoScope writes it. The exception is the v1 `region` and `acrocentric` sets, whose hierarchy changed after they were written: store those.
-- **All feature sets in one file.** `--db features.tsv` merges one sample's per-set BEDs into a single, smaller track. Smoothed sets merged this way also need `--hier hierarchy.tsv`, on encode and on every read.
+- **All feature sets in one file.** `-d features.tsv` merges one sample's per-set BEDs into a single, smaller track. Smoothed sets merged this way also need `--hier hierarchy.tsv`, on encode and on every read.
 
 ```
-karyozip encode --db features.tsv s.acrocentric.bed.gz s.chromosome.bed.gz ... > s.all.kst
-karyozip decode --db features.tsv --out DIR s.all.kst       # every set's BED back
-karyozip decode --db features.tsv --set gene s.all.kst      # one set
+karyozip encode -d features.tsv -i s.acrocentric.bed.gz -i s.chromosome.bed.gz ... -o s.all.kst
+karyozip decode -d features.tsv -i s.all.kst --out-dir DIR      # every set's BED back
+karyozip decode -d features.tsv -i s.all.kst --set gene         # one set
 ```
 
-- **Against a reference.** With the reads aligned to a reference (a PAF) and the reference's own track, `--aln P.paf --ref ref.bed` stores only what differs from the reference. Every read of such a file takes the same `--aln` and `--ref`.
+- **Against a reference.** With the reads aligned to a reference (a PAF) and the reference's own track, `-a P.paf -r ref.bed` stores only what differs from the reference. Every read of such a file takes the same `-a` and `-r`.
 
 ## Read names
 
@@ -71,30 +69,38 @@ Read names are stored in the file by default.
 
 | flag | effect |
 |---|---|
-| `--names drop` | store none; the file is smaller and a read is known by its number |
-| `--names drop:F` | write the names to `F` beside the track |
-| `--names F` | on decode, region and smooth: take names from `F`, a `drop:F` file, a FASTA, a FASTQ or a list, one a line |
-| `--names ordinal` | on decode: accept a track stored with `--names drop` and print the numbers |
-| `--names keep` | store names even when they are 0, 1, 2, ... |
+| `-n drop` | store none; the file is smaller and a read is known by its number |
+| `-n drop:F` | write the names to `F` beside the track |
+| `-n F` | on decode, region and smooth: take names from `F`, a `drop:F` file, a FASTA, a FASTQ or a list, one a line |
+| `-n ordinal` | on decode: accept a track stored with `-n drop` and print the numbers |
+| `-n keep` | store names even when they are 0, 1, 2, ... |
 
-`--sort` groups records by their labels, which pays on short reads stored with `--names drop`; a decode then returns the rows in that order.
+`--sort` groups records by their labels, which pays on short reads stored with `-n drop`; a decode then returns the rows in that order.
 
 ## All flags
 
 | flag | on | effect |
 |---|---|---|
+| `-i`, `--input FILE` | all | encode: the BED, one `-i` per set under `-d`, else stdin; the others: the track |
+| `-o`, `--output FILE` | all but index | where the output goes, else stdout; aln-pack: the packed file |
+| `-s`, `--seq SEQ` | region, smooth | the sequence |
+| `-p`, `--pos N` | region | the run covering position N |
+| `--start N`, `--end N` | region, smooth | a range; region prints the runs overlapping it, smooth smooths the whole sequence and prints the overlap |
+| `--halo N` | region | N more runs each side of the range |
+| `-f`, `--feature-set FS` | smooth | the feature set to smooth |
+| `--hier FILE` | smooth; encode and readers with `-d` | the KaryoScope hierarchy.tsv |
 | `--fast`, `--slow`, `--queryable` | encode | see Size or speed |
-| `--block N`, `--block all` | encode | rows per block by hand; `all`, the default, is one block |
-| `--level N` | encode | zstd level, 1 to 22, default 17 |
+| `-b`, `--block N`, `--block all` | encode | rows per block by hand; `all`, the default, is one block |
+| `-l`, `--level N` | encode | zstd level, 1 to 22, default 17 |
 | `--sort`, `--sort=MEM` | encode | group records by labels; spill to disk past `MEM` |
-| `--names ...` | encode, readers | see Read names |
-| `--db features.tsv`, `--hier H`, `--set A,B` | encode, readers | see Feature sets |
-| `--aln P.paf --ref R`, `--aln-names F` | encode, readers | see Feature sets; `--aln-names`: read N is line N+1 of `F` |
-| `--out DIR`, `--raw` | decode | one BED per set under `--db`; `--raw` prints what is stored, for debugging |
+| `-n`, `--names ...` | encode, readers | see Read names |
+| `-d`, `--db features.tsv`, `--set A,B` | encode, readers | see Feature sets |
+| `-a`, `--aln P.paf`, `-r`, `--ref R`, `--aln-names F` | encode, readers, aln-pack | see Feature sets; `--aln-names`: read N is line N+1 of `F` |
+| `--out-dir DIR`, `--raw` | decode | one BED per set under `-d`; `--raw` prints what is stored, for debugging |
 | `--max-gap N`, `--v1` | smooth | KaryoScope's smoothing options |
-| `--threads N`, `-t N` | all | default `OMP_NUM_THREADS`, else the cores, up to 8 |
+| `-t`, `--threads N` | all | default `OMP_NUM_THREADS`, else the cores, up to 8 |
 | `--tmp-dir DIR` | all | where temporary files go, default `TMPDIR`, else /tmp |
-| `--profile`, `--help`, `--version` | all | time per phase; usage; library versions |
+| `--profile`, `-h`, `--help`, `--version` | all | time per phase; usage; library versions |
 | `--tail 0\|1`, `--tok-chunk N`, `--id-codec N`, `--len-codec N` | encode | pin a choice the encoder otherwise makes itself |
 
 Flags work on either side of the command name.

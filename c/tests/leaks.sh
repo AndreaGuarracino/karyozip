@@ -30,7 +30,7 @@ printf 'feature_set\tchild\tparent\nfs\tA\tcategorized\nfs\tB\tcategorized\nfs\t
 "$SAN" encode < "$D/ls.bed" > "$W/p.kt" 2>/dev/null
 "$SAN" encode --names drop:"$W/side" < "$D/ls.bed" > "$W/s.kt" 2>/dev/null
 "$SAN" encode --aln "$D/lp.paf" --ref "$D/lref.bed" < "$D/ls.bed" > "$W/a.kt" 2>/dev/null
-DB="$D/db.acrocentric.bed $D/db.chromosome.bed $D/db.gene.bed $D/db.region.bed $D/db.repeat.bed $D/db.subtelomeric.bed"
+DB="-i $D/db.acrocentric.bed -i $D/db.chromosome.bed -i $D/db.gene.bed -i $D/db.region.bed -i $D/db.repeat.bed -i $D/db.subtelomeric.bed"
 "$SAN" encode --db "$D/db.features.tsv" $DB > "$W/f.kt" 2>/dev/null
 mkdir -p "$W/out"
 run "encode"                       "$SAN" encode < "$D/ls.bed"
@@ -41,20 +41,20 @@ run "encode --sort=1M"             "$SAN" --tmp-dir "$W" --sort=1M encode < "$D/
 run "encode --names drop:F"        "$SAN" encode --names drop:"$W/side2" < "$D/ls.bed"
 run "encode --aln --ref"           "$SAN" encode --aln "$D/lp.paf" --ref "$D/lref.bed" < "$D/ls.bed"
 run "encode --db"                  "$SAN" encode --db "$D/db.features.tsv" $DB
-run "decode"                       "$SAN" decode "$W/p.kt"
-run "decode --raw"                 "$SAN" decode --raw "$W/p.kt"
-run "decode --names F"             "$SAN" --names "$W/side" decode "$W/s.kt"
-run "decode --aln --ref"           "$SAN" decode --aln "$D/lp.paf" --ref "$D/lref.bed" "$W/a.kt"
-run "decode --db --out"            "$SAN" decode --db "$D/db.features.tsv" --out "$W/out" "$W/f.kt"
-run "region, a name that is there" "$SAN" region "$W/p.kt" r1
-run "region, a name that is not (refused)" "$SAN" region "$W/p.kt" nosuchname
-run "region SEQ POS"               "$SAN" region "$W/p.kt" r1 150
-run "region SEQ START END HALO"    "$SAN" region "$W/p.kt" r1 0 200 3
-run "index"                        "$SAN" index "$W/p.kt"
-run "region, after index"          "$SAN" region "$W/p.kt" r1 150
-run "smooth"                       "$SAN" smooth "$W/p.kt" "$W/h.tsv" fs
-run "smooth, one sequence"         "$SAN" smooth "$W/p.kt" "$W/h.tsv" fs r1
-run "aln-pack"                     "$SAN" aln-pack "$D/lp.paf" "$D/lref.bed" "$W/pk"
+run "decode"                       "$SAN" decode -i "$W/p.kt"
+run "decode --raw"                 "$SAN" decode --raw -i "$W/p.kt"
+run "decode --names F"             "$SAN" --names "$W/side" decode -i "$W/s.kt"
+run "decode --aln --ref"           "$SAN" decode --aln "$D/lp.paf" --ref "$D/lref.bed" -i "$W/a.kt"
+run "decode --db --out"            "$SAN" decode --db "$D/db.features.tsv" --out-dir "$W/out" -i "$W/f.kt"
+run "region, a name that is there" "$SAN" region -i "$W/p.kt" -s r1
+run "region, a name that is not (refused)" "$SAN" region -i "$W/p.kt" -s nosuchname
+run "region SEQ POS"               "$SAN" region -i "$W/p.kt" -s r1 -p 150
+run "region SEQ START END HALO"    "$SAN" region -i "$W/p.kt" -s r1 --start 0 --end 200 --halo 3
+run "index"                        "$SAN" index -i "$W/p.kt"
+run "region, after index"          "$SAN" region -i "$W/p.kt" -s r1 -p 150
+run "smooth"                       "$SAN" smooth -i "$W/p.kt" --hier "$W/h.tsv" -f fs
+run "smooth, one sequence"         "$SAN" smooth -i "$W/p.kt" --hier "$W/h.tsv" -f fs -s r1
+run "aln-pack"                     "$SAN" aln-pack -a "$D/lp.paf" -r "$D/lref.bed" -o "$W/pk"
 run "--help"                       "$SAN" --help
 run "--version"                    "$SAN" --version
 [ $fail = 0 ] && echo "leaks: clean" || echo "leaks: FOUND SOMETHING"

@@ -292,3 +292,13 @@ pub fn tok_decode(src: &[u8]) -> Option<Vec<u8>> {
         Some(v)
     }
 }
+
+unsafe extern "C" { fn dup2(a: i32, b: i32) -> i32; }
+
+/// -i and -o: the file takes the place of stdin or stdout
+pub fn redirect(path: &str, fd: i32) {
+    use std::os::{fd::AsRawFd, unix::fs::OpenOptionsExt};
+    let f = if fd == 0 { std::fs::File::open(path) }
+            else { std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o644).open(path) };
+    if !f.is_ok_and(|f| unsafe { dup2(f.as_raw_fd(), fd) } >= 0) { crate::bail(&format!("cannot open {path}")) }
+}

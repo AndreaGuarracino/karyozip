@@ -926,7 +926,7 @@ fn cname(c: i32) -> String {
 
 /// the mode's candidates
 /// MB the default ranks every codec on
-pub const DEFSAMPLE: usize = 64;
+pub const DEFSAMPLE: usize = 16;
 
 pub fn candlist(slow: bool) -> Vec<i32> {
     KCAND.iter().filter(|(_, f)| slow || *f).map(|(c, _)| *c).collect()

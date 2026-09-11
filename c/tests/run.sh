@@ -689,13 +689,17 @@ cp "$W/B.txt" "$W/A.txt"
   && echo "index after the name file changed: ignored" || { echo "index after the name file changed: WRONG"; fail=1; }
 python3 - "$W" <<'PY'
 import struct, sys
-# the index is a trailer inside the track: n, dup, bind, magic in the last
-# four words, and n*20 bytes of table before them
+# the index is a trailer inside the track: n, bucket bits, bind, payload,
+# magic in the last five words; the payload ends in entries of a 32-bit
+# fingerprint and a w-bit ordinal, bit-packed. Swap the first and last ordinal.
 W = sys.argv[1]; d = bytearray(open(W + "/hc.kt", "rb").read())
-n = struct.unpack_from("<Q", d, len(d) - 32)[0]
-base = len(d) - 32 - n * 20
-o = base + 16 * n; ords = list(struct.unpack_from("<%dI" % n, d, o)); ords[0], ords[-1] = ords[-1], ords[0]
-struct.pack_into("<%dI" % n, d, o, *ords); open(W + "/hc.kt", "wb").write(d)
+n, k, _, pay = struct.unpack_from("<4Q", d, len(d) - 40)
+nb = 1 << k; base = len(d) - 40 - pay + nb + (nb + 1023) // 1024 * 8
+w = max(1, (n - 1).bit_length()); ent = int.from_bytes(d[base:len(d) - 48], "little")
+get = lambda i: (ent >> (i * (32 + w) + 32)) & ((1 << w) - 1)
+put = lambda e, i, v: (e & ~(((1 << w) - 1) << (i * (32 + w) + 32))) | (v << (i * (32 + w) + 32))
+a, z = get(0), get(n - 1); ent = put(put(ent, 0, z), n - 1, a)
+d[base:len(d) - 48] = ent.to_bytes(len(d) - 48 - base, "little"); open(W + "/hc.kt", "wb").write(d)
 PY
 $KT region "$W/hc.kt" aaa 2>/dev/null | cmp -s - <(grep -P '^aaa\t' "$W/hc.bed") \
   && echo "index with edited ordinals: not trusted" || { echo "index with edited ordinals: WRONG"; fail=1; }

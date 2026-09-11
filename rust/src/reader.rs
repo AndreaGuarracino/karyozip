@@ -106,7 +106,7 @@ pub struct Reader {
     /// side, perm_ext, dropped, int, tok, perm, perm_tok
     nf: u8,
     /// the appended index: offset of its key table, and its trailer's binding word
-    idx: Option<(u64, u64)>,
+    idx: Option<(u64, u64, u64, u64)>,   // index base, binding, bucket bits, payload
     /// name -> rank, built on the first lookup, which is also where the C
     /// notices that two sequences share a name.
     /// as the C's buildhash: a power-of-two table of ordinals over the
@@ -176,15 +176,14 @@ impl Reader {
         let mut idx = None;
         // An index trailer sits past the data: take it off, so every size
         // check below still bounds the data alone.
-        if fsz >= 32 + 8 + 128 {
-            let mut t = [0u8; 32];
-            rd(f.seek(SeekFrom::Start(fsz - 32)), "seek");
+        if fsz >= 40 + 8 + 128 {                    // n, bucket bits, binding, payload, magic
+            let mut t = [0u8; 40];
+            rd(f.seek(SeekFrom::Start(fsz - 40)), "seek");
             rd(f.read_exact(&mut t), "seek");
-            let w: Vec<u64> = (0..4)
+            let w: Vec<u64> = (0..5)
                 .map(|i| u64::from_le_bytes(t[i * 8..i * 8 + 8].try_into().unwrap())).collect();
-            if w[3] == IDXMAGIC && w[0] == h[0] && w[0] <= (fsz - 32) / 20
-                && fsz - 32 - w[0] * 20 >= 8 + 128 {
-                fsz -= 32 + w[0] * 20; hasidx = true; idx = Some((fsz, w[2]));
+            if w[4] == IDXMAGIC && w[0] == h[0] && w[1] < 40 && w[3] <= fsz - 40 - 8 - 128 {
+                fsz -= 40 + w[3]; hasidx = true; idx = Some((fsz, w[2], w[1], w[3]));
             }
         }
         let nml = h[1] & !FLAGS;
@@ -938,38 +937,29 @@ impl Reader {
         h
     }
 
-    /// The appended index, as the C reads it: a binary search over the
-    /// sorted hash column, then the second hash and the ordinal confirm.
+    /// The appended index, as the C reads it: the name's bucket, its
+    /// fingerprints, and a name decoded only when one fingerprint is not enough.
     fn idxlookup(&self, nm: &[u8]) -> i64 {
         use std::os::unix::fs::FileExt;
-        let Some((base, bind)) = self.idx else { return -1 };
-        if bind != self.mhash ^ self.namesrc() { return -1; }
+        let Some((base, bind, k, pay)) = self.idx else { return -1 };
         let n = self.nreads;
-        let word = |off: u64| -> u64 { let mut b = [0u8; 8]; rd(self.f.read_exact_at(&mut b, off), "index read"); u64::from_le_bytes(b) };
-        let ord = |i: u64| -> u64 { let mut b = [0u8; 4]; rd(self.f.read_exact_at(&mut b, base + n * 16 + i * 4), "index read"); u32::from_le_bytes(b) as u64 };
-        let (want, want2) = (kst::fnv(FNV0, nm), h64b(nm));
-        let (mut lo, mut hi) = (0u64, n);
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            let k = word(base + mid * 8);
-            if k == want {
-                let (mut a2, mut b2) = (mid, mid + 1);
-                while a2 > 0 && word(base + (a2 - 1) * 8) == want { a2 -= 1; }
-                while b2 < n && word(base + b2 * 8) == want { b2 += 1; }
-                let fits = |j: u64| { let o = ord(j); o < n && word(base + n * 8 + j * 8) == want2 ^ o.wrapping_mul(H64B_K) };
-                if b2 - a2 == 1 {
-                    let o = ord(a2);
-                    let named = self.names.get().is_some_and(|_| self.name_at(o) != nm);
-                    return if fits(a2) && !named { o as i64 } else { -1 };
-                }
-                for j in a2..b2 {
-                    if fits(j) && self.name_at(ord(j)) == nm { return ord(j) as i64; }
-                }
-                return -1;
-            }
-            if k < want { lo = mid + 1; } else { hi = mid; }
-        }
-        -1
+        let (nb, w) = (1u64 << k, ixw(n.max(1)));
+        let ns = nb.div_ceil(1024);
+        if bind != self.mhash ^ self.namesrc() || pay != nb + ns * 8 + (n * (32 + w)).div_ceil(8) + 8 { return -1; }
+        let mut t = vec![0u8; crate::ckalloc(pay as usize)];
+        rd(self.f.read_exact_at(&mut t, base), "index read");
+        let h = h64b(nm);
+        let b = if k > 0 { h >> (64 - k) } else { 0 };
+        let mut at = u64::from_le_bytes(t[(nb + (b >> 10) * 8) as usize..][..8].try_into().unwrap());
+        for j in (b & !1023)..b { at += t[j as usize] as u64; }
+        let ent = &t[(nb + ns * 8) as usize..];
+        let hits: Vec<u64> = (at..(at + t[b as usize] as u64).min(n)).filter_map(|e| {
+            let bit = e * (32 + w);
+            let o = ixget(ent, bit + 32, w);
+            (o < n && ixget(ent, bit, 32) == ixfp(h, o)).then_some(o)
+        }).collect();
+        if hits.len() == 1 && self.names.get().is_none() { return hits[0] as i64; }   // one fingerprint: no name to decode
+        hits.into_iter().find(|&o| self.name_at(o) == nm).map_or(-1, |o| o as i64)
     }
 
     fn find(&self, seq: &[u8]) -> i64 {
@@ -1116,7 +1106,7 @@ pub(crate) fn skip(b: &[u8], mut i: usize) -> usize {
 
 /* ------------------------------------------------------------ the index */
 
-/// "KSTIDX01" reversed into the trailer's last word.
+/// the name hash the index buckets and fingerprints by
 const H64B_K: u64 = 0x9e37_79b9_7f4a_7c15;
 
 fn h64b(s: &[u8]) -> u64 {
@@ -1137,29 +1127,51 @@ impl Reader {
         if self.nreads > u32::MAX as u64 {
             crate::bail("more than 2^32 sequences: the index stores the ordinal in 32 bits");
         }
-        let n = self.nreads as usize;
-        let mut pair: Vec<(u64, u32)> = (0..n)
-            .map(|i| (kst::fnv(FNV0, self.name_at(i as u64)), i as u32)).collect();
-        pair.sort_unstable();
-        let dup = pair.windows(2).filter(|w| w[0].0 == w[1].0).count() as u64;
-        let mut t = Vec::with_capacity(crate::ckalloc(n * 20 + 32));
-        for (k, _) in &pair { t.extend_from_slice(&k.to_le_bytes()); }
-        for (_, o) in &pair {
-            t.extend_from_slice(&(h64b(self.name_at(*o as u64))
-                                  ^ (*o as u64).wrapping_mul(H64B_K)).to_le_bytes());
+        let n = self.nreads;
+        let w = ixw(n.max(1));
+        let mut k = 0u32;
+        while k < 30 && (1u64 << (k + 2)) < n { k += 1; }   // about 4 reads a bucket
+        let hs: Vec<u64> = (0..n).map(|i| h64b(self.name_at(i))).collect();
+        let key = loop {                                   // a count must fit its byte
+            let mut key: Vec<(u64, u64)> = hs.iter().enumerate()
+                .map(|(i, &h)| ((if k > 0 { (h >> (64 - k)) << 32 } else { 0 }) | ixfp(h, i as u64), i as u64)).collect();
+            key.sort_unstable();
+            let top = key.chunk_by(|a, b| a.0 >> 32 == b.0 >> 32).map(|c| c.len()).max().unwrap_or(0);
+            if top <= 255 { break key; }
+            k += 1;
+        };
+        let (nb, dup) = (1u64 << k, key.windows(2).filter(|p| p[0].0 == p[1].0).count() as u64);
+        let ns = nb.div_ceil(1024);
+        let pay = nb + ns * 8 + (n * (32 + w)).div_ceil(8) + 8;
+        let mut t = vec![0u8; crate::ckalloc(pay as usize)];
+        let eo = (nb + ns * 8) as usize;
+        for (i, &(kk, o)) in key.iter().enumerate() {
+            t[(kk >> 32) as usize] += 1;
+            let (bit, v) = (i as u64 * (32 + w), (kk & 0xffff_ffff) | (o << 32));
+            for j in 0..32 + w { if v >> j & 1 == 1 { t[eo + ((bit + j) >> 3) as usize] |= 1 << ((bit + j) & 7); } }
         }
-        for (_, o) in &pair { t.extend_from_slice(&o.to_le_bytes()); }
-        for v in [self.nreads, dup, self.mhash ^ self.namesrc(), IDXMAGIC] {
-            t.extend_from_slice(&v.to_le_bytes());
+        let mut sum = 0u64;
+        for g in 0..ns {
+            t[(nb + g * 8) as usize..][..8].copy_from_slice(&sum.to_le_bytes());
+            for b in g * 1024..nb.min((g + 1) * 1024) { sum += t[b as usize] as u64; }
         }
+        for v in [n, k as u64, self.mhash ^ self.namesrc(), pay, IDXMAGIC] { t.extend_from_slice(&v.to_le_bytes()); }
         use std::io::Write;
         let mut f = rd(std::fs::OpenOptions::new().append(true).open(path),
                        "cannot append the index to the track");
         rd(f.write_all(&t), "index write failed");
         rd(f.flush(), "index write failed");
-        eprintln!("index: {} sequences, {} B appended, {dup} hash collisions",
-                  self.nreads, 32 + n * 20);
+        eprintln!("index: {n} sequences, {} B appended, {dup} fingerprint collisions", pay + 40);
     }
+}
+
+/// the name's 32 bits, bound to its ordinal: a damaged entry fails to match
+fn ixfp(h: u64, o: u64) -> u64 { (h ^ o.wrapping_mul(H64B_K)) & 0xffff_ffff }
+/// bits for an ordinal below n, at least 1
+fn ixw(n: u64) -> u64 { let mut w = 1; while w < 32 && (n - 1) >> w != 0 { w += 1; } w }
+fn ixget(p: &[u8], bit: u64, nb: u64) -> u64 {
+    let v = u64::from_le_bytes(p[(bit >> 3) as usize..][..8].try_into().unwrap());
+    (v >> (bit & 7)) & ((1u64 << nb) - 1)
 }
 
 impl Reader {

@@ -157,7 +157,6 @@ static inline uint64_t rowmix(uint64_t h, uint64_t nh, uint64_t st, uint64_t en,
 }
 static uint64_t fnvstr(const char *s) { return fnvbuf(FNV0, s, strlen(s)); }
 static uint64_t ld64(const void *p) { uint64_t v; memcpy(&v, p, 8); return v; }
-static uint32_t ld32(const void *p) { uint32_t v; memcpy(&v, p, 4); return v; }
 
 static long int_arg(const char *p, long lo, long hi, const char *what) {   /* digits only, in range */
     if (!p || !*p || strspn(p, "0123456789") != strlen(p) || strlen(p) > 18) die(what);
@@ -380,7 +379,7 @@ static const char *NAMESARG = NULL;
 /* the default searches hard; --fast trades size for encode time */
 static int SLOW = 0;                  /* --slow: every codec over the whole file */
 #ifndef DEFSAMPLE
-#define DEFSAMPLE 64                  /* MB the default ranks every codec on */
+#define DEFSAMPLE 16                  /* MB the default ranks every codec on */
 #endif
 static int FASTMODE = 0;              /* --fast: the sampled search */
 static int SORT = 0;                  /* --sort: order records by label tuple */
@@ -3215,11 +3214,11 @@ static R *ropen(const char *path) {
     /* An index trailer, if any, sits past the data: take it off fsz so every
        size check below still bounds the data alone. Magic last, so a torn
        append is simply not seen. */
-    if (fsz >= 32 + 8 + 128) {
-        uint64_t t[4];
-        if (fseeko(r->f, (off_t)fsz - 32, SEEK_SET) || fread(t, 8, 4, r->f) != 4) die("seek");
-        if (t[3] == IDXMAGIC && t[0] == h[0] && t[0] <= (fsz - 32) / 20
-            && fsz - 32 - t[0] * 20 >= 8 + 128) { fsz -= 32 + t[0] * 20; r->hasidx = 1; }
+    if (fsz >= 40 + 8 + 128) {           /* n, bucket bits, binding, payload, magic */
+        uint64_t t[5];
+        if (fseeko(r->f, (off_t)fsz - 40, SEEK_SET) || fread(t, 8, 5, r->f) != 5) die("seek");
+        if (t[4] == IDXMAGIC && t[0] == h[0] && t[1] < 40 && t[3] <= fsz - 40 - 8 - 128)
+            { fsz -= 40 + t[3]; r->hasidx = 1; }
     }
     r->fsz = fsz;
     ALLOCMAX = (size_t)1 << 38;
@@ -3663,46 +3662,66 @@ static int kcmp(const void *a, const void *b) {
 
 static void rclose(R *r);
 
+/* The name index: reads in 2^k buckets by the top k bits of a 64-bit hash of
+   the name, a byte a bucket for its count and a running total every 1024
+   buckets, then per read its low 32 hash bits and its ordinal in w bits, in
+   bucket order, bit-packed. The 32 bits are bound to the ordinal beside them,
+   so a damaged entry fails to match and the query falls back to the names.
+   32 + w + 2 bits a read where the old table spent 160: a lookup still reads
+   one bucket and decodes no name, and an absent name passes for a present
+   one 4 times in 2^32. */
+#define IXFP(h, o) ((uint32_t)((h) ^ (o) * 0x9e3779b97f4a7c15ULL))
+static int ixw(uint64_t n) { int w = 1; while (w < 32 && (n - 1) >> w) w++; return w; }
+static uint64_t ixget(const uint8_t *p, uint64_t bit, int nb) {
+    uint64_t v; memcpy(&v, p + (bit >> 3), 8);
+    return (v >> (bit & 7)) & ((1ULL << nb) - 1);
+}
+
 static void buildindex(const char *path) {
     R *r = ropen(path);
     ensurenames(r);
     if (r->hasidx) { fprintf(stderr, "karyozip: %s already carries an index\n", path); rclose(r); return; }
     if (r->nreads > 0xffffffffu)
         die("more than 2^32 sequences: the index stores the ordinal in 32 bits");
-
-    uint64_t n = r->nreads ? r->nreads : 1;
-    uint64_t *key = xmalloc(mul(n, 8)), *key2 = xmalloc(mul(n, 8));
-    uint32_t *ord = xmalloc(mul(n, 4));
-    uint64_t *pair = xmalloc(mul(n, 16));          /* sort key and ordinal together */
-    for (uint64_t i = 0; i < r->nreads; i++) {
-        pair[2 * i] = fnvstr(r->name[i]);
-        pair[2 * i + 1] = i;
+    uint64_t n = r->nreads, *key = xmalloc(mul(n ? n : 1, 16));
+    int w = ixw(n ? n : 1), k = 0;
+    while (k < 30 && (1ULL << (k + 2)) < n) k++;          /* about 4 reads a bucket */
+    for (;; k++) {                                        /* a count must fit its byte */
+        for (uint64_t i = 0; i < n; i++) {
+            uint64_t h = h64b(r->name[i]);
+            key[2 * i] = (k ? (h >> (64 - k)) << 32 : 0) | IXFP(h, i); key[2 * i + 1] = i;
+        }
+        qsort(key, n, 16, kcmp);
+        uint64_t run = 0, top = 0;
+        for (uint64_t i = 0; i < n; i++) { run = i && key[2 * i] >> 32 == key[2 * i - 2] >> 32 ? run + 1 : 1; if (run > top) top = run; }
+        if (top <= 255) break;
     }
-    qsort(pair, r->nreads, 16, kcmp);
-    uint64_t dup = 0;
-    for (uint64_t i = 0; i < r->nreads; i++) {
-        key[i] = pair[2 * i];
-        ord[i] = (uint32_t)pair[2 * i + 1];
-        key2[i] = h64b(r->name[ord[i]]) ^ (ord[i] * 0x9e3779b97f4a7c15ULL);   /* bound to its ordinal */
-        if (i && key[i] == key[i - 1]) dup++;
+    uint64_t nb = 1ULL << k, ns = (nb + 1023) / 1024, eb = (n * (32 + (uint64_t)w) + 7) / 8 + 8;
+    uint64_t pay = nb + ns * 8 + eb, dup = 0;
+    uint8_t *t = xcalloc(pay, 1), *cnt = t, *ent = t + nb + ns * 8;
+    for (uint64_t i = 0; i < n; i++) {
+        cnt[key[2 * i] >> 32]++;
+        if (i && key[2 * i] == key[2 * i - 2]) dup++;
+        uint64_t bit = i * (32 + (uint64_t)w), v = (uint32_t)key[2 * i] | (key[2 * i + 1] << 32);
+        for (int j = 0; j < 32 + w; j++) if (v >> j & 1) ent[(bit + j) >> 3] |= (uint8_t)(1 << ((bit + j) & 7));
     }
-    free(pair);
+    for (uint64_t g = 0, sum = 0; g < ns; g++) {
+        memcpy(t + nb + g * 8, &sum, 8);
+        for (uint64_t b = g * 1024; b < nb && b < (g + 1) * 1024; b++) sum += cnt[b];
+    }
+    free(key);
     /* Appended to the track, magic last: a torn write leaves no magic and
        the reader simply does not see an index. One file, not two. */
     uint64_t off0 = (uint64_t)r->fsz;
     FILE *f = fopen(path, "r+b");
     if (!f || fseeko(f, 0, SEEK_END)) die("cannot append the index to the track");
-    uint64_t tail[4] = { r->nreads, dup, r->mhash ^ namesrc(), IDXMAGIC };
-    int bad = fwrite(key, 8, r->nreads, f) != r->nreads
-           || fwrite(key2, 8, r->nreads, f) != r->nreads
-           || fwrite(ord, 4, r->nreads, f) != r->nreads
-           || fwrite(tail, 8, 4, f) != 4 || fflush(f);
+    uint64_t tail[5] = { n, (uint64_t)k, r->mhash ^ namesrc(), pay, IDXMAGIC };
+    int bad = fwrite(t, 1, pay, f) != pay || fwrite(tail, 8, 5, f) != 5 || fflush(f);
     if (bad) { (void)!ftruncate(fileno(f), (off_t)off0); fclose(f); die("index write failed"); }
     if (fclose(f)) die("index write failed");
-    free(key); free(key2); free(ord);
-    fprintf(stderr, "index: %llu sequences, %llu B appended, %llu hash collisions\n",
-            (unsigned long long)r->nreads,
-            (unsigned long long)(32 + r->nreads * 20), (unsigned long long)dup);
+    free(t);
+    fprintf(stderr, "index: %llu sequences, %llu B appended, %llu fingerprint collisions\n",
+            (unsigned long long)n, (unsigned long long)(pay + 40), (unsigned long long)dup);
     rclose(r);
 }
 
@@ -3711,49 +3730,31 @@ static int64_t idxlookup(R *r, const char *path, const char *nm) {
     int fd = open(path, O_RDONLY);
     if (fd < 0) return -1;
     struct stat st;
-    if (fstat(fd, &st) || (size_t)st.st_size < 32) { close(fd); return -1; }
+    if (fstat(fd, &st) || (size_t)st.st_size < 40) { close(fd); return -1; }
     void *m = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
     close(fd);
     if (m == MAP_FAILED) return -1;
-    /* the trailer is the last four words, magic last. Nothing in the file is
-       aligned, so every word is read with memcpy, never through a cast. */
-    const char *tail = (const char *)m + st.st_size - 32;
-    uint64_t n = ld64(tail);
-    if (ld64(tail + 24) != IDXMAGIC || n != r->nreads || n > (uint64_t)st.st_size / 20
-        || (uint64_t)st.st_size < 32 + n * 20
+    /* every word is read with memcpy, never through a cast: nothing is aligned */
+    const char *tail = (const char *)m + st.st_size - 40;
+    uint64_t n = ld64(tail), k = ld64(tail + 8), pay = ld64(tail + 24);
+    uint64_t nb = 1ULL << (k < 40 ? k : 0), ns = (nb + 1023) / 1024;
+    int w = ixw(n ? n : 1);
+    if (ld64(tail + 32) != IDXMAGIC || n != r->nreads || k >= 40 || pay > (uint64_t)st.st_size - 40
+        || pay != nb + ns * 8 + (n * (32 + (uint64_t)w) + 7) / 8 + 8
         || ld64(tail + 16) != (r->mhash ^ namesrc())) { munmap(m, (size_t)st.st_size); return -1; }
-    const char *base = (const char *)m + st.st_size - 32 - n * 20;
-    #define KEY(i) ld64(base + (i) * 8)
-    #define KEY2(i) ld64(base + n * 8 + (i) * 8)
-    #define ORD(i) ld32(base + n * 16 + (i) * 4)
-    uint64_t want = fnvstr(nm), want2 = h64b(nm);
-    int64_t out = -1;
-    uint64_t lo = 0, hi = n;
-    while (lo < hi) {
-        uint64_t mid = lo + (hi - lo) / 2;
-        if (KEY(mid) == want) {
-            uint64_t a2 = mid;
-            while (a2 > 0 && KEY(a2 - 1) == want) a2--;
-            uint64_t b2 = mid + 1;
-            while (b2 < n && KEY(b2) == want) b2++;
-
-            if (b2 - a2 == 1 && KEY2(a2) == (want2 ^ (ORD(a2) * 0x9e3779b97f4a7c15ULL)) && ORD(a2) < r->nreads
-                && (!r->names_ready || !strcmp(r->name[ORD(a2)], nm))) { out = (int64_t)ORD(a2); break; }
-            if (b2 - a2 == 1) break;
-            ensurenames(r);
-            for (uint64_t j = a2; j < b2; j++)
-                if (ORD(j) < r->nreads && KEY2(j) == (want2 ^ (ORD(j) * 0x9e3779b97f4a7c15ULL)) && !strcmp(r->name[ORD(j)], nm)) {
-                    out = (int64_t)ORD(j); break;
-                }
-            break;
-        }
-        if (KEY(mid) < want) lo = mid + 1; else hi = mid;
+    const uint8_t *cnt = (const uint8_t *)tail - pay, *ent = cnt + nb + ns * 8;
+    uint64_t h = h64b(nm), b = k ? h >> (64 - k) : 0, at = ld64((const char *)cnt + nb + (b >> 10) * 8);
+    for (uint64_t j = b & ~1023ULL; j < b; j++) at += cnt[j];
+    uint64_t hit[256], nh = 0;
+    for (uint64_t e = at; e < at + cnt[b] && e < n; e++) {
+        uint64_t bit = e * (32 + (uint64_t)w), o = ixget(ent, bit + 32, w);
+        if (o < r->nreads && ixget(ent, bit, 32) == IXFP(h, o)) hit[nh++] = o;
     }
-    #undef KEY
-    #undef KEY2
-    #undef ORD
     munmap(m, (size_t)st.st_size);
-    return out;
+    if (nh == 1 && !r->names_ready) return (int64_t)hit[0];   /* one fingerprint: no name to decode */
+    if (nh) ensurenames(r);
+    for (uint64_t j = 0; j < nh; j++) if (!strcmp(r->name[hit[j]], nm)) return (int64_t)hit[j];
+    return -1;
 }
 
 static int64_t rfind(R *r, const char *nm) {

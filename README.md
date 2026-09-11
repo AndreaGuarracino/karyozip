@@ -19,8 +19,8 @@ karyozip region -i sample.kst -s chr1_hap1 --start 1000000 --end 1200000  # the 
 karyozip smooth -i sample.kst --hier hierarchy.tsv -f chromosome          # KaryoScope's smoothing, from the presmoothed track
 ```
 
-Without `-i`, `encode` reads stdin, so it can sit behind `karyoscope annotate` in a pipe; without `-o`, every command writes stdout.
-Every text input may be plain or gzipped.
+Every text input may be plain or gzipped. Without `-i`, `encode` reads stdin, so it can sit behind `karyoscope annotate` in a pipe; without `-o`, every command writes stdout.
+
 
 ## Commands
 
@@ -39,14 +39,10 @@ karyozip aln-pack -a P.paf -r REF.bed|REF.kst -o OUT  cuts a PAF to what -a need
 
 | you want | use |
 |---|---|
-| the smallest file, to archive | `encode`, the default |
-| a smaller file still, whatever the time | `encode --slow` |
-| a quicker encode, a larger file | `encode --fast` |
-| fast `region` queries on a big track | `encode --queryable`, 3.1% larger in our test |
-
-The default looks at the first 16 MB of a track to choose how to store it, `--fast` at 4 MB, `--slow` at all of it.
-On our four biggest test tracks, up to 84,741,909 rows, `--slow` took 4.5 to 6.6 times as long as the default and came out 0% to 3.1% smaller.
-`--queryable` combines with any of the three.
+| a small file, the usual choice | `encode` |
+| the smallest file, however long it takes | `encode --slow` |
+| a quick encode | `encode --fast` |
+| fast `region` queries on a big track | `encode --queryable`, with any of the above |
 
 ## Feature sets, smoothing and alignments
 

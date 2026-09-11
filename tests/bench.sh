@@ -26,7 +26,7 @@ alnnames=""; [ $ordinal = 1 ] && [ -s "$D/names.txt" ] && alnnames="--aln-names 
 allsets=$(head -1 "$FEAT" | cut -f2- | tr '\t' ' ')
 sets=$(for s in $allsets; do ls "$D"/*."$s".presmoothed.bed.gz >/dev/null 2>&1 && echo $s; done | tr '\n' ' ')   # the ones this cell has
 
-printf 'class\tdb\tbackend\tset\ttype\tinformed\tseekable\tmode\timpl\trows\tseqs\tbed_gz_B\tbed_plain_B\tkst_B\tindex_B\tcompanion_B\ttotal_B\tratio_gz\tratio_plain\tB_per_row\tencode_s\tencode_MB\tdecode_s\tdecode_MB\tsmooth_s\tsmooth_MB\troundtrip\tquery_mean_ms\tquery_sd_ms\tquery_p50_ms\tquery_p99_ms\tthreads\tlayout\tlen_codec\tid_codec\tcodec_search_s\tlayout_search_s\tcompress_s\n'
+printf 'class\tdb\tbackend\tset\ttype\tinformed\tseekable\tmode\timpl\trows\tseqs\tbed_gz_B\tbed_plain_B\tkst_B\tindex_B\tcompanion_B\ttotal_B\tratio_gz\tratio_plain\tB_per_row\tencode_s\tencode_MB\tdecode_s\tdecode_MB\tsmooth_s\tsmooth_MB\troundtrip\tquery_mean_ms\tquery_sd_ms\tquery_p50_ms\tquery_p99_ms\tthreads\tlayout\tlen_codec\tid_codec\tnames_codec\tcodec_search_s\tlayout_search_s\tcompress_s\n'
 
 best() { sort -n | head -1; }
 refof() {  # refof SET KIND: a cut cell keeps its reference beside its tracks, named ref.*
@@ -43,9 +43,10 @@ timed() {  # timed OUTFILE IN cmd... : fastest wall, largest RSS, or "refused re
   echo "$(cut -d' ' -f1 "$W/t" | best) $(( $(cut -d' ' -f2 "$W/t" | sort -n | tail -1) / 1024 ))"
 }
 choice() {  # the last encode's layout, codecs and profile phases, for the table
-  awk -F'\t' 'BEGIN{l="NA"; c="NA"; y="NA"; p="NA"} /^layout: /{sub(/^layout: /,""); n=split($0,f,", "); l=f[1]; sub(/^lengths /,"",f[2]); c=f[2]; y="none"; if (f[3] ~ /^labels /) {sub(/^labels /,"",f[3]); y=f[3]}}
+  awk -F'\t' 'BEGIN{l="NA"; c="NA"; y="NA"; nm="none"; p="NA"} /^layout: /{sub(/^layout: /,""); n=split($0,f,", "); l=f[1]; sub(/^lengths /,"",f[2]); c=f[2]; y="none"; if (f[3] ~ /^labels /) {sub(/^labels /,"",f[3]); y=f[3]}}
+    /^names: /{sub(/^names: /,""); split($0,f,", "); nm=f[1]; gsub(/ /,"-",nm)}
     /phase codec search/{split($0,g," "); cs=g[4]} /phase layout search/{split($0,g," "); ls=g[4]} /phase compress/{split($0,g," "); p=g[3]}
-    END{printf "%s\t%s\t%s\t%s\t%s\t%s", l, c, y, (cs==""?"NA":cs), (ls==""?"NA":ls), p}' "$W/err"
+    END{printf "%s\t%s\t%s\t%s\t%s\t%s\t%s", l, c, y, nm, (cs==""?"NA":cs), (ls==""?"NA":ls), p}' "$W/err"
 }
 ratio() { awk -v a=$1 -v b=$2 'BEGIN{ if (b > 0) printf "%.2f", a/b; else print "NA" }'; }
 queries() {  # queries BIN "FLAGS" KST NAMEFILE : NQ random point queries, ms stats; NA unless every one answered
@@ -86,7 +87,7 @@ row() {  # row SET KIND INFORMED SEEK MODE IMPL BIN INPUT(s) ENCFLAGS DECFLAGS C
   local es=$1 em=$2 ch=$(choice)
   if [ "$es" = refused ]; then
     echo "bench: encode refused on $set $kind $inf $seek $mode $impl" >&2; BAD=$((BAD+1))
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\tNA\tNA\t%s\tNA\tNA\tNA\tNA\trefused\tNA\tNA\tNA\tNA\tNA\trefused\tNA\tNA\tNA\tNA\t%s\tNA\tNA\tNA\tNA\tNA\tNA\n' \
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\tNA\tNA\t%s\tNA\tNA\tNA\tNA\trefused\tNA\tNA\tNA\tNA\tNA\trefused\tNA\tNA\tNA\tNA\t%s\tNA\tNA\tNA\tNA\tNA\tNA\tNA\n' \
       "$class" "$dbv" "$backend" "$set" "$kind" "$inf" "$seek" "$mode" "$impl" "$rows" "$seqs" "$gz" "$plain" "$comp" "$T"
     return
   fi

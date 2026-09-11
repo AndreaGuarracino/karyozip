@@ -34,9 +34,8 @@ echo "codecs: every candidate round-trips"
 
 # 2. encode must be byte-identical, over every fixture and flag.
 for f in "$D"/*.bed; do
-  for fl in "" "--block 4" "--block 262144" "--names keep" "--tok-chunk 2" \
-            "--effort low" "--effort low --block 4" "--tail 0" "--tail 1" "--names drop" \
-            "--tok-chunk 250000" "--effort high" \
+  for fl in "" "--block 4" "--block 262144" "--names keep" \
+            "--effort low" "--effort low --block 4" "--names drop" "--effort high" \
             "--sort" "--sort --names keep" "--sort --names drop" "--sort=1M" \
             "--sort --block 4"; do
     IN=$f both "encode $(basename "$f") [$fl]" $fl encode
@@ -248,7 +247,7 @@ cli() {
 cli; cli --help; cli -h; cli --version; cli --bogus; cli --bogus encode
 cli decode; cli encode extra; cli --profile; cli --threads; cli --threads 4
 cli badcmd; cli region; cli region -i f; cli index; cli smooth -i f; cli aln-pack
-cli encode --names ordinal; cli decode --tail 1; cli index --effort low
+cli encode --names ordinal; cli decode --sort; cli index --effort low
 cli encode --block; cli encode --effort max; cli encode --block 0
 cli -t; cli -t 0; cli -t 99999; cli --tmp-dir; cli decode --raw x --raw
 cli index --block 0; cli aln-pack -a a -r b; cli smooth -i f --hier h; cli region -i f -s s -p 1 --start 2 --end 3
@@ -256,11 +255,9 @@ cli encode --sort=0; cli encode --names foo; cli decode --names keep
 cli aln-pack --names foo -a a -r b -o c; cli encode --db; cli --version encode
 cli index -i f x; cli decode -i f x; cli smooth -i f --hier h -f fs --start 1; cli aln-pack -a a -r b -o c d
 cli smooth -i f --hier h -f fs --start 1 --end 2; cli region -i f -s s --halo 3; cli region -i f -s s -p 1
-cli encode --tok-chunk 0; cli encode --id-codec zz; cli smooth --max-gap x -i f --hier h -f fs
-cli decode --out-dir D; cli region -i f -s s --start 1; cli encode --tail 2; cli region -i f -s s -p +1
-cli encode --tail 01; cli encode --id-codec +5; cli encode --id-codec 0X100; cli encode --block +5
-cli encode --id-codec 0x10; cli encode --id-codec 999999; cli encode --len-codec 0x10004
-cli encode --id-codec 0x10 --len-codec 999999; cli encode --aln p; cli encode --ref r
+cli smooth --max-gap x -i f --hier h -f fs
+cli decode --out-dir D; cli region -i f -s s --start 1; cli region -i f -s s -p +1
+cli encode --block +5; cli encode --aln p; cli encode --ref r
 cli decode --aln-names f; cli index --names ordinal; cli encode --sort --sort=1M
 cli decode --aln p; cli decode --ref r; cli decode --aln p --ref r
 cli encode --names drop --aln p --ref r; cli decode --db f; cli encode --db f

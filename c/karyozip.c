@@ -164,13 +164,6 @@ static long int_arg(const char *p, long lo, long hi, const char *what) {   /* di
     if (v < lo || v > hi) die(what);
     return v;
 }
-static long codec_arg(const char *p, const char *what) {   /* a codec id: digits, or 0x and hex digits */
-    int hex = p && p[0] == '0' && (p[1] == 'x' || p[1] == 'X'); if (hex) p += 2;
-    if (!p || !*p || strlen(p) > 8 || strspn(p, hex ? "0123456789abcdefABCDEF" : "0123456789") != strlen(p)) die(what);
-    long v = strtol(p, NULL, hex ? 16 : 10);
-    if (v > 0x7fffffff) die(what);
-    return v;
-}
 
 static uint64_t mem_arg(const char *p) {   /* bytes, with a K, M, G or T suffix */
     if (!p || !*p) die("--sort=MEM must be positive");
@@ -401,7 +394,7 @@ static const char *ALNNAMES = NULL;   /* --names FILE: ordinal N is line N+1 */
 static char **ORD; static size_t nord;
 
 static uint64_t BYT_LENS = 0, BYT_LABS = 0;
-static int IDCODEC = -1, LENCODEC = -1;   /* -1 picks the winner on a sample */
+static int IDCODEC = -1, LENCODEC = -1;   /* the search sets them */
 #define INTFLAG (1ULL << 62)
 #define FLDFLAG (1ULL << 50)   /* names as field deltas */
 
@@ -645,8 +638,7 @@ static char *fldnamesd(const uint8_t *b, size_t n, uint64_t cnt, size_t *outn) {
 
 #define TOKMAX 9000000u
 
-static uint32_t TOKCHUNK = 3000000;     /* --tok-chunk overrides */
-static int TOKSET = 0, V1 = 0;
+static int V1 = 0;
 static const char *TMPD = NULL;         /* --tmp-dir, else TMPDIR, else /tmp */
 
 #include "htscodecs/tokenise_name3.h"
@@ -749,7 +741,6 @@ static char *tokd(const uint8_t *b, size_t n, size_t *outn) {
 static const uint32_t TCAND[] = { 250000, 1000000, 3000000, TOKMAX };
 static uint32_t TOKPICK = 250000;        /* the chunk the last tokbest chose */
 static size_t tokbest(buf *in, uint8_t **out) {
-    if (TOKSET) return tokc(in, out, TOKPICK = TOKCHUNK);
     size_t n = sizeof TCAND / sizeof *TCAND, best = 0;
     for (size_t i = 0; i < n; i++) {
         if (FASTMODE && i) continue;    /* -e low: the smallest chunk only */
@@ -803,14 +794,6 @@ static size_t bestnames(buf *b, uint64_t n, uint8_t **out, int *kind) {
 
 
 static int nosz(int c) { unsigned u = (unsigned)c; return u && !(u & CODEC_BZIP3) && (u & 0x10); }
-static int badcodec(int c) {   /* bits no codec defines, or a bzip3 block size out of range */
-    unsigned u = (unsigned)c;
-    if (u & CODEC_LZMA) return u != (unsigned)CODEC_LZMA;
-    if (u & CODEC_BZIP3) { unsigned mb = u & 0xffff;
-                           return (u & ~(unsigned)(CODEC_BZIP3 | 0xffff)) || mb < 1 || mb > 511; }
-    return (u & ~(unsigned)(CODEC_ARITH | 0x3ff)) != 0;
-}
-static int noext(int c) { unsigned u = (unsigned)c; return (u & CODEC_ARITH) && !(u & CODEC_BZIP3) && (u & 0x04); }
 
 /* every field pinned: a preset that moved between liblzma releases would
    change the bytes, and the C and the Rust must write the same ones */
@@ -890,7 +873,6 @@ static int TAILSEEN = 0;   /* how many totals sampled so far */
 
 #define TAILSKIP 64
 static int TAILON = -1;          /* -1 undecided, decided at sequence TAILSKIP */
-static int TAILFORCE = -1;       /* --tail overrides the decision */
 static uint64_t TAILSAMP[TAILSKIP];
 static __thread int TAILDEC = 0;          /* the file being read uses it */
 static __thread uint64_t TAILPRED_R = 0;  /* its predictor, from the header */
@@ -1067,7 +1049,6 @@ static void ktw_tail(ktw *w) {
                 dev += TAILSAMP[i] > TAILPRED ? TAILSAMP[i] - TAILPRED
                                               : TAILPRED - TAILSAMP[i];
             TAILON = dev * 12 <= TAILPRED * TAILSKIP;
-            if (TAILFORCE >= 0) TAILON = TAILFORCE;
         }
         lensput(w, w->pval); w->phas = 0; return;
     }
@@ -2327,7 +2308,7 @@ static int fastenough(int codec) {
 
 static void pickcodecs(int rawfd, const blkmeta *bm, size_t nraw, int onelay) {
 
-    if ((IDCODEC >= 0 && LENCODEC >= 0) || onelay) return;   /* the layout search ranks it all */
+    if (onelay) return;   /* the layout search ranks it all */
 
         int CANDBUF[KCAND_N]; size_t NC = candlist(CANDBUF);
         const int *CAND = CANDBUF;
@@ -2510,12 +2491,9 @@ static void pickcodecs(int rawfd, const blkmeta *bm, size_t nraw, int onelay) {
             free(ti); free(tl); free(live_i); free(live_l);
         }
         free(sbuf);
-        if (IDCODEC < 0) IDCODEC = wi;
-        if (LENCODEC < 0) LENCODEC = wl;
+        IDCODEC = wi; LENCODEC = wl;
         fprintf(stderr, "codec: len=0x%x id=0x%x from %zu sample blocks, %s\n",
                 LENCODEC, IDCODEC, np, seekable ? "seekable" : "one block");
-    if (IDCODEC < 0) IDCODEC = 0;
-    if (LENCODEC < 0) LENCODEC = 0;
 }
 
 static size_t complens(ZSTD_CCtx *tc, const uint8_t *src, size_t n, uint8_t **out, size_t bound) {
@@ -2532,21 +2510,20 @@ static size_t complens(ZSTD_CCtx *tc, const uint8_t *src, size_t n, uint8_t **ou
 /* Every stream by every codec of the mode in one pool, LZMA and bzip3
    first since they take longest. Per stream the smallest that round trips
    on its sample wins, ties to the earlier of zstd, the table, zstd-22.
-   m[s] bytes are ranked of a stream n[s] bytes whole; fix[s] >= 0 pins a
-   codec. Out: cd[s], lv[s] the zstd level or -1, sz[s] 0 if none came back. */
+   m[s] bytes are ranked of a stream n[s] bytes whole. Out: cd[s], lv[s]
+   the zstd level or -1, sz[s] 0 if none came back. */
 typedef struct { int s, c, lv, r, cls; size_t z; } rjob;
 static int rjcmp(const void *a, const void *b) {
     const rjob *x = a, *y = b;
     return x->cls != y->cls ? x->cls - y->cls : x->s != y->s ? x->s - y->s : x->r - y->r;
 }
 static void rankall(int ns, const uint8_t *const *src, const size_t *m, const size_t *n,
-                    const int *fix, int *cd, int *lv, size_t *sz) {
+                    int *cd, int *lv, size_t *sz) {
     int cb[KCAND_N]; size_t nc = candlist(cb), nj = 0;
     rjob *jb = xmalloc((size_t)ns * (nc + 2) * sizeof *jb);
     for (int t = 0; t < ns; t++) {
-        cd[t] = fix[t] > 0 ? fix[t] : 0; lv[t] = -1; sz[t] = 0;
+        cd[t] = 0; lv[t] = -1; sz[t] = 0;
         if (!m[t]) continue;
-        if (fix[t] >= 0) { jb[nj++] = (rjob){ t, fix[t], fix[t] ? -1 : LEVEL, 0, 2, 0 }; continue; }
         jb[nj++] = (rjob){ t, 0, LEVEL, 0, 2, 0 };
         for (size_t k = 0; k < nc; k++) {
             if (packdup(cb[k], src[t], m[t]) || bz3dup(cb[k], m[t], n[t], cb, nc)) continue;
@@ -2718,8 +2695,8 @@ static void ktw_close(ktw *w) {
         const uint8_t *src[5] = { is, ls, lay[1], lay[2], lay[3] };
         size_t m5[5] = { pi, pl, n4[1], n4[2], n4[3] }, n5[5] = { ni0, nl0 }, r5[5];
         for (int k = 2; k < 5; k++) n5[k] = pl ? (size_t)((unsigned __int128)m5[k] * nl0 / pl) : m5[k];
-        int fix[5] = { IDCODEC, LENCODEC, LENCODEC, LENCODEC, LENCODEC }, c5[5], l5[5];
-        rankall(5, src, m5, n5, fix, c5, l5, r5);
+        int c5[5], l5[5];
+        rankall(5, src, m5, n5, c5, l5, r5);
         int idok = !pi || r5[0];
         if (r5[1] && idok) sz[0] = r5[1] + r5[0] + ic.n;      /* plain pays its index */
         if (r5[2] && idok) sz[1] = r5[2] + r5[0];
@@ -5189,7 +5166,6 @@ int main(int argc, char **argv) {
             "  encode:      -e, --effort: low is a quick encode with blocks and an index for fast\n"
             "               queries, medium the default, high the smallest file\n"
             "               -b N|all sets the blocks by hand\n"
-            "               --tail 0|1  --tok-chunk N  --id-codec N  --len-codec N pin what the search picks\n"
             "  readers:     -n, -d, --hier, -a, -r as encode was given; -n FILE takes the names from\n"
             "               drop:FILE, a FASTA, FASTQ or list; -n ordinal accepts dropped names\n"
             "               --set A,B picks feature sets of a -d track, default all; decode without\n"
@@ -5219,7 +5195,6 @@ int main(int argc, char **argv) {
                *FSA = NULL, *HIERA = NULL;
     static const struct { const char *f; int nv; } FLAGS[] = {
         {"--version",0},{"--threads",1},{"-t",1},{"--profile",0},{"--tmp-dir",1},{"--names",1},
-        {"--tok-chunk",1},{"--tail",1},{"--id-codec",1},{"--len-codec",1},
         {"--max-gap",1},{"--v1",0},{"--aln-names",1},{"--sort",0},
         {"--effort",1},
         {"--block",1},{"--db",1},{"--aln",1},
@@ -5275,15 +5250,6 @@ int main(int argc, char **argv) {
             else if (enc) die("encode takes --names keep, drop or drop:FILE; a name file is --aln-names");
             else { ok = rd; NAMESARG = v; }   /* the blob drop:FILE wrote, or a FASTA, FASTQ or list */
             take = 2; }
-        else if (!strcmp(a, "--tok-chunk")) { ok = enc;
-            TOKCHUNK = (uint32_t)int_arg(v, 1, 0x7fffffff, "--tok-chunk needs a number");
-            if (TOKCHUNK > TOKMAX) TOKCHUNK = TOKMAX;
-            TOKSET = 1; take = 2; }
-        else if (!strcmp(a, "--tail")) { ok = enc; TAILFORCE = (int)int_arg(v, 0, 1, "--tail is 0 or 1"); take = 2; }
-        else if (!strcmp(a, "--id-codec")) { ok = enc;
-            IDCODEC = (int)codec_arg(v, "--id-codec needs a codec id"); take = 2; }
-        else if (!strcmp(a, "--len-codec")) { ok = enc;
-            LENCODEC = (int)codec_arg(v, "--len-codec needs a codec id"); take = 2; }
         else if (!strcmp(a, "--max-gap")) { ok = sm; MAXGAP = num_arg(v, UINT64_MAX, "--max-gap needs a number"); take = 2; }
         else if (!strcmp(a, "--v1")) { ok = sm; V1 = 1; take = 1; }
         else if (!strcmp(a, "--aln-names")) {   /* the alignment's own table: ordinal N is line N+1 */
@@ -5325,9 +5291,6 @@ int main(int argc, char **argv) {
         if (argv[i][0] == '-' && argv[i][1]) fprintf(stderr, "karyozip: unknown flag %s\n", argv[i]);
         else fprintf(stderr, "karyozip: unexpected argument %s\n", argv[i]);
         exit(1); }
-    if ((IDCODEC >= 0 && badcodec(IDCODEC)) || (LENCODEC >= 0 && badcodec(LENCODEC))) die("--id-codec and --len-codec take a codec id, not any number");
-    if (nosz(IDCODEC) || nosz(LENCODEC)) die("a NOSZ codec (0x10) stores no size and is not accepted");
-    if (noext(IDCODEC) || noext(LENCODEC)) die("arith X_EXT (0x04) needs libbz2 and is not accepted");
     if (NTHREADS > 1024) NTHREADS = 1024;   /* libgomp keeps team state on the stack */
 #ifdef _OPENMP
     if (omp_get_max_threads() > 1024) omp_set_num_threads(1024);   /* OMP_NUM_THREADS too */

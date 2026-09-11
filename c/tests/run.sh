@@ -292,15 +292,11 @@ for s in range(4000):
     for c in cuts + [116]:
         print(f"r{s}\t{p}\t{c}\tL{random.randint(0,5)}"); p = c
 PY
-a=$($KT --tail 0 encode --block 4096 < "$W/tail.bed" 2>/dev/null | wc -c)
-b=$($KT --tail 1 encode --block 4096 < "$W/tail.bed" 2>/dev/null | wc -c)
 $KT encode --block 4096 < "$W/tail.bed" > "$W/tail.kt" 2>/dev/null
 $KT decode -i "$W/tail.kt" 2>/dev/null > "$W/tail.out"
 cmp -s "$W/tail.bed" "$W/tail.out" \
   && echo "constant-length reads: round-trip" \
  || { echo "constant-length reads: DIFFERS"; fail=1; }
-[ "$b" -lt "$a" ] && echo "constant-length reads: $a -> $b bytes" \
- || { echo "constant-length reads: no gain, $a -> $b"; fail=1; }
 # random access must still land on the right rows
 $KT region -i "$W/tail.kt" -s r2000 2>/dev/null > "$W/tq.out"
 grep "^r2000	" "$W/tail.bed" > "$W/tq.exp"
@@ -318,10 +314,6 @@ for s in range(4000):
     for c in cuts + [L]:
         print(f"r{s}\t{p}\t{c}\tL{random.randint(0,5)}"); p = c
 PY
-a=$($KT --tail 0 encode --block 4096 < "$W/vlen.bed" 2>/dev/null | wc -c)
-b=$($KT encode --block 4096 < "$W/vlen.bed" 2>/dev/null | wc -c)
-[ "$a" = "$b" ] && echo "reads of mixed length: left alone, $a bytes" \
- || { echo "reads of mixed length: changed $a -> $b, gate is wrong"; fail=1; }
 $KT encode --block 4096 < "$W/vlen.bed" > "$W/vlen.kt" 2>/dev/null
 $KT decode -i "$W/vlen.kt" 2>/dev/null | cmp -s - "$W/vlen.bed" \
   && echo "reads of mixed length: round-trip" \
@@ -338,10 +330,6 @@ for s in range(4000):
     for c in cuts + [L]:
         print(f"r{s}\t{p}\t{c}\tL{random.randint(0,5)}"); p = c
 PY
-a=$($KT --tail 0 encode --block 4096 < "$W/out.bed" 2>/dev/null | wc -c)
-b=$($KT encode --block 4096 < "$W/out.bed" 2>/dev/null | wc -c)
-[ "$b" -lt "$a" ] && echo "uniform reads with stray lengths: $a -> $b bytes" \
- || { echo "uniform reads with stray lengths: gate gave up, $a -> $b"; fail=1; }
 $KT encode --block 4096 < "$W/out.bed" > "$W/out.kt" 2>/dev/null
 $KT decode -i "$W/out.kt" 2>/dev/null | cmp -s - "$W/out.bed" \
   && echo "uniform reads with stray lengths: round-trip" \
@@ -384,9 +372,6 @@ $KT encode --block 4 < "$W/nonl.bed" > /dev/null 2>&1 \
   && { echo "input without a trailing newline: ACCEPTED"; fail=1; } \
  || echo "input without a trailing newline: refused, as it should"
 
-timeout 20 $KT --tok-chunk 0 encode --block 4 < "$W/ord2.bed" > /dev/null 2>&1 \
-  && { echo "--tok-chunk 0: ACCEPTED"; fail=1; } \
- || echo "--tok-chunk 0: refused, as it should"
 
 # The --db parser used strtoull and took "x" as 0, an overflow as UINT64_MAX
 # and a reverse interval as valid, while the plain parser rejected all three.
@@ -561,7 +546,6 @@ $KT decode --aln "$W/mn.paf" --ref "$W/mn.ref" -i "$W/mn.kt" 2>/dev/null | cmp -
 
 # A NOSZ codec carries no size, so a forged index could not be caught: refused
 # from the environment and in a header.
-must_fail "--id-codec 0x10, a NOSZ codec" $KT --id-codec 0x10 encode < "$D/s.bed"
 
 # Round 32: flags with no command dereferenced argv[1] past the end of a
 # compacted argv and segfaulted (exit 139). The argc<2 guard ran before the
@@ -863,7 +847,6 @@ for e in 1 3 16; do
 done
 [ $ok = 1 ] && echo "OMP_NUM_THREADS: no effect on the stored bytes" \
   || { echo "OMP_NUM_THREADS: MOVED THE STORED BYTES"; fail=1; }
-must_fail "--id-codec with arith X_EXT" $KT --id-codec 0x10004 encode < "$D/s.bed"
 must_fail "--block 4abc" $KT encode --block 4abc < "$D/s.bed"
 must_fail "-t 4x" $KT -t 4x encode < "$D/s.bed"
 must_fail "--sort=nan" $KT encode --tmp-dir "$W" --sort=nan < "$D/s.bed"
@@ -931,8 +914,6 @@ $KT decode --names "$W/side.fa" -i "$W/side.kt" 2>&1 | grep -q "does not belong 
 $KT decode --names "$W/side.names" -i "$W/side.kt" 2>/dev/null | cmp -s - "$D/s.bed" \
   && echo "the sidecar it wrote: round trips" || { echo "the sidecar it wrote: BROKEN"; fail=1; }
 
-must_fail "--len-codec 999999" $KT encode --len-codec 999999 < "$D/s.bed"
-must_fail "--id-codec 999999" $KT encode --id-codec 999999 < "$D/s.bed"
 # A sorted track decodes in sorted order, never the input order.
 $KT encode --sort < "$D/s.bed" > "$W/so.kt" 2>/dev/null
 $KT decode -i "$W/so.kt" 2>/dev/null | cmp -s - "$D/s.bed" \
@@ -956,7 +937,7 @@ $KT --help > "$W/help.txt" 2>/dev/null && [ -s "$W/help.txt" ] \
 must_fail "query --db" $KT region --db x -i "$W/side1.kt"
 must_fail "encode --out" $KT encode --out-dir "$W" < "$D/s.bed"
 must_fail "encode --names ordinal" $KT encode --names ordinal < "$D/s.bed"
-must_fail "decode --tail" $KT decode --tail 1 -i "$W/side1.kt"
+must_fail "decode --sort" $KT decode --sort -i "$W/side1.kt"
 must_fail "decode two tracks" $KT decode -i "$W/side1.kt" -i "$W/side2.kt"
 must_fail "the retired --sort-mem" $KT encode --sort-mem -i 1M
 

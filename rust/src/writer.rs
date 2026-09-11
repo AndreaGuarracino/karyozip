@@ -38,21 +38,16 @@ pub struct Options {
     pub keep_names: bool,
     pub drop_names: bool,
     pub names_out: Option<String>,
-    pub tail: Option<bool>,
-    pub tok_chunk: Option<usize>,
     pub sort: bool,
     /// --sort=MEM: bytes held before a spill, 0 for none.
     pub sortmem: u64,
-    pub id_codec: Option<i32>,
-    pub len_codec: Option<i32>,
 }
 
 impl Default for Options {
     fn default() -> Self {
         Options { block: u64::MAX, level: 17, levelset: false, slow: true, whole: false, sortmem: 0,
                   keep_names: false, drop_names: false, names_out: None,
-                  tail: None, tok_chunk: None, sort: false,
-                  id_codec: None, len_codec: None }
+                  sort: false }
     }
 }
 
@@ -199,8 +194,7 @@ impl Writer {
                 let dev: u64 = self.tailsamp.iter()
                     .map(|&v| v.abs_diff(self.tailpred))
                     .sum();
-                self.tailon = Some(self.opt.tail
-                    .unwrap_or(dev * 12 <= self.tailpred * TAILSKIP as u64));
+                self.tailon = Some(dev * 12 <= self.tailpred * TAILSKIP as u64);
             }
             self.lensput(self.pval);
             self.phas = false;
@@ -544,8 +538,7 @@ impl Writer {
             let src: Vec<&[u8]> = vec![is, ls, lay[1].as_deref().unwrap_or(&e), lay[2].as_deref().unwrap_or(&e), lay[3].as_deref().unwrap_or(&e)];
             let scale = |m: usize| if pl > 0 { (m as u128 * lens0.len() as u128 / pl as u128) as usize } else { m };
             let n5 = [ids0.len(), lens0.len(), scale(src[2].len()), scale(src[3].len()), scale(src[4].len())];
-            let lf = self.opt.len_codec;
-            let r = rank_all(&src, &n5, &[self.opt.id_codec, lf, lf, lf, lf], &self.opt);
+            let r = rank_all(&src, &n5, &self.opt);
             let idok = pi == 0 || r[0].2 > 0;
             let mut sz = [0usize; 4];
             if r[1].2 > 0 && idok { sz[0] = r[1].2 + r[0].2 + idx; }   // plain pays its index
@@ -705,7 +698,7 @@ impl Writer {
                     None => break,
                 }
             }
-            let b = best_names(&self.names[..q], smpn, level, self.opt.slow, self.opt.tok_chunk);
+            let b = best_names(&self.names[..q], smpn, level, self.opt.slow);
             let r = if q == self.names.len() {
                 (b.bytes, b.kind == 2, b.kind == 1, b.kind == 3)   // the sample was all of it
             } else {
@@ -747,9 +740,9 @@ impl Writer {
                 srt.extend_from_slice(nt[v as usize]);
                 srt.push(b'\n');
             }
-            let b = best_names(&srt, self.nidx, level, self.opt.slow, self.opt.tok_chunk);
+            let b = best_names(&srt, self.nidx, level, self.opt.slow);
             let p1 = ffi::zstd(&self.natbuf, level);
-            let p2 = tok_best(&self.natbuf, self.opt.slow, self.opt.tok_chunk).map(|t| t.0);
+            let p2 = tok_best(&self.natbuf, self.opt.slow).map(|t| t.0);
             let (pbest, ptok) = match p2 {
                 Some(t) if t.len() < p1.len() => (t, true),
                 _ => (p1, false),
@@ -972,12 +965,9 @@ pub struct Pick { pub id: i32, pub len: i32, pub lvl_id: i32, pub lvl_len: i32, 
 pub fn pick(all: &dyn Fn(usize) -> (Vec<u8>, Vec<u8>), nraw: usize, rawtot: usize,
             maxstream: usize, level: i32, o: &Options, onelay: bool) -> Pick {
     let (block, slow, whole, levelset) = (o.block, o.slow, o.whole, o.levelset);
-    let (forced_id, forced_len) = (o.id_codec, o.len_codec);
     let cv = candlist(slow); let cand: &[i32] = &cv;
     let nc = cand.len();
-    if onelay || (forced_id.is_some() && forced_len.is_some()) {
-        return Pick { id: forced_id.unwrap_or(0), len: forced_len.unwrap_or(0), lvl_id: -1, lvl_len: -1, level };
-    }
+    if onelay { return Pick { id: 0, len: 0, lvl_id: -1, lvl_len: -1, level }; }   // the layout search ranks it all
     let seekable = nraw > 1 || rawtot as u64 > block;
     let mut picks: Vec<usize> = Vec::new();
     if nraw > 0 {
@@ -1111,9 +1101,9 @@ pub fn pick(all: &dyn Fn(usize) -> (Vec<u8>, Vec<u8>), nraw: usize, rawtot: usiz
                   nc + 2, if whole { "the whole file" } else { "the sample" });
     }
     eprintln!("codec: len=0x{:x} id=0x{:x} from {} sample blocks, {}",
-              forced_len.unwrap_or(wl), forced_id.unwrap_or(wi), picks.len(),
+              wl, wi, picks.len(),
               if seekable { "seekable" } else { "one block" });
-    Pick { id: forced_id.unwrap_or(wi), len: forced_len.unwrap_or(wl), lvl_id, lvl_len, level }
+    Pick { id: wi, len: wl, lvl_id, lvl_len, level }
 }
 
 fn sz(v: Option<Vec<u8>>) -> usize { v.map_or(usize::MAX / 4, |x| x.len()) }
@@ -1200,14 +1190,12 @@ fn pack_dup(c: i32, p: &[u8]) -> bool {
 /// Every stream by every codec of the mode in one pool, LZMA and bzip3 first
 /// since they take longest. Per stream the smallest that round trips on its
 /// sample wins, ties to the earlier of zstd, the table, zstd-22. `n` is each
-/// stream's whole size, `fix` pins a codec; out: codec, zstd level or -1,
-/// size, 0 when none came back.
-fn rank_all(src: &[&[u8]], n: &[usize], fix: &[Option<i32>], o: &Options) -> Vec<(i32, i32, usize)> {
+/// stream's whole size; out: codec, zstd level or -1, size, 0 when none came back.
+fn rank_all(src: &[&[u8]], n: &[usize], o: &Options) -> Vec<(i32, i32, usize)> {
     let cand = candlist(o.slow);
     let mut jobs: Vec<(u8, usize, usize, i32, i32)> = Vec::new();   // class, stream, rank, codec, level
     for (t, s) in src.iter().enumerate() {
         if s.is_empty() { continue; }
-        if let Some(c) = fix[t] { jobs.push((2, t, 0, c, if c == 0 { o.level } else { -1 })); continue; }
         jobs.push((2, t, 0, 0, o.level));
         for (k, &c) in cand.iter().enumerate() {
             if pack_dup(c, s) || bz3_dup(c, s.len(), n[t], &cand) { continue; }
@@ -1227,7 +1215,7 @@ fn rank_all(src: &[&[u8]], n: &[usize], fix: &[Option<i32>], o: &Options) -> Vec
             let (_, _, _, c, lv) = jobs[j];
             if c == 0 || verifies(src[t], c) { return (c, lv, z[j]); }   // zstd is trusted, the rest read back
         }
-        (fix[t].unwrap_or(0), -1, 0)
+        (0, -1, 0)
     }).collect()
 }
 
@@ -1306,8 +1294,7 @@ pub fn int_names(names: &[u8], n: u64) -> Option<Vec<u8>> {
 /// only the ends of the list, which is what the default encode does.
 pub const TCAND: [usize; 4] = [250_000, 1_000_000, 3_000_000, 9_000_000];
 /// The smallest tokeniser blob and its chunk.
-pub fn tok_best(names: &[u8], slow: bool, fixed: Option<usize>) -> Option<(Vec<u8>, usize)> {
-    if let Some(k) = fixed { return tok_chunked(names, k).map(|b| (b, k)); }   // --tok-chunk
+pub fn tok_best(names: &[u8], slow: bool) -> Option<(Vec<u8>, usize)> {
     let mut best: Option<(Vec<u8>, usize)> = None;
     for (i, &chunk) in TCAND.iter().enumerate() {
         if !slow && i > 0 { continue; }   // -e low: the smallest chunk only
@@ -1437,10 +1424,10 @@ fn fld_names1(names: &[u8], n: u64, sep: u8) -> Option<Vec<u8>> {
     Some(out)
 }
 
-pub fn best_names(names: &[u8], n: u64, level: i32, slow: bool, chunk: Option<usize>) -> BestNames {
+pub fn best_names(names: &[u8], n: u64, level: i32, slow: bool) -> BestNames {
     let (z, t) = rayon::join(
         || ffi::zstd(names, level),
-        || tok_best(names, slow, chunk),
+        || tok_best(names, slow),
     );
     let i = int_names(names, n).map(|v| ffi::zstd(&v, level));
     let mut out = BestNames { bytes: z, kind: 0, chunk: TCAND[0] };

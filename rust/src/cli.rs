@@ -82,16 +82,6 @@ pub struct Cli {
     /// show what is stored, reversing no transform
     #[arg(long, global = true)]
     pub raw: bool,
-    /// force the tail predictor off or on
-    #[arg(long, global = true, value_name = "0|1")]
-    pub tail: Option<String>,
-    /// names per tokeniser chunk
-    #[arg(long = "tok-chunk", global = true, value_name = "N")]
-    pub tok_chunk: Option<String>,
-    #[arg(long = "id-codec", global = true, value_name = "N")]
-    pub id_codec: Option<String>,
-    #[arg(long = "len-codec", global = true, value_name = "N")]
-    pub len_codec: Option<String>,
     /// smooth: the largest gap two runs may span
     #[arg(long = "max-gap", global = true, value_name = "N")]
     pub max_gap: Option<String>,
@@ -180,10 +170,6 @@ impl Cli {
         if self.block.is_some() && !enc { bad("--block")?; }
         if self.effort.is_some() && !enc { bad("--effort")?; }
         if self.sort.is_some() && !enc { bad("--sort")?; }
-        if self.tail.is_some() && !enc { bad("--tail")?; }
-        if self.tok_chunk.is_some() && !enc { bad("--tok-chunk")?; }
-        if self.id_codec.is_some() && !enc { bad("--id-codec")?; }
-        if self.len_codec.is_some() && !enc { bad("--len-codec")?; }
         if self.out.is_some() && !dec { bad("--out-dir")?; }
         let (pack, reg) = (c == "aln-pack", c == "region");
         if !self.input.is_empty() && pack { bad("--input")?; }

@@ -144,7 +144,7 @@ row() {  # row SET KIND INFORMED SEEK MODE IMPL BIN INPUT(s) ENCFLAGS DECFLAGS C
     # only that flag: index takes no --aln or --db
     local ixf=""; case "$df" in "--names "*) ixf="$df";; esac
     if "$bin" $ixf index -i "$W/ki.kst" >/dev/null 2>&1; then ix=$(( $(stat -c%s "$W/ki.kst") - kst ))
-      q=$(NQ=$(case "$inf" in not-informed|db-informed|names-dropped|sorted*|block-*|level-*|tail-*) echo $NQ;; *) echo $NQ_ALN;; esac) queries "$bin" "$df" "$W/ki.kst" "$W/names")
+      q=$(NQ=$(case "$inf" in not-informed|db-informed|names-dropped|sorted*|block-*) echo $NQ;; *) echo $NQ_ALN;; esac) queries "$bin" "$df" "$W/ki.kst" "$W/names")
     else echo "index refused on $set $kind $inf $mode $impl" >&2; ix=NA; fi
   fi
   local tot=$((kst + comp))
@@ -171,8 +171,6 @@ for kind in $KINDS; do
             [ $ordinal = 0 ] && row "$set" "$kind" names-dropped "$seek" "$mode" "$impl" "$bin" "$q" "$bf $mf --names drop:$W/side" "--names $W/side" side
             [ "$mode" = medium ] && row "$set" "$kind" sorted "$seek" "$mode" "$impl" "$bin" "$q" "$bf $mf --sort" "" 0
             [ "$mode" = medium ] && row "$set" "$kind" sorted-1M "$seek" "$mode" "$impl" "$bin" "$q" "$bf $mf --sort=1M" "" 0
-            [ "$mode" = medium ] && for v in 0 1; do
-              row "$set" "$kind" "tail-$v" "$seek" "$mode" "$impl" "$bin" "$q" "$bf --tail $v" "" 0; done
             # a block is decoded whole, so its size trades bytes against the query
             [ "$mode" = medium ] && for v in $BLOCKS; do
               row "$set" "$kind" "block-$v" "$seek" "$mode" "$impl" "$bin" "$q" "--block $v" "" 0; done; }

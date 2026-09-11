@@ -12,25 +12,10 @@ pub const CODEC_ARITH: i32 = 0x10000;
 pub const CODEC_BZIP3: i32 = 0x20000;
 pub const CODEC_LZMA: i32 = 0x40000;
 
-/// Bits no codec defines, or a bzip3 block size out of range.
-pub fn badcodec(c: i32) -> bool {
-    let u = c as u32;
-    if u & CODEC_LZMA as u32 != 0 { return u != CODEC_LZMA as u32; }
-    if u & CODEC_BZIP3 as u32 != 0 {
-        let mb = u & 0xffff;
-        return u & !(CODEC_BZIP3 as u32 | 0xffff) != 0 || !(1..=511).contains(&mb);
-    }
-    u & !(CODEC_ARITH as u32 | 0x3ff) != 0
-}
 /// Stores no size, so a size check cannot be made.
 pub fn nosz(c: i32) -> bool {
     let u = c as u32;
     u != 0 && u & CODEC_BZIP3 as u32 == 0 && u & 0x10 != 0
-}
-/// arith X_EXT, which needs libbz2.
-pub fn noext(c: i32) -> bool {
-    let u = c as u32;
-    u & CODEC_ARITH as u32 != 0 && u & CODEC_BZIP3 as u32 == 0 && u & 0x04 != 0
 }
 
 unsafe extern "C" {

@@ -63,21 +63,9 @@ fn main() {
         if m.is_empty() && std::env::args().any(|a| a == "--sort=") { mem_arg(""); }
         if !m.is_empty() { opt.sortmem = mem_arg(m); }
     }
-    opt.tail = cnt(&c.tail, 0, 1, "--tail is 0 or 1").map(|t| t == 1);
-    if let Some(k) = cnt(&c.tok_chunk, 1, 0x7fff_ffff, "--tok-chunk needs a number") {
-        opt.tok_chunk = Some((k as usize).min(9_000_000));
-    }
-    opt.id_codec = c.id_codec.as_deref().map(|v| parse_codec(v, "--id-codec"));
-    opt.len_codec = c.len_codec.as_deref().map(|v| parse_codec(v, "--len-codec"));
 
     let Some(cmd) = c.cmd.as_ref() else { die(cli::USAGE) };
     prof::start(c.profile, n);
-    // The C tests each predicate over both codecs before the next one.
-    let ks = [opt.id_codec, opt.len_codec];
-    let any = |f: fn(i32) -> bool| ks.iter().flatten().any(|&k| f(k));
-    if any(ffi::badcodec) { die("--id-codec and --len-codec take a codec id, not any number"); }
-    if any(ffi::nosz) { die("a NOSZ codec (0x10) stores no size and is not accepted"); }
-    if any(ffi::noext) { die("arith X_EXT (0x04) needs libbz2 and is not accepted"); }
     c.check_scope().unwrap_or_else(|m| die(&m));
     let mut ro = reader::ReadOpts { raw: c.raw, db: c.db.is_some(), ..Default::default() };
     // The C keeps a mode and a file separately, so a repeat of one does not
@@ -273,17 +261,6 @@ fn mem_arg(p: &str) -> u64 {
     let m = val * mul;
     if m < (1 << 20) { die("--sort=MEM must be at least 1M"); }
     m
-}
-
-fn parse_codec(s: &str, flag: &str) -> i32 {
-    // digits, or 0x and hex digits, as the C reads it
-    let (h, radix) = match s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
-        Some(h) => (h, 16), None => (s, 10) };
-    let ok = !h.is_empty() && h.len() <= 8 && h.chars().all(|c| c.is_digit(radix));
-    match i64::from_str_radix(h, radix) {
-        Ok(v) if ok && v <= 0x7fff_ffff => v as i32,
-        _ => die(&format!("{flag} needs a codec id")),
-    }
 }
 
 /// --aln needs --ref, and the two are read once, before any row.

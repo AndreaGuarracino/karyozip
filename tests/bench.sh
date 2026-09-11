@@ -12,7 +12,7 @@ D=$1; PAF=$2; FEAT=$3; HIER=$4; REFD=$5
 C=${6:-$(dirname "$0")/../c/build/karyozip}; R=${7:-$(dirname "$0")/../rust/target/release/karyozip}
 PART=${8:-}
 T=8; NQ=50; NQ_ALN=50; REPS=1   # an aln-informed query parses the reference track
-BLOCKS="65536 1048576"; LEVELS="9 22"; IMPLS="C Rust"   # swept beside the 262144 and 17 defaults
+BLOCKS="65536 1048576"; LEVELS="3 9 22"; IMPLS="C Rust"   # swept beside the 262144 and 17 defaults
 KINDS="presmoothed smoothed"; ONLY=""; SEEKS="seekable non-seekable"
 if [ -n "$PART" ]; then IFS=: read -r KINDS ONLY sk im <<< "$PART"
   [ -n "$sk" ] && SEEKS=$sk
@@ -85,7 +85,7 @@ row() {  # row SET KIND INFORMED SEEK MODE IMPL BIN INPUT(s) ENCFLAGS DECFLAGS C
       "$class" "$dbv" "$backend" "$set" "$kind" "$inf" "$seek" "$mode" "$impl" "$rows" "$seqs" "$gz" "$plain" "$comp" "$T"
     return
   fi
-  local kst=$(stat -c%s "$W/k.kst")
+  local kst=$(stat -c%s "$W/k.kst" 2>/dev/null)   # none for ALL not-informed, summed below
   [ "$comp" = side ] && comp=$(stat -c%s "$W/side")
   local ds dm rt
   if [ "$set" = ALL ] && [ "$inf" = not-informed ]; then
@@ -104,7 +104,7 @@ row() {  # row SET KIND INFORMED SEEK MODE IMPL BIN INPUT(s) ENCFLAGS DECFLAGS C
   fi
   # sorting permutes whole records, so both sides are sorted before the
   # comparison, as the matrix does: the verdict stays exact or DIFFERS
-  if [ "$inf" = sorted ]; then
+  if [ "${inf%-*}" = sorted ]; then
     sort "$W/plain.bed" > "$W/w.bed"; sort "$W/back.bed" | cmp -s - "$W/w.bed" && rt=exact || rt=DIFFERS
   fi
   if [ "$rt" != exact ]; then echo "bench: round trip $rt on $set $kind $inf $seek $mode $impl" >&2; BAD=$((BAD+1))
@@ -113,15 +113,22 @@ row() {  # row SET KIND INFORMED SEEK MODE IMPL BIN INPUT(s) ENCFLAGS DECFLAGS C
   if [ "$set" != ALL ] || [ "$inf" != not-informed ]; then
     if [ "$impl" = C ]; then cp "$W/k.kst" "$kc"
     elif [ -s "$kc" ] && ! cmp -s "$W/k.kst" "$kc"; then
-      echo "bench: C and Rust bytes differ on $set $kind $inf $seek $mode" >&2; BAD=$((BAD+1)); fi
+      echo "bench: C and Rust bytes differ on $set $kind $inf $seek $mode" >&2; BAD=$((BAD+1))
+    elif [ -s "$kc" ] && [ "$set" != ALL ]; then     # and both readers answer alike on it
+      local sq=$(head -1 "$W/plain.bed" | cut -f1) rd
+      for rd in "decode --raw" "region $sq 100" "region $sq 100 5000 50"; do
+        "$C" $df $rd "$kc" > "$W/rc" 2>&1; "$R" $df $rd "$kc" > "$W/rr" 2>&1
+        cmp -s "$W/rc" "$W/rr" || { echo "bench: C and Rust readers differ on $rd, $set $kind $inf $seek $mode" >&2; BAD=$((BAD+1)); }
+      done
+    fi
   fi
   # an unsmoothed track is also smoothed, timed: what the tool replaces
   local sm="NA NA"
   if [ "$kind" = presmoothed ] && [ "$set" != ALL ] && [ -s "$HIER" ]; then
     set -- $(timed "$W/sm.bed" /dev/null "$bin" -t $T $df smooth "$W/k.kst" "$HIER" "$set"); sm="$1 $2"
-    # and must give KaryoScope's own smoothed track, unless a window clipped the ends
+    # and must give KaryoScope's own smoothed track
     local smo=$(ls "$D"/*."$set".smoothed.bed.gz 2>/dev/null | grep -v '/ref\.' | head -1)
-    if [ "$inf" = not-informed ] && [ -s "$smo" ] && [ ! -e "$D/window" ] && ! zcat "$smo" | cmp -s - "$W/sm.bed"; then
+    if [ "$inf" = not-informed ] && [ -s "$smo" ] && ! zcat "$smo" | cmp -s - "$W/sm.bed"; then
       echo "bench: smooth differs from KaryoScope on $set $seek $mode $impl" >&2; BAD=$((BAD+1)); fi
   fi
   local ix=0 q="NA NA NA NA"
@@ -131,7 +138,7 @@ row() {  # row SET KIND INFORMED SEEK MODE IMPL BIN INPUT(s) ENCFLAGS DECFLAGS C
     # only that flag: index takes no --aln or --db
     local ixf=""; case "$df" in "--names "*) ixf="$df";; esac
     if "$bin" $ixf index "$W/ki.kst" >/dev/null 2>&1; then ix=$(( $(stat -c%s "$W/ki.kst") - kst ))
-      q=$(NQ=$(case "$inf" in not-informed|db-informed|names-dropped|sorted|block-*|level-*) echo $NQ;; *) echo $NQ_ALN;; esac) queries "$bin" "$df" "$W/ki.kst" "$W/names")
+      q=$(NQ=$(case "$inf" in not-informed|db-informed|names-dropped|sorted*|block-*|level-*|tail-*) echo $NQ;; *) echo $NQ_ALN;; esac) queries "$bin" "$df" "$W/ki.kst" "$W/names")
     else echo "index refused on $set $kind $inf $mode $impl" >&2; ix=NA; fi
   fi
   local tot=$((kst + comp))
@@ -157,6 +164,9 @@ for kind in $KINDS; do
             # ordinal-named tracks have no names to move to a sidecar
             [ $ordinal = 0 ] && row "$set" "$kind" names-dropped "$seek" "$mode" "$impl" "$bin" "$q" "$bf $mf --names drop:$W/side" "--names $W/side" side
             [ "$mode" = default ] && row "$set" "$kind" sorted "$seek" "$mode" "$impl" "$bin" "$q" "$bf $mf --sort" "" 0
+            [ "$mode" = default ] && row "$set" "$kind" sorted-1M "$seek" "$mode" "$impl" "$bin" "$q" "$bf $mf --sort=1M" "" 0
+            [ "$mode" = default ] && for v in 0 1; do
+              row "$set" "$kind" "tail-$v" "$seek" "$mode" "$impl" "$bin" "$q" "$bf --tail $v" "" 0; done
             # a block is decoded whole, so its size trades bytes against the
             # query; the level trades bytes against the encode
             [ "$mode" = default ] && for v in $BLOCKS; do

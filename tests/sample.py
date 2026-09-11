@@ -5,13 +5,13 @@
 #     inventory, one a sample, fixed seed; then the staged cells, which alone
 #     carry alignments. A line: cell, source directory, alignment or -.
 #   sample.py cut SRC OUT PAF ROWS BGZIP
-#     every track of SRC to at most about ROWS rows, the same sequences in
-#     every track: reads whole, picked by a hash of the name; an assembly, whose
-#     few sequences are each bigger than the cut, the same leading window of
-#     every sequence, ending where the largest track reaches its share of rows,
-#     ends clipped and a file named window left beside the tracks. Ordinal cells renumbered from 0 with their
-#     names.txt rewritten; the alignment keeps the picked reads. bgzip level 6,
-#     the level of the originals, so the ratio divides by the same kind of file.
+#     every track of SRC to at most about ROWS rows, the same reads in every
+#     track, whole, picked by a hash of the name: a sequence must run gap-free
+#     from 0, so rows cannot be picked one at a time. A cell whose cut would
+#     keep fewer than 100 sequences, an assembly, is taken whole. Ordinal cells
+#     renumbered from 0 with their names.txt rewritten; the alignment keeps the
+#     picked reads. bgzip level 6, the level of the originals, so the ratio
+#     divides by the same kind of file.
 import sys, os, zlib, random, subprocess, collections, multiprocessing
 STD = {'acrocentric', 'chromosome', 'gene', 'region', 'repeat', 'subtelomeric', 'haplotype'}
 
@@ -58,16 +58,13 @@ def count(path):
     return int(subprocess.run(f"zcat '{path}' | wc -l", shell=True, capture_output=True, text=True).stdout)
 
 def write(job):                                  # one track, filtered, bgzip level 6
-    path, dest, bgz, frac, window, end, new = job
+    path, dest, bgz, frac, new = job
     p = subprocess.Popen([bgz, '-l', '6', '-c'], stdin=subprocess.PIPE, stdout=open(dest, 'wb'))
     k, prev, kept = 0, None, False
     for line in lines(path):
         nm, s, e, rest = line.split('\t', 3)
-        if nm != prev: prev = nm; kept = window or frac == 1 or zlib.crc32(nm.encode()) < frac * 2 ** 32
+        if nm != prev: prev = nm; kept = frac == 1 or zlib.crc32(nm.encode()) < frac * 2 ** 32
         if not kept: continue
-        if window:
-            if int(s) >= end[nm]: continue
-            e = str(min(int(e), end[nm]))
         p.stdin.write(f"{new[nm] if new else nm}\t{s}\t{e}\t{rest}".encode()); k += 1
     p.stdin.close()
     if p.wait(): sys.exit(f'sample: bgzip failed on {path}')
@@ -80,39 +77,36 @@ def cut(src, out, paf, cap, bgz):
     with multiprocessing.Pool(8) as pool: rows = dict(zip(beds, pool.map(count, [os.path.join(src, f) for f in beds])))
     big = max(beds, key=rows.get)                 # the largest track sets the rate
     frac = min(1.0, cap / rows[big])
-    nseq, per, prev = 0, collections.Counter(), None
+    nseq, prev = 0, None
     for line in lines(os.path.join(src, big)):
-        nm = line.split('\t', 1)[0]; per[nm] += 1
+        nm = line.split('\t', 1)[0]
         if nm != prev: nseq += 1; prev = nm
-    window = frac < 1 and frac * nseq < 100
-    end = {}
-    if window:                                    # few sequences: each ends where the largest
-        want = {nm: int(n * frac) for nm, n in per.items()}   # track reaches its share of rows
-        seen = collections.Counter()
-        for line in lines(os.path.join(src, big)):
-            nm, s, e, _ = line.split('\t', 3); seen[nm] += 1
-            if seen[nm] == want[nm] or (want[nm] == 0 and seen[nm] == 1): end[nm] = int(e) if want[nm] else 1
-        open(os.path.join(out, 'window'), 'w').close()   # clipped ends: no smoothing oracle
-    del per
+    if frac * nseq < 100: frac = 1.0             # an assembly: whole
+    if frac == 1:                                 # whole: link, the originals are level 6 already
+        for f in beds: os.symlink(os.path.join(src, f), os.path.join(out, '{}.{}.{}.{}.bed.gz'.format(smp, *parse(f))))
+        if os.path.exists(os.path.join(src, 'names.txt')): os.symlink(os.path.join(src, 'names.txt'), os.path.join(out, 'names.txt'))
+        if paf != '-': os.symlink(paf, os.path.join(out, 'aln.paf'))
+        print(f"sample: {os.path.basename(out)} whole, {len(beds)} tracks, up to {rows[big]} rows", flush=True)
+        return
     first = next(lines(os.path.join(src, big))).split('\t', 1)[0]
     new = names = None
-    if first.isdigit() and not window:           # ordinal: read N is line N+1
+    if first.isdigit() and frac < 1:           # ordinal: read N is line N+1
         olds = sorted({int(l.split('\t', 1)[0]) for l in lines(os.path.join(src, big))
                        if zlib.crc32(l.split('\t', 1)[0].encode()) < frac * 2 ** 32})
         new = {str(o): str(j) for j, o in enumerate(olds)}
         allnames = open(os.path.join(src, 'names.txt')).read().split('\n')
         names = [allnames[o] for o in olds]
         open(os.path.join(out, 'names.txt'), 'w').write('\n'.join(names) + '\n')
-    jobs = [(os.path.join(src, f), os.path.join(out, '{}.{}.{}.{}.bed.gz'.format(smp, *parse(f))), bgz, frac, window, end, new) for f in beds]
+    jobs = [(os.path.join(src, f), os.path.join(out, '{}.{}.{}.{}.bed.gz'.format(smp, *parse(f))), bgz, frac, new) for f in beds]
     with multiprocessing.Pool(8) as pool: kept = pool.map(write, jobs)
     q = 0
-    if paf != '-' and not window:
+    if paf != '-':
         want = set(names) if names else None
         with open(os.path.join(out, 'aln.paf'), 'w') as o:
             for line in open(paf):
                 nm = line.split('\t', 1)[0]
                 if (nm in want) if want is not None else zlib.crc32(nm.encode()) < frac * 2 ** 32: o.write(line); q += 1
-    print(f"sample: {os.path.basename(out)} {'window' if window else 'reads'} {frac:.6f} of up to "
+    print(f"sample: {os.path.basename(out)} reads {frac:.6f} of up to "
           f"{rows[big]} rows, {len(beds)} tracks, {min(kept)} to {max(kept)} rows kept, {q} alignment lines", flush=True)
 
 if sys.argv[1] == 'pick': pick(sys.argv[2], int(sys.argv[3]), sys.argv[4])

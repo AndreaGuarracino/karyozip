@@ -52,7 +52,7 @@ ratio() { awk -v a=$1 -v b=$2 'BEGIN{ if (b > 0) printf "%.2f", a/b; else print 
 queries() {  # queries BIN "FLAGS" KST NAMEFILE : NQ random point queries, ms stats; NA unless every one answered
   local b=$1 fl=$2 k=$3 nf=$4; : > "$W/q"; : > "$W/qbad"
   shuf -r -n $NQ --random-source=<(yes) "$nf" | while read -r nm; do   # with replacement: a cut cell may hold 10 sequences
-    s=$(date +%s%N); "$b" $fl region -i "$k" -s "$nm" -p 100 > "$W/qo" 2>/dev/null || echo x >> "$W/qbad"; e=$(date +%s%N)
+    s=$(date +%s%N); "$b" $fl region -i "$k" -r "$nm":100-101 > "$W/qo" 2>/dev/null || echo x >> "$W/qbad"; e=$(date +%s%N)
     [ -s "$W/qo" ] || echo x >> "$W/qbad"
     echo $(( (e - s) / 1000 )) >> "$W/q"
   done
@@ -122,7 +122,7 @@ row() {  # row SET KIND INFORMED SEEK MODE IMPL BIN INPUT(s) ENCFLAGS DECFLAGS C
       echo "bench: C and Rust bytes differ on $set $kind $inf $seek $mode" >&2; BAD=$((BAD+1))
     elif [ -s "$kc" ] && [ "$set" != ALL ]; then     # and both readers answer alike on it
       local sq=$(head -1 "$W/plain.bed" | cut -f1) rd
-      for rd in "decode --raw" "region -s $sq -p 100" "region -s $sq --start 100 --end 5000 --halo 50"; do
+      for rd in "decode --raw" "region -r $sq:100-101" "region -r $sq:100-5000 --halo 50"; do
         "$C" $df $rd -i "$kc" > "$W/rc" 2>&1; "$R" $df $rd -i "$kc" > "$W/rr" 2>&1
         cmp -s "$W/rc" "$W/rr" || { echo "bench: C and Rust readers differ on $rd, $set $kind $inf $seek $mode" >&2; BAD=$((BAD+1)); }
       done

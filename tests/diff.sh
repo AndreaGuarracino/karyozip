@@ -68,7 +68,7 @@ for f in ls.bed s.bed db.rall.bed ord.bed; do
   for bl in "" "--block 4"; do
     "$C" $bl encode < "$D/$f" > "$W/t.kst" 2>/dev/null
     for seq in $(awk -F'\t' '{print $1}' "$D/$f" | uniq | head -3); do
-      for q in "-s $seq" "-s $seq -p 50" "-s $seq --start 0 --end 100" "-s $seq --start 0 --end 100 --halo 2" "-s $seq -p 999999"; do
+      for q in "-r $seq" "-r $seq:50-51" "-r $seq:0-100" "-r $seq:0-100 --halo 2" "-r $seq:999999-1000000"; do
         both "region $f [$bl] [$q]" region $q -i "$W/t.kst"
       done
     done
@@ -83,7 +83,7 @@ cp "$W/ci.kst" "$W/ri.kst"
 "$R" index -i "$W/ri.kst" >/dev/null 2>&1; irr=$?
 if [ $irc = 0 ] && [ $irr = 0 ] && cmp -s "$W/ci.kst" "$W/ri.kst"; then echo "index: byte-identical trailer"
 else echo "index: TRAILERS DIFFER (rc $irc/$irr)"; fail=1; fi
-both "index cross-read" region -i "$W/ci.kst" -s seq0005; tally "index cross-read"
+both "index cross-read" region -i "$W/ci.kst" -r seq0005; tally "index cross-read"
 
 # 6b. a sorted track: the Rust must resolve the ranks the same way.
 for f in ls.bed s.bed db.rall.bed ord.bed; do
@@ -114,7 +114,7 @@ for f in ls.bed s.bed db.rall.bed; do
   "$C" encode < "$D/$f" > "$W/t.kst" 2>/dev/null
   for q in "" "--v1" "--max-gap 5" "--max-gap 100000"; do both "smooth $f [$q]" $q smooth -i "$W/t.kst" --hier "$W/h.tsv" -f fs; done
   for seq in $(awk -F'\t' '{print $1}' "$D/$f" | uniq | head -2); do
-    for q in "-s $seq" "-s $seq --start 0 --end 100"; do both "smooth $f [$q]" smooth -i "$W/t.kst" --hier "$W/h.tsv" -f fs $q; done
+    for q in "-r $seq" "-r $seq:0-100"; do both "smooth $f [$q]" smooth -i "$W/t.kst" --hier "$W/h.tsv" -f fs $q; done
   done
 done
 tally smooth
@@ -169,8 +169,8 @@ for pair in "s.bed p.paf ref.bed" "ls.bed lp.paf lref.bed"; do
 done
 for pair in "p.paf ref.bed" "lp.paf lref.bed" "db.self.paf db.rall.bed"; do
   set -- $pair
-  "$C" aln-pack -a "$D/$1" -r "$D/$2" -o "$W/c.pk" >/dev/null 2>&1; c1=$?
-  "$R" aln-pack -a "$D/$1" -r "$D/$2" -o "$W/r.pk" >/dev/null 2>&1; c2=$?
+  "$C" aln-pack -a "$D/$1" --ref "$D/$2" -o "$W/c.pk" >/dev/null 2>&1; c1=$?
+  "$R" aln-pack -a "$D/$1" --ref "$D/$2" -o "$W/r.pk" >/dev/null 2>&1; c2=$?
   if cmp -s "$W/c.pk" "$W/r.pk" && [ $c1 = $c2 ]; then aok=$((aok+1))
   else abad=$((abad+1)); echo "  aln-pack differs: $1"; fi
 done
@@ -186,7 +186,7 @@ for bad_in in 'r1\t0\t10' 'r1\t5\t10\tA' 'r1\t0\t0\tA' '\t0\t10\tA' 'r1\tx\t10\t
 done
 # the same refusals on companions: a blank --aln-names line, a cut .gz reference, a packed alignment with a byte over
 printf 'q1\n\nq2\n' > "$W/blank"; gzip -c "$D/ref.bed" | head -c 40 > "$W/cut.gz"
-"$C" aln-pack -a "$D/p.paf" -r "$D/ref.bed" -o "$W/over.pk" >/dev/null 2>&1; printf '\0' >> "$W/over.pk"
+"$C" aln-pack -a "$D/p.paf" --ref "$D/ref.bed" -o "$W/over.pk" >/dev/null 2>&1; printf '\0' >> "$W/over.pk"
 "$C" encode --aln "$D/p.paf" --ref "$D/ref.bed" < "$D/s.bed" > "$W/a.kst" 2>/dev/null
 for form in "encode --aln $D/p.paf --ref $D/ref.bed --aln-names $W/blank" "encode --aln $D/p.paf --ref $W/cut.gz" "decode --aln $W/over.pk --ref $D/ref.bed -i $W/a.kst"; do
   "$C" $form < "$D/s.bed" 2> "$W/ce" >/dev/null; c1=$?; cm=$(tail -1 "$W/ce")
@@ -250,20 +250,20 @@ cli badcmd; cli region; cli region -i f; cli index; cli smooth -i f; cli aln-pac
 cli encode --names ordinal; cli decode --sort; cli index --effort low
 cli encode --block; cli encode --effort max; cli encode --block 0
 cli -t; cli -t 0; cli -t 99999; cli --tmp-dir; cli decode --raw x --raw
-cli index --block 0; cli aln-pack -a a -r b; cli smooth -i f --hier h; cli region -i f -s s -p 1 --start 2 --end 3
+cli index --block 0; cli aln-pack -a a --ref b; cli smooth -i f --hier h; cli region -i f -r s:5-5
 cli encode --sort=0; cli encode --names foo; cli decode --names keep
-cli aln-pack --names foo -a a -r b -o c; cli encode --db; cli --version encode
-cli index -i f x; cli decode -i f x; cli smooth -i f --hier h -f fs --start 1; cli aln-pack -a a -r b -o c d
-cli smooth -i f --hier h -f fs --start 1 --end 2; cli region -i f -s s --halo 3; cli region -i f -s s -p 1
+cli aln-pack --names foo -a a --ref b -o c; cli encode --db; cli --version encode
+cli index -i f x; cli decode -i f x; cli smooth -i f --hier h -f fs -r s:9-3; cli aln-pack -a a --ref b -o c d
+cli smooth -i f --hier h -f fs -r s:1-2; cli region -i f -r s --halo 3; cli region -i f -r s:1-2
 cli smooth --max-gap x -i f --hier h -f fs
-cli decode --out-dir D; cli region -i f -s s --start 1; cli region -i f -s s -p +1
+cli decode --out-dir D; cli region -i f --halo 2; cli region -i f -r s:+1-5; cli region -i f -r s:99999999999999999999-1
 cli encode --block +5; cli encode --aln p; cli encode --ref r
 cli decode --aln-names f; cli index --names ordinal; cli encode --sort --sort=1M
 cli decode --aln p; cli decode --ref r; cli decode --aln p --ref r
 cli encode --names drop --aln p --ref r; cli decode --db f; cli encode --db f
 cli encode --names drop --names drop:x; cli encode --names drop:
 cli encode --sort --names drop --aln p --ref r --aln-names q
-cli decode -i a -i b; cli encode -i nosuch; cli index -i f -o x; cli region -i f -s s --start 2 --end 1
+cli decode -i a -i b; cli encode -i nosuch; cli index -i f -o x; cli region -i f -r s:2-1
 [ $cbad = 0 ] && echo "cli: $cok forms give the same words and code" \
   || { echo "cli: $cbad of $((cok+cbad)) DIFFER"; fail=1; }
 

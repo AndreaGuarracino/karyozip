@@ -46,15 +46,15 @@ run "decode --raw"                 "$SAN" decode --raw -i "$W/p.kt"
 run "decode --names F"             "$SAN" --names "$W/side" decode -i "$W/s.kt"
 run "decode --aln --ref"           "$SAN" decode --aln "$D/lp.paf" --ref "$D/lref.bed" -i "$W/a.kt"
 run "decode --db --out"            "$SAN" decode --db "$D/db.features.tsv" --out-dir "$W/out" -i "$W/f.kt"
-run "region, a name that is there" "$SAN" region -i "$W/p.kt" -s r1
-run "region, a name that is not (refused)" "$SAN" region -i "$W/p.kt" -s nosuchname
-run "region SEQ POS"               "$SAN" region -i "$W/p.kt" -s r1 -p 150
-run "region SEQ START END HALO"    "$SAN" region -i "$W/p.kt" -s r1 --start 0 --end 200 --halo 3
+run "region, a name that is there" "$SAN" region -i "$W/p.kt" -r r1
+run "region, a name that is not (refused)" "$SAN" region -i "$W/p.kt" -r nosuchname
+run "region SEQ POS"               "$SAN" region -i "$W/p.kt" -r r1:150-151
+run "region SEQ START END HALO"    "$SAN" region -i "$W/p.kt" -r r1:0-200 --halo 3
 run "index"                        "$SAN" index -i "$W/p.kt"
-run "region, after index"          "$SAN" region -i "$W/p.kt" -s r1 -p 150
+run "region, after index"          "$SAN" region -i "$W/p.kt" -r r1:150-151
 run "smooth"                       "$SAN" smooth -i "$W/p.kt" --hier "$W/h.tsv" -f fs
-run "smooth, one sequence"         "$SAN" smooth -i "$W/p.kt" --hier "$W/h.tsv" -f fs -s r1
-run "aln-pack"                     "$SAN" aln-pack -a "$D/lp.paf" -r "$D/lref.bed" -o "$W/pk"
+run "smooth, one sequence"         "$SAN" smooth -i "$W/p.kt" --hier "$W/h.tsv" -f fs -r r1
+run "aln-pack"                     "$SAN" aln-pack -a "$D/lp.paf" --ref "$D/lref.bed" -o "$W/pk"
 run "--help"                       "$SAN" --help
 run "--version"                    "$SAN" --version
 [ $fail = 0 ] && echo "leaks: clean" || echo "leaks: FOUND SOMETHING"

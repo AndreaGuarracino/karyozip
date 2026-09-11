@@ -144,24 +144,10 @@ fn main() {
         }
         Cmd::Region { .. } => {
             let track = track();
-            let seq = c.seq.as_deref().unwrap_or_else(|| die("region needs -s SEQ"));
-            if c.pos.is_some() && (c.start.is_some() || c.end.is_some()) { die("region: give -p POS, or --start and --end"); }
-            if c.start.is_some() != c.end.is_some() { die("region: give --start and --end together"); }
-            if c.halo.is_some() && c.start.is_none() { die("region: --halo needs --start and --end"); }
-            let p = |v: &Option<String>, w: &'static str| karyozip::bedcoord(v.as_ref().unwrap().as_bytes(), w);
-            let (mut lo, mut hi) = (0, 0);
-            if c.pos.is_some() {
-                lo = p(&c.pos, "region: -p is not a number");
-                if lo == u64::MAX { die("region: -p is not a number"); }
-                hi = lo + 1;
-            }
-            if c.start.is_some() {
-                lo = p(&c.start, "region: --start is not a number");
-                if lo == u64::MAX { die("region: --start is not a number"); }
-                hi = p(&c.end, "region: --end is not a number");
-                if lo >= hi { die("region: --end must be past --start"); }
-            }
-            let hlo = c.halo.as_ref().map_or(0, |_| p(&c.halo, "region: --halo is not a number"));
+            let r = c.region.as_deref().unwrap_or_else(|| die("region needs -r NAME[:START-END]"));
+            let (seq, lo, hi) = regparse(r);
+            if c.halo.is_some() && hi == 0 { die("region: --halo needs -r NAME:START-END"); }
+            let hlo = c.halo.as_ref().map_or(0, |h| karyozip::bedcoord(h.as_bytes(), "region: --halo is not a number"));
             let feats = informed(&c, &mut ro, "region ", None, aln::Lazy::OneSeq);
             let mut r = reader::Reader::open_with(track, &ro);
             if let Some(f) = &feats { f.check_hash(&r); }
@@ -175,21 +161,13 @@ fn main() {
             let track = track();
             let (Some(hier), Some(fs)) = (c.hier.as_deref(), c.feature_set.as_deref())
                 else { die("smooth needs --hier HIER and -f FEATURE_SET") };
-            if c.start.is_some() != c.end.is_some() { die("smooth: give --start and --end together"); }
-            if c.start.is_some() && c.seq.is_none() { die("smooth: --start and --end need -s SEQ"); }
             let maxgap = num(&c.max_gap, 0, u64::MAX, "--max-gap needs a number").unwrap_or(1000);
-            let (lo, hi) = match (&c.start, &c.end) {
-                (Some(a), Some(b)) => (
-                    karyozip::bedcoord(a.as_bytes(), "smooth: --start is not a number"),
-                    karyozip::bedcoord(b.as_bytes(), "smooth: --end is not a number")),
-                _ => (0, 0),
-            };
-            if c.start.is_some() && lo >= hi { die("smooth: --end must be past --start"); }
+            let (seq, lo, hi) = c.region.as_deref().map_or(("", 0, 0), regparse);
             let feats = informed(&c, &mut ro, "smooth ", Some(hier), aln::Lazy::Contig);
             // not stdout().lock(): a lock guard cannot cross to the smooth
             // workers, and they are serialized by turn anyway
             let mut o = BufWriter::new(std::io::stdout());
-            smooth::run(track, hier, fs.as_bytes(), c.seq.as_ref().map(|s| s.as_bytes()),
+            smooth::run(track, hier, fs.as_bytes(), c.region.as_ref().map(|_| seq.as_bytes()),
                         lo, hi, c.v1, maxgap, &ro, feats.as_ref(), &mut o);
             o.flush().unwrap_or_else(|e| die(&e.to_string()));
         }
@@ -201,7 +179,7 @@ fn main() {
         Cmd::Codecs { file } => probe(need(file)),
         Cmd::AlnPack { .. } => {
             let (Some(paf), Some(rbed), Some(dest)) = (&c.aln, &c.refbed, &c.output)
-                else { die("usage: karyozip aln-pack -a P.paf -r REF.bed|REF.kst -o OUT") };
+                else { die("usage: karyozip aln-pack -a P.paf --ref REF.bed|REF.kst -o OUT") };
             let mut a = aln::Aln::default();
             a.load_ref(rbed, aln::Lazy::No);
             let rh = aln::refhash(&a);
@@ -254,6 +232,20 @@ fn mem_arg(p: &str) -> u64 {
     let m = val * mul;
     if m < (1 << 20) { die("--sort=MEM must be at least 1M"); }
     m
+}
+
+/// -r NAME or NAME:START-END, the range BED's: 0-based, END excluded. A
+/// name may hold ':' itself, so only a digits-digits tail is a range.
+fn regparse(r: &str) -> (&str, u64, u64) {
+    let digits = |x: &str| !x.is_empty() && x.bytes().all(|b| b.is_ascii_digit());
+    let Some((nm, tail)) = r.rsplit_once(':') else { return (r, 0, 0) };
+    let Some((a, b)) = tail.split_once('-') else { return (r, 0, 0) };
+    if !digits(a) || !digits(b) { return (r, 0, 0); }
+    let lo = karyozip::bedcoord(a.as_bytes(), "-r: START is not a number");
+    if lo == u64::MAX { die("-r: START is not a number"); }
+    let hi = karyozip::bedcoord(b.as_bytes(), "-r: END is not a number");
+    if lo >= hi { die("-r: END must be past START"); }
+    (nm, lo, hi)
 }
 
 /// --aln needs --ref, and the two are read once, before any row.

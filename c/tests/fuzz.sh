@@ -138,7 +138,7 @@ echo "fuzz: $d damaged files, none crashed"
 # 2b. a damaged packed alignment: the companion is read whole from disk, so
 # every flip and every cut must be refused or decoded right, never crash.
 $KT encode --aln "$D/p.paf" --ref "$D/ref.bed" < "$D/s.bed" > "$W/pa.kt" 2>/dev/null
-$KT aln-pack -a "$D/p.paf" -r "$D/ref.bed" -o "$W/pa.pk" >/dev/null 2>&1
+$KT aln-pack -a "$D/p.paf" --ref "$D/ref.bed" -o "$W/pa.pk" >/dev/null 2>&1
 $KT decode --aln "$D/p.paf" --ref "$D/ref.bed" -i "$W/pa.kt" 2>/dev/null > "$W/pa.want"
 psz=$(stat -c%s "$W/pa.pk"); pd=0
 for cut in $(seq 1 $psz) ; do head -c $((psz - cut)) "$W/pa.pk" > "$W/m.pk"
@@ -179,7 +179,7 @@ printf 'feature_set\tchild\tparent\nfs\tL0\tcategorized\n' > "$W/hier.tsv"
 one_forged() {   # one file, three commands, its own error file
   local m=$1 e="$1.err"
   for c in "decode --names ordinal" "region --names ordinal" smooth; do
-    case $c in region*) args="-i $m -s read1";; smooth) args="-i $m --hier $W/hier.tsv -f fs";; *) args="-i $m";; esac
+    case $c in region*) args="-i $m -r read1";; smooth) args="-i $m --hier $W/hier.tsv -f fs";; *) args="-i $m";; esac
     ASAN_OPTIONS=detect_leaks=0 timeout 30 ${SAN:-$KT} $c $args > /dev/null 2>"$e"; rc=$?
     [ $rc -gt 1 ] && { echo "fuzz: forged $(basename $m) $c crashed rc=$rc"; return 1; }
     grep -qE "AddressSanitizer|runtime error" "$e" && { echo "fuzz: forged $(basename $m) $c sanitizer report"; return 1; }
@@ -286,12 +286,12 @@ hh = list(h); hh[4] = h[4] - 1; open("%s/fidx%d.kt" % (W, k), "wb").write(build(
 hh = list(h); hh[8] = 16; open("%s/fidx%d.kt" % (W, k), "wb").write(build(frames, chunks, hh)); k += 1
 hh = list(h); hh[13] = 3; open("%s/fidx%d.kt" % (W, k), "wb").write(build(frames, chunks, hh)); k += 1
 PY
-$KT region -i "$W/t5.kt" -s s69999 2>/dev/null > "$W/want5"
+$KT region -i "$W/t5.kt" -r s69999 2>/dev/null > "$W/want5"
 printf 'feature_set\tchild\tparent\nfs\tA\tcategorized\nfs\tB\tcategorized\n' > "$W/hier.tsv"
 $KT smooth -i "$W/t5.kt" --hier "$W/hier.tsv" -f fs 2>/dev/null > "$W/want5s"
 one_fidx() {
   local m=$1 e="$1.err" out rc
-  out=$(ASAN_OPTIONS=detect_leaks=0 timeout 30 ${SAN:-$KT} region -i "$m" -s s69999 2>"$e"); rc=$?
+  out=$(ASAN_OPTIONS=detect_leaks=0 timeout 30 ${SAN:-$KT} region -i "$m" -r s69999 2>"$e"); rc=$?
   [ $rc -gt 1 ] && { echo "fuzz: forged index $(basename $m) crashed rc=$rc"; return 1; }
   grep -qE "AddressSanitizer|runtime error" "$e" && { echo "fuzz: forged index $(basename $m) sanitizer report"; return 1; }
   [ $rc -eq 0 ] && { printf '%s\n' "$out" | cmp -s - "$W/want5" || { echo "fuzz: forged index $(basename $m) WRONG rows with exit 0"; return 1; }; }

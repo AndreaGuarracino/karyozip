@@ -29,16 +29,9 @@ pub struct Cli {
     /// where the output goes, else stdout
     #[arg(long, short = 'o', global = true, value_name = "FILE")]
     pub output: Option<String>,
-    /// region, smooth: the sequence
-    #[arg(long, short = 's', global = true, value_name = "SEQ")]
-    pub seq: Option<String>,
-    /// region: the run covering this position
-    #[arg(long, short = 'p', global = true, value_name = "POS")]
-    pub pos: Option<String>,
-    #[arg(long, global = true, value_name = "N")]
-    pub start: Option<String>,
-    #[arg(long, global = true, value_name = "N")]
-    pub end: Option<String>,
+    /// region, smooth: NAME or NAME:START-END
+    #[arg(long, short = 'r', global = true, value_name = "NAME[:START-END]")]
+    pub region: Option<String>,
     /// region: runs each side of --start --end
     #[arg(long, global = true, value_name = "N")]
     pub halo: Option<String>,
@@ -74,7 +67,7 @@ pub struct Cli {
     #[arg(long, short = 'a', global = true, value_name = "P.paf")]
     pub aln: Option<String>,
     /// the reference track --aln deltas against
-    #[arg(long = "ref", short = 'r', global = true, value_name = "R")]
+    #[arg(long = "ref", global = true, value_name = "R")]
     pub refbed: Option<String>,
     /// ordinal N is line N+1 of this file
     #[arg(long = "aln-names", global = true, value_name = "F")]
@@ -174,10 +167,7 @@ impl Cli {
         let (pack, reg) = (c == "aln-pack", c == "region");
         if !self.input.is_empty() && pack { bad("--input")?; }
         if self.output.is_some() && c == "index" { bad("--output")?; }
-        if self.seq.is_some() && !(sm || reg) { bad("--seq")?; }
-        if self.pos.is_some() && !reg { bad("--pos")?; }
-        if self.start.is_some() && !(sm || reg) { bad("--start")?; }
-        if self.end.is_some() && !(sm || reg) { bad("--end")?; }
+        if self.region.is_some() && !(sm || reg) { bad("--region")?; }
         if self.halo.is_some() && !reg { bad("--halo")?; }
         if self.feature_set.is_some() && !sm { bad("--feature-set")?; }
         if self.set.is_some() && !(dec || c == "region") { bad("--set")?; }

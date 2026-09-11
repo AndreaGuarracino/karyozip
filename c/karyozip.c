@@ -747,15 +747,16 @@ static char *tokd(const uint8_t *b, size_t n, size_t *outn) {
 }
 
 static const uint32_t TCAND[] = { 250000, 1000000, 3000000, TOKMAX };
+static uint32_t TOKPICK = 250000;        /* the chunk the last tokbest chose */
 static size_t tokbest(buf *in, uint8_t **out) {
-    if (TOKSET) return tokc(in, out, TOKCHUNK);
+    if (TOKSET) return tokc(in, out, TOKPICK = TOKCHUNK);
     size_t n = sizeof TCAND / sizeof *TCAND, best = 0;
     for (size_t i = 0; i < n; i++) {
-        if (FASTMODE && i) continue;    /* fast: the smallest chunk only; --slow tries all */
+        if (FASTMODE && i) continue;    /* --fast: the smallest chunk only */
         uint8_t *o2 = NULL;
         size_t b = tokc(in, &o2, TCAND[i]);
-        /* a larger chunk must save 0.1% to win: chunks decode in parallel */
-        if (b && (!best || b + b / 1000 < best)) { free(*out); *out = o2; best = b; }
+        /* smallest wins; a tie keeps the smaller chunk */
+        if (b && (!best || b < best)) { free(*out); *out = o2; best = b; TOKPICK = TCAND[i]; }
         else free(o2);
     }
     return best;
@@ -769,12 +770,12 @@ static size_t bestnames(buf *b, uint64_t n, uint8_t **out, int *kind) {
     /* zstd and the tokeniser are independent and neither gains from threads
        on a buffer this size, so run them side by side. tok3 overwrites every
        separator with NUL and puts it back, so it cannot share the buffer with
-       a concurrent reader: it gets a copy. b is at most the 50,000-name
-       sample here, one tokeniser chunk, so nothing is lost by not nesting. */
+       a concurrent reader: it gets a copy. Past one tokeniser chunk the
+       two run in turn, so the tokeniser's own threads are not nested. */
     buf tb = { xmalloc(b->n ? b->n : 1), b->n, b->n };
     memcpy(tb.d, b->d, b->n);
 #ifdef _OPENMP
-#pragma omp parallel sections num_threads(2)
+#pragma omp parallel sections num_threads(2) if(n <= TCAND[0])
 #endif
     {
 #ifdef _OPENMP
@@ -2324,9 +2325,9 @@ static int fastenough(int codec) {
     return (codec & (CODEC_BZIP3 | CODEC_ARITH | CODEC_LZMA)) == 0;
 }
 
-static void pickcodecs(int rawfd, const blkmeta *bm, size_t nraw) {
+static void pickcodecs(int rawfd, const blkmeta *bm, size_t nraw, int onelay) {
 
-    if (IDCODEC >= 0 && LENCODEC >= 0) return;
+    if ((IDCODEC >= 0 && LENCODEC >= 0) || onelay) return;   /* the layout search ranks it all */
 
         int CANDBUF[KCAND_N]; size_t NC = candlist(CANDBUF);
         const int *CAND = CANDBUF;
@@ -2526,55 +2527,64 @@ static size_t complens(ZSTD_CCtx *tc, const uint8_t *src, size_t n, uint8_t **ou
     return a;
 }
 
-/* the ids frame, the codec the search picked for it */
-static size_t compids(ZSTD_CCtx *tc, const uint8_t *src, size_t n, uint8_t **out, size_t bound) {
-    if (IDCODEC) return paycomp(src, n, IDCODEC, out);
-    *out = malloc(bound + 64);
-    if (!*out) return 0;
-    size_t a = ZSTD_compressCCtx(tc, *out, bound + 64, src, n, LEVEL_I < 0 ? LEVEL : LEVEL_I);
-    if (ZSTD_isError(a)) { free(*out); *out = NULL; return 0; }
-    return a;
-}
-
 /* A respelt block is a different stream from the one the codec was chosen
    on, so it counts only at the size it comes back at. */
-/* The interleaved frame is neither of the two streams the search ranked, so
-   rank it on its own: without this the thorough default could pick a
-   spelling --fast beat, which it is meant never to do. */
-/* The mode's codecs ranked on the mode's sample, all at once; the smallest
-   that round trips on the whole stream wins, and its whole size is returned. */
-static size_t ilvbest(const uint8_t *src, size_t n, int *codec) {
-    int cb[KCAND_N]; size_t nc = candlist(cb), sz[KCAND_N];
-    size_t m = SLOW || n < ((size_t)(FASTMODE ? 4 : DEFSAMPLE) << 20) ? n : (size_t)(FASTMODE ? 4 : DEFSAMPLE) << 20;
-    *codec = 0;
+/* Every stream by every codec of the mode in one pool, LZMA and bzip3
+   first since they take longest. Per stream the smallest that round trips
+   on its sample wins, ties to the earlier of zstd, the table, zstd-22.
+   m[s] bytes are ranked of a stream n[s] bytes whole; fix[s] >= 0 pins a
+   codec. Out: cd[s], lv[s] the zstd level or -1, sz[s] 0 if none came back. */
+typedef struct { int s, c, lv, r, cls; size_t z; } rjob;
+static int rjcmp(const void *a, const void *b) {
+    const rjob *x = a, *y = b;
+    return x->cls != y->cls ? x->cls - y->cls : x->s != y->s ? x->s - y->s : x->r - y->r;
+}
+static void rankall(int ns, const uint8_t *const *src, const size_t *m, const size_t *n,
+                    const int *fix, int *cd, int *lv, size_t *sz) {
+    int cb[KCAND_N]; size_t nc = candlist(cb), nj = 0;
+    rjob *jb = xmalloc((size_t)ns * (nc + 2) * sizeof *jb);
+    for (int t = 0; t < ns; t++) {
+        cd[t] = fix[t] > 0 ? fix[t] : 0; lv[t] = -1; sz[t] = 0;
+        if (!m[t]) continue;
+        if (fix[t] >= 0) { jb[nj++] = (rjob){ t, fix[t], fix[t] ? -1 : LEVEL, 0, 2, 0 }; continue; }
+        jb[nj++] = (rjob){ t, 0, LEVEL, 0, 2, 0 };
+        for (size_t k = 0; k < nc; k++) {
+            if (packdup(cb[k], src[t], m[t]) || bz3dup(cb[k], m[t], n[t], cb, nc)) continue;
+            if (n[t] >= 0x7fffffffu && !(cb[k] & (CODEC_BZIP3 | CODEC_LZMA))) continue;   /* rANS, arith: below INT_MAX */
+            jb[nj++] = (rjob){ t, cb[k], -1, (int)k + 1, cb[k] & CODEC_LZMA ? 0 : cb[k] & CODEC_BZIP3 ? 1 : 2, 0 };
+        }
+        if (!FASTMODE && !LEVELSET) jb[nj++] = (rjob){ t, 0, 22, (int)nc + 1, 2, 0 };
+    }
+    qsort(jb, nj, sizeof *jb, rjcmp);
 #ifdef _OPENMP
 #pragma omp parallel for schedule(dynamic, 1) num_threads(nthreads())
 #endif
-    for (size_t k = 0; k < nc; k++) {
-        uint8_t *c = NULL;
-        sz[k] = packdup(cb[k], src, n) || bz3dup(cb[k], m, n, cb, nc) ? 0 : paycomp(src, m, cb[k], &c);
-        free(c);
+    for (size_t j = 0; j < nj; j++) {
+        const uint8_t *p = src[jb[j].s]; size_t k = m[jb[j].s]; uint8_t *o = NULL;
+        if (jb[j].c) { jb[j].z = paycomp(p, k, jb[j].c, &o); free(o); continue; }
+        size_t cap = ZSTD_compressBound(k); o = malloc(cap);
+        size_t z = o ? ZSTD_compress(o, cap, p, k, jb[j].lv) : 0;
+        jb[j].z = !o || ZSTD_isError(z) ? 0 : z; free(o);
     }
-    for (;;) {
-        size_t q = nc;
-        for (size_t k = 0; k < nc; k++) if (sz[k] && (q == nc || sz[k] < sz[q])) q = k;
-        if (q == nc) return 0;
-        uint8_t *c = NULL, *v = NULL; size_t z = paycomp(src, n, cb[q], &c);
-        int ok = z && (v = malloc(n)) && paydecomp(c, z, cb[q], v, n) == n && !memcmp(v, src, n);
-        free(c); free(v);
-        if (ok) { *codec = cb[q]; return z; }
-        sz[q] = 0;                                /* it does not come back: the next */
-    }
-}
-
-/* ilvbest with zstd as candidate zero: the length codec for a spelling */
-static size_t lenbest(ZSTD_CCtx *mc, const uint8_t *src, size_t n, int *cd) {
-    size_t a = ilvbest(src, n, cd), zb = ZSTD_compressBound(n) + 64;
-    uint8_t *zf = malloc(zb);
-    size_t z = zf ? ZSTD_compressCCtx(mc, zf, zb, src, n, LEVEL_L < 0 ? LEVEL : LEVEL_L) : 0;
-    if (zf && !ZSTD_isError(z) && (!a || z < a)) { a = z; *cd = 0; }
-    free(zf);
-    return a;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic, 1) num_threads(nthreads() < ns ? nthreads() : ns)
+#endif
+    for (int t = 0; t < ns; t++)
+        for (;;) {
+            size_t q = nj;
+            for (size_t j = 0; j < nj; j++)
+                if (jb[j].s == t && jb[j].z && (q == nj || jb[j].z < jb[q].z || (jb[j].z == jb[q].z && jb[j].r < jb[q].r))) q = j;
+            if (q == nj) break;
+            int ok = 1;
+            if (jb[q].c) {                        /* zstd is trusted, the rest read back */
+                uint8_t *o = NULL, *v = NULL; size_t z = paycomp(src[t], m[t], jb[q].c, &o);
+                ok = z && (v = malloc(m[t])) && paydecomp(o, z, jb[q].c, v, m[t]) == m[t] && !memcmp(v, src[t], m[t]);
+                free(o); free(v);
+            }
+            if (ok) { cd[t] = jb[q].c; lv[t] = jb[q].lv; sz[t] = jb[q].z; break; }
+            jb[q].z = 0;                          /* it does not come back: the next */
+        }
+    free(jb);
 }
 
 static size_t lensok(ZSTD_CCtx *tc, const uint8_t *src, size_t n) {
@@ -2584,23 +2594,6 @@ static size_t lensok(ZSTD_CCtx *tc, const uint8_t *src, size_t n) {
         uint8_t *v = malloc(n ? n : 1); size_t g = 0;
         if (v) {
             if (LENCODEC) g = paydecomp(c, z, LENCODEC, v, n);
-            else { g = ZSTD_decompress(v, n, c, z);
-                   if (ZSTD_isError(g)) g = 0; }
-            if (g == n && !memcmp(v, src, n)) ok = z;
-        }
-        free(v);
-    }
-    free(c);
-    return ok;
-}
-
-static size_t idsok(ZSTD_CCtx *tc, const uint8_t *src, size_t n) {
-    uint8_t *c = NULL; size_t z = compids(tc, src, n, &c, ZSTD_compressBound(n));
-    size_t ok = 0;
-    if (z) {
-        uint8_t *v = malloc(n ? n : 1); size_t g = 0;
-        if (v) {
-            if (IDCODEC) g = paydecomp(c, z, IDCODEC, v, n);
             else { g = ZSTD_decompress(v, n, c, z);
                    if (ZSTD_isError(g)) g = 0; }
             if (g == n && !memcmp(v, src, n)) ok = z;
@@ -2676,7 +2669,7 @@ static void ktw_close(ktw *w) {
     const blkmeta *bm = w->bm; size_t nraw = w->nraw;
 
     double _ts = nowsec();
-    pickcodecs(w->rawfd, bm, nraw);
+    pickcodecs(w->rawfd, bm, nraw, nraw == 1 && w->ibx.n);
     PH_ADD(8, _ts);
 
     size_t maxraw = 0;
@@ -2715,21 +2708,28 @@ static void ktw_close(ktw *w) {
         const uint8_t *ls = rb0, *is = rb0 + nl0, *bs = w->ibx.d;
         buf ibs = { (uint8_t *)w->ibx.d, pb, pb }, ic = {0}, it = {0};
         idxbuild(&ibs, &ic, &it);
-        size_t ids = idsok(mc, is, pi), sz[4] = {0}, n4[4] = {0}; int cd[4] = {0};
+        size_t sz[4] = {0}, n4[4] = {0};
         uint8_t *lay[4] = {0};                    /* plain, heads, grouped, interleaved */
         n4[1] = splice_heads(ls, pl, bs, pb, &lay[1]);
         if (!FASTMODE) n4[2] = grp_pack(ls, pl, is, pi, bs, pb, &lay[2]);   /* a sort a read back */
         n4[3] = ilv_pack(ls, pl, is, pi, bs, pb, &lay[3]);
-        size_t a0 = lenbest(mc, ls, pl, &cd[0]);
-        if (a0 && ids) sz[0] = a0 + ids + ic.n;               /* plain pays its index */
-        for (int L = 1; L < 4; L++) if (n4[L]) {
-            size_t a = lenbest(mc, lay[L], n4[L], &cd[L]);
-            if (a && (L == 3 || ids)) sz[L] = a + (L == 3 ? 0 : ids);   /* interleaved: no ids frame */
-        }
+        /* the labels and the four length spellings, ranked in one pool; a
+           spelling's whole size is its sample's scaled by the lengths' */
+        const uint8_t *src[5] = { is, ls, lay[1], lay[2], lay[3] };
+        size_t m5[5] = { pi, pl, n4[1], n4[2], n4[3] }, n5[5] = { ni0, nl0 }, r5[5];
+        for (int k = 2; k < 5; k++) n5[k] = pl ? (size_t)((unsigned __int128)m5[k] * nl0 / pl) : m5[k];
+        int fix[5] = { IDCODEC, LENCODEC, LENCODEC, LENCODEC, LENCODEC }, c5[5], l5[5];
+        rankall(5, src, m5, n5, fix, c5, l5, r5);
+        int idok = !pi || r5[0];
+        if (r5[1] && idok) sz[0] = r5[1] + r5[0] + ic.n;      /* plain pays its index */
+        if (r5[2] && idok) sz[1] = r5[2] + r5[0];
+        if (r5[3] && idok) sz[2] = r5[3] + r5[0];
+        if (r5[4]) sz[3] = r5[4];                             /* interleaved: no ids frame */
         int L = 0;
         for (int k = 1; k < 4; k++) if (sz[k] && (!sz[L] || sz[k] < sz[L])) L = k;
         for (int k = 1; k < 4; k++) free(lay[k]);
-        LENCODEC = cd[L];
+        IDCODEC = c5[0]; LEVEL_I = l5[0];
+        LENCODEC = c5[L + 1]; LEVEL_L = l5[L + 1];
         size_t hn = 0; uint8_t *hb = NULL;
         if (L) hn = splice_heads(rb0, nl0, w->ibx.d, w->ibx.n, &hb);
         if (L == 1) { altbuf = hb; altlen = alt_lens = hn; hb = NULL; }
@@ -2894,9 +2894,11 @@ static void ktw_close(ktw *w) {
     size_t nzl = 0; int tokused = 0, intused = 0, fldused = 0;
     double _tn = nowsec();
     if (!ordinal) {
+        /* whole names up to 4 MB --fast, DEFSAMPLE MB the default, all --slow */
         buf smp = { names.d, 0, 0 }; uint64_t smpn = 0;   /* a view, not a copy */
+        size_t ncap = SLOW ? SIZE_MAX : (size_t)(FASTMODE ? 4 : DEFSAMPLE) << 20;
         { const char *q = (const char *)names.d, *e2 = q + names.n;
-          while (q < e2 && smpn < 50000) {
+          while (q < e2 && (size_t)(q - (const char *)names.d) < ncap) {
               const char *nl = memchr(q, '\n', (size_t)(e2 - q));
               if (!nl) break;
               q = nl + 1; smpn++; }
@@ -2910,10 +2912,15 @@ static void ktw_close(ktw *w) {
         } else {
             free(smpz);
             if (pick == 1) { nzl = intnames(&names, nidx, &nz); intused = nzl != 0; }
-            else if (pick == 2) { nzl = tokbest(&names, &nz); tokused = nzl != 0; }
+            else if (pick == 2) { nzl = tokc(&names, &nz, TOKPICK); tokused = nzl != 0; }
             else if (pick == 3) { nzl = fldnames(&names, nidx, &nz); fldused = nzl != 0; }
         }
         if (!nzl) { nzl = zc(&names, &nz); tokused = intused = fldused = 0; }  /* refused */
+        { static const char *NK[4] = { "zstd", "integers", "tokeniser", "fields" };
+          int k = intused ? 1 : tokused ? 2 : fldused ? 3 : 0;
+          fprintf(stderr, "names: %s", NK[k]);
+          if (k == 2) fprintf(stderr, " chunk %u", TOKPICK);
+          fprintf(stderr, ", decided on %zu of %zu B\n", smp.n, names.n); }
         /* The rows carry a rank per record. */
         if (PERMON && NAMEMODE == 1) { free(natbuf.d); natbuf.n = 0; natbuf.d = NULL; }
         else if (PERMON && !NATORD && natbuf.n) {

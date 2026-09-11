@@ -34,7 +34,7 @@ pub struct Options {
     pub level: i32,
     pub levelset: bool,
     pub slow: bool,
-    pub whole: bool,       // --slow: decide on the whole file
+    pub whole: bool,       // -e high: decide on the whole file
     pub keep_names: bool,
     pub drop_names: bool,
     pub names_out: Option<String>,
@@ -492,7 +492,7 @@ impl Writer {
         let level = self.opt.level;
 
         // The codec search samples the first, middle and last block, which is
-        // why it cannot run until every row has arrived. --slow reads them all.
+        // why it cannot run until every row has arrived. -e high reads them all.
         let rawtot: usize = self.bm.iter().map(|b| b.len).sum();
         let get = |i: usize| self.read_block(i).expect("staged block");
         let _s = crate::prof::span(8);
@@ -520,8 +520,8 @@ impl Writer {
         if self.bm.len() == 1 && !self.ibx.is_empty() {
             let (lens0, ids0) = self.read_block(0).expect("staged block");
             // The layout is decided on the mode's sample, as the codec is: whole
-            // reads up to 4 MB of lengths --fast, DEFSAMPLE MB the default, all
-            // of them --slow. Each layout gets its own best codec there; only
+            // reads up to 4 MB of lengths -e low, DEFSAMPLE MB the default, all
+            // of them -e high. Each layout gets its own best codec there; only
             // the winner is built whole, compressed once and read back.
             let (slow, whole) = (self.opt.slow, self.opt.whole);
             let cap = if whole { usize::MAX } else { (if slow { DEFSAMPLE } else { 4 }) << 20 };
@@ -691,8 +691,8 @@ impl Writer {
         }
         if ordinal { self.names.clear(); }
 
-        // Rank the names codecs on whole names up to 4 MB --fast, DEFSAMPLE
-        // MB the default, all --slow, then run the winner over the whole
+        // Rank the names codecs on whole names up to 4 MB -e low, DEFSAMPLE
+        // MB the default, all -e high, then run the winner over the whole
         // buffer: a level 17 zstd of 9.4M ONT read names is 130 s on its own.
         let (mut nz, mut tokused, mut intused, mut fldused) = if ordinal {
             (Vec::new(), false, false, false)
@@ -891,7 +891,7 @@ fn io(e: std::io::Error) -> String { e.to_string() }
 
 /* ------------------------------------------------- choosing a codec */
 /// One list. The default tries all of it and spends whatever that costs;
-/// --fast is the subset marked true, the codecs whose encode and decode stay
+/// -e low is the subset marked true, the codecs whose encode and decode stay
 /// reasonable, so it can never reach a candidate the default did not.
 /// Codec 0 means zstd, so bare rANS order 0 is spelled 0x100.
 pub const KCAND: [(i32, bool); 51] = [
@@ -968,7 +968,7 @@ fn srec_cmp(a: &SRec, b: &SRec) -> std::cmp::Ordering {
 pub struct Pick { pub id: i32, pub len: i32, pub lvl_id: i32, pub lvl_len: i32, pub level: i32 }
 
 /// `blocks` yields every block as (lens, ids); the default search reads three
-/// of them, --slow reads them all, twice.
+/// of them, -e high reads them all, twice.
 pub fn pick(all: &dyn Fn(usize) -> (Vec<u8>, Vec<u8>), nraw: usize, rawtot: usize,
             maxstream: usize, level: i32, o: &Options, onelay: bool) -> Pick {
     let (block, slow, whole, levelset) = (o.block, o.slow, o.whole, o.levelset);
@@ -985,8 +985,8 @@ pub fn pick(all: &dyn Fn(usize) -> (Vec<u8>, Vec<u8>), nraw: usize, rawtot: usiz
         if nraw > 2 { picks.push(nraw / 2); }
         if nraw > 1 { picks.push(nraw - 1); }
     }
-    // one rule, three samples: --fast its codecs on 4 MB, the default all of
-    // them on DEFSAMPLE MB, --slow all of them on the whole file
+    // one rule, three samples: -e low its codecs on 4 MB, the default all of
+    // them on DEFSAMPLE MB, -e high all of them on the whole file
     let mut scap = if slow { DEFSAMPLE << 20 } else { 4usize << 20 };
     if whole { scap = maxstream.clamp(4 << 20, 2048 << 20); }
     let big = maxstream >= 0x7fff_ffff;
@@ -1107,7 +1107,7 @@ pub fn pick(all: &dyn Fn(usize) -> (Vec<u8>, Vec<u8>), nraw: usize, rawtot: usiz
         wl = if ql < nc { cand[ql] } else { 0 };
         if wi == 0 { lvl_id = if qi == nc + 1 { 22 } else { level }; }
         if wl == 0 { lvl_len = if ql == nc + 1 { 22 } else { level }; }
-        eprintln!("codec: {} ranked {} candidates on {}", if !slow { "--fast" } else if whole { "--slow" } else { "the default" },
+        eprintln!("codec: {} ranked {} candidates on {}", if !slow { "effort low" } else if whole { "effort high" } else { "effort medium" },
                   nc + 2, if whole { "the whole file" } else { "the sample" });
     }
     eprintln!("codec: len=0x{:x} id=0x{:x} from {} sample blocks, {}",
@@ -1310,7 +1310,7 @@ pub fn tok_best(names: &[u8], slow: bool, fixed: Option<usize>) -> Option<(Vec<u
     if let Some(k) = fixed { return tok_chunked(names, k).map(|b| (b, k)); }   // --tok-chunk
     let mut best: Option<(Vec<u8>, usize)> = None;
     for (i, &chunk) in TCAND.iter().enumerate() {
-        if !slow && i > 0 { continue; }   // --fast: the smallest chunk only
+        if !slow && i > 0 { continue; }   // -e low: the smallest chunk only
         // smallest wins; a tie keeps the smaller chunk
         if let Some(b) = tok_chunked(names, chunk) {
             if best.as_ref().is_none_or(|x| b.len() < x.0.len()) { best = Some((b, chunk)); }

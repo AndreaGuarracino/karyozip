@@ -39,9 +39,9 @@ karyozip aln-pack -a P.paf -r REF.bed|REF.kst -o OUT  cuts a PAF to what -a need
 
 | you want | use |
 |---|---|
-| a small file, the usual choice | `encode` |
-| the smallest file, however long it takes | `encode --slow` |
-| a quick encode and fast `region` queries, a larger file | `encode --fast` |
+| a small file, the usual choice | `encode`, or `-e medium` |
+| the smallest file, however long it takes | `encode -e high` |
+| a quick encode and fast `region` queries, a larger file | `encode -e low` |
 
 ## Feature sets, smoothing and alignments
 
@@ -84,9 +84,8 @@ Read names are stored in the file by default.
 | `--halo N` | region | N more runs each side of the range |
 | `-f`, `--feature-set FS` | smooth | the feature set to smooth |
 | `--hier FILE` | smooth; encode and readers with `-d` | the KaryoScope hierarchy.tsv |
-| `--fast`, `--slow` | encode | see Size or speed |
-| `-b`, `--block N`, `--block all` | encode | rows per block by hand: `all` is one block, the default; `--fast` uses 262144 |
-| `-l`, `--level N` | encode | zstd level, 1 to 22, default 17 |
+| `-e`, `--effort low\|medium\|high` | encode | see Size or speed; default medium |
+| `-b`, `--block N`, `--block all` | encode | rows per block by hand: `all` is one block, the default; `-e low` uses 262144 |
 | `--sort`, `--sort=MEM` | encode | group records by labels; spill to disk past `MEM` |
 | `-n`, `--names ...` | encode, readers | see Read names |
 | `-d`, `--db features.tsv`, `--set A,B` | encode, readers | see Feature sets |
@@ -106,12 +105,12 @@ Flags work on either side of the command name.
 `make test` (64.5 s) runs the test suite, sanitizers and fuzzing on both and compares them encode by encode.
 The C finds zstd, liblzma, zlib and libgomp at the path in its rpath; the Rust bundles zstd.
 
-**How encode chooses.** The three modes are one rule with two settings: `--fast` tries 8 of the 51 codecs on 4 MB, the default all 51 plus zstd at 17 and 22 on 16 MB, `--slow` the same on the whole file.
+**How encode chooses.** The three efforts are one rule with two settings: `low` tries 8 of the 51 codecs plus zstd at 17 on 4 MB, `medium` all 51 plus zstd at 17 and 22 on 16 MB, `high` the same on the whole file.
 The smallest wins, with no margin, and must read back what it was ranked on.
 A one-block file also chooses its layout on the same sample: lengths and labels apart, run counts heading each read's lengths, lengths grouped by label, or labels interleaved with lengths; every layout and codec is ranked in one parallel pool.
 Names are ranked the same way among zstd, integer deltas, field deltas and the CRAM name tokeniser.
 Encode prints what it chose on stderr, on its `layout:` and `names:` lines.
-`--fast` also writes 262144-row blocks and a block index, which a query decodes one at a time, and so drops the codecs slow to decode: bzip3, arith and LZMA.
+`-e low` also writes 262144-row blocks and a block index, which a query decodes one at a time, and so drops the codecs slow to decode: bzip3, arith and LZMA.
 
 **Name index.** `karyozip index` appends a 32-bit fingerprint and a bit-packed ordinal per name, 2,044,644 B for 300,000 reads; a fingerprint match is confirmed against the decoded name.
 

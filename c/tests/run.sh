@@ -569,7 +569,7 @@ must_fail "--id-codec 0x10, a NOSZ codec" $KT --id-codec 0x10 encode < "$D/s.bed
 must_fail "--profile with no command" $KT --profile
 must_fail "--threads with no command" $KT --threads 4
 must_fail "--tmp-dir with no command" $KT --tmp-dir /tmp
-must_fail "--fast with no command" $KT --fast
+must_fail "--effort low with no command" $KT --effort low
 $KT --profile 2>&1 | grep -q '^karyozip: usage:' \
   && echo "flags with no command: usage, not a crash" \
   || { echo "flags with no command: WRONG"; fail=1; }
@@ -840,16 +840,12 @@ $KT --max-gap 18446744073709551615 smooth -i "$W/sm.kt" --hier "$W/sm.tsv" -f ac
 must_fail "region with END before START" $KT region -i "$W/p.kt" -s q1 --start 150 --end 20
 
 # Round 24: 100,000 threads crashed in libgomp; a file-size limit killed
-# encode by signal; --fast used zstd-22 over an explicit --level; the block
-# temp file ignored TMPDIR.
+# encode by signal; the block temp file ignored TMPDIR.
 must_fail "--threads 100000" $KT -t 100000 encode < "$D/s.bed"
 rc=0; (ulimit -f 1; $KT encode < "$W/pbig.bed" > "$W/lim.kt" 2> "$W/lim.err") || rc=$?
 [ $rc = 1 ] && echo "file-size limit: exit 1, not a signal" || { echo "file-size limit: rc=$rc"; fail=1; }
-$KT --len-codec 0 --id-codec 0 encode --level 1 --block 262144 < "$W/pbig.bed" > "$W/l5.kt" 2>/dev/null
-$KT --len-codec 0 --id-codec 0 encode --level 1 --fast < "$W/pbig.bed" > "$W/l5s.kt" 2>/dev/null
-[ "$(stat -c%s "$W/l5.kt")" = "$(stat -c%s "$W/l5s.kt")" ] && echo "--fast keeps --level: same size" || { echo "--fast keeps --level: WRONG"; fail=1; }
-$KT encode < "$D/db.rall.bed" > "$W/sd.kt" 2>/dev/null; $KT --fast encode < "$D/db.rall.bed" > "$W/ss.kt" 2>/dev/null
-[ "$(stat -c%s "$W/ss.kt")" -le "$(stat -c%s "$W/sd.kt")" ] && echo "--fast never larger: $(stat -c%s "$W/ss.kt") <= $(stat -c%s "$W/sd.kt") B" || { echo "--fast LARGER than the default"; fail=1; }
+$KT encode < "$D/db.rall.bed" > "$W/sd.kt" 2>/dev/null; $KT --effort low encode < "$D/db.rall.bed" > "$W/ss.kt" 2>/dev/null
+[ "$(stat -c%s "$W/ss.kt")" -le "$(stat -c%s "$W/sd.kt")" ] && echo "--effort low never larger: $(stat -c%s "$W/ss.kt") <= $(stat -c%s "$W/sd.kt") B" || { echo "--effort low LARGER than the default"; fail=1; }
 must_fail "--tmp-dir that does not exist" $KT --tmp-dir /nonexistent/dir encode < "$D/s.bed"
 $KT --tmp-dir "$W" encode < "$D/s.bed" 2>/dev/null | cmp -s - "$W/p.kt" && echo "--tmp-dir honoured: same bytes" || { echo "--tmp-dir honoured: WRONG"; fail=1; }
 
@@ -868,7 +864,6 @@ done
 [ $ok = 1 ] && echo "OMP_NUM_THREADS: no effect on the stored bytes" \
   || { echo "OMP_NUM_THREADS: MOVED THE STORED BYTES"; fail=1; }
 must_fail "--id-codec with arith X_EXT" $KT --id-codec 0x10004 encode < "$D/s.bed"
-must_fail "--level abc" $KT encode --level abc < "$D/s.bed"
 must_fail "--block 4abc" $KT encode --block 4abc < "$D/s.bed"
 must_fail "-t 4x" $KT -t 4x encode < "$D/s.bed"
 must_fail "--sort=nan" $KT encode --tmp-dir "$W" --sort=nan < "$D/s.bed"
@@ -919,14 +914,12 @@ must_fail "--names keep with --names drop" $KT encode --names keep --names drop 
 must_fail "the retired --one-block" $KT encode --one-block < "$D/s.bed"
 must_fail "--block junk" $KT encode --block xyz < "$D/s.bed"
 must_fail "--threads 1025" $KT -t 1025 encode < "$D/s.bed"
-must_fail "--level 23" $KT encode --level 23 < "$D/s.bed"
-must_fail "--level -1" $KT encode --level -1 < "$D/s.bed"
-$KT -t 1024 encode --level 22 < "$D/s.bed" > /dev/null 2>&1 && echo "the documented limits: accepted" || { echo "the documented limits: REFUSED"; fail=1; }
+$KT -t 1024 encode < "$D/s.bed" > /dev/null 2>&1 && echo "the documented limits: accepted" || { echo "the documented limits: REFUSED"; fail=1; }
 
 # Every flag is parsed once, before the command, so it works on either side of
 # it and a flag on the wrong command is refused instead of read as an argument.
-$KT --fast encode < "$D/s.bed" > "$W/side1.kt" 2>/dev/null
-$KT encode --fast < "$D/s.bed" > "$W/side2.kt" 2>/dev/null
+$KT --effort low encode < "$D/s.bed" > "$W/side1.kt" 2>/dev/null
+$KT encode --effort low < "$D/s.bed" > "$W/side2.kt" 2>/dev/null
 cmp -s "$W/side1.kt" "$W/side2.kt" && echo "a flag before the command: same bytes" \
   || { echo "a flag before the command: DIFFERENT"; fail=1; }
 # A names file that is not the one drop:FILE wrote is refused by name, not as

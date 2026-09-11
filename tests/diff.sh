@@ -34,9 +34,9 @@ echo "codecs: every candidate round-trips"
 
 # 2. encode must be byte-identical, over every fixture and flag.
 for f in "$D"/*.bed; do
-  for fl in "" "--block 4" "--block 262144" "--level 3" "--level 22" "--names keep" "--tok-chunk 2" \
-            "--fast" "--fast --block 4" "--tail 0" "--tail 1" "--names drop" \
-            "--tok-chunk 250000" "--fast --level 22" \
+  for fl in "" "--block 4" "--block 262144" "--names keep" "--tok-chunk 2" \
+            "--effort low" "--effort low --block 4" "--tail 0" "--tail 1" "--names drop" \
+            "--tok-chunk 250000" "--effort high" \
             "--sort" "--sort --names keep" "--sort --names drop" "--sort=1M" \
             "--sort --block 4"; do
     IN=$f both "encode $(basename "$f") [$fl]" $fl encode
@@ -47,7 +47,7 @@ tally encode
 # 3. decode: the Rust must give back exactly what was encoded.
 dok=0; dbad=0
 for f in "$D"/*.bed; do
-  for fl in "" "--block 4" "--block 262144" "--level 3" "--names keep"; do
+  for fl in "" "--block 4" "--block 262144" "--names keep"; do
     "$C" $fl encode < "$f" > "$W/t.kst" 2>/dev/null
     "$R" decode -i "$W/t.kst" 2>/dev/null | cmp -s - "$f" && dok=$((dok+1)) \
       || { dbad=$((dbad+1)); echo "  decode differs: $(basename "$f") [$fl]"; }
@@ -149,7 +149,7 @@ done
 aok=0; abad=0
 for pair in "s.bed p.paf ref.bed" "ls.bed lp.paf lref.bed"; do
   set -- $pair
-  for fl in "" "--block 4" "--fast"; do
+  for fl in "" "--block 4" "--effort low"; do
     "$C" $fl encode --aln "$D/$2" --ref "$D/$3" < "$D/$1" > "$W/c.kst" 2>/dev/null; c1=$?
     "$R" $fl encode --aln "$D/$2" --ref "$D/$3" < "$D/$1" > "$W/r.kst" 2>/dev/null; c2=$?
     if cmp -s "$W/c.kst" "$W/r.kst" && [ $c1 = $c2 ]; then aok=$((aok+1))
@@ -201,7 +201,7 @@ echo "refusals: same message from both"
 python3 "$D/kt.py" gen "$W" 20
 gok=0; gbad=0
 for f in "$W"/ok*.bed; do
-  for fl in "" "--block 4" "--block 262144" "--sort" "--names drop" "--fast --block 3"; do
+  for fl in "" "--block 4" "--block 262144" "--sort" "--names drop" "--effort low --block 3"; do
     "$C" $fl encode < "$f" > "$W/c.kst" 2>/dev/null; c1=$?
     "$R" $fl encode < "$f" > "$W/r.kst" 2>/dev/null; c2=$?
     if cmp -s "$W/c.kst" "$W/r.kst" && [ $c1 = $c2 ]; then gok=$((gok+1))
@@ -248,8 +248,8 @@ cli() {
 cli; cli --help; cli -h; cli --version; cli --bogus; cli --bogus encode
 cli decode; cli encode extra; cli --profile; cli --threads; cli --threads 4
 cli badcmd; cli region; cli region -i f; cli index; cli smooth -i f; cli aln-pack
-cli encode --names ordinal; cli decode --tail 1; cli index --fast
-cli encode --block; cli encode --level 99; cli encode --block 0
+cli encode --names ordinal; cli decode --tail 1; cli index --effort low
+cli encode --block; cli encode --effort max; cli encode --block 0
 cli -t; cli -t 0; cli -t 99999; cli --tmp-dir; cli decode --raw x --raw
 cli index --block 0; cli aln-pack -a a -r b; cli smooth -i f --hier h; cli region -i f -s s -p 1 --start 2 --end 3
 cli encode --sort=0; cli encode --names foo; cli decode --names keep

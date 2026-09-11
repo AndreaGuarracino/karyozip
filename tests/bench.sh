@@ -12,7 +12,7 @@ D=$1; PAF=$2; FEAT=$3; HIER=$4; REFD=$5
 C=${6:-$(dirname "$0")/../c/build/karyozip}; R=${7:-$(dirname "$0")/../rust/target/release/karyozip}
 PART=${8:-}
 T=8; NQ=50; NQ_ALN=50; REPS=1   # an aln-informed query parses the reference track
-BLOCKS="65536 1048576"; LEVELS="3 9 22"; IMPLS="C Rust"   # swept beside the 262144 and 17 defaults
+BLOCKS="65536 1048576"; IMPLS="C Rust"   # swept beside the 262144 default
 KINDS="presmoothed smoothed"; ONLY=""; SEEKS="seekable non-seekable"
 if [ -n "$PART" ]; then IFS=: read -r KINDS ONLY sk im <<< "$PART"
   [ -n "$sk" ] && SEEKS=$sk
@@ -160,7 +160,7 @@ for kind in $KINDS; do
     q=$(ls "$D"/*."$set"."$kind".bed.gz 2>/dev/null | grep -v '/ref\.' | head -1); [ -n "$q" ] || { echo "bench: no $set $kind track in the cell" >&2; BAD=$((BAD+1)); continue; }
     ref=""; [ -s "$PAF" ] && { ref=$(refof "$set" "$kind"); [ -s "$ref" ] && ref=$(kstref "$ref"); [ -s "$ref" ] || { echo "bench: no $set $kind reference track" >&2; BAD=$((BAD+1)); }; }
     for seek in $SEEKS; do bf="--block all"; [ $seek = seekable ] && bf="--block 262144"
-      for mode in default fast; do mf=""; [ $mode = fast ] && mf="--fast"
+      for mode in medium low; do mf=""; [ $mode = low ] && mf="--effort low"
         for impl in $IMPLS; do bin=$C; [ $impl = Rust ] && bin=$R
           row "$set" "$kind" not-informed "$seek" "$mode" "$impl" "$bin" "$q" "$bf $mf" "" 0
           [ -s "$ref" ] && row "$set" "$kind" aln-informed "$seek" "$mode" "$impl" "$bin" "$q" "$bf $mf --aln $PAF --ref $ref $alnnames" "--aln $PAF --ref $ref $alnnames" "$pafB"
@@ -169,16 +169,13 @@ for kind in $KINDS; do
           [ "$kind" = presmoothed ] && [ "$seek" = seekable ] && {
             # ordinal-named tracks have no names to move to a sidecar
             [ $ordinal = 0 ] && row "$set" "$kind" names-dropped "$seek" "$mode" "$impl" "$bin" "$q" "$bf $mf --names drop:$W/side" "--names $W/side" side
-            [ "$mode" = default ] && row "$set" "$kind" sorted "$seek" "$mode" "$impl" "$bin" "$q" "$bf $mf --sort" "" 0
-            [ "$mode" = default ] && row "$set" "$kind" sorted-1M "$seek" "$mode" "$impl" "$bin" "$q" "$bf $mf --sort=1M" "" 0
-            [ "$mode" = default ] && for v in 0 1; do
+            [ "$mode" = medium ] && row "$set" "$kind" sorted "$seek" "$mode" "$impl" "$bin" "$q" "$bf $mf --sort" "" 0
+            [ "$mode" = medium ] && row "$set" "$kind" sorted-1M "$seek" "$mode" "$impl" "$bin" "$q" "$bf $mf --sort=1M" "" 0
+            [ "$mode" = medium ] && for v in 0 1; do
               row "$set" "$kind" "tail-$v" "$seek" "$mode" "$impl" "$bin" "$q" "$bf --tail $v" "" 0; done
-            # a block is decoded whole, so its size trades bytes against the
-            # query; the level trades bytes against the encode
-            [ "$mode" = default ] && for v in $BLOCKS; do
-              row "$set" "$kind" "block-$v" "$seek" "$mode" "$impl" "$bin" "$q" "--block $v" "" 0; done
-            [ "$mode" = default ] && for v in $LEVELS; do
-              row "$set" "$kind" "level-$v" "$seek" "$mode" "$impl" "$bin" "$q" "--level $v" "" 0; done; }
+            # a block is decoded whole, so its size trades bytes against the query
+            [ "$mode" = medium ] && for v in $BLOCKS; do
+              row "$set" "$kind" "block-$v" "$seek" "$mode" "$impl" "$bin" "$q" "--block $v" "" 0; done; }
         done
       done
     done
@@ -189,7 +186,7 @@ for kind in $KINDS; do
   [ $(echo $ins | wc -w) = $(echo $allsets | wc -w) ] || { echo "bench: $kind --db rows skipped, the cell lacks a set its database lists" >&2; continue; }
   ref=""; [ -s "$PAF" ] && { ref=$(refof chromosome "$kind"); [ -s "$ref" ] && ref=$(kstref "$ref"); [ -s "$ref" ] || { echo "bench: no chromosome $kind reference track" >&2; BAD=$((BAD+1)); }; }
   for seek in $SEEKS; do bf="--block all"; [ $seek = seekable ] && bf="--block 262144"
-    for mode in default fast; do mf=""; [ $mode = fast ] && mf="--fast"
+    for mode in medium low; do mf=""; [ $mode = low ] && mf="--effort low"
       for impl in $IMPLS; do bin=$C; [ $impl = Rust ] && bin=$R
         row ALL "$kind" not-informed "$seek" "$mode" "$impl" "$bin" "$ins" "$bf $mf" "" 0
         row ALL "$kind" db-informed "$seek" "$mode" "$impl" "$bin" "$ins" "--db $FEAT --hier $HIER $bf $mf" "--db $FEAT --hier $HIER" 0

@@ -28,7 +28,7 @@ static int BLOCKSET = 0;                 /* --block was given */
 /* 0 means use every core; --threads overrides */
 static int NTHREADS = 0;
 static int LEVEL = 17;
-static int LEVELSET = 0;              /* --level was given: do not override */
+static int LEVELSET = 0;              /* kt_level was called: do not override */
 static int LEVEL_L = -1, LEVEL_I = -1;   /* per stream, chosen by the search */
 
 static const char MAGIC[8] = "KST00001";   /* KaryoScope Track, format version 1 */
@@ -376,12 +376,12 @@ static const char *NAMESIN = NULL;
  * sequences themselves. The track says which, so the file is never sniffed
  * (a pipe cannot be reopened). Resolved in ropen, see NAMESARG. */
 static const char *NAMESARG = NULL;
-/* the default searches hard; --fast trades size for encode time */
-static int SLOW = 0;                  /* --slow: every codec over the whole file */
+/* the default searches hard; -e low trades size for encode time */
+static int SLOW = 0;                  /* -e high: every codec over the whole file */
 #ifndef DEFSAMPLE
 #define DEFSAMPLE 16                  /* MB the default ranks every codec on */
 #endif
-static int FASTMODE = 0;              /* --fast: the sampled search */
+static int FASTMODE = 0;              /* -e low: the sampled search */
 static int SORT = 0;                  /* --sort: order records by label tuple */
 static uint64_t SORTBP;               /* end of the run --sort last took */
 static uint64_t SORTMEM = 0;
@@ -448,7 +448,7 @@ static char *intnamesd(const uint8_t *b, size_t n, uint64_t cnt, size_t *outn) {
 }
 
 /* One list. The default tries all of it and spends whatever that costs;
-   --fast is the subset marked 1, the codecs whose encode and decode stay
+   -e low is the subset marked 1, the codecs whose encode and decode stay
    reasonable, so it can never reach a candidate the default did not. */
 typedef struct { int codec; int fast; } kcand;
 static const kcand KCAND[] = {
@@ -752,7 +752,7 @@ static size_t tokbest(buf *in, uint8_t **out) {
     if (TOKSET) return tokc(in, out, TOKPICK = TOKCHUNK);
     size_t n = sizeof TCAND / sizeof *TCAND, best = 0;
     for (size_t i = 0; i < n; i++) {
-        if (FASTMODE && i) continue;    /* --fast: the smallest chunk only */
+        if (FASTMODE && i) continue;    /* -e low: the smallest chunk only */
         uint8_t *o2 = NULL;
         size_t b = tokc(in, &o2, TCAND[i]);
         /* smallest wins; a tie keeps the smaller chunk */
@@ -2339,8 +2339,8 @@ static void pickcodecs(int rawfd, const blkmeta *bm, size_t nraw, int onelay) {
             if (bm[i2].len - bm[i2].lens > maxstream) maxstream = bm[i2].len - bm[i2].lens; }
         int big = maxstream >= 0x7fffffffu;   /* rANS and arith decode below INT_MAX */
         int seekable = nraw > 1 || (uint64_t)rawtot > BLOCK;
-        /* one rule, three samples: --fast its codecs on 4 MB, the default all
-           of them on DEFSAMPLE MB, --slow all of them on the whole file */
+        /* one rule, three samples: -e low its codecs on 4 MB, the default all
+           of them on DEFSAMPLE MB, -e high all of them on the whole file */
         size_t SCAP = FASTMODE ? (4u << 20) : ((size_t)DEFSAMPLE << 20);
 
         if (SLOW) {
@@ -2360,7 +2360,7 @@ static void pickcodecs(int rawfd, const blkmeta *bm, size_t nraw, int onelay) {
            Overlapping the two phases would be worth about 26% of encode, they
            are 2.24 s each at -t 8 and strictly sequential, but sampling the
            first three blocks instead changes which codec wins on every encode
-           and changes what --slow means. Measured and declined. */
+           and changes what -e high means. Measured and declined. */
         if (nraw) { pick[np++] = 0;
                     if (nraw > 2) pick[np++] = nraw / 2;
                     if (nraw > 1) pick[np++] = nraw - 1; }
@@ -2505,7 +2505,7 @@ static void pickcodecs(int rawfd, const blkmeta *bm, size_t nraw, int onelay) {
             wl = ql < NCAND ? CAND[ql] : 0;
             if (!wi) LEVEL_I = qi == NCAND + 1 ? 22 : LEVEL;
             if (!wl) LEVEL_L = ql == NCAND + 1 ? 22 : LEVEL;
-            fprintf(stderr, "codec: %s ranked %zu candidates on %s\n", FASTMODE ? "--fast" : SLOW ? "--slow" : "the default",
+            fprintf(stderr, "codec: %s ranked %zu candidates on %s\n", FASTMODE ? "effort low" : SLOW ? "effort high" : "effort medium",
                     (size_t)NCAND + 2, SLOW ? "the whole file" : "the sample");
             free(ti); free(tl); free(live_i); free(live_l);
         }
@@ -2694,8 +2694,8 @@ static void ktw_close(ktw *w) {
         rawget(w->rawfd, (off_t)bm[0].off, rb0, bm[0].len);
         ZSTD_CCtx *mc = ZSTD_createCCtx();
         /* The layout is decided on the mode's sample, as the codec is: whole
-           reads up to 4 MB of lengths --fast, DEFSAMPLE MB the default, all
-           of them --slow. Each layout gets its own best codec there; only the
+           reads up to 4 MB of lengths -e low, DEFSAMPLE MB the default, all
+           of them -e high. Each layout gets its own best codec there; only the
            winner is built whole, compressed once and read back. */
         size_t cap = SLOW ? SIZE_MAX : (size_t)(FASTMODE ? 4 : DEFSAMPLE) << 20, pl = 0, pi = 0, pb = 0;
         {   const uint8_t *p = rb0, *e = rb0 + nl0, *q = rb0 + nl0, *qe = q + ni0, *r = w->ibx.d, *re = r + w->ibx.n;
@@ -2894,7 +2894,7 @@ static void ktw_close(ktw *w) {
     size_t nzl = 0; int tokused = 0, intused = 0, fldused = 0;
     double _tn = nowsec();
     if (!ordinal) {
-        /* whole names up to 4 MB --fast, DEFSAMPLE MB the default, all --slow */
+        /* whole names up to 4 MB -e low, DEFSAMPLE MB the default, all -e high */
         buf smp = { names.d, 0, 0 }; uint64_t smpn = 0;   /* a view, not a copy */
         size_t ncap = SLOW ? SIZE_MAX : (size_t)(FASTMODE ? 4 : DEFSAMPLE) << 20;
         { const char *q = (const char *)names.d, *e2 = q + names.n;
@@ -5167,15 +5167,15 @@ static void redirect(const char *path, int fd) {
 int main(int argc, char **argv) {
     /* glibc raises its mmap threshold to the first large mapped chunk it
        frees, after which every big buffer comes from a per-thread heap and
-       stays resident: 113 MB against 57 on one --slow encode. Pin it. */
+       stays resident: 113 MB against 57 on one -e high encode. Pin it. */
     mallopt(M_MMAP_THRESHOLD, 128 << 10);
     signal(SIGXFSZ, SIG_IGN);
     for (int fd = 0; fd < 3; fd++) if (fcntl(fd, F_GETFD) < 0) die("stdin, stdout or stderr is closed");
     atexit(profdump);
     atexit(emitflush);
     static const char *const USAGE = "usage:\n"
-            "  karyozip encode [-i IN.bed[.gz]] [-o OUT.kst] [--fast | --slow]\n"
-            "                  [-b N|all] [-l N] [-n keep|drop|drop:FILE] [--sort[=MEM]]\n"
+            "  karyozip encode [-i IN.bed[.gz]] [-o OUT.kst] [-e low|medium|high]\n"
+            "                  [-n keep|drop|drop:FILE] [--sort[=MEM]]\n"
             "                  [-d features.tsv [--hier H] -i SET.bed ...] [-a P.paf -r R.bed|R.kst [--aln-names F]]\n"
             "  karyozip decode -i F [-o OUT.bed] [-n FILE|ordinal] [--raw]\n"
             "                  [-d features.tsv [--hier H] [--set A,B] [--out-dir DIR]] [-a P.paf -r R]\n"
@@ -5186,8 +5186,9 @@ int main(int argc, char **argv) {
             "  encode reads stdin without -i; every command but index writes stdout without -o\n"
             "  any command: -t N, --threads N  --profile  --tmp-dir DIR  -h, --help\n"
             "               --version prints the zstd, libbz3 and htscodecs versions\n"
-            "  encode:      --fast: a quick encode, and blocks with an index for fast queries\n"
-            "               --slow: the smallest file; -b N|all sets the blocks by hand\n"
+            "  encode:      -e, --effort: low is a quick encode with blocks and an index for fast\n"
+            "               queries, medium the default, high the smallest file\n"
+            "               -b N|all sets the blocks by hand\n"
             "               --tail 0|1  --tok-chunk N  --id-codec N  --len-codec N pin what the search picks\n"
             "  readers:     -n, -d, --hier, -a, -r as encode was given; -n FILE takes the names from\n"
             "               drop:FILE, a FASTA, FASTQ or list; -n ordinal accepts dropped names\n"
@@ -5197,7 +5198,7 @@ int main(int argc, char **argv) {
             "  with -a:     --aln-names FILE, on encode and decode, when the track names rows by ordinal\n"
             "  smooth:      --max-gap N  --v1\n"
             "  long forms:  -i --input  -o --output  -s --seq  -p --pos  -f --feature-set  -b --block\n"
-            "               -l --level  -n --names  -d --db  -a --aln  -r --ref\n"
+            "               -e --effort  -n --names  -d --db  -a --aln  -r --ref\n"
             "  Two variables are read, and neither changes the stored bytes:\n"
             "    TMPDIR         where temp files go, when --tmp-dir is not given\n"
             "    OMP_NUM_THREADS  the thread count, when --threads is not given";
@@ -5220,15 +5221,15 @@ int main(int argc, char **argv) {
         {"--version",0},{"--threads",1},{"-t",1},{"--profile",0},{"--tmp-dir",1},{"--names",1},
         {"--tok-chunk",1},{"--tail",1},{"--id-codec",1},{"--len-codec",1},
         {"--max-gap",1},{"--v1",0},{"--aln-names",1},{"--sort",0},
-        {"--fast",0},{"--slow",0},
-        {"--block",1},{"--level",1},{"--db",1},{"--aln",1},
+        {"--effort",1},
+        {"--block",1},{"--db",1},{"--aln",1},
         {"--ref",1},{"--out-dir",1},{"--set",1},{"--raw",0},{"--hier",1},
         {"--input",1},{"--output",1},{"--seq",1},{"--pos",1},{"--start",1},{"--end",1},
         {"--halo",1},{"--feature-set",1},
     };
     static const char *const SHORT[][2] = {   /* each short form is its long one */
         {"-i","--input"},{"-o","--output"},{"-s","--seq"},{"-p","--pos"},{"-f","--feature-set"},
-        {"-b","--block"},{"-l","--level"},{"-n","--names"},{"-d","--db"},{"-a","--aln"},{"-r","--ref"},
+        {"-b","--block"},{"-e","--effort"},{"-n","--names"},{"-d","--db"},{"-a","--aln"},{"-r","--ref"},
     };
     const char *cmd = "";   /* the first word that is not a flag or its value */
     for (int i = 1; i < argc; i++) {
@@ -5289,16 +5290,14 @@ int main(int argc, char **argv) {
             ok = inf; ALNNAMES = v; take = 2; }
         else if (!strcmp(a, "--sort")) { ok = enc; SORT = 1; take = 1; }
         else if (!strncmp(a, "--sort=", 7)) { ok = enc; SORT = 1; SORTMEM = mem_arg(a + 7); take = 1; }
-        else if (!strcmp(a, "--fast") || !strcmp(a, "--slow")) {
-            if (FASTMODE || SLOW) die("encode takes --fast or --slow, not both");
-            ok = enc; SLOW = a[2] == 's'; FASTMODE = !SLOW; take = 1; }
+        else if (!strcmp(a, "--effort")) { ok = enc;
+            if (strcmp(v, "low") && strcmp(v, "medium") && strcmp(v, "high")) die("--effort is low, medium or high");
+            FASTMODE = !strcmp(v, "low"); SLOW = !strcmp(v, "high"); take = 2; }
         else if (!strcmp(a, "--block")) { ok = enc;
             BLOCK = !strcmp(v, "all") ? UINT64_MAX      /* one block, no random access */
                   : (uint64_t)int_arg(v, 1, 0x7fffffffffffffffL,
                                       "--block is a number of runs, 1 or more, or \"all\"");
             BLOCKSET = 1; take = 2; }
-        else if (!strcmp(a, "--level")) { ok = enc;
-            LEVEL = (int)int_arg(v, 1, 22, "--level is a zstd level, 1 to 22"); LEVELSET = 1; take = 2; }
         else if (!strcmp(a, "--db")) { ok = inf; DBFEATS = v; take = 2; }
         else if (!strcmp(a, "--hier")) { ok = inf; HIERA = v; take = 2; }
         else if (!strcmp(a, "--aln")) { ok = inf || pack; ALNPAF = v; take = 2; }
@@ -5321,7 +5320,7 @@ int main(int argc, char **argv) {
     }
     if (!*cmd) die(USAGE);   /* flags but no command: argv[1] is now past the end */
     if (!enc && !rd && !pack) die("bad command or missing arguments");
-    if (FASTMODE && !BLOCKSET) BLOCK = 262144;   /* --fast: blocks and an index, for queries */
+    if (FASTMODE && !BLOCKSET) BLOCK = 262144;   /* -e low: blocks and an index, for queries */
     for (int i = 2; i < argc; i++) {   /* every argument is a flag now */
         if (argv[i][0] == '-' && argv[i][1]) fprintf(stderr, "karyozip: unknown flag %s\n", argv[i]);
         else fprintf(stderr, "karyozip: unexpected argument %s\n", argv[i]);

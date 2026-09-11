@@ -48,15 +48,9 @@ pub struct Cli {
     /// rows per block, or "all" for one block
     #[arg(long, short = 'b', global = true, value_name = "N|all")]
     pub block: Option<String>,
-    /// zstd level, 1 to 22
-    #[arg(long, short = 'l', global = true, value_name = "N")]
-    pub level: Option<String>,
-    /// the sampled codec search: quicker, larger
-    #[arg(long, global = true)]
-    pub fast: bool,
-    /// every codec decided on the whole file
-    #[arg(long, global = true)]
-    pub slow: bool,
+    /// low: quick, with blocks and an index; medium; high: the smallest
+    #[arg(long, short = 'e', global = true, value_name = "low|medium|high")]
+    pub effort: Option<String>,
     /// order by label tuple, then lengths
     #[arg(long, global = true, num_args = 0..=1, require_equals = true,
           default_missing_value = "", value_name = "MEM")]
@@ -184,10 +178,7 @@ impl Cli {
             Err(format!("{f} does not apply to {c}"))
         };
         if self.block.is_some() && !enc { bad("--block")?; }
-        if self.level.is_some() && !enc { bad("--level")?; }
-        if self.fast && !enc { bad("--fast")?; }
-        if self.slow && !enc { bad("--slow")?; }
-        if self.fast && self.slow { return Err("encode takes --fast or --slow, not both".into()); }
+        if self.effort.is_some() && !enc { bad("--effort")?; }
         if self.sort.is_some() && !enc { bad("--sort")?; }
         if self.tail.is_some() && !enc { bad("--tail")?; }
         if self.tok_chunk.is_some() && !enc { bad("--tok-chunk")?; }

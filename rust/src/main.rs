@@ -51,13 +51,11 @@ fn main() {
             count(b, 1, i64::MAX as u64, "--block is a number of runs, 1 or more, or \"all\"")
         };
     }
-    if let Some(l) = cnt(&c.level, 1, 22, "--level is a zstd level, 1 to 22") {
-        opt.level = l as i32;
-        opt.levelset = true;
-    }
-    opt.slow = !c.fast;
-    opt.whole = c.slow;
-    if c.fast && c.block.is_none() { opt.block = 262144; }   // --fast: blocks and an index, for queries
+    let effort = c.effort.as_deref().unwrap_or("medium");
+    if !["low", "medium", "high"].contains(&effort) { die("--effort is low, medium or high"); }
+    opt.slow = effort != "low";
+    opt.whole = effort == "high";
+    if effort == "low" && c.block.is_none() { opt.block = 262144; }   // -e low: blocks and an index, for queries
     if let Some(m) = &c.sort {
         opt.sort = true;
         // clap cannot tell "--sort" from "--sort=", and the C refuses the

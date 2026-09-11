@@ -35,7 +35,6 @@ pub struct Options {
     pub levelset: bool,
     pub slow: bool,
     pub whole: bool,       // -e high: decide on the whole file
-    pub keep_names: bool,
     pub drop_names: bool,
     pub names_out: Option<String>,
     pub sort: bool,
@@ -46,7 +45,7 @@ pub struct Options {
 impl Default for Options {
     fn default() -> Self {
         Options { block: u64::MAX, level: 17, levelset: false, slow: true, whole: false, sortmem: 0,
-                  keep_names: false, drop_names: false, names_out: None,
+                  drop_names: false, names_out: None,
                   sort: false }
     }
 }
@@ -652,7 +651,6 @@ impl Writer {
         // as text, as ordinals, in a sidecar, or as ranks plus a blob.
         let mut perm_on = self.perm_on;
         let mut ordinal = self.ordok && self.nidx > 0;
-        if self.opt.keep_names { ordinal = false; }
         if !self.opt.drop_names && self.nidx > 1 {
             check_unique(if perm_on { &self.natbuf } else { &self.names })?;
         }
@@ -675,7 +673,7 @@ impl Writer {
         }
         if ordinal && self.opt.names_out.is_some() && !self.opt.drop_names {
             return Err("--names drop:FILE: the names are already the record ordinals, so a \
-                        file beside the track would be redundant; use --names keep to store them".into());
+                        file beside the track would be redundant: the track rebuilds them".into());
         }
         if perm_on && !self.natord && ordinal && !self.opt.drop_names {
             self.names = std::mem::take(&mut self.natbuf);

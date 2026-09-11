@@ -362,7 +362,7 @@ static int RUNHEAD = 0;               /* the writer is using that layout */
 static int ILV = 0;                   /* and whether the two frames are one */
 static int GRP = 0;                   /* and whether the lengths are grouped */
 
-static int NAMEMODE = 0;              /* 0 auto, 1 drop, 2 keep */
+static int NAMEMODE = 0;              /* 0 store, 1 drop */
 static const char *NAMEFILE = NULL;
 static const char *NAMESIN = NULL;
 /* One flag, two kinds of file: the blob "--names drop:F" wrote, or the
@@ -2836,7 +2836,6 @@ static void ktw_close(ktw *w) {
     uint8_t *nz = NULL, *lz = NULL;
 
     int ordinal = w->ordok && nidx > 0;   /* the writer tracked this */
-    if (NAMEMODE == 2) ordinal = 0;                    /* keep: store them */
     if (NAMEMODE != 1 && nidx > 1) namesunique(PERMON ? &natbuf : &names, PERMON ? NATN : nidx);
 
     int dropnames = NAMEMODE == 1;
@@ -2860,7 +2859,7 @@ static void ktw_close(ktw *w) {
 
     if (ordinal && NAMES_OUT && NAMEMODE != 1)
         die("--names drop:FILE: the names are already the record ordinals, so a "
-            "file beside the track would be redundant; use --names keep to store them");
+            "file beside the track would be redundant: the track rebuilds them");
 
     if (PERMON && !NATORD && ordinal && NAMEMODE != 1) {
         free(names.d); names = natbuf; natbuf.n = 0; natbuf.d = NULL;
@@ -3589,9 +3588,9 @@ static void ensurenames(R *r) {
         if (r->perm_ext) {
             if (!NAMEFILE) {
                 if (RAW || ORDNAMES) goto ranks_are_names;
-                die("--sort --no-names keeps the rank of every record and no "
+                die("--sort --names drop keeps the rank of every record and no "
                     "name text: give the original FASTA/FASTQ in "
-                    "--names FILE, or --ordinal-names to see the ranks");
+                    "--names FILE, or --names ordinal to see the ranks");
             }
             nat = readnamefile(r->nreads);
         }
@@ -5152,7 +5151,7 @@ int main(int argc, char **argv) {
     atexit(emitflush);
     static const char *const USAGE = "usage:\n"
             "  karyozip encode [-i IN.bed[.gz]] [-o OUT.kst] [-e low|medium|high]\n"
-            "                  [-n keep|drop|drop:FILE] [--sort[=MEM]]\n"
+            "                  [-n drop|drop:FILE] [--sort[=MEM]]\n"
             "                  [-d features.tsv [--hier H] -i SET.bed ...] [-a P.paf -r R.bed|R.kst [--aln-names F]]\n"
             "  karyozip decode -i F [-o OUT.bed] [-n FILE|ordinal] [--raw]\n"
             "                  [-d features.tsv [--hier H] [--set A,B] [--out-dir DIR]] [-a P.paf -r R]\n"
@@ -5240,14 +5239,13 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--profile")) { PROF = 1; take = 1; }
         else if (!strcmp(a, "--tmp-dir")) { TMPD = v; take = 2; }
         else if (!strcmp(a, "--names")) {
-            if (!strcmp(v, "keep")) { ok = enc; if (NAMEMODE == 1) die("--names keep and --names drop are exclusive"); NAMEMODE = 2; }
-            else if (!strcmp(v, "drop")) { ok = enc; if (NAMEMODE == 2) die("--names keep and --names drop are exclusive"); NAMEMODE = 1; }
+            if (!strcmp(v, "drop")) { ok = enc; NAMEMODE = 1; }
             else if (!strncmp(v, "drop:", 5)) { ok = enc; NAMES_OUT = v + 5;
                                                 if (!*NAMES_OUT) die("--names drop:FILE needs a file"); }
             else if (!strcmp(v, "ordinal")) {
-                if (enc) die("encode takes --names keep, drop or drop:FILE");
+                if (enc) die("encode takes --names drop or drop:FILE");
                 ok = rd; ORDNAMES = 1; }
-            else if (enc) die("encode takes --names keep, drop or drop:FILE; a name file is --aln-names");
+            else if (enc) die("encode takes --names drop or drop:FILE; a name file is --aln-names");
             else { ok = rd; NAMESARG = v; }   /* the blob drop:FILE wrote, or a FASTA, FASTQ or list */
             take = 2; }
         else if (!strcmp(a, "--max-gap")) { ok = sm; MAXGAP = num_arg(v, UINT64_MAX, "--max-gap needs a number"); take = 2; }

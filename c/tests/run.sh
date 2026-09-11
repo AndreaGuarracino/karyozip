@@ -257,7 +257,7 @@ cmp -s "$D/ord2.bed" "$W/ord2.out" \
 
 # A run that ends where the reference run ends stores no length at all. This
 # fixture is built so 6 of its 8 rows do, which the s.bed fixture never did.
-$KT encode --aln "$D/lp.paf" --ref "$D/lref.bed" --names keep < "$D/ls.bed" \
+$KT encode --aln "$D/lp.paf" --ref "$D/lref.bed" < "$D/ls.bed" \
   > "$W/ls.kt" 2>/dev/null
 $KT decode --aln "$D/lp.paf" --ref "$D/lref.bed" -i "$W/ls.kt" 2>/dev/null > "$W/ls.out"
 cmp -s "$D/ls.bed" "$W/ls.out" \
@@ -359,12 +359,12 @@ for f in gap ovl; do
   done
 done
 
-# --names keep on names that are already 0,1,2,... wrote a file it refused to read
+# names that are already 0,1,2,...
 printf '0\t0\t10\tA\n1\t0\t10\tB\n2\t0\t10\tC\n' > "$W/ord2.bed"
-$KT encode --block 4 --names keep < "$W/ord2.bed" > "$W/ord2.kt" 2>/dev/null
+$KT encode --block 4 < "$W/ord2.bed" > "$W/ord2.kt" 2>/dev/null
 $KT decode -i "$W/ord2.kt" 2>/dev/null | cmp -s - "$W/ord2.bed" \
-  && echo "--names keep on ordinals: round-trips" \
- || { echo "--names keep on ordinals: DIFFERS"; fail=1; }
+  && echo "ordinal names: round-trip" \
+ || { echo "ordinal names: DIFFERS"; fail=1; }
 
 # a single line with no trailing newline was thrown away and still exited 0
 printf 'a\t0\t10\tA' > "$W/nonl.bed"
@@ -480,7 +480,7 @@ $KT region -i "$W/halo4.kt" -s s --start 45 --end 46 --halo 3 2>/dev/null | cmp 
   && echo "halo across blocks: 7 rows" || { echo "halo across blocks: WRONG"; fail=1; }
 awk 'BEGIN{for(i=0;i<20;i++)printf "r%d\t0\t%d\tL%d\n",i,50+i,i%5}' > "$W/idx.bed"
 $KT encode < "$W/idx.bed" > "$W/idx.kt" 2>/dev/null; $KT index -i "$W/idx.kt" >/dev/null 2>&1
-$KT encode --sort --names keep < "$W/idx.bed" > "$W/idx.kt" 2>/dev/null
+$KT encode --sort < "$W/idx.bed" > "$W/idx.kt" 2>/dev/null
 $KT region -i "$W/idx.kt" -s r7 2>/dev/null | cmp -s - <(grep -P '^r7\t' "$W/idx.bed") \
   && echo "stale idx: ignored" || { echo "stale idx: WRONG ROWS"; fail=1; }
 $KT index -i "$W/idx.kt" >/dev/null 2>&1; $KT region -i "$W/idx.kt" -s r7 2>/dev/null | cmp -s - <(grep -P '^r7\t' "$W/idx.bed") \
@@ -620,7 +620,7 @@ printf 'a\t0\t10\tA\nb\t0\t10\tB\na\t0\t10\tC\n' > "$W/dupname.bed"
 must_fail "a sequence name that repeats later" $KT encode < "$W/dupname.bed"
 must_fail "a sequence name that repeats later, sorted" $KT encode --sort < "$W/dupname.bed"
 N512=$(head -c 512 /dev/zero | tr '\0' n); printf '%s\t0\t10\tA\n' "$N512" > "$W/n512.bed"
-must_fail "a 512-byte name under --sort" $KT encode --sort --names keep < "$W/n512.bed"
+must_fail "a 512-byte name under --sort" $KT encode --sort < "$W/n512.bed"
 
 # Round 14: two names with one FNV hash, a repeat of the second was missed;
 # a spill left behind when the disk filled; CRLF and one-line name lists; a
@@ -892,8 +892,6 @@ mkdir -p "$W/dbsig"; ( $KT decode --db "$D/db.features.tsv" --out-dir "$W/dbsig"
 must_fail "--sort=1e18T" $KT encode --tmp-dir "$W" --sort=1e18T < "$D/s.bed"
 
 # The README says these pairs are exclusive and these ranges are the limits.
-must_fail "--names drop with --names keep" $KT encode --names drop --names keep < "$D/s.bed"
-must_fail "--names keep with --names drop" $KT encode --names keep --names drop < "$D/s.bed"
 must_fail "the retired --one-block" $KT encode --one-block < "$D/s.bed"
 must_fail "--block junk" $KT encode --block xyz < "$D/s.bed"
 must_fail "--threads 1025" $KT -t 1025 encode < "$D/s.bed"

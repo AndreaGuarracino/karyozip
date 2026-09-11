@@ -34,9 +34,9 @@ echo "codecs: every candidate round-trips"
 
 # 2. encode must be byte-identical, over every fixture and flag.
 for f in "$D"/*.bed; do
-  for fl in "" "--block 4" "--block 262144" "--names keep" \
+  for fl in "" "--block 4" "--block 262144" \
             "--effort low" "--effort low --block 4" "--names drop" "--effort high" \
-            "--sort" "--sort --names keep" "--sort --names drop" "--sort=1M" \
+            "--sort" "--sort --names drop" "--sort=1M" \
             "--sort --block 4"; do
     IN=$f both "encode $(basename "$f") [$fl]" $fl encode
   done
@@ -46,7 +46,7 @@ tally encode
 # 3. decode: the Rust must give back exactly what was encoded.
 dok=0; dbad=0
 for f in "$D"/*.bed; do
-  for fl in "" "--block 4" "--block 262144" "--names keep"; do
+  for fl in "" "--block 4" "--block 262144"; do
     "$C" $fl encode < "$f" > "$W/t.kst" 2>/dev/null
     "$R" decode -i "$W/t.kst" 2>/dev/null | cmp -s - "$f" && dok=$((dok+1)) \
       || { dbad=$((dbad+1)); echo "  decode differs: $(basename "$f") [$fl]"; }
@@ -87,7 +87,7 @@ both "index cross-read" region -i "$W/ci.kst" -s seq0005; tally "index cross-rea
 
 # 6b. a sorted track: the Rust must resolve the ranks the same way.
 for f in ls.bed s.bed db.rall.bed ord.bed; do
-  for fl in "--sort" "--sort --names keep"; do
+  for fl in "--sort"; do
     "$C" $fl encode < "$D/$f" > "$W/t.kst" 2>/dev/null
     both "sorted decode $f [$fl]" decode -i "$W/t.kst"
   done

@@ -72,14 +72,7 @@ fn main() {
     // clear the other, and drop plus drop:FILE is a refusal.
     for n in &c.names {
         match n.as_str() {
-            "keep" => {
-                if opt.drop_names { die("--names keep and --names drop are exclusive"); }
-                opt.keep_names = true;
-            }
-            "drop" => {
-                if opt.keep_names { die("--names keep and --names drop are exclusive"); }
-                opt.drop_names = true;
-            }
+            "drop" => opt.drop_names = true,
             _ if n.starts_with("drop:") => {
                 if n.len() == 5 { die("--names drop:FILE needs a file"); }
                 opt.names_out = Some(n[5..].to_string());

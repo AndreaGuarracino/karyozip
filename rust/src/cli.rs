@@ -55,7 +55,7 @@ pub struct Cli {
     #[arg(long, global = true, num_args = 0..=1, require_equals = true,
           default_missing_value = "", value_name = "MEM")]
     pub sort: Option<String>,
-    /// keep|drop|drop:FILE on encode, a file or "ordinal" on the readers
+    /// drop|drop:FILE on encode, a file or "ordinal" on the readers
     #[arg(long, short = 'n', global = true, value_name = "WHAT")]
     pub names: Vec<String>,
     /// one BED per feature set, or one merged featureID track
@@ -191,12 +191,12 @@ impl Cli {
         if self.max_gap.is_some() && !sm { bad("--max-gap")?; }
         if self.v1 && !sm { bad("--v1")?; }
         for n in &self.names {
-            let enc_form = n == "keep" || n == "drop" || n.starts_with("drop:");
+            let enc_form = n == "drop" || n.starts_with("drop:");
             if enc && !enc_form {
                 return Err(if n == "ordinal" {
-                    "encode takes --names keep, drop or drop:FILE".into()
+                    "encode takes --names drop or drop:FILE".into()
                 } else {
-                    "encode takes --names keep, drop or drop:FILE; a name file is --aln-names".into()
+                    "encode takes --names drop or drop:FILE; a name file is --aln-names".into()
                 });
             }
             if !enc && enc_form { bad("--names")?; }

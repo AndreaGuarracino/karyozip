@@ -896,7 +896,7 @@ impl Reader {
                 match &self.names_file {
                     Some(f) => Some(read_name_file(f, n)),
                     None if self.raw || self.ordnames => None,
-                    None => crate::bail("--sort --no-names keeps the rank of every record and no name text: give the original FASTA/FASTQ in --names FILE, or --ordinal-names to see the ranks"),
+                    None => crate::bail("--sort --names drop keeps the rank of every record and no name text: give the original FASTA/FASTQ in --names FILE, or --names ordinal to see the ranks"),
                 }
             } else if perm_tok {
                 Some(tok_d(pz))

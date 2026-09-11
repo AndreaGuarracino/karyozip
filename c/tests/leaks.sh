@@ -5,8 +5,7 @@
 #   bash leaks.sh [SANITIZER_BINARY]
 set -u
 D=$(cd "$(dirname "$0")" && pwd)
-SRC=$D/..
-SAN=${1:-${KARYOZIP_SAN:-}}; BUILT=""
+SAN=${1:-${KARYOZIP_SAN:-}}
 W=$(mktemp -d)
 # a Rust binary under test runs under valgrind, which sees the same leaks
 if [ -z "$SAN" ] && [ -n "${KT:-}" ] && grep -q rust_begin_unwind "$KT" 2>/dev/null; then
@@ -15,17 +14,8 @@ if [ -z "$SAN" ] && [ -n "${KT:-}" ] && grep -q rust_begin_unwind "$KT" 2>/dev/n
   printf '{\n  tls\n  Memcheck:Leak\n  match-leak-kinds: definite\n  fun:calloc\n  fun:allocate_dtv\n}\n' > "$W/supp"
   printf '#!/bin/bash\nulimit -n 4096 2>/dev/null\nexec valgrind -q --leak-check=full --errors-for-leak-kinds=definite --error-exitcode=99 --suppressions="%s" "%s" "$@"\n' "$W/supp" "$KT" > "$W/san"; chmod +x "$W/san"; SAN=$W/san
 fi
-if [ -z "$SAN" ]; then BUILT=1
-  command -v gcc >/dev/null || { echo "leaks: skipped, no gcc"; exit 0; }
-  SAN=$(mktemp -u /tmp/kz-lsan.XXXXXX)
-  gcc -O1 -g -fsanitize=address -std=gnu11 -fopenmp -D_GNU_SOURCE -DVERSION='"1.5.3"' \
-      -o "$SAN" "$SRC"/karyozip.c "$SRC"/htscodecs/tokenise_name3.c \
-      "$SRC"/htscodecs/rANS_static4x16pr.c "$SRC"/htscodecs/rANS_static32x16pr.c \
-      "$SRC"/htscodecs/arith_dynamic.c "$SRC"/htscodecs/rle.c "$SRC"/htscodecs/pack.c \
-      "$SRC"/htscodecs/utils.c "$SRC"/bzip3/libbz3.c -I"$SRC" -lzstd -llzma -lz -lm -lpthread \
-      >/dev/null 2>&1 || { echo "leaks: sanitizer build FAILED"; exit 1; }
-fi
-trap 'rm -rf "$W" ${BUILT:+"$SAN"}' EXIT
+[ -x "${SAN%% *}" ] || { echo "leaks: FAILED, no sanitizer build: make -C c build/karyozip-san"; exit 1; }
+trap 'rm -rf "$W"' EXIT
 fail=0
 run() {   # description, then the command; a refusal is a failure unless the description says (refused)
   local what=$1; shift

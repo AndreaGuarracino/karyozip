@@ -56,6 +56,8 @@ queries() {  # queries BIN "FLAGS" KST NAMEFILE : NQ random point queries, ms st
 
 row() {  # row SET KIND INFORMED SEEK MODE IMPL BIN INPUT(s) ENCFLAGS DECFLAGS COMPANION_B
   local set=$1 kind=$2 inf=$3 seek=$4 mode=$5 impl=$6 bin=$7 in=$8 ef=$9 df=${10} comp=${11}
+  local kc="$W/kC.$set.$kind.$inf.$seek.$mode.kst"   # the C file a Rust row must match
+  [ "$impl" = C ] && rm -f "$kc"
   # the input's plain text, row and sequence counts and name list: once per
   # input, not per row, since 16 rows share each one and Illumina is 3.3 GB
   if [ "$in" != "$LASTIN" ]; then LASTIN=$in
@@ -107,10 +109,20 @@ row() {  # row SET KIND INFORMED SEEK MODE IMPL BIN INPUT(s) ENCFLAGS DECFLAGS C
   fi
   if [ "$rt" != exact ]; then echo "bench: round trip $rt on $set $kind $inf $seek $mode $impl" >&2; BAD=$((BAD+1))
   fi
+  # one format, two writers: a Rust row must match the same row's C file
+  if [ "$set" != ALL ] || [ "$inf" != not-informed ]; then
+    if [ "$impl" = C ]; then cp "$W/k.kst" "$kc"
+    elif [ -s "$kc" ] && ! cmp -s "$W/k.kst" "$kc"; then
+      echo "bench: C and Rust bytes differ on $set $kind $inf $seek $mode" >&2; BAD=$((BAD+1)); fi
+  fi
   # an unsmoothed track is also smoothed, timed: what the tool replaces
   local sm="NA NA"
   if [ "$kind" = presmoothed ] && [ "$set" != ALL ] && [ -s "$HIER" ]; then
-    set -- $(timed /dev/null /dev/null "$bin" -t $T $df smooth "$W/k.kst" "$HIER" "$set"); sm="$1 $2"
+    set -- $(timed "$W/sm.bed" /dev/null "$bin" -t $T $df smooth "$W/k.kst" "$HIER" "$set"); sm="$1 $2"
+    # and must give KaryoScope's own smoothed track, unless a window clipped the ends
+    local smo=$(ls "$D"/*."$set".smoothed.bed.gz 2>/dev/null | grep -v '/ref\.' | head -1)
+    if [ "$inf" = not-informed ] && [ -s "$smo" ] && [ ! -e "$D/window" ] && ! zcat "$smo" | cmp -s - "$W/sm.bed"; then
+      echo "bench: smooth differs from KaryoScope on $set $seek $mode $impl" >&2; BAD=$((BAD+1)); fi
   fi
   local ix=0 q="NA NA NA NA"
   if [ "$seek" = seekable ] && [ "$set" != ALL ]; then
@@ -171,4 +183,4 @@ for kind in $KINDS; do
   done
 done
 # every row must round-trip: a refusal or a difference fails the run
-[ "${BAD:-0}" = 0 ] || { echo "bench: $BAD rows did not round-trip" >&2; exit 1; }
+[ "${BAD:-0}" = 0 ] || { echo "bench: $BAD rows failed a check" >&2; exit 1; }

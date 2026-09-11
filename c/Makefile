@@ -37,8 +37,15 @@ build/libkaryozip.a: $(SRC) $(HDR)
 build/libtest: build/libkaryozip.a tests/libtest.c
 	$(CC) $(CFLAGS) $(ZSTD_CFLAGS) -o $@ tests/libtest.c build/libkaryozip.a $(LDFLAGS) $(ZSTD_LIBS) -llzma -lm -lpthread -lz
 
-test: build/karyozip build/libtest
-	KT=$(CURDIR)/build/karyozip tests/run.sh
+# the memory-checked twin leaks.sh and fuzz.sh run: one build, kept until a
+# source changes, where each script used to compile its own every run
+build/karyozip-san: $(SRC) $(HDR)
+	mkdir -p build
+	$(CC) -O1 -g -fsanitize=address,undefined -std=gnu11 -fopenmp -D_GNU_SOURCE -DVERSION='"$(BZIP3_VERSION)"' -I. \
+	  $(ZSTD_CFLAGS) -o $@ $(SRC) $(LDFLAGS) $(ZSTD_LIBS) -llzma -lm -lpthread -lz
+
+test: build/karyozip build/libtest build/karyozip-san
+	KT=$(CURDIR)/build/karyozip KARYOZIP_SAN=$(CURDIR)/build/karyozip-san tests/run.sh
 
 clean:
 	rm -rf build

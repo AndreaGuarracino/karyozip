@@ -26,7 +26,6 @@ const RUNFLAG: u64 = 1 << 61;
 const FLDFLAG: u64 = 1 << 50;
 const ILVFLAG: u64 = 1 << 51;
 const GRPFLAG: u64 = 1 << 49;
-const ZTFLAG: u64 = 1 << 48;
 const ICHUNK: u64 = 65536;
 const TAILSKIP: usize = 64;
 
@@ -512,7 +511,7 @@ impl Writer {
         // index. One block only, since a split read has no count to head it,
         // and measured against the index it would replace.
         let mut altbuf: Vec<u8> = Vec::new();
-        let (mut runhead, mut ilv, mut grp, mut zt, mut alt_lens) = (false, false, false, false, 0usize);
+        let (mut runhead, mut ilv, mut grp, mut alt_lens) = (false, false, false, 0usize);
         let mut ilvcodec = p.len;
         let mut altv: [Option<(Vec<u8>, usize)>; 3] = [None, None, None];
         if self.bm.len() == 1 && !self.ibx.is_empty() {
@@ -522,13 +521,10 @@ impl Writer {
             let ids = ids_ok(&ids0, p.id, lvl_id);
             let mut bestsz = match (base, ids) { (Some(a), Some(b)) => a + b + idx, _ => 0 };
             if bestsz > 0 {
-                // z: the zero tail folded into the head
-                let hz = [splice_heads(&lens0, &self.ibx, false), splice_heads(&lens0, &self.ibx, true)];
-                for (z, h) in hz.iter().enumerate() {
-                    let Some(h) = h else { continue };
-                    if let (Some(a), Some(b)) = (lens_ok(h, p.len, lvl_len), ids) {
+                if let Some(h) = splice_heads(&lens0, &self.ibx) {
+                    if let (Some(a), Some(b)) = (lens_ok(&h, p.len, lvl_len), ids) {
                         if a + b < bestsz {
-                            bestsz = a + b; runhead = true; zt = z == 1; alt_lens = h.len(); altbuf = h.clone();
+                            bestsz = a + b; runhead = true; alt_lens = h.len(); altbuf = h;
                         }
                     }
                 }
@@ -536,20 +532,21 @@ impl Writer {
                 if let Some(g) = self.opt.slow.then(|| grp_pack(&lens0, &ids0, &self.ibx)).flatten() {
                     if let (Some(a), Some(b)) = (lens_ok(&g, p.len, lvl_len), ids) {
                         if a + b < bestsz {
-                            bestsz = a + b; runhead = true; grp = true; zt = false;
+                            bestsz = a + b; runhead = true; grp = true;
                             alt_lens = g.len(); altbuf = g;
                         }
                     }
                 }
-                for (z, h) in hz.iter().enumerate() {
-                    let Some(h) = h else { continue };
-                    let Some(v) = ilv_pack(&lens0, &ids0, &self.ibx, z == 1) else { continue };
+                if let Some(v) = ilv_pack(&lens0, &ids0, &self.ibx) {
                     // one frame, so whichever codec reads it back smaller is
                     // the file's length codec: the ids frame is gone either way
-                    if let Some((a, cd)) = ilv_best(&v, self.opt.slow, lvl_len) {
+                    let r = ilv_best(&v, self.opt.slow, lvl_len);
+                    let (a, cd) = match r { Some((a, c)) => (Some(a), c), None => (None, 0) };
+                    if let Some(a) = a {
                         if a < bestsz {
-                            bestsz = a; ilv = true; runhead = true; grp = false; zt = z == 1; ilvcodec = cd;
-                            alt_lens = h.len(); altbuf = v;
+                            ilv = true; runhead = true; grp = false; ilvcodec = cd;
+                            alt_lens = lens0.len() + self.ibx.len();
+                            altbuf = v;
                         }
                     }
                 }
@@ -569,10 +566,10 @@ impl Writer {
                     if m.alen[v] == 0 { continue; }
                     let alt = &self.rawalt[v][m.aoff[v]..m.aoff[v] + m.alen[v]];
                     let Some(ah) = (if grp { grp_pack(alt, &ids0, &self.ibx) }
-                                    else { splice_heads(alt, &self.ibx, zt) }) else { continue };
+                                    else { splice_heads(alt, &self.ibx) }) else { continue };
                     let ahn = ah.len();
                     if !ilv { altv[v + 1] = Some((ah, ahn)); continue; }
-                    if let Some(ai) = ilv_pack(alt, &ids0, &self.ibx, zt) { altv[v + 1] = Some((ai, ahn)); }
+                    if let Some(ai) = ilv_pack(alt, &ids0, &self.ibx) { altv[v + 1] = Some((ai, ahn)); }
                 }
             }
         }
@@ -807,8 +804,7 @@ impl Writer {
              | if self.tailon == Some(true) { TAILFLAG } else { 0 }
              | if runhead { RUNFLAG } else { 0 }
              | if ilv { ILVFLAG } else { 0 }
-             | if grp { GRPFLAG } else { 0 }
-             | if zt { ZTFLAG } else { 0 };
+             | if grp { GRPFLAG } else { 0 };
         h[2] = ichunks.len() as u64;
         h[3] = sz.len() as u64;
         h[4] = self.rows;
@@ -1135,19 +1131,16 @@ fn verifies(src: &[u8], codec: i32) -> bool {
 pub fn ilv_flip(v: u64) -> u64 { if v < 128 { 127 - v } else { v } }
 
 /// One stream a read: its run count, then a label beside its own length.
-fn ilv_pack(lens: &[u8], ids: &[u8], ibx: &[u8], z: bool) -> Option<Vec<u8>> {
-    let mut out = Vec::with_capacity(lens.len() + ids.len() + 2 * ibx.len() + 16);
+fn ilv_pack(lens: &[u8], ids: &[u8], ibx: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(lens.len() + ids.len() + ibx.len() + 16);
     let (mut p, mut q, mut r) = (0usize, 0usize, 0usize);
     while r < ibx.len() {
         let (k, n) = vget(ibx, r); r = n;
-        let zz = z && zero_tail(lens, p, k)?;
-        kst::put(&mut out, if z { 2 * k + zz as u64 } else { k });
-        for j in 0..k {
+        kst::put(&mut out, k);
+        for _ in 0..k {
             if q >= ids.len() || p >= lens.len() { return None; }
             let (lb, n2) = vget(ids, q); kst::put(&mut out, ilv_flip(lb)); q = n2;
-            let n2 = crate::reader::skip(lens, p);
-            if !(zz && j + 1 == k) { out.extend_from_slice(&lens[p..n2]); }
-            p = n2;
+            let n2 = crate::reader::skip(lens, p); out.extend_from_slice(&lens[p..n2]); p = n2;
         }
     }
     if p != lens.len() || q != ids.len() { None } else { Some(out) }
@@ -1178,27 +1171,17 @@ fn grp_pack(lens: &[u8], ids: &[u8], ibx: &[u8]) -> Option<Vec<u8>> {
     if p != lens.len() || q != ids.len() { None } else { Some(out) }
 }
 
-/// Whether the read of k lengths at p ends in a one-byte 0, the tail a
-/// head of 2k+1 folds in; None when the lengths run short.
-fn zero_tail(lens: &[u8], mut p: usize, k: u64) -> Option<bool> {
-    let mut last = p;
-    for _ in 0..k { if p >= lens.len() { return None; } last = p; p = crate::reader::skip(lens, p); }
-    Some(k > 0 && p - last == 1 && lens[last] == 0)
-}
-
 /// the same lengths with each read's run count in front of its own
-fn splice_heads(lens: &[u8], ibx: &[u8], z: bool) -> Option<Vec<u8>> {
-    let mut out = Vec::with_capacity(lens.len() + 2 * ibx.len() + 16);
+fn splice_heads(lens: &[u8], ibx: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(lens.len() + ibx.len() + 16);
     let (mut p, mut q) = (0usize, 0usize);
     while q < ibx.len() {
         let (k, n) = vget(ibx, q); q = n;
-        let zz = z && zero_tail(lens, p, k)?;
-        kst::put(&mut out, if z { 2 * k + zz as u64 } else { k });
-        for j in 0..k {
+        kst::put(&mut out, k);
+        for _ in 0..k {
             if p >= lens.len() { return None; }
             let n2 = crate::reader::skip(lens, p);
-            if !(zz && j + 1 == k) { out.extend_from_slice(&lens[p..n2]); }
-            p = n2;
+            out.extend_from_slice(&lens[p..n2]); p = n2;
         }
     }
     if p != lens.len() { return None; } else { Some(out) }

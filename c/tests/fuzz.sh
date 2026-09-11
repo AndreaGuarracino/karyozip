@@ -12,19 +12,11 @@ for t in python3 zstd; do command -v $t >/dev/null || { echo "fuzz: $t not on PA
 # always runs with memory checking on, not only when someone remembers.
 # The C build gets a sanitizer twin; any other binary under test, the Rust,
 # is fuzzed as itself.
-SAN=${KARYOZIP_SAN:-}; BUILT=""
+SAN=${KARYOZIP_SAN:-}
 if [ -z "$SAN" ] && ! [ "$KT" -ef "$(dirname "$0")/../build/karyozip" ]; then SAN=$KT; fi
-if [ -z "$SAN" ] && command -v gcc >/dev/null; then
-  SRC=$(dirname "$0")/..
-  SAN=$(mktemp -u /tmp/kz-san.XXXXXX); BUILT=1
-  gcc -O1 -g -fsanitize=address,undefined -std=gnu11 -fopenmp -D_GNU_SOURCE -DVERSION='"1.5.3"' \
-      -o "$SAN" "$SRC"/karyozip.c "$SRC"/htscodecs/tokenise_name3.c "$SRC"/htscodecs/rANS_static4x16pr.c \
-      "$SRC"/htscodecs/rANS_static32x16pr.c "$SRC"/htscodecs/arith_dynamic.c "$SRC"/htscodecs/rle.c \
-      "$SRC"/htscodecs/pack.c "$SRC"/htscodecs/utils.c "$SRC"/bzip3/libbz3.c -I"$SRC" -lzstd -llzma -lz -lm -lpthread \
-      >/dev/null 2>&1 || { echo "fuzz: sanitizer build FAILED"; exit 1; }
-fi
+[ -x "$SAN" ] || { echo "fuzz: FAILED, no sanitizer build: make -C c build/karyozip-san"; exit 1; }
 D=$(dirname "$0")
-W=$(mktemp -d); trap 'rm -rf "$W" ${BUILT:+"$SAN"}' EXIT
+W=$(mktemp -d); trap 'rm -rf "$W"' EXIT
 fail=0
 N=${FUZZ_N:-60}
 J=${FUZZ_J:-$(nproc)}          # forged files run several at a time

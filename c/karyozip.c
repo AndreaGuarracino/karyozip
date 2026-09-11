@@ -366,14 +366,9 @@ static size_t zc(buf *in, uint8_t **out) { return zcl(in, out, LEVEL); }
 /* Lengths grouped by label id within a read. The labels stay in their own
    order and are the permutation, so nothing else is stored. */
 #define GRPFLAG  (1ULL << 49)
-/* Each read's head is 2k+z: z set, its last length was 0 and is not
-   written. The count already says which run is last; a context coder
-   cannot, and paid for every zero tail it had to learn. */
-#define ZTFLAG   (1ULL << 48)
 static int RUNHEAD = 0;               /* the writer is using that layout */
 static int ILV = 0;                   /* and whether the two frames are one */
 static int GRP = 0;                   /* and whether the lengths are grouped */
-static int ZT = 0;                    /* and whether a zero tail folds into the head */
 
 static int NAMEMODE = 0;              /* 0 auto, 1 drop, 2 keep */
 static const char *NAMEFILE = NULL;
@@ -921,21 +916,20 @@ typedef struct ktw {
 
 /* the same lengths with each read's run count in front of its own */
 static size_t splice_heads(const uint8_t *lens, size_t nl, const uint8_t *ib,
-                           size_t ibn, int z, uint8_t **out) {
-    *out = xmalloc(nl + 2 * ibn + 16);
+                           size_t ibn, uint8_t **out) {
+    *out = xmalloc(nl + ibn + 16);
     const uint8_t *p = lens, *e = lens + nl, *q = ib, *qe = ib + ibn;
     uint8_t *w = *out;
     while (q < qe) {
         uint64_t k = vgetb(&q, qe);
-        const uint8_t *s0 = p, *last = p;
+        vput(&w, k);
         for (uint64_t j = 0; j < k; j++) {
+            const uint8_t *s0 = p;
             if (p >= e) { free(*out); *out = NULL; return 0; }
-            last = p; vgetb(&p, e);
+            vgetb(&p, e);
+            size_t len = (size_t)(p - s0);
+            memcpy(w, s0, len); w += len;
         }
-        int zz = z && k && p - last == 1 && !*last;
-        vput(&w, z ? 2 * k + (uint64_t)zz : k);
-        size_t len = (size_t)((zz ? last : p) - s0);
-        memcpy(w, s0, len); w += len;
     }
     if (p != e) { free(*out); *out = NULL; return 0; }
     return (size_t)(w - *out);
@@ -951,25 +945,18 @@ static size_t splice_heads(const uint8_t *lens, size_t nl, const uint8_t *ib,
 static inline uint64_t ilv_flip(uint64_t v) { return v < 128 ? 127 - v : v; }
 
 static size_t ilv_pack(const uint8_t *lens, size_t nl, const uint8_t *ids, size_t ni,
-                       const uint8_t *ib, size_t ibn, int z, uint8_t **out) {
-    *out = xmalloc(nl + ni + 2 * ibn + 16);
+                       const uint8_t *ib, size_t ibn, uint8_t **out) {
+    *out = xmalloc(nl + ni + ibn + 16);
     const uint8_t *p = lens, *e = lens + nl, *q = ids, *qe = ids + ni;
     const uint8_t *r = ib, *re = ib + ibn;
     uint8_t *w = *out;
     while (r < re) {
         uint64_t k = vgetb(&r, re);
-        const uint8_t *t = p, *last = p;
+        vput(&w, k);
         for (uint64_t j = 0; j < k; j++) {
-            if (t >= e) { free(*out); *out = NULL; return 0; }
-            last = t; vgetb(&t, e);
-        }
-        int zz = z && k && t - last == 1 && !*last;
-        vput(&w, z ? 2 * k + (uint64_t)zz : k);
-        for (uint64_t j = 0; j < k; j++) {
-            if (q >= qe) { free(*out); *out = NULL; return 0; }
+            if (q >= qe || p >= e) { free(*out); *out = NULL; return 0; }
             vput(&w, ilv_flip(vgetb(&q, qe)));
             const uint8_t *s0 = p; vgetb(&p, e);
-            if (zz && j + 1 == k) continue;
             memcpy(w, s0, (size_t)(p - s0)); w += p - s0;
         }
     }
@@ -2710,8 +2697,7 @@ static void ktw_close(ktw *w) {
         size_t nl0 = bm[0].lens, ni0 = bm[0].len - nl0;
         uint8_t *rb0 = xmalloc(bm[0].len);
         rawget(w->rawfd, (off_t)bm[0].off, rb0, bm[0].len);
-        uint8_t *hb[2] = {0}; size_t hn[2];         /* z: the zero tail folded in */
-        for (int z = 0; z < 2; z++) hn[z] = splice_heads(rb0, nl0, w->ibx.d, w->ibx.n, z, &hb[z]);
+        uint8_t *hb = NULL; size_t hn = splice_heads(rb0, nl0, w->ibx.d, w->ibx.n, &hb);
         buf ib0 = w->ibx, ic = {0}, it = {0};
         idxbuild(&ib0, &ic, &it);
         ZSTD_CCtx *mc = ZSTD_createCCtx();
@@ -2719,38 +2705,36 @@ static void ktw_close(ktw *w) {
         size_t base = lensok(mc, rb0, nl0);
         size_t ids = idsok(mc, rb0 + nl0, ni0);
         size_t bestsz = base && ids ? base + ids + ic.n : 0;
-        int bh = 0, bi = 0, bz = 0, ilvcodec = LENCODEC;
-        for (int z = 0; z < 2; z++)                /* heads, index dropped */
-            if (hn[z] && bestsz) {
-                size_t a = lensok(mc, hb[z], hn[z]);
-                if (a && a + ids < bestsz) { bestsz = a + ids; bh = 1; bi = 0; bz = z; }
-            }
+        int bh = 0, bi = 0, ilvcodec = LENCODEC;
+        if (hn && bestsz) {                        /* heads, index dropped */
+            size_t a = lensok(mc, hb, hn);
+            if (a && a + ids < bestsz) { bestsz = a + ids; bh = 1; bi = 0; }
+        }
         int bg = 0;
         uint8_t *gb = NULL; size_t gn = 0;
         if (bestsz && !FASTMODE) {                 /* the same heads, grouped:
             a sort a read on the way back, so the thorough default only */
             gn = grp_pack(rb0, nl0, rb0 + nl0, ni0, w->ibx.d, w->ibx.n, &gb);
             if (gn) { size_t a = lensok(mc, gb, gn);
-                      if (a && a + ids < bestsz) { bestsz = a + ids; bh = 1; bi = 0; bg = 1; bz = 0; } }
+                      if (a && a + ids < bestsz) { bestsz = a + ids; bh = 1; bi = 0; bg = 1; } }
         }
-        for (int z = 0; bestsz && z < 2; z++) {    /* interleaved: always headed */
+        if (bestsz) {                              /* interleaved: always headed */
             uint8_t *iv = NULL;
-            size_t vn = hn[z] ? ilv_pack(rb0, nl0, rb0 + nl0, ni0, w->ibx.d, w->ibx.n, z, &iv) : 0;
+            size_t vn = ilv_pack(rb0, nl0, rb0 + nl0, ni0, w->ibx.d, w->ibx.n, &iv);
             if (vn) {
                 /* one frame, so whichever codec reads it back smaller is the
                    file's length codec: the ids frame is gone either way */
                 int cd = 0; size_t a = lenbest(mc, iv, vn, &cd);
                 if (a && a < bestsz) {
-                    bestsz = a; bh = 1; bi = 1; bz = z; ilvcodec = cd;
-                    free(altbuf); altbuf = iv; altlen = vn; alt_lens = hn[z]; iv = NULL;
+                    bestsz = a; bh = 1; bi = 1; ilvcodec = cd;
+                    free(altbuf); altbuf = iv; altlen = vn; alt_lens = hn; iv = NULL;
                 }
             }
             free(iv);
         }
-        ZT = bz;
         if (bi) { ILV = 1; RUNHEAD = 1; LENCODEC = ilvcodec; bg = 0; }
         else if (bg) { RUNHEAD = 1; GRP = 1; free(altbuf); altbuf = gb; altlen = gn; alt_lens = gn; gb = NULL; }
-        else if (bh) { RUNHEAD = 1; free(altbuf); altbuf = hb[bz]; altlen = alt_lens = hn[bz]; hb[bz] = NULL; }
+        else if (bh) { RUNHEAD = 1; free(altbuf); altbuf = hb; altlen = hn; alt_lens = hn; hb = NULL; }
         else { free(altbuf); altbuf = NULL; altlen = alt_lens = 0; }
         if (RUNHEAD && !ILV) {         /* the codec was chosen on the plain lengths:
             rank again on the spelling that won, or --fast's sample can beat it */
@@ -2766,16 +2750,16 @@ static void ktw_close(ktw *w) {
                 const uint8_t *alt = w->rawalt[v - 1].d + bm[0].aoff[v - 1];
                 uint8_t *ah = NULL;
                 size_t ahn = GRP ? grp_pack(alt, an, rb0 + nl0, ni0, w->ibx.d, w->ibx.n, &ah)
-                                 : splice_heads(alt, an, w->ibx.d, w->ibx.n, ZT, &ah);
+                                 : splice_heads(alt, an, w->ibx.d, w->ibx.n, &ah);
                 if (!ahn) { free(ah); continue; }
                 if (!ILV) { altv[v] = ah; altvn[v] = ahn; altvl[v] = ahn; continue; }
                 uint8_t *ai = NULL;
-                size_t ain = ilv_pack(alt, an, rb0 + nl0, ni0, w->ibx.d, w->ibx.n, ZT, &ai);
+                size_t ain = ilv_pack(alt, an, rb0 + nl0, ni0, w->ibx.d, w->ibx.n, &ai);
                 free(ah);
                 if (ain) { altv[v] = ai; altvn[v] = ain; altvl[v] = ahn; } else free(ai);
             }
         }
-        free(hb[0]); free(hb[1]); free(gb); free(rb0);
+        free(hb); free(gb); free(rb0);
         free(ic.d); free(it.d); ZSTD_freeCCtx(mc);
     }
     if (RUNHEAD) { free(w->ibx.d); w->ibx.d = NULL; w->ibx.n = 0; }
@@ -2999,7 +2983,7 @@ static void ktw_close(ktw *w) {
     uint64_t h[16] = { nidx, (NAMES_OUT ? 0 : nzl) | (tokused ? TOKFLAG : 0) | (CARTUSED ? CARTFLAG : 0)
                              | (intused ? INTFLAG : 0) | (fldused ? FLDFLAG : 0) | (dropnames && !(w->ordok && nidx > 0) ? DROPPED : 0)
                              | (ALNPAF ? LENFLAG : 0) | (TAILON > 0 ? TAILFLAG : 0)
-                             | (RUNHEAD ? RUNFLAG : 0) | (ILV ? ILVFLAG : 0) | (GRP ? GRPFLAG : 0) | (ZT ? ZTFLAG : 0)
+                             | (RUNHEAD ? RUNFLAG : 0) | (ILV ? ILVFLAG : 0) | (GRP ? GRPFLAG : 0)
                              | (ALNPAF ? ALNFLAG : 0) | (DBFEATS ? DBFLAG : 0)
                              | (NAMES_OUT ? SIDEFLAG : 0)
                              | (npl || (PERMON && NAMEMODE == 1) ? PERMFLAG : 0)
@@ -3070,7 +3054,7 @@ kt_writer *kt_open(FILE *out) {
     for (int i = 0; i < nlabtab; i++) free(labtab[i]);
     free(labhash); labhash = NULL;
     nlabtab = 0; lastid = -1; labhash_init = 0; lcache_init = 0;
-    TAILSEEN = 0; TAILON = -1; TAILPRED = 0; ALNHIT = 0; RUNHEAD = ILV = GRP = ZT = 0;
+    TAILSEEN = 0; TAILON = -1; TAILPRED = 0; ALNHIT = 0; RUNHEAD = ILV = GRP = 0;
     return ktw_open(out);
 }
 void kt_block(kt_writer *w, uint64_t rows) { (void)w; BLOCK = rows ? rows : UINT64_MAX; BLOCKSET = 1; }
@@ -3140,7 +3124,7 @@ typedef struct {
     const uint8_t *payend;        /* the cached block's payload end, per reader */
     const uint8_t *curlp, *curip;
     uint64_t rowhash, tailpred, tailskip; int taildec;   /* for a track read as --ref */
-    int runhead, ilv, grp, zt, rfilled; uint32_t *rtab;   /* run counts lifted out of the lengths */
+    int runhead, ilv, grp, rfilled; uint32_t *rtab;   /* run counts lifted out of the lengths */
 } R;
 
 static void loadichunk(R *r, uint64_t c) {
@@ -3244,7 +3228,7 @@ static R *ropen(const char *path) {
     if (fseeko(r->f, 8 + 128, SEEK_SET)) die("seek");
     uint64_t nml = h[1] & ~(TOKFLAG | INTFLAG | FLDFLAG | DROPPED | ALNFLAG | DBFLAG
                             | SIDEFLAG | LENFLAG | TAILFLAG | PERMFLAG
-                            | PERMTOK | CARTFLAG | RUNFLAG | ILVFLAG | GRPFLAG | ZTFLAG);   /* h[1] also holds flags */
+                            | PERMTOK | CARTFLAG | RUNFLAG | ILVFLAG | GRPFLAG);   /* h[1] also holds flags */
 
     if (nml > fsz || h[2] > fsz || h[3] > fsz || h[6] > fsz || h[11] > fsz
         || h[14] > fsz || h[11] + h[14] > fsz
@@ -3318,13 +3302,12 @@ static R *ropen(const char *path) {
     if (was_aln && ALNPAF && (h[13] >> 8) != (ALNHASH & ((1ull << 56) - 1)))
         die("this PAF, reference or name map is not the one the track was encoded with");
     r->cart = (h[1] & CARTFLAG) != 0;
-    r->runhead = runhead; r->ilv = ilv; r->grp = (h[1] & GRPFLAG) != 0; r->zt = (h[1] & ZTFLAG) != 0;
-    if (r->zt && (r->grp || !runhead)) die("corrupt file: a folded zero tail without plain run counts");
+    r->runhead = runhead; r->ilv = ilv; r->grp = (h[1] & GRPFLAG) != 0;
     if (r->grp && (ilv || !runhead)) die("corrupt file: grouped lengths without their run counts");
     if (runhead) r->rtab = xmalloc(mul(h[0] ? h[0] : 1, sizeof *r->rtab));
     if (r->cart && !was_db) die("corrupt file: vocabulary featureIDs without --db");
     h[1] &= ~(TOKFLAG | INTFLAG | DROPPED | ALNFLAG | DBFLAG | SIDEFLAG | LENFLAG
-              | TAILFLAG | PERMFLAG | PERMTOK | CARTFLAG | RUNFLAG | ILVFLAG | FLDFLAG | GRPFLAG | ZTFLAG);
+              | TAILFLAG | PERMFLAG | PERMTOK | CARTFLAG | RUNFLAG | ILVFLAG | FLDFLAG | GRPFLAG);
     uint8_t *iz = xmalloc(h[2]), *sz = xmalloc(h[3]);
     uint8_t *nz = NULL;
     r->nz_off = ftello(r->f);
@@ -3792,12 +3775,11 @@ static size_t rmheads(R *r, uint8_t *b, size_t n) {
     uint64_t i = 0, seen = 0;
     while (p < e) {
         if (i >= r->nreads) die("corrupt block: more reads than the header claims");
-        uint64_t k = vget(&p), zz = r->zt ? k & 1 : 0;
-        if (r->zt) k >>= 1;
+        uint64_t k = vget(&p);
         if (p > e) die("corrupt block: a run count runs past the lengths");
         if (!k || k > r->rows - seen) die("corrupt block: a run count is out of range");
         r->rtab[i++] = (uint32_t)k; seen += k;
-        for (uint64_t j = 0; j < k - zz; j++) {
+        for (uint64_t j = 0; j < k; j++) {
             const uint8_t *s0 = p;
             if (p >= e) die("corrupt block: a read runs past its lengths");
             vget(&p);
@@ -3805,7 +3787,6 @@ static size_t rmheads(R *r, uint8_t *b, size_t n) {
             size_t len = (size_t)(p - s0);
             memmove(w, s0, len); w += len;
         }
-        if (zz) *w++ = 0;                  /* the folded zero tail, back */
     }
     if (i != r->nreads || seen != r->rows)
         die("corrupt block: the run counts do not add up to the row count");
@@ -3834,8 +3815,7 @@ static size_t ilv_split(R *r, uint8_t *b, size_t n, size_t nl, size_t ni) {
     while (p < e) {
         const uint8_t *h0 = p;
         if (p >= e) break;
-        uint64_t k = vget(&p), zz = r->zt ? k & 1 : 0;
-        if (r->zt) k >>= 1;
+        uint64_t k = vget(&p);
         if (p > e) die("corrupt block: a run count runs past the frame");
         if (!k || k > r->rows - seen) die("corrupt block: a run count is out of range");
         size_t hg = (size_t)(p - h0);
@@ -3849,7 +3829,7 @@ static size_t ilv_split(R *r, uint8_t *b, size_t n, size_t nl, size_t ni) {
             size_t lg = (size_t)(lw - lv);
             if ((size_t)(wi - tmp) + lg > ni) die("corrupt block: the label region overflows");
             memcpy(wi, lv, lg); wi += lg;
-            if (!(zz && j + 1 == k)) TAKE(wl, nl, b);
+            TAKE(wl, nl, b);
         }
         seen += k;
     }

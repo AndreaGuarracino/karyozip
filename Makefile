@@ -6,23 +6,21 @@ all:
 rust:
 	cd rust && cargo build --release
 
-# Every local check, one target, 6 minutes: the hand-computed cases, leaks
-# and fuzz on the C, the same on the Rust (they found 13 divergences diff.sh
-# could not see), and C against Rust on generated inputs. The matrix takes 18
-# minutes a cell and runs on gemini, tests/matrix.sbatch.
+# Every local check, one target: the hand-computed cases, leaks and fuzz on
+# the C, the same on the Rust (they found 13 divergences diff.sh could not
+# see), and C against Rust on generated inputs. The three are independent and
+# run side by side, each one's output kept together.
 test: all rust
-	$(MAKE) -C c test
-	KT=$(CURDIR)/rust/target/release/karyozip LT=$(CURDIR)/c/build/libtest bash c/tests/run.sh
-	bash tests/diff.sh
-
-# The real-data gate: every track of a corpus, both binaries, both modes;
-# BASE=old/karyozip also fails on any track the change made bigger.
-CORPUS ?= $(HOME)/karyoscope-realdata/kstracks
-sweep: all rust
-	bash tests/sweep.sh $(CORPUS) c/build/karyozip rust/target/release/karyozip $(BASE)
+	@$(MAKE) --no-print-directory -j3 -O test-c test-rust test-diff
+test-c:
+	@$(MAKE) --no-print-directory -C c test
+test-rust:
+	@KT=$(CURDIR)/rust/target/release/karyozip LT=$(CURDIR)/c/build/libtest bash c/tests/run.sh
+test-diff:
+	@bash tests/diff.sh
 
 clean:
 	$(MAKE) -C c clean
 	cd rust && cargo clean 2>/dev/null || true
 
-.PHONY: all rust test sweep clean
+.PHONY: all rust test test-c test-rust test-diff clean

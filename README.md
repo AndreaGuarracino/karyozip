@@ -1,85 +1,123 @@
 # karyozip
 
-Reads and writes the **KaryoScope Track (KST)** format: lossless, compact storage and O(1) random access for k-mer annotation tracks.
+Compresses KaryoScope annotation tracks losslessly, and reads them back without decompressing the whole file.
+A `.bed.gz` track becomes one `.kst` file, several times smaller; `decode` returns the original BED byte for byte.
 
-Two implementations, `c/` and `rust/`, which produce the same bytes and print the same `--help`.
-`make test` proves it; `COMPARISON.md` has the numbers.
+## Install
 
 ```
-make            # both binaries
-make test       # 64.5 s: the suite, sanitizers and fuzz on both binaries, C against Rust
+make            # builds c/build/karyozip and rust/target/release/karyozip
 ```
 
-`tests/bench.sbatch` runs the benchmark on the cluster at three sizes over the same rows, `small`, `wide` and `big`, every row checked for its round trip, for C against Rust bytes and for smoothing against KaryoScope's own, and recording the layout and codecs each encode chose.
-`tests/bench.sh CELLDIR PAF FEATURES HIER REFDIR [C] [RUST] [KIND:PART[:SEEK[:IMPL]]]` prints its table, one TSV row per feature set, smoothing, storage form, seekability, mode and implementation.
+Either binary works; they write and read the same files.
+The C needs zstd, liblzma, zlib and an OpenMP compiler; the Rust needs cargo, liblzma and libgomp.
+
+## Quick start
+
+```
+karyozip encode < sample.chromosome.presmoothed.bed.gz > sample.kst
+karyozip decode sample.kst > sample.bed                  # the original BED, byte for byte
+karyozip region sample.kst chr1_hap1 1000000 1200000     # the runs overlapping a range
+karyozip smooth sample.kst hierarchy.tsv chromosome      # KaryoScope's smoothing, from the presmoothed track
+```
+
+`encode` reads plain or gzipped BED from stdin, so it can sit behind `karyoscope annotate` in a pipe.
+Every other text input may be plain or gzipped too.
 
 ## Commands
 
-Every text input may be plain, gzipped or bgzipped, and is inflated on the fly: the BED on stdin, the `--db` BEDs, `--ref`, the PAF, `--aln-names`, `--names F` and the hierarchy.
+```
+karyozip encode [flags] < in.bed[.gz] > out.kst
+karyozip decode F                               the whole track as BED
+karyozip region F SEQ                           one sequence
+karyozip region F SEQ POS                       the run covering POS
+karyozip region F SEQ START END [HALO]          the runs overlapping START..END, plus HALO runs each side
+karyozip smooth F HIER FS [SEQ [START END]]     KaryoScope's hierarchy smoothing of feature set FS
+karyozip index F                                adds a name index, so region finds a read fast on tracks with many reads
+karyozip aln-pack P.paf REF.bed|REF.kst OUT     cuts a PAF to what --aln needs
+```
+
+## Size or speed
+
+| you want | use |
+|---|---|
+| the smallest file, to archive | `encode`, the default |
+| a smaller file still, whatever the time | `encode --slow` |
+| a quicker encode, a larger file | `encode --fast` |
+| fast `region` queries on a big track | `encode --queryable`, 3.1% larger in our test |
+
+The default looks at the first 16 MB of a track to choose how to store it, `--fast` at 4 MB, `--slow` at all of it.
+On our four biggest test tracks, up to 84,741,909 rows, `--slow` took 4.5 to 6.6 times as long as the default and came out 0% to 3.1% smaller.
+`--queryable` combines with any of the three.
+
+## Feature sets, smoothing and alignments
+
+A KaryoScope run writes one BED per feature set, presmoothed and smoothed.
+
+- **Smoothed tracks need not be stored.** `karyozip smooth` rebuilds a smoothed track from the presmoothed one, row for row as KaryoScope writes it. The exception is the v1 `region` and `acrocentric` sets, whose hierarchy changed after they were written: store those.
+- **All feature sets in one file.** `--db features.tsv` merges one sample's per-set BEDs into a single, smaller track. Smoothed sets merged this way also need `--hier hierarchy.tsv`, on encode and on every read.
 
 ```
-karyozip encode [flags] < in.bed[.gz]   > out.kst
-karyozip decode F | --db F.tsv [--hier H] [--out DIR] [--set A,B] F
-karyozip region F SEQ | SEQ POS | SEQ START END [HALO]
-karyozip smooth F HIER FS [SEQ [START END]]
-karyozip index  F                       appends a name index to the track
-karyozip aln-pack P.paf REF.bed|REF.kst OUT   packs a PAF to only what --aln reads
+karyozip encode --db features.tsv s.acrocentric.bed.gz s.chromosome.bed.gz ... > s.all.kst
+karyozip decode --db features.tsv --out DIR s.all.kst       # every set's BED back
+karyozip decode --db features.tsv --set gene s.all.kst      # one set
 ```
 
-## Encode modes
+- **Against a reference.** With the reads aligned to a reference (a PAF) and the reference's own track, `--aln P.paf --ref ref.bed` stores only what differs from the reference. Every read of such a file takes the same `--aln` and `--ref`.
 
-With no flag the file is one block, the smallest, with no random access.
-The three search modes are one algorithm with two settings, which codecs and how much data decides:
+## Read names
 
-| mode | codecs | decides on |
-|---|---|---|
-| `--fast` | 8 of the 51 codecs, plus zstd | the first 4 MB of each stream |
-| default | every codec, plus zstd at the level and at 22 | the first 16 MB |
-| `--slow` | every codec, plus zstd at the level and at 22 | the whole file |
-
-In all three the smallest wins, with no margin, and must read back what it was ranked on.
-A one-block file also picks its layout on the same sample: lengths and labels apart, run counts heading each read's lengths, lengths grouped by label, or labels interleaved with lengths.
-Read names get the same rule: zstd, integer deltas, field deltas or the CRAM name tokeniser, ranked on the mode's sample.
-Encode says on stderr what it chose, on its `layout:` and `names:` lines; `--profile` adds the time each phase took.
-
-`--queryable` asks for 262144-row blocks and a block index, and keeps only codecs that decode fast: no bzip3, arith or LZMA.
-It composes with the three modes.
-
-## Flags
+Read names are stored in the file by default.
 
 | flag | effect |
 |---|---|
-| `--queryable` | 262144-row blocks, a block index and fast-decoding codecs only |
-| `--fast`, `--slow` | the search modes above; not both |
-| `--block N`, `--block all` | rows per block by hand; `all`, the default, is one block |
-| `--level N` | zstd level, 1 to 22, default 17; given, zstd-22 is no longer tried |
-| `--sort`, `--sort=MEM` | order records by label tuple, then lengths; spill to `--tmp-dir` past `MEM` |
-| `--names keep` | store names even when they are 0,1,2,... |
-| `--names drop`, `--names drop:F` | store none, or write them to `F` beside the track |
-| `--db features.tsv` | one BED per feature set, or one merged featureID track; every reader takes it, and region then prints one label per set |
-| `--hier hierarchy.tsv` | with `--db`: a label tuple outside features.tsv, as a smoothed track carries, gets 2^26 plus its rank in the sorted per-set vocabulary (the features.tsv column, the hierarchy nodes of that set, `novel`), the same id in every file; a track that used one needs the same two files to read, and smooth takes its HIER as the `--hier` |
-| `--aln P.paf --ref R` | do not store what the reference already gives; every reader takes the same pair. `R` is the reference BED, or that BED encoded plainly as a `.kst`, which a query reads one contig of instead of parsing the whole text |
-| `--aln-names F` | with `--aln`, on encode and decode: ordinal N is line N+1 of `F` |
-| `--tail 0\|1`, `--tok-chunk N`, `--id-codec N`, `--len-codec N` | pin what the search would choose: the last-run trick, the name tokeniser's chunk, the label and length codecs |
-| `--names F`, `--names ordinal` | on the readers: names from a `drop:F` file, a FASTA, a FASTQ or a list, one a line; or accept a track whose names were dropped |
-| `--raw`, `--out DIR` | on decode: what is stored, reversing no transform; one BED per feature set under `--db` |
-| `--set A,B` | decode and region under `--db`: which feature sets, default all. decode without `--out` and region print the picked labels as columns, merged where they all agree, so one set gives that set's own track |
-| `--max-gap N`, `--v1` | on smooth; `SEQ START END` smooths the whole sequence and prints the overlap, so it equals the full smooth |
-| `--threads N`, `-t N` | 1 to 1024. Default `OMP_NUM_THREADS`, else cores capped at 8 |
-| `--tmp-dir DIR`, `--profile`, `--help`, `--version` | any command |
+| `--names drop` | store none; the file is smaller and a read is known by its number |
+| `--names drop:F` | write the names to `F` beside the track |
+| `--names F` | on decode, region and smooth: take names from `F`, a `drop:F` file, a FASTA, a FASTQ or a list, one a line |
+| `--names ordinal` | on decode: accept a track stored with `--names drop` and print the numbers |
+| `--names keep` | store names even when they are 0, 1, 2, ... |
 
-Every flag is read before the command runs, so it works on either side of the command name.
-Two environment variables are read and neither changes the stored bytes: `TMPDIR` when `--tmp-dir` is not given, and `OMP_NUM_THREADS` when `--threads` is not given, so a SLURM allocation is honoured.
+`--sort` groups records by their labels, which pays on short reads stored with `--names drop`; a decode then returns the rows in that order.
 
-`--sort` reorders records, so a decode of a sorted track returns the rows in sorted order.
-Compare such a decode against a sorted copy of the input.
+## All flags
 
-The name index `karyozip index` appends holds a 32-bit fingerprint and a bit-packed ordinal a name, 2,044,644 bytes for 300,000 reads, so `region` finds a read by name without decoding every name.
+| flag | on | effect |
+|---|---|---|
+| `--fast`, `--slow`, `--queryable` | encode | see Size or speed |
+| `--block N`, `--block all` | encode | rows per block by hand; `all`, the default, is one block |
+| `--level N` | encode | zstd level, 1 to 22, default 17 |
+| `--sort`, `--sort=MEM` | encode | group records by labels; spill to disk past `MEM` |
+| `--names ...` | encode, readers | see Read names |
+| `--db features.tsv`, `--hier H`, `--set A,B` | encode, readers | see Feature sets |
+| `--aln P.paf --ref R`, `--aln-names F` | encode, readers | see Feature sets; `--aln-names`: read N is line N+1 of `F` |
+| `--out DIR`, `--raw` | decode | one BED per set under `--db`; `--raw` prints what is stored, for debugging |
+| `--max-gap N`, `--v1` | smooth | KaryoScope's smoothing options |
+| `--threads N`, `-t N` | all | default `OMP_NUM_THREADS`, else the cores, up to 8 |
+| `--tmp-dir DIR` | all | where temporary files go, default `TMPDIR`, else /tmp |
+| `--profile`, `--help`, `--version` | all | time per phase; usage; library versions |
+| `--tail 0\|1`, `--tok-chunk N`, `--id-codec N`, `--len-codec N` | encode | pin a choice the encoder otherwise makes itself |
 
-## Library
+Flags work on either side of the command name.
 
-An annotator can write a `.kst` directly instead of emitting a BED for karyozip to re-parse.
-`make` builds `c/build/libkaryozip.a`; the API is six calls in `c/karyozip.h`: `kt_open`, `kt_block`, `kt_level`, `kt_row`, `kt_close`, `kt_version`.
+## Supplementary: technical notes
+
+**Two implementations.** `c/` and `rust/` write the same bytes, print the same `--help` and refuse the same inputs with the same words; `rust/build.rs` takes the usage text from `c/karyozip.c`.
+`make test` (64.5 s) runs the test suite, sanitizers and fuzzing on both and compares them encode by encode.
+The C finds zstd, liblzma, zlib and libgomp at the path in its rpath; the Rust bundles zstd.
+
+**How encode chooses.** The three modes are one rule with two settings: `--fast` tries 8 of the 51 codecs on 4 MB, the default all 51 plus zstd at 17 and 22 on 16 MB, `--slow` the same on the whole file.
+The smallest wins, with no margin, and must read back what it was ranked on.
+A one-block file also chooses its layout on the same sample: lengths and labels apart, run counts heading each read's lengths, lengths grouped by label, or labels interleaved with lengths; every layout and codec is ranked in one parallel pool.
+Names are ranked the same way among zstd, integer deltas, field deltas and the CRAM name tokeniser.
+Encode prints what it chose on stderr, on its `layout:` and `names:` lines.
+`--queryable` asks for 262144-row blocks and a block index and drops the codecs slow to decode: bzip3, arith and LZMA.
+
+**Name index.** `karyozip index` appends a 32-bit fingerprint and a bit-packed ordinal per name, 2,044,644 B for 300,000 reads; a fingerprint match is confirmed against the decoded name.
+
+**Benchmark.** `tests/bench.sbatch` runs `tests/bench.sh` on the cluster at three sizes over the same rows, `small`, `wide` and `big`, checking every row's round trip, C against Rust bytes and smoothing against KaryoScope's, and recording the layout, codecs and phase times each encode chose.
+
+**Library.** `make` also builds `c/build/libkaryozip.a`, six calls in `c/karyozip.h` (`kt_open`, `kt_block`, `kt_level`, `kt_row`, `kt_close`, `kt_version`), for an annotator that writes `.kst` directly.
+Rows must arrive grouped by sequence, each sequence once, starting at 0, gapless; anything else is refused with the CLI's message.
 
 ```c
 kt_writer *w = kt_open(f);
@@ -87,12 +125,5 @@ kt_row(w, name, nlen, run_len, label, llen, start);   /* once per run */
 kt_close(w);
 ```
 
-Rows must arrive as a track is already laid out: grouped by sequence, each sequence appearing once, starting at 0, gapless.
-Those three properties were checked on 264,914,318 real rows across all four data classes with zero violations, and anything else is refused with the message the CLI gives.
-
-## Dependencies
-
-zstd and liblzma, and the vendored htscodecs and bzip3 under `c/`.
-Both vendored libraries are pinned: `c/htscodecs/PROVENANCE` and `c/bzip3/PROVENANCE` name the release and every local patch.
-The bzip3 patches matter: upstream 1.5.3 loses half the data on an input that is an exact multiple of the block size, and `c/bzip3/lastblock_check.c` reproduces it.
-The vendored `libbz3.c` also encodes and decodes its independent blocks in parallel with OpenMP, writing the same bytes as the serial loop.
+**Vendored code.** htscodecs and bzip3 under `c/` are pinned; `c/htscodecs/PROVENANCE` and `c/bzip3/PROVENANCE` name the release and every local patch.
+Upstream bzip3 1.5.3 loses half the data on an input that is an exact multiple of the block size, which `c/bzip3/lastblock_check.c` reproduces; the vendored copy also runs its independent blocks in parallel, writing the same bytes.

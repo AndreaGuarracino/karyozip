@@ -57,7 +57,7 @@ fn main() {
     }
     opt.slow = !c.fast;
     opt.whole = c.slow;
-    if c.queryable && c.block.is_none() { opt.block = 262144; }
+    if c.fast && c.block.is_none() { opt.block = 262144; }   // --fast: blocks and an index, for queries
     if let Some(m) = &c.sort {
         opt.sort = true;
         // clap cannot tell "--sort" from "--sort=", and the C refuses the

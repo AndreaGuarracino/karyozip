@@ -57,9 +57,6 @@ pub struct Cli {
     /// every codec decided on the whole file
     #[arg(long, global = true)]
     pub slow: bool,
-    /// blocks and an index, for random access
-    #[arg(long, global = true)]
-    pub queryable: bool,
     /// order by label tuple, then lengths
     #[arg(long, global = true, num_args = 0..=1, require_equals = true,
           default_missing_value = "", value_name = "MEM")]
@@ -191,7 +188,6 @@ impl Cli {
         if self.fast && !enc { bad("--fast")?; }
         if self.slow && !enc { bad("--slow")?; }
         if self.fast && self.slow { return Err("encode takes --fast or --slow, not both".into()); }
-        if self.queryable && !enc { bad("--queryable")?; }
         if self.sort.is_some() && !enc { bad("--sort")?; }
         if self.tail.is_some() && !enc { bad("--tail")?; }
         if self.tok_chunk.is_some() && !enc { bad("--tok-chunk")?; }

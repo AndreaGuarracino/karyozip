@@ -35,7 +35,7 @@ DB="-i $D/db.acrocentric.bed -i $D/db.chromosome.bed -i $D/db.gene.bed -i $D/db.
 mkdir -p "$W/out"
 run "encode"                       "$SAN" encode < "$D/ls.bed"
 run "encode --fast"                "$SAN" --fast encode < "$D/ls.bed"
-run "encode --queryable"           "$SAN" --queryable encode < "$D/ls.bed"
+run "encode --block 262144"       "$SAN" --block 262144 encode < "$D/ls.bed"
 run "encode --sort"                "$SAN" --sort encode < "$D/ls.bed"
 run "encode --sort=1M"             "$SAN" --tmp-dir "$W" --sort=1M encode < "$D/ls.bed"
 run "encode --names drop:F"        "$SAN" encode --names drop:"$W/side2" < "$D/ls.bed"

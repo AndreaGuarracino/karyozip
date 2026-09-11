@@ -159,7 +159,7 @@ for kind in $KINDS; do
   for set in $sets; do [ -n "$ONLY" ] && [ "$ONLY" != "$set" ] && continue
     q=$(ls "$D"/*."$set"."$kind".bed.gz 2>/dev/null | grep -v '/ref\.' | head -1); [ -n "$q" ] || { echo "bench: no $set $kind track in the cell" >&2; BAD=$((BAD+1)); continue; }
     ref=""; [ -s "$PAF" ] && { ref=$(refof "$set" "$kind"); [ -s "$ref" ] && ref=$(kstref "$ref"); [ -s "$ref" ] || { echo "bench: no $set $kind reference track" >&2; BAD=$((BAD+1)); }; }
-    for seek in $SEEKS; do bf=""; [ $seek = seekable ] && bf="--queryable"
+    for seek in $SEEKS; do bf="--block all"; [ $seek = seekable ] && bf="--block 262144"
       for mode in default fast; do mf=""; [ $mode = fast ] && mf="--fast"
         for impl in $IMPLS; do bin=$C; [ $impl = Rust ] && bin=$R
           row "$set" "$kind" not-informed "$seek" "$mode" "$impl" "$bin" "$q" "$bf $mf" "" 0
@@ -188,7 +188,7 @@ for kind in $KINDS; do
   ins=""; for set in $sets; do f=$(ls "$D"/*."$set"."$kind".bed.gz 2>/dev/null | grep -v '/ref\.' | head -1); [ -n "$f" ] && ins="$ins $f"; done
   [ $(echo $ins | wc -w) = $(echo $allsets | wc -w) ] || { echo "bench: $kind --db rows skipped, the cell lacks a set its database lists" >&2; continue; }
   ref=""; [ -s "$PAF" ] && { ref=$(refof chromosome "$kind"); [ -s "$ref" ] && ref=$(kstref "$ref"); [ -s "$ref" ] || { echo "bench: no chromosome $kind reference track" >&2; BAD=$((BAD+1)); }; }
-  for seek in $SEEKS; do bf=""; [ $seek = seekable ] && bf="--queryable"
+  for seek in $SEEKS; do bf="--block all"; [ $seek = seekable ] && bf="--block 262144"
     for mode in default fast; do mf=""; [ $mode = fast ] && mf="--fast"
       for impl in $IMPLS; do bin=$C; [ $impl = Rust ] && bin=$R
         row ALL "$kind" not-informed "$seek" "$mode" "$impl" "$bin" "$ins" "$bf $mf" "" 0

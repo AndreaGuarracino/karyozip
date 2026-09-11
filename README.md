@@ -41,8 +41,7 @@ karyozip aln-pack -a P.paf -r REF.bed|REF.kst -o OUT  cuts a PAF to what -a need
 |---|---|
 | a small file, the usual choice | `encode` |
 | the smallest file, however long it takes | `encode --slow` |
-| a quick encode | `encode --fast` |
-| fast `region` queries on a big track | `encode --queryable`, with any of the above |
+| a quick encode and fast `region` queries, a larger file | `encode --fast` |
 
 ## Feature sets, smoothing and alignments
 
@@ -85,8 +84,8 @@ Read names are stored in the file by default.
 | `--halo N` | region | N more runs each side of the range |
 | `-f`, `--feature-set FS` | smooth | the feature set to smooth |
 | `--hier FILE` | smooth; encode and readers with `-d` | the KaryoScope hierarchy.tsv |
-| `--fast`, `--slow`, `--queryable` | encode | see Size or speed |
-| `-b`, `--block N`, `--block all` | encode | rows per block by hand; `all`, the default, is one block |
+| `--fast`, `--slow` | encode | see Size or speed |
+| `-b`, `--block N`, `--block all` | encode | rows per block by hand: `all` is one block, the default; `--fast` uses 262144 |
 | `-l`, `--level N` | encode | zstd level, 1 to 22, default 17 |
 | `--sort`, `--sort=MEM` | encode | group records by labels; spill to disk past `MEM` |
 | `-n`, `--names ...` | encode, readers | see Read names |
@@ -112,7 +111,7 @@ The smallest wins, with no margin, and must read back what it was ranked on.
 A one-block file also chooses its layout on the same sample: lengths and labels apart, run counts heading each read's lengths, lengths grouped by label, or labels interleaved with lengths; every layout and codec is ranked in one parallel pool.
 Names are ranked the same way among zstd, integer deltas, field deltas and the CRAM name tokeniser.
 Encode prints what it chose on stderr, on its `layout:` and `names:` lines.
-`--queryable` asks for 262144-row blocks and a block index and drops the codecs slow to decode: bzip3, arith and LZMA.
+`--fast` also writes 262144-row blocks and a block index, which a query decodes one at a time, and so drops the codecs slow to decode: bzip3, arith and LZMA.
 
 **Name index.** `karyozip index` appends a 32-bit fingerprint and a bit-packed ordinal per name, 2,044,644 B for 300,000 reads; a fingerprint match is confirmed against the decoded name.
 

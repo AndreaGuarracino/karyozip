@@ -34,7 +34,7 @@ echo "codecs: every candidate round-trips"
 
 # 2. encode must be byte-identical, over every fixture and flag.
 for f in "$D"/*.bed; do
-  for fl in "" "--block 4" "--queryable" "--level 3" "--level 22" "--names keep" "--tok-chunk 2" \
+  for fl in "" "--block 4" "--block 262144" "--level 3" "--level 22" "--names keep" "--tok-chunk 2" \
             "--fast" "--fast --block 4" "--tail 0" "--tail 1" "--names drop" \
             "--tok-chunk 250000" "--fast --level 22" \
             "--sort" "--sort --names keep" "--sort --names drop" "--sort=1M" \
@@ -47,7 +47,7 @@ tally encode
 # 3. decode: the Rust must give back exactly what was encoded.
 dok=0; dbad=0
 for f in "$D"/*.bed; do
-  for fl in "" "--block 4" "--queryable" "--level 3" "--names keep"; do
+  for fl in "" "--block 4" "--block 262144" "--level 3" "--names keep"; do
     "$C" $fl encode < "$f" > "$W/t.kst" 2>/dev/null
     "$R" decode -i "$W/t.kst" 2>/dev/null | cmp -s - "$f" && dok=$((dok+1)) \
       || { dbad=$((dbad+1)); echo "  decode differs: $(basename "$f") [$fl]"; }
@@ -201,7 +201,7 @@ echo "refusals: same message from both"
 python3 "$D/kt.py" gen "$W" 20
 gok=0; gbad=0
 for f in "$W"/ok*.bed; do
-  for fl in "" "--block 4" "--queryable" "--sort" "--names drop" "--fast --block 3"; do
+  for fl in "" "--block 4" "--block 262144" "--sort" "--names drop" "--fast --block 3"; do
     "$C" $fl encode < "$f" > "$W/c.kst" 2>/dev/null; c1=$?
     "$R" $fl encode < "$f" > "$W/r.kst" 2>/dev/null; c2=$?
     if cmp -s "$W/c.kst" "$W/r.kst" && [ $c1 = $c2 ]; then gok=$((gok+1))

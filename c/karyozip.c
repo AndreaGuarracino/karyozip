@@ -5174,7 +5174,7 @@ int main(int argc, char **argv) {
     atexit(profdump);
     atexit(emitflush);
     static const char *const USAGE = "usage:\n"
-            "  karyozip encode [-i IN.bed[.gz]] [-o OUT.kst] [--fast | --slow] [--queryable]\n"
+            "  karyozip encode [-i IN.bed[.gz]] [-o OUT.kst] [--fast | --slow]\n"
             "                  [-b N|all] [-l N] [-n keep|drop|drop:FILE] [--sort[=MEM]]\n"
             "                  [-d features.tsv [--hier H] -i SET.bed ...] [-a P.paf -r R.bed|R.kst [--aln-names F]]\n"
             "  karyozip decode -i F [-o OUT.bed] [-n FILE|ordinal] [--raw]\n"
@@ -5186,7 +5186,8 @@ int main(int argc, char **argv) {
             "  encode reads stdin without -i; every command but index writes stdout without -o\n"
             "  any command: -t N, --threads N  --profile  --tmp-dir DIR  -h, --help\n"
             "               --version prints the zstd, libbz3 and htscodecs versions\n"
-            "  encode:      --queryable asks for blocks and an index, for random access\n"
+            "  encode:      --fast: a quick encode, and blocks with an index for fast queries\n"
+            "               --slow: the smallest file; -b N|all sets the blocks by hand\n"
             "               --tail 0|1  --tok-chunk N  --id-codec N  --len-codec N pin what the search picks\n"
             "  readers:     -n, -d, --hier, -a, -r as encode was given; -n FILE takes the names from\n"
             "               drop:FILE, a FASTA, FASTQ or list; -n ordinal accepts dropped names\n"
@@ -5219,7 +5220,7 @@ int main(int argc, char **argv) {
         {"--version",0},{"--threads",1},{"-t",1},{"--profile",0},{"--tmp-dir",1},{"--names",1},
         {"--tok-chunk",1},{"--tail",1},{"--id-codec",1},{"--len-codec",1},
         {"--max-gap",1},{"--v1",0},{"--aln-names",1},{"--sort",0},
-        {"--fast",0},{"--slow",0},{"--queryable",0},
+        {"--fast",0},{"--slow",0},
         {"--block",1},{"--level",1},{"--db",1},{"--aln",1},
         {"--ref",1},{"--out-dir",1},{"--set",1},{"--raw",0},{"--hier",1},
         {"--input",1},{"--output",1},{"--seq",1},{"--pos",1},{"--start",1},{"--end",1},
@@ -5291,7 +5292,6 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--fast") || !strcmp(a, "--slow")) {
             if (FASTMODE || SLOW) die("encode takes --fast or --slow, not both");
             ok = enc; SLOW = a[2] == 's'; FASTMODE = !SLOW; take = 1; }
-        else if (!strcmp(a, "--queryable")) { ok = enc; BLOCK = 262144; BLOCKSET = 1; take = 1; }
         else if (!strcmp(a, "--block")) { ok = enc;
             BLOCK = !strcmp(v, "all") ? UINT64_MAX      /* one block, no random access */
                   : (uint64_t)int_arg(v, 1, 0x7fffffffffffffffL,
@@ -5321,6 +5321,7 @@ int main(int argc, char **argv) {
     }
     if (!*cmd) die(USAGE);   /* flags but no command: argv[1] is now past the end */
     if (!enc && !rd && !pack) die("bad command or missing arguments");
+    if (FASTMODE && !BLOCKSET) BLOCK = 262144;   /* --fast: blocks and an index, for queries */
     for (int i = 2; i < argc; i++) {   /* every argument is a flag now */
         if (argv[i][0] == '-' && argv[i][1]) fprintf(stderr, "karyozip: unknown flag %s\n", argv[i]);
         else fprintf(stderr, "karyozip: unexpected argument %s\n", argv[i]);

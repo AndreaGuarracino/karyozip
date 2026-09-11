@@ -55,7 +55,7 @@ echo "fuzz: $n malformed encodes, all refused"
 python3 "$D/kt.py" gen "$W" "$N"
 v=0
 for f in "$W"/ok*.bed; do
-  for m in "" "--block 4" "--queryable" "--sort" "--names drop" "--fast --block 3" "--level 1"; do
+  for m in "" "--block 4" "--block 262144" "--sort" "--names drop" "--fast --block 3" "--level 1"; do
     $KT encode $m < "$f" > "$W/v.kt" 2>"$W/err" || { echo "fuzz: valid BED REFUSED ($f $m): $(tail -1 "$W/err")"; fail=1; continue; }
     case "$m" in *sort*)  $KT decode -i "$W/v.kt" 2>/dev/null | sort | cmp -s - <(sort "$f") ;;
                  *drop*)  $KT decode --names ordinal -i "$W/v.kt" 2>/dev/null | cut -f2- | cmp -s - <(cut -f2- "$f") ;;
@@ -93,7 +93,7 @@ d=0
 # every writer path: plain, one block, slow, sorted with names, sorted
 # without, a sidecar, and a --db track
 $KT encode --block 32 --names drop:"$W/side.names" < "$W/ok.bed" > "$W/side.kt" 2>/dev/null
-for m in "--block 32" "--queryable --level 22" "--block 32 --fast" "--block 32 --sort=1G" \
+for m in "--block 32" "--block 262144 --level 22" "--block 32 --fast" "--block 32 --sort=1G" \
          "--block 32 --sort=1G --names drop" "names-in"; do
   case "$m" in *names-in*) cp "$W/side.kt" "$W/t.kt";; *) $KT encode $m < "$W/ok.bed" > "$W/t.kt" 2>/dev/null || { echo "fuzz: encode $m FAILED"; fail=1; continue; };; esac
   sz=$(stat -c%s "$W/t.kt")

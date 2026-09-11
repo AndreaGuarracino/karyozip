@@ -78,7 +78,7 @@ $KT encode < "$D/s.bed" > "$W/p.kt" 2>/dev/null
 $KT encode < "$D/db.rall.bed" > "$W/omp.ref" 2>/dev/null
 $KT decode -i "$W/p.kt" 2>/dev/null | cmp -s - "$D/s.bed" && echo "plain: byte-identical" || { echo "plain: WRONG"; fail=1; }
 
-for f in --sort "--sort --names drop" "--queryable" "--block 4"; do
+for f in --sort "--sort --names drop" "--block 262144" "--block 4"; do
   ofl=""
   $KT encode $f < "$D/s.bed" > "$W/f.kt" 2>/dev/null || { echo "$f: ENCODE FAILED"; fail=1; continue; }
   case "$f" in
@@ -845,8 +845,8 @@ must_fail "region with END before START" $KT region -i "$W/p.kt" -s q1 --start 1
 must_fail "--threads 100000" $KT -t 100000 encode < "$D/s.bed"
 rc=0; (ulimit -f 1; $KT encode < "$W/pbig.bed" > "$W/lim.kt" 2> "$W/lim.err") || rc=$?
 [ $rc = 1 ] && echo "file-size limit: exit 1, not a signal" || { echo "file-size limit: rc=$rc"; fail=1; }
-$KT --len-codec 0 --id-codec 0 encode --level 1 --queryable < "$W/pbig.bed" > "$W/l5.kt" 2>/dev/null
-$KT --len-codec 0 --id-codec 0 encode --level 1 --queryable --fast < "$W/pbig.bed" > "$W/l5s.kt" 2>/dev/null
+$KT --len-codec 0 --id-codec 0 encode --level 1 --block 262144 < "$W/pbig.bed" > "$W/l5.kt" 2>/dev/null
+$KT --len-codec 0 --id-codec 0 encode --level 1 --fast < "$W/pbig.bed" > "$W/l5s.kt" 2>/dev/null
 [ "$(stat -c%s "$W/l5.kt")" = "$(stat -c%s "$W/l5s.kt")" ] && echo "--fast keeps --level: same size" || { echo "--fast keeps --level: WRONG"; fail=1; }
 $KT encode < "$D/db.rall.bed" > "$W/sd.kt" 2>/dev/null; $KT --fast encode < "$D/db.rall.bed" > "$W/ss.kt" 2>/dev/null
 [ "$(stat -c%s "$W/ss.kt")" -le "$(stat -c%s "$W/sd.kt")" ] && echo "--fast never larger: $(stat -c%s "$W/ss.kt") <= $(stat -c%s "$W/sd.kt") B" || { echo "--fast LARGER than the default"; fail=1; }
@@ -985,9 +985,9 @@ if [ -x "$LT" ]; then
     $LT "$D/$f" "$W/ll.kt" 2>/dev/null
     cmp -s "$W/lc.kt" "$W/ll.kt" || { lok=0; echo "  library differs on $f"; }
   done
-  $KT --queryable encode < "$D/db.rall.bed" > "$W/lc.kt" 2>/dev/null
+  $KT --block 262144 encode < "$D/db.rall.bed" > "$W/lc.kt" 2>/dev/null
   $LT "$D/db.rall.bed" "$W/ll.kt" 262144 2>/dev/null
-  cmp -s "$W/lc.kt" "$W/ll.kt" || { lok=0; echo "  library differs on --queryable"; }
+  cmp -s "$W/lc.kt" "$W/ll.kt" || { lok=0; echo "  library differs on --block 262144"; }
   $KT --block 4 encode < "$D/db.rall.bed" > "$W/lc.kt" 2>/dev/null
   $LT "$D/db.rall.bed" "$W/ll.kt" 4 2>/dev/null
   $LT -twice "$W/lt1.kt" "$W/lt2.kt" 2>/dev/null; printf 't1\t0\t7\tCCC\nt1\t7\t12\tAAA\n' | $KT encode 2>/dev/null | cmp -s - "$W/lt2.kt" \

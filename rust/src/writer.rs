@@ -540,11 +540,11 @@ impl Writer {
             for k in 1..4 { if sz[k] > 0 && (sz[l] == 0 || sz[k] < sz[l]) { l = k; } }
             (idc, lvl_id) = (r[0].0, if r[0].1 < 0 { level } else { r[0].1 });
             (ilvcodec, lvl_len) = (r[l + 1].0, if r[l + 1].1 < 0 { level } else { r[l + 1].1 });
-            let hb = if l > 0 { splice_heads(&lens0, &self.ibx) } else { None };
-            match l {
-                1 => { altbuf = hb.unwrap_or_default(); alt_lens = altbuf.len(); }
+            match l {   // the winner built whole; only the headed one keeps its buffer
+                1 => { altbuf = splice_heads(&lens0, &self.ibx).unwrap_or_default(); alt_lens = altbuf.len(); }
                 2 => { altbuf = grp_pack(&lens0, &ids0, &self.ibx).unwrap_or_default(); alt_lens = altbuf.len(); grp = true; }
-                3 => { altbuf = ilv_pack(&lens0, &ids0, &self.ibx).unwrap_or_default(); alt_lens = hb.map_or(0, |h| h.len()); ilv = true; }
+                3 => { alt_lens = splice_heads(&lens0, &self.ibx).map_or(0, |h| h.len());
+                       altbuf = ilv_pack(&lens0, &ids0, &self.ibx).unwrap_or_default(); ilv = true; }
                 _ => {}
             }
             runhead = l > 0;
@@ -853,10 +853,11 @@ impl Writer {
     fn read_block(&self, i: usize) -> std::io::Result<(Vec<u8>, Vec<u8>)> {
         use std::os::unix::fs::FileExt;
         let m = &self.bm[i];
-        let mut b = vec![0u8; m.len];
-        self.raw.read_exact_at(&mut b, m.off)?;
-        let ids = b.split_off(m.lens);
-        Ok((b, ids))
+        // two buffers read in place: one read then split_off kept the labels twice
+        let (mut lens, mut ids) = (vec![0u8; m.lens], vec![0u8; m.len - m.lens]);
+        self.raw.read_exact_at(&mut lens, m.off)?;
+        self.raw.read_exact_at(&mut ids, m.off + m.lens as u64)?;
+        Ok((lens, ids))
     }
 }
 

@@ -332,6 +332,7 @@ fn encode(opt: writer::Options, tmpdir: &std::path::Path, a: Option<aln::Aln>) {
     }
 
     drop(_p);
+    drop(slab); drop(stdin);   // the input buffers go before the close, as the C's
     finish(w, aln_on);
 }
 

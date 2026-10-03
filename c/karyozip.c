@@ -619,11 +619,10 @@ static size_t fldnames(buf *names, uint64_t n, uint8_t **out) {
 }
 
 static size_t fldnames1(buf *names, uint64_t n, uint8_t **out) {
-    if (!n) return 0;
+    if (!n || !names->n || names->d[names->n - 1] != '\n') return 0;
     const char *p = (const char *)names->d, *end = p + names->n;
-    const char *f0[FLDMAX]; size_t l0[FLDMAX]; int nf = 0, isnum[FLDMAX];
+    const char *f0[FLDMAX]; size_t l0[FLDMAX]; int nf = 0;
     {   const char *q = p, *nl = memchr(q, '\n', (size_t)(end - q));
-        if (!nl) return 0;
         while (q <= nl) {
             const char *s = memchr(q, FLDSEP, (size_t)(nl - q));
             const char *e2 = s ? s : nl;
@@ -633,42 +632,59 @@ static size_t fldnames1(buf *names, uint64_t n, uint8_t **out) {
             q = s + 1;
         }
     }
-    int ishex[FLDMAX];
-    for (int i = 0; i < nf; i++) { isnum[i] = 1; ishex[i] = !(l0[i] & 1) && l0[i] > 0 && l0[i] <= 64; }   /* the reader takes 64 */
-    int *same = xmalloc((size_t)nf * sizeof *same);
-    for (int i = 0; i < nf; i++) same[i] = 1;
-    int64_t *prev = xcalloc((size_t)nf, sizeof *prev);
-    buf v = {0};
-    /* one pass: the fields of every name, checked and delta'd as we go */
-    const char *q = p;
-    for (uint64_t r = 0; r < n; r++) {
-        const char *nl = q < end ? memchr(q, '\n', (size_t)(end - q)) : NULL;
-        if (!nl) { free(v.d); free(same); free(prev); return 0; }
-        const char *c = q; int k = 0;
-        while (c <= nl && k < nf) {
-            const char *s = memchr(c, FLDSEP, (size_t)(nl - c));
-            const char *e2 = s ? s : nl;
-            size_t len = (size_t)(e2 - c);
-            if (same[k] && (len != l0[k] || memcmp(c, f0[k], len))) same[k] = 0;
-            if (isnum[k]) {
-                if (!len || len > 18 || (len > 1 && c[0] == '0')) isnum[k] = 0;
-                else for (size_t j = 0; j < len; j++)
-                         if (c[j] < '0' || c[j] > '9') { isnum[k] = 0; break; }
-            }
-            if (ishex[k]) {
-                if (len != l0[k]) ishex[k] = 0;
-                else for (size_t j = 0; j < len; j++)
-                         if (!((c[j] >= '0' && c[j] <= '9') || (c[j] >= 'a' && c[j] <= 'f')))
-                             { ishex[k] = 0; break; }
-            }
-            if (!same[k] && !isnum[k] && !ishex[k]) { free(v.d); free(same); free(prev); return 0; }
-            c = e2 + 1; k++;
-            if (!s) break;
-        }
-        if (k != nf || c != nl + 1) { free(v.d); free(same); free(prev); return 0; }
-        q = nl + 1;
+    /* one chunk a thread, cut at line ends: each decides its fields, then
+       each writes its deltas from the last name of the chunk before */
+    int T = nthreads(); if (T > 64) T = 64;
+    size_t cut[65]; cut[0] = 0;
+    for (int t = 1; t < T; t++) {
+        size_t g = names->n * (size_t)t / (size_t)T; if (g < cut[t - 1]) g = cut[t - 1];
+        const char *nl = g < names->n ? memchr(p + g, '\n', names->n - g) : NULL;
+        cut[t] = nl ? (size_t)(nl - p) + 1 : names->n;
     }
-    /* the template, then a read's varying fields together */
+    cut[T] = names->n;
+    uint8_t cs[64][FLDMAX], cnum[64][FLDMAX], chex[64][FLDMAX]; uint64_t cseen[64]; int cbad[64];
+#ifdef _OPENMP
+#pragma omp parallel for num_threads(T)
+#endif
+    for (int t = 0; t < T; t++) {
+        uint8_t *same = cs[t], *isnum = cnum[t], *ishex = chex[t]; uint64_t seen = 0; int bad = 0;
+        for (int k = 0; k < nf; k++) { same[k] = 1; isnum[k] = 1; ishex[k] = !(l0[k] & 1) && l0[k] > 0 && l0[k] <= 64; }   /* the reader takes 64 */
+        for (const char *q = p + cut[t], *ce = p + cut[t + 1]; q < ce && !bad; ) {
+            const char *nl = memchr(q, '\n', (size_t)(ce - q)), *c = q; int k = 0;
+            while (c <= nl) {
+                const char *s = memchr(c, FLDSEP, (size_t)(nl - c)), *e2 = s ? s : nl;
+                size_t len = (size_t)(e2 - c);
+                if (k == nf) { bad = 1; break; }
+                if (same[k] && (len != l0[k] || memcmp(c, f0[k], len))) same[k] = 0;
+                if (isnum[k]) {
+                    if (!len || len > 18 || (len > 1 && c[0] == '0')) isnum[k] = 0;
+                    else for (size_t j = 0; j < len; j++) if (c[j] < '0' || c[j] > '9') { isnum[k] = 0; break; }
+                }
+                if (ishex[k]) {
+                    if (len != l0[k]) ishex[k] = 0;
+                    else for (size_t j = 0; j < len; j++)
+                             if (!((c[j] >= '0' && c[j] <= '9') || (c[j] >= 'a' && c[j] <= 'f'))) { ishex[k] = 0; break; }
+                }
+                if (!same[k] && !isnum[k] && !ishex[k]) { bad = 1; break; }
+                c = e2 + 1; k++;
+                if (!s) break;
+            }
+            if (k != nf) bad = 1;
+            seen++; q = nl + 1;
+        }
+        cseen[t] = seen; cbad[t] = bad;
+    }
+    int same[FLDMAX], isnum[FLDMAX]; uint64_t seen = 0;
+    for (int k = 0; k < nf; k++) { same[k] = 1; isnum[k] = 1; }
+    int ishex[FLDMAX]; for (int k = 0; k < nf; k++) ishex[k] = 1;
+    for (int t = 0; t < T; t++) {
+        if (cbad[t]) return 0;
+        seen += cseen[t];
+        for (int k = 0; k < nf; k++) { same[k] &= cs[t][k]; isnum[k] &= cnum[t][k]; ishex[k] &= chex[t][k]; }
+    }
+    if (seen != n) return 0;
+    for (int k = 0; k < nf; k++) if (!same[k] && !isnum[k] && !ishex[k]) return 0;
+    buf v = {0};   /* the template, then a read's varying fields together */
     bvar(&v, (uint64_t)nf);
     bvar(&v, (uint64_t)(unsigned char)FLDSEP);
     for (int i = 0; i < nf; i++) {
@@ -677,30 +693,44 @@ static size_t fldnames1(buf *names, uint64_t n, uint8_t **out) {
         if (ty == 0) { bvar(&v, l0[i]); bput(&v, f0[i], l0[i]); }
         else if (ty == 2) bvar(&v, l0[i]);
     }
-    q = p;
-    for (uint64_t r = 0; r < n; r++) {
-        const char *nl = memchr(q, '\n', (size_t)(end - q));
-        const char *c = q; int k = 0;
-        while (k < nf) {
-            const char *s = memchr(c, FLDSEP, (size_t)(nl - c));
-            const char *e2 = s ? s : nl;
-            if (!same[k] && isnum[k]) {
-                int64_t x = 0;
-                for (const char *j = c; j < e2; j++) x = x * 10 + (*j - '0');
-                int64_t d = x - prev[k]; prev[k] = x;
-                bvar(&v, ((uint64_t)d << 1) ^ (uint64_t)(d >> 63));
-            } else if (!same[k]) {                     /* hex, two nibbles a byte */
-                for (size_t j = 0; j + 1 < l0[k]; j += 2) {
-                    int hi = c[j] <= '9' ? c[j] - '0' : c[j] - 'a' + 10;
-                    int lo = c[j + 1] <= '9' ? c[j + 1] - '0' : c[j + 1] - 'a' + 10;
-                    uint8_t b8 = (uint8_t)(hi << 4 | lo); bput(&v, &b8, 1);
-                }
+    buf *w = xcalloc((size_t)T, sizeof *w);
+#ifdef _OPENMP
+#pragma omp parallel for num_threads(T)
+#endif
+    for (int t = 0; t < T; t++) {
+        int64_t prev[FLDMAX] = {0};
+        if (cut[t]) {                                  /* the last name before the chunk */
+            const char *nl = p + cut[t] - 1, *c = nl;
+            while (c > p && c[-1] != '\n') c--;
+            for (int k = 0; k < nf; k++) {
+                const char *s = memchr(c, FLDSEP, (size_t)(nl - c)), *e2 = s ? s : nl;
+                if (isnum[k]) for (const char *j = c; j < e2; j++) prev[k] = prev[k] * 10 + (*j - '0');
+                c = e2 + 1;
             }
-            c = e2 + 1; k++;
         }
-        q = nl + 1;
+        for (const char *q = p + cut[t], *ce = p + cut[t + 1]; q < ce; ) {
+            const char *nl = memchr(q, '\n', (size_t)(ce - q)), *c = q;
+            for (int k = 0; k < nf; k++) {
+                const char *s = memchr(c, FLDSEP, (size_t)(nl - c)), *e2 = s ? s : nl;
+                if (!same[k] && isnum[k]) {
+                    int64_t x = 0;
+                    for (const char *j = c; j < e2; j++) x = x * 10 + (*j - '0');
+                    int64_t d = x - prev[k]; prev[k] = x;
+                    bvar(&w[t], ((uint64_t)d << 1) ^ (uint64_t)(d >> 63));
+                } else if (!same[k]) {                     /* hex, two nibbles a byte */
+                    for (size_t j = 0; j + 1 < l0[k]; j += 2) {
+                        int hi = c[j] <= '9' ? c[j] - '0' : c[j] - 'a' + 10;
+                        int lo = c[j + 1] <= '9' ? c[j + 1] - '0' : c[j + 1] - 'a' + 10;
+                        uint8_t b8 = (uint8_t)(hi << 4 | lo); bput(&w[t], &b8, 1);
+                    }
+                }
+                c = e2 + 1;
+            }
+            q = nl + 1;
+        }
     }
-    free(same); free(prev);
+    for (int t = 0; t < T; t++) { bput(&v, w[t].d, w[t].n); free(w[t].d); }
+    free(w);
     uint8_t *z = NULL; size_t zn = paycomp(v.d, v.n, CODEC_BZIP3 | 64, &z);
     if (!zn) { free(v.d); free(z); return 0; }
     uint8_t hdr[10], *hw = hdr; vput(&hw, v.n);   /* bzip3 needs the size back */

@@ -1383,26 +1383,49 @@ fn fld_names1(names: &[u8], n: u64, sep: u8) -> Option<Vec<u8>> {
     let first: Vec<&[u8]> = names.split(|&c| c == b'\n').next()?.split(|&c| c == sep).collect();
     let nf = first.len();
     if nf == 0 || nf > FLDMAX { return None; }
-    let (mut same, mut isnum) = (vec![true; nf], vec![true; nf]);
-    let mut ishex: Vec<bool> = first.iter().map(|f| !f.is_empty() && f.len() % 2 == 0 && f.len() <= 64).collect();
-    let mut seen = 0u64;
-    for line in names.split(|&c| c == b'\n') {          // one pass to decide
-        if seen == n { if line.is_empty() { break; } return None; }
-        let mut k = 0usize;
-        for g in line.split(|&c| c == sep) {             // in place: no vector a name
-            if k == nf { return None; }
-            if same[k] && g != first[k] { same[k] = false; }
-            if isnum[k] && (g.is_empty() || g.len() > 18 || (g.len() > 1 && g[0] == b'0')
-                            || !g.iter().all(|c| c.is_ascii_digit())) { isnum[k] = false; }
-            if ishex[k] && (g.len() != first[k].len()
-                            || !g.iter().all(|c| c.is_ascii_digit() || (*c >= b'a' && *c <= b'f'))) { ishex[k] = false; }
-            if !same[k] && !isnum[k] && !ishex[k] { return None; }
-            k += 1;
-        }
-        if k != nf { return None; }
-        seen += 1;
+    // one chunk a thread, cut at line ends: each decides its fields, then
+    // each writes its deltas from the last name of the chunk before
+    let nt = rayon::current_num_threads().max(1);
+    let mut cut = vec![0usize];
+    for t in 1..nt {
+        let g = names.len() * t / nt;
+        let e = memchr::memchr(b'\n', &names[g.max(*cut.last().unwrap())..]).map_or(names.len(), |k| g.max(*cut.last().unwrap()) + k + 1);
+        cut.push(e.min(names.len()));
     }
-    if seen != n { return None; }
+    cut.push(names.len());
+    let scan = |a: usize, b: usize| -> Option<(Vec<bool>, Vec<bool>, Vec<bool>, u64)> {
+        let (mut same, mut isnum) = (vec![true; nf], vec![true; nf]);
+        let mut ishex: Vec<bool> = first.iter().map(|f| !f.is_empty() && f.len() % 2 == 0 && f.len() <= 64).collect();
+        let mut seen = 0u64;
+        for line in names[a..b].split(|&c| c == b'\n') {
+            if line.is_empty() && seen > 0 { continue; }
+            let mut k = 0usize;
+            for g in line.split(|&c| c == sep) {             // in place: no vector a name
+                if k == nf { return None; }
+                if same[k] && g != first[k] { same[k] = false; }
+                if isnum[k] && (g.is_empty() || g.len() > 18 || (g.len() > 1 && g[0] == b'0')
+                                || !g.iter().all(|c| c.is_ascii_digit())) { isnum[k] = false; }
+                if ishex[k] && (g.len() != first[k].len()
+                                || !g.iter().all(|c| c.is_ascii_digit() || (*c >= b'a' && *c <= b'f'))) { ishex[k] = false; }
+                if !same[k] && !isnum[k] && !ishex[k] { return None; }
+                k += 1;
+            }
+            if k != nf { return None; }
+            seen += 1;
+        }
+        Some((same, isnum, ishex, seen))
+    };
+    let parts: Vec<_> = cut.windows(2).collect::<Vec<_>>().into_par_iter()
+        .map(|w| if w[0] == w[1] { Some((vec![true; nf], vec![true; nf], vec![true; nf], 0)) } else { scan(w[0], w[1]) })
+        .collect::<Option<Vec<_>>>()?;
+    let (mut same, mut isnum, mut ishex) = (vec![true; nf], vec![true; nf], vec![true; nf]);
+    let mut seen = 0u64;
+    for (sa, nu, hx, c) in &parts {
+        for k in 0..nf { same[k] &= sa[k]; isnum[k] &= nu[k]; ishex[k] &= hx[k]; }
+        seen += c;
+    }
+    if names.last() != Some(&b'\n') || seen != n { return None; }
+    if (0..nf).any(|k| !same[k] && !isnum[k] && !ishex[k]) { return None; }
     let mut v = Vec::new();
     kst::put(&mut v, nf as u64);
     kst::put(&mut v, sep as u64);
@@ -1412,25 +1435,30 @@ fn fld_names1(names: &[u8], n: u64, sep: u8) -> Option<Vec<u8>> {
         if ty == 0 { kst::put(&mut v, first[k].len() as u64); v.extend_from_slice(first[k]); }
         else if ty == 2 { kst::put(&mut v, first[k].len() as u64); }
     }
-    let mut prev = vec![0i64; nf];
-    let mut left = n;
-    for line in names.split(|&c| c == b'\n') {          // then one to write
-        if left == 0 { break; }
-        let mut k = 0usize;
-        for f in line.split(|&c| c == sep) {
-            if !same[k] && isnum[k] {
-                let mut x: i64 = 0;
-                for &c in f { x = x * 10 + (c - b'0') as i64; }
-                let d = x - prev[k]; prev[k] = x;
-                kst::put(&mut v, ((d << 1) ^ (d >> 63)) as u64);
-            } else if !same[k] {
-                let hx = |c: u8| if c <= b'9' { c - b'0' } else { c - b'a' + 10 };
-                for j in (0..f.len() - 1).step_by(2) { v.push(hx(f[j]) << 4 | hx(f[j + 1])); }
-            }
-            k += 1;
+    let num = |f: &[u8]| f.iter().fold(0i64, |x, &c| x * 10 + (c - b'0') as i64);
+    let write = |a: usize, b: usize| -> Vec<u8> {
+        let mut w = Vec::with_capacity((b - a) / 2);
+        let mut prev = vec![0i64; nf];
+        if a > 0 {   // the last name before this chunk seeds the deltas
+            let s0 = memchr::memrchr(b'\n', &names[..a - 1]).map_or(0, |k| k + 1);
+            for (k, f) in names[s0..a - 1].split(|&c| c == sep).enumerate() { if isnum[k] { prev[k] = num(f); } }
         }
-        left -= 1;
-    }
+        for line in names[a..b].split(|&c| c == b'\n') {
+            if line.is_empty() { continue; }
+            for (k, f) in line.split(|&c| c == sep).enumerate() {
+                if !same[k] && isnum[k] {
+                    let x = num(f); let d = x - prev[k]; prev[k] = x;
+                    kst::put(&mut w, ((d << 1) ^ (d >> 63)) as u64);
+                } else if !same[k] {
+                    let hx = |c: u8| if c <= b'9' { c - b'0' } else { c - b'a' + 10 };
+                    for j in (0..f.len() - 1).step_by(2) { w.push(hx(f[j]) << 4 | hx(f[j + 1])); }
+                }
+            }
+        }
+        w
+    };
+    let pieces: Vec<Vec<u8>> = cut.windows(2).collect::<Vec<_>>().into_par_iter().map(|w| write(w[0], w[1])).collect();
+    for p in pieces { v.extend_from_slice(&p); }
     let z = ffi::paycomp(&v, ffi::CODEC_BZIP3 | 64)?;
     let mut out = Vec::with_capacity(z.len() + 10);
     kst::put(&mut out, v.len() as u64);

@@ -100,8 +100,15 @@ static void profdump(void) {
                 ru.ru_maxrss / 1048576.0);
     }
 }
-static void die(const char *m) { fprintf(stderr, "karyozip: %s\n", m); exit(1); }
-static void die2(const char *a, const char *b) { fprintf(stderr, "karyozip: %s%s\n", a, b); exit(1); }
+/* Workers die too, from inside parallel regions: two threads calling
+   exit() at once is undefined, so the first one through takes the lock,
+   prints and exits, and any other waits there until the process ends. */
+static pthread_mutex_t DIELOCK = PTHREAD_MUTEX_INITIALIZER;
+static void die2(const char *a, const char *b) {
+    pthread_mutex_lock(&DIELOCK);
+    fprintf(stderr, "karyozip: %s%s\n", a, b); exit(1);
+}
+static void die(const char *m) { die2(m, ""); }
 
 static __thread size_t ALLOCMAX = 0;
 static void ckalloc(size_t n) {
@@ -1705,6 +1712,13 @@ static uint32_t refrow(const qseg *Q, uint64_t st, uint64_t len) {
     uint32_t a = reflabel(Q, st + len / 4), b = reflabel(Q, st + len / 2);
     if (a == b) return a;
     return a == reflabel(Q, st + 3 * len / 4) ? a : b;
+}
+/* the reference's label id for a row stored as "=", by query or by name */
+static uint32_t refrow_at(const char *nm, uint64_t st, uint64_t len);
+static uint32_t eqrow(const qseg *Q, const char *nm, uint64_t st, uint64_t len, uint64_t nlab) {
+    uint32_t rl = Q ? refrow(Q, st, len) : refrow_at(nm, st, len);
+    if (rl == UINT32_MAX || rl >= nlab) die("a delta row has no reference answer: wrong PAF or reference track");
+    return rl;
 }
 static uint32_t refrow_at(const char *nm, uint64_t st, uint64_t len) {
     static __thread const qseg *cq = NULL; static __thread char cn[512];
@@ -4017,11 +4031,7 @@ static char *putlab(char *o, const R *r, uint64_t f, const char *seq, uint64_t s
     if (r->lab && f >= r->nlab) die("corrupt block: a label id past the table");
     if (!r->lab) return putu64(o, f);
     const char *L = r->lab[f];
-    if (ALNPAF && L[0] == '=' && !L[1]) {
-        uint32_t rl = refrow_at(seq, st, len);
-        if (rl == UINT32_MAX || rl >= r->nlab) die("a delta row has no reference answer: wrong PAF or reference track");
-        L = r->lab[rl];
-    }
+    if (ALNPAF && L[0] == '=' && !L[1]) L = r->lab[eqrow(NULL, seq, st, len, r->nlab)];
     if (!DBFEATS) { size_t n = strlen(L); memcpy(o, L, n); return o + n; }
     uint32_t id = featid(L);
     for (size_t j = 0; j < NSETK; j++) {
@@ -4079,10 +4089,7 @@ static void dump(const char *path) {
             const char *L2 = (lablen && f < r->nlab) ? r->lab[f] : NULL;
             size_t Ln = L2 ? lablen[f] : 0;
             if (ALNPAF && L2 && L2[0] == '=' && !L2[1]) {
-                uint32_t rl = refrow(Q, st, e - st);
-                if (rl == UINT32_MAX) die("a delta row has no reference answer: "
-                                          "wrong PAF or reference track");
-                L2 = labtab[rl]; Ln = strlen(L2); restored++;
+                L2 = labtab[eqrow(Q, NULL, st, e - st, (uint64_t)nlabtab)]; Ln = strlen(L2); restored++;
             }
             size_t need = nlen + (L2 ? Ln : 20) + 48;   /* this row: name, two numbers, label */
             if ((size_t)(o - ob) + need > OCAP) {
@@ -4436,11 +4443,7 @@ static uint64_t loadseq(R *r, int64_t ri, uint64_t **st, uint64_t **en, int **fe
         (*st)[k] = s; (*en)[k] = e;
         if (f >= r->nlab) die("corrupt block: a label id past the table");
         int m = labmap[f];
-        if (m == INT_MIN) {                 /* stored as =: the reference row's label */
-            uint32_t rl = refrow_at(r->name[ri], s, e - s);
-            if (rl == UINT32_MAX || rl >= r->nlab) die("a delta row has no reference answer: wrong PAF or reference track");
-            f = rl; m = labmap[f];
-        }
+        if (m == INT_MIN) { f = eqrow(NULL, r->name[ri], s, e - s, r->nlab); m = labmap[f]; }   /* stored as = */
         if (m == INT_MIN + 1) die("corrupt --db track: a label is not a featureID");
         (*novel)[k] = isnovel[f];
         (*feat)[k] = isnovel[f] ? ROOTID : m;
@@ -5059,12 +5062,7 @@ static void decode_db(const char *path, const char *dir) {
             if (r->lab && f >= r->nlab) die("corrupt block: a label id past the table");
             const char *idtxt = (r->lab && f < r->nlab) ? r->lab[f] : NULL;
 
-            if (ALNPAF && idtxt && idtxt[0] == '=' && !idtxt[1]) {
-                uint32_t rl = refrow(Q, s, len);
-                if (rl == UINT32_MAX)
-                    die("a delta row has no reference answer: wrong PAF or --ref");
-                idtxt = labtab[rl];
-            }
+            if (ALNPAF && idtxt && idtxt[0] == '=' && !idtxt[1]) idtxt = labtab[eqrow(Q, NULL, s, len, (uint64_t)nlabtab)];
             /* the label text IS the featureID: parse it as strictly as encode did */
             uint32_t id = idtxt ? featid(idtxt) : (uint32_t)f;
             for (size_t j = 0; j < nout; j++) {

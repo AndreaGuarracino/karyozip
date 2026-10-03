@@ -327,7 +327,7 @@ impl Aln {
         let mut nb = 0usize;
         let mut at = 0usize;
         while at < nms.len() {
-            let Some(k) = memchr::memchr(b'\n', &nms[at..]) else {
+            let Some(k) = crate::ffi::find(b'\n', &nms[at..]) else {
                 crate::bail("corrupt packed alignment: a name has no newline")
             };
             let name = nms[at..at + k].to_vec();

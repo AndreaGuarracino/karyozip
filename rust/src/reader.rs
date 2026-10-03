@@ -191,7 +191,7 @@ impl Reader {
             if h[7] == 0 { crate::bail("corrupt file: a label table with no labels"); }
             let mut q = 0;
             for _ in 0..h[7] {
-                let nl = memchr::memchr(b'\n', &lbuf[q..]).unwrap_or_else(|| crate::bail("bad label table"));
+                let nl = crate::ffi::find(b'\n', &lbuf[q..]).unwrap_or_else(|| crate::bail("bad label table"));
                 lab.push(lbuf[q..q + nl].to_vec()); q += nl + 1;
             }
             if q != lbuf.len() { crate::bail("corrupt file: the label table has more lines than its count"); }

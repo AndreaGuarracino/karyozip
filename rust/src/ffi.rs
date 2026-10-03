@@ -294,3 +294,21 @@ pub fn redirect(path: &str, fd: i32) {
             else { std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o644).open(path) };
     if !f.is_ok_and(|f| unsafe { dup2(f.as_raw_fd(), fd) } >= 0) { crate::bail(&format!("cannot open {path}")) }
 }
+
+// glibc's byte search: on short fields 2.4x fewer instructions than the
+// memchr crate's dispatch layers, and the same code the C calls
+unsafe extern "C" {
+    #[link_name = "memchr"] fn c_memchr(s: *const u8, c: i32, n: usize) -> *const u8;
+    #[link_name = "memrchr"] fn c_memrchr(s: *const u8, c: i32, n: usize) -> *const u8;
+    #[link_name = "strchrnul"] fn c_strchrnul(s: *const u8, c: i32) -> *const u8;
+}
+fn at(s: &[u8], p: *const u8) -> Option<usize> { if p.is_null() { None } else { Some(p as usize - s.as_ptr() as usize) } }
+/// The first `b` in `s`.
+pub fn find(b: u8, s: &[u8]) -> Option<usize> { at(s, unsafe { c_memchr(s.as_ptr(), b as i32, s.len()) }) }
+/// The last `b` in `s`.
+pub fn rfind(b: u8, s: &[u8]) -> Option<usize> { at(s, unsafe { c_memrchr(s.as_ptr(), b as i32, s.len()) }) }
+/// The first newline or NUL in `s`, which must end in a newline.
+pub fn line_end(s: &[u8]) -> usize {
+    assert_eq!(s.last(), Some(&b'\n'));
+    unsafe { c_strchrnul(s.as_ptr(), b'\n' as i32) as usize - s.as_ptr() as usize }
+}

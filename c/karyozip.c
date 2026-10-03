@@ -128,6 +128,24 @@ static uint64_t bedcoord_e(const char *p, const char *end, const char *what,
     }
     return v;
 }
+/* digits then a tab: the fast path */
+static inline char *digtab(char *p, const char *e, uint64_t *v) {
+    char *s = p; uint64_t x = 0;
+    if (e - p >= 8) {                       /* eight digits at once */
+        uint64_t w; memcpy(&w, p, 8);
+        uint64_t m = ((w + 0x4646464646464646u) | (w - 0x3030303030303030u)) & 0x8080808080808080u;
+        int n = m ? __builtin_ctzll(m) >> 3 : 8;
+        if (!n) return NULL;
+        w = (w - 0x3030303030303030u) << (64 - 8 * n);
+        w = (w * 2561) >> 8;
+        w = ((w & 0x00FF00FF00FF00FFu) * 6553601) >> 16;
+        x = (uint32_t)(((w & 0x0000FFFF0000FFFFu) * 42949672960001u) >> 32);
+        p += n;
+    }
+    while (p < e && (unsigned)(*p - '0') < 10) x = x * 10 + (uint64_t)(*p++ - '0');
+    if (p == s || p == e || *p != '\t' || p - s > 19) return NULL;
+    *v = x; return p;
+}
 static uint64_t bedcoord(const char *p, const char *end, const char *what) {
     const char *err = NULL;
     uint64_t v = bedcoord_e(p, end, what, &err);
@@ -2385,19 +2403,25 @@ static void encode(void) {
             size_t n = 0;
             const char *e = NULL;
             char *p = slab + cb[t], *e2 = slab + cb[t + 1], *nlp;
-            while (p < e2 && (nlp = memchr(p, '\n', (size_t)(e2 - p)))) {
+            /* a chunk ends in a newline, so strchrnul stays inside */
+            while (p < e2) {
+                nlp = strchrnul(p, '\n');
+                if (!*nlp) { e = "a NUL byte inside a row"; break; }
                 *nlp = 0;
                 ssize_t len = (ssize_t)(nlp - p);
                 char *line = p;
                 p = nlp + 1;
-                if (memchr(line, 0, (size_t)len)) { e = "a NUL byte inside a row"; break; }
-                char *t1 = memchr(line, '\t', (size_t)len); if (!t1) { e = "bad line"; break; }
-                char *t2 = memchr(t1 + 1, '\t', (size_t)(len - (t1 + 1 - line))); if (!t2) { e = "bad line"; break; }
-                char *t3 = memchr(t2 + 1, '\t', (size_t)(len - (t2 + 1 - line))); if (!t3) { e = "bad line"; break; }
-                if (t1 + 1 == t2 || t2 + 1 == t3) { e = "empty start or end column"; break; }
+                char *t1 = memchr(line, '\t', (size_t)len), *t2, *t3;
                 uint64_t st = 0, en = 0;
-                st = bedcoord_e(t1 + 1, t2, "start is not a number", &e); if (e) break;
-                en = bedcoord_e(t2 + 1, t3, "end is not a number", &e); if (e) break;
+                if (!t1 || !(t2 = digtab(t1 + 1, nlp, &st)) || !(t3 = digtab(t2 + 1, nlp, &en))) {
+                    /* the slow path names the fault */
+                    if (!t1) { e = "bad line"; break; }
+                    t2 = memchr(t1 + 1, '\t', (size_t)(len - (t1 + 1 - line))); if (!t2) { e = "bad line"; break; }
+                    t3 = memchr(t2 + 1, '\t', (size_t)(len - (t2 + 1 - line))); if (!t3) { e = "bad line"; break; }
+                    if (t1 + 1 == t2 || t2 + 1 == t3) { e = "empty start or end column"; break; }
+                    st = bedcoord_e(t1 + 1, t2, "start is not a number", &e); if (e) break;
+                    en = bedcoord_e(t2 + 1, t3, "end is not a number", &e); if (e) break;
+                }
                 if (en < st) { e = "end is before start"; break; }
 
                 if (en == st) { e = "end equals start: a run must cover at least one base"; break; }

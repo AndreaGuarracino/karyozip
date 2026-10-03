@@ -297,6 +297,7 @@ fn encode(opt: writer::Options, tmpdir: &std::path::Path, a: Option<aln::Aln>) {
     let nthr = rayon::current_num_threads().min(32);
     let mut stdin = karyozip::unzip(std::io::stdin());   // plain or .gz
     let mut eof = false;
+    let mut rows: Vec<Vec<Row>> = (0..nthr).map(|_| Vec::new()).collect();   // kept across slabs, as the C's pr
     let _p = prof::span(0);
     loop {
         while !eof && have < SLAB {
@@ -317,7 +318,7 @@ fn encode(opt: writer::Options, tmpdir: &std::path::Path, a: Option<aln::Aln>) {
         // Split the lines on threads, append in order. The append is
         // serial because the streams come out in row order.
         let _s = prof::span(5);
-        let rows = parse_slab(&slab[..end], nthr);
+        parse_slab(&slab[..end], &mut rows);
         drop(_s);
         let _s = prof::span(6);
         for r in rows.iter().flatten() {
@@ -352,11 +353,12 @@ fn report(st: &writer::Stats) {
 /// 32 bytes instead of 48.
 struct Row { nm: (u32, u32), lab: (u32, u32), st: u64, en: u64 }
 
-/// Splits `s` at line boundaries into `t` chunks, parses each on its own
-/// thread, and returns the rows in order. A worker records the first thing
-/// it refuses; main reports the earliest chunk's.
-fn parse_slab(s: &[u8], t: usize) -> Vec<Vec<Row>> {
+/// Splits `s` at line boundaries into one chunk per buffer, parses each on
+/// its own thread into its buffer, in order. A worker records the first
+/// thing it refuses; main reports the earliest chunk's.
+fn parse_slab(s: &[u8], bufs: &mut [Vec<Row>]) {
     use rayon::prelude::*;
+    let t = bufs.len();
     let mut cut = vec![0usize];
     for k in 1..t {
         let mut g = s.len() * k / t;
@@ -365,28 +367,54 @@ fn parse_slab(s: &[u8], t: usize) -> Vec<Vec<Row>> {
     }
     cut.push(s.len());
     for k in 1..cut.len() { if cut[k] < cut[k - 1] { cut[k] = cut[k - 1]; } }
-    let parts: Vec<Result<Vec<Row>, &'static str>> = (0..cut.len() - 1)
-        .into_par_iter()
-        .map(|k| parse_chunk(s, cut[k], cut[k + 1]))
+    let errs: Vec<Result<(), &'static str>> = bufs.par_iter_mut().enumerate()
+        .map(|(k, out)| parse_chunk(s, cut[k], cut[k + 1], out))
         .collect();
-    parts.into_iter().map(|p| p.unwrap_or_else(|m| die(m))).collect()
+    for e in errs { e.unwrap_or_else(|m| die(m)); }
 }
 
-fn parse_chunk(s: &[u8], from: usize, to: usize) -> Result<Vec<Row>, &'static str> {
-    // a row is at least 8 bytes: sized once, so no doubling copy and only
-    // the rows used are touched, as the C's per-thread arrays
-    let mut out: Vec<Row> = Vec::with_capacity((to - from) / 8 + 1);
+/// Digits then a tab, from `p`: the tab's index and the value.
+#[inline(always)]
+fn dig_tab(l: &[u8], mut p: usize) -> Option<(usize, u64)> {
+    let (s, mut x) = (p, 0u64);
+    if l.len() - p >= 8 {   // eight digits at once
+        let mut w = u64::from_le_bytes(l[p..p + 8].try_into().unwrap());
+        let m = (w.wrapping_add(0x4646464646464646) | w.wrapping_sub(0x3030303030303030)) & 0x8080808080808080;
+        let n = if m == 0 { 8 } else { m.trailing_zeros() as usize >> 3 };
+        if n == 0 { return None; }
+        w = w.wrapping_sub(0x3030303030303030) << (64 - 8 * n);
+        w = w.wrapping_mul(2561) >> 8;
+        w = ((w & 0x00FF00FF00FF00FF).wrapping_mul(6553601)) >> 16;
+        x = ((w & 0x0000FFFF0000FFFF).wrapping_mul(42949672960001) >> 32) as u32 as u64;
+        p += n;
+    }
+    while p < l.len() && l[p].wrapping_sub(b'0') < 10 { x = x * 10 + (l[p] - b'0') as u64; p += 1; }
+    if p == s || p == l.len() || l[p] != b'\t' || p - s > 19 { return None; }
+    Some((p, x))
+}
+
+#[inline(never)]
+fn parse_chunk(s: &[u8], from: usize, to: usize, out: &mut Vec<Row>) -> Result<(), &'static str> {
+    // a row is at least 8 bytes: sized once and reused, so no doubling copy
+    // and no fresh pages each slab, as the C's per-thread arrays
+    out.clear();
+    out.reserve((to - from) / 8 + 1);
     let mut p = from;
     while p < to {
-        let Some(nl) = memchr::memchr(b'\n', &s[p..to]).map(|i| p + i) else { break };
+        // the newline and a NUL in one pass; a chunk ends in a newline
+        let nl = p + ffi::line_end(&s[p..to]);
+        if s[nl] == 0 { return Err("a NUL byte inside a row"); }
         let line = &s[p..nl];
-        if memchr::memchr(0, line).is_some() { return Err("a NUL byte inside a row"); }
-        let t1 = memchr::memchr(b'\t', line).ok_or("bad line")?;
-        let t2 = memchr::memchr(b'\t', &line[t1 + 1..]).ok_or("bad line")? + t1 + 1;
-        let t3 = memchr::memchr(b'\t', &line[t2 + 1..]).ok_or("bad line")? + t2 + 1;
-        if t1 + 1 == t2 || t2 + 1 == t3 { return Err("empty start or end column"); }
-        let st = bedcoord_r(&line[t1 + 1..t2], "start is not a number")?;
-        let en = bedcoord_r(&line[t2 + 1..t3], "end is not a number")?;
+        let t1 = ffi::find(b'\t', line);
+        let fast = t1.and_then(|t1| { let (t2, st) = dig_tab(line, t1 + 1)?; let (t3, en) = dig_tab(line, t2 + 1)?; Some((t1, t3, st, en)) });
+        let (t1, t3, st, en) = match fast { Some(f) => f, None => {
+            // the slow path names the fault
+            let t1 = t1.ok_or("bad line")?;
+            let t2 = ffi::find(b'\t', &line[t1 + 1..]).ok_or("bad line")? + t1 + 1;
+            let t3 = ffi::find(b'\t', &line[t2 + 1..]).ok_or("bad line")? + t2 + 1;
+            if t1 + 1 == t2 || t2 + 1 == t3 { return Err("empty start or end column"); }
+            (t1, t3, bedcoord_r(&line[t1 + 1..t2], "start is not a number")?, bedcoord_r(&line[t2 + 1..t3], "end is not a number")?)
+        } };
         if en < st { return Err("end is before start"); }
         if en == st { return Err("end equals start: a run must cover at least one base"); }
         if t1 == 0 { return Err("empty sequence name"); }
@@ -394,7 +422,7 @@ fn parse_chunk(s: &[u8], from: usize, to: usize) -> Result<Vec<Row>, &'static st
                        lab: ((p + t3 + 1) as u32, nl as u32), st, en });
         p = nl + 1;
     }
-    Ok(out)
+    Ok(())
 }
 
 fn probe(path: &str) {

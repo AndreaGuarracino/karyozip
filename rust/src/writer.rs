@@ -683,7 +683,7 @@ impl Writer {
             let (mut q, mut smpn) = (0usize, 0u64);
             let ncap = if self.opt.whole { usize::MAX } else { (if self.opt.slow { DEFSAMPLE } else { 4 }) << 20 };
             while q < self.names.len() && q < ncap {
-                match memchr::memchr(b'\n', &self.names[q..]) {
+                match crate::ffi::find(b'\n', &self.names[q..]) {
                     Some(k) => { q += k + 1; smpn += 1; }
                     None => break,
                 }
@@ -1396,7 +1396,7 @@ fn fld_names1(names: &[u8], n: u64, sep: u8) -> Option<Vec<u8>> {
     let mut cut = vec![0usize];
     for t in 1..nt {
         let g = names.len() * t / nt;
-        let e = memchr::memchr(b'\n', &names[g.max(*cut.last().unwrap())..]).map_or(names.len(), |k| g.max(*cut.last().unwrap()) + k + 1);
+        let e = crate::ffi::find(b'\n', &names[g.max(*cut.last().unwrap())..]).map_or(names.len(), |k| g.max(*cut.last().unwrap()) + k + 1);
         cut.push(e.min(names.len()));
     }
     cut.push(names.len());
@@ -1447,7 +1447,7 @@ fn fld_names1(names: &[u8], n: u64, sep: u8) -> Option<Vec<u8>> {
         let mut w = Vec::with_capacity((b - a) / 2);
         let mut prev = vec![0i64; nf];
         if a > 0 {   // the last name before this chunk seeds the deltas
-            let s0 = memchr::memrchr(b'\n', &names[..a - 1]).map_or(0, |k| k + 1);
+            let s0 = crate::ffi::rfind(b'\n', &names[..a - 1]).map_or(0, |k| k + 1);
             for (k, f) in names[s0..a - 1].split(|&c| c == sep).enumerate() { if isnum[k] { prev[k] = num(f); } }
         }
         for line in names[a..b].split(|&c| c == b'\n') {

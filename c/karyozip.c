@@ -2528,14 +2528,24 @@ static void rankall(int ns, const uint8_t *const *src, const size_t *m, const si
     }
     qsort(jb, nj, sizeof *jb, rjcmp);
     double *jt = xcalloc(nj, sizeof *jt), tp = nowsec();   /* per job, under --profile */
+    uint8_t **bo = xcalloc((size_t)ns, sizeof *bo); long *bj = xmalloc((size_t)ns * sizeof *bj);
+    for (int t = 0; t < ns; t++) bj[t] = -1;
 #ifdef _OPENMP
 #pragma omp parallel for schedule(dynamic, 1) num_threads(nthreads())
 #endif
     for (size_t j = 0; j < nj; j++) {
         const uint8_t *p = src[jb[j].s]; size_t k = m[jb[j].s]; uint8_t *o = NULL;
         double t0 = PROF ? nowsec() : 0;
-        if (jb[j].c) { jb[j].z = paycomp(p, k, jb[j].c, &o); free(o); }
-        else {
+        if (jb[j].c) {   /* the stream's best so far is kept for the read-back */
+            jb[j].z = paycomp(p, k, jb[j].c, &o);
+            int t = jb[j].s;
+#ifdef _OPENMP
+#pragma omp critical(rbest)
+#endif
+            if (jb[j].z && (bj[t] < 0 || jb[j].z < jb[bj[t]].z || (jb[j].z == jb[bj[t]].z && jb[j].r < jb[bj[t]].r))) {
+                free(bo[t]); bo[t] = o; o = NULL; bj[t] = (long)j; }
+            free(o);
+        } else {
             size_t cap = ZSTD_compressBound(k); o = malloc(cap);
             size_t z = o ? ZSTD_compress(o, cap, p, k, jb[j].lv) : 0;
             jb[j].z = !o || ZSTD_isError(z) ? 0 : z; free(o);
@@ -2562,7 +2572,9 @@ static void rankall(int ns, const uint8_t *const *src, const size_t *m, const si
             if (q == nj) break;
             int ok = 1;
             if (jb[q].c) {                        /* zstd is trusted, the rest read back */
-                uint8_t *o = NULL, *v = NULL; size_t z = paycomp(src[t], m[t], jb[q].c, &o);
+                uint8_t *o = NULL, *v = NULL;
+                size_t z = (long)q == bj[t] ? jb[q].z : paycomp(src[t], m[t], jb[q].c, &o);
+                if ((long)q == bj[t]) { o = bo[t]; bo[t] = NULL; }
                 ok = z && (v = malloc(m[t])) && paydecomp(o, z, jb[q].c, v, m[t]) == m[t] && !memcmp(v, src[t], m[t]);
                 free(o); free(v);
             }
@@ -2570,7 +2582,8 @@ static void rankall(int ns, const uint8_t *const *src, const size_t *m, const si
             jb[q].z = 0;                          /* it does not come back: the next */
         }
     if (PROF) fprintf(stderr, "  rank read-back: %.3f s\n", nowsec() - tp);
-    free(jb); free(jt);
+    for (int t = 0; t < ns; t++) free(bo[t]);
+    free(jb); free(jt); free(bo); free(bj);
 }
 
 static size_t lensok(ZSTD_CCtx *tc, const uint8_t *src, size_t n) {

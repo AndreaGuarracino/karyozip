@@ -1183,18 +1183,31 @@ fn rank_all(src: &[&[u8]], n: &[usize], o: &Options) -> Vec<(i32, i32, usize)> {
     jobs.sort_unstable_by_key(|j| (j.0, std::cmp::Reverse(src[j.1].len()), j.1, j.2));
     use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
     let (next, zs): (AtomicUsize, Vec<AtomicUsize>) = (AtomicUsize::new(0), jobs.iter().map(|_| AtomicUsize::new(0)).collect());
+    // each stream's best so far (size, rank, job, bytes), kept for the read-back
+    let best: Vec<std::sync::Mutex<Option<(usize, usize, usize, Vec<u8>)>>> = src.iter().map(|_| Default::default()).collect();
     rayon::broadcast(|_| loop {
         let j = next.fetch_add(1, Relaxed);
-        let Some(&(_, t, _, c, lv)) = jobs.get(j) else { break };
-        zs[j].store(if c != 0 { ffi::paycomp(src[t], c).map_or(0, |v| v.len()) } else { ffi::zstd(src[t], lv).len() }, Relaxed);
+        let Some(&(_, t, r, c, lv)) = jobs.get(j) else { break };
+        if c == 0 { zs[j].store(ffi::zstd(src[t], lv).len(), Relaxed); continue; }
+        let Some(v) = ffi::paycomp(src[t], c) else { continue };
+        zs[j].store(v.len(), Relaxed);
+        let mut b = best[t].lock().unwrap_or_else(|e| e.into_inner());
+        if b.as_ref().is_none_or(|x| (v.len(), r) < (x.0, x.1)) { *b = Some((v.len(), r, j, v)); }
     });
     let z: Vec<usize> = zs.into_iter().map(AtomicUsize::into_inner).collect();
-    (0..src.len()).into_par_iter().map(|t| {
+    let mut kept: Vec<Option<(usize, Vec<u8>)>> = best.into_iter()
+        .map(|m| m.into_inner().unwrap_or_else(|e| e.into_inner()).map(|x| (x.2, x.3))).collect();
+    kept.par_iter_mut().enumerate().map(|(t, k)| {
         let mut live: Vec<usize> = (0..jobs.len()).filter(|&j| jobs[j].1 == t && z[j] > 0).collect();
         live.sort_by_key(|&j| (z[j], jobs[j].2));
         for j in live {
             let (_, _, _, c, lv) = jobs[j];
-            if c == 0 || verifies(src[t], c) { return (c, lv, z[j]); }   // zstd is trusted, the rest read back
+            // zstd is trusted, the rest read back; the pool's bytes when it kept them
+            let ok = c == 0 || match k.take() {
+                Some((kj, v)) if kj == j => ffi::paydecomp(&v, c, src[t].len()).as_deref() == Some(src[t]),
+                _ => verifies(src[t], c),
+            };
+            if ok { return (c, lv, z[j]); }
         }
         (0, -1, 0)
     }).collect()

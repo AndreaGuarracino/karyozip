@@ -7,7 +7,7 @@ use karyozip::bail as die;
 /// The C's own usage text, lifted from karyozip.c by build.rs.
 pub const USAGE: &str = include_str!(concat!(env!("OUT_DIR"), "/usage.txt"));
 
-pub enum Cmd { Encode, Decode, Region, Smooth, Index, AlnPack, Codecs { file: Option<String> } }
+pub enum Cmd { Encode, Decode, Smooth, Index, AlnPack, Codecs { file: Option<String> } }
 
 #[derive(Default)]
 pub struct Cli {
@@ -78,9 +78,9 @@ impl Cli {
         }
         av = av.into_iter().map(long).collect();
         let c = cmd.as_str();
-        let (enc, dec, sm, reg) = (c == "encode", c == "decode", c == "smooth", c == "region");
-        let rd = sm || dec || reg || c == "index";
-        let inf = enc || sm || dec || reg;
+        let (enc, dec, sm) = (c == "encode", c == "decode", c == "smooth");
+        let rd = sm || dec || c == "index";
+        let inf = enc || sm || dec;
         let pack = c == "aln-pack";
         let mut o = Cli::default();
         let mut i = 0;
@@ -127,10 +127,10 @@ impl Cli {
                 "--out-dir" => { o.out = Some(val()); dec }
                 "--input" => { o.input.push(val()); !pack }
                 "--output" => { o.output = Some(val()); c != "index" }
-                "--region" => { o.region = Some(val()); sm || reg }
-                "--halo" => { o.halo = Some(val()); reg }
+                "--region" => { o.region = Some(val()); sm || dec }
+                "--halo" => { o.halo = Some(val()); dec }
                 "--feature-set" => { o.feature_set = Some(val()); sm }
-                "--set" => { o.set = Some(val()); dec || reg }
+                "--set" => { o.set = Some(val()); dec }
                 "--raw" => { o.raw = true; dec }
                 _ => { i += 1; continue; }
             };
@@ -142,7 +142,7 @@ impl Cli {
         }
         if cmd.is_empty() { die(USAGE); }
         o.cmd = Some(match c {
-            "encode" => Cmd::Encode, "decode" => Cmd::Decode, "region" => Cmd::Region,
+            "encode" => Cmd::Encode, "decode" => Cmd::Decode,
             "smooth" => Cmd::Smooth, "index" => Cmd::Index, "aln-pack" => Cmd::AlnPack,
             "codecs" => Cmd::Codecs { file: if av.len() > 1 { Some(av.remove(1)) } else { None } },
             _ => die("bad command or missing arguments"),
@@ -156,7 +156,7 @@ impl Cli {
 
     pub fn name(&self) -> &'static str {
         match self.cmd.as_ref().unwrap() {
-            Cmd::Encode => "encode", Cmd::Decode => "decode", Cmd::Region => "region",
+            Cmd::Encode => "encode", Cmd::Decode => "decode",
             Cmd::Smooth => "smooth", Cmd::Index => "index", Cmd::AlnPack => "aln-pack",
             Cmd::Codecs { .. } => "codecs",
         }

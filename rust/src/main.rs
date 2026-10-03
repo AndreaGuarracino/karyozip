@@ -118,8 +118,9 @@ fn main() {
                 }
             }
         }
-        Cmd::Decode => {
+        Cmd::Decode if c.region.is_none() => {
             let track = track();
+            if c.halo.is_some() { die("--halo needs -r NAME:START-END"); }
             let feats = informed(&c, &mut ro, "decode ", None, aln::Lazy::Contig);
             let mut r = reader::Reader::open_with(track, &ro);
             if let Some(f) = &feats { f.check_hash(&r); }
@@ -133,13 +134,14 @@ fn main() {
                 }
             }
         }
-        Cmd::Region => {
+        Cmd::Decode => {   // one sequence, or the runs overlapping a range of it
             let track = track();
-            let r = c.region.as_deref().unwrap_or_else(|| die("region needs -r NAME[:START-END]"));
-            let (seq, lo, hi) = regparse(r);
-            if c.halo.is_some() && hi == 0 { die("region: --halo needs -r NAME:START-END"); }
-            let hlo = c.halo.as_ref().map_or(0, |h| karyozip::bedcoord(h.as_bytes(), "region: --halo is not a number"));
-            let feats = informed(&c, &mut ro, "region ", None, aln::Lazy::OneSeq);
+            if c.out.is_some() { die("-r and --out-dir: give one"); }
+            if c.raw { die("-r and --raw: give one"); }
+            let (seq, lo, hi) = regparse(c.region.as_deref().unwrap());
+            if c.halo.is_some() && hi == 0 { die("--halo needs -r NAME:START-END"); }
+            let hlo = c.halo.as_ref().map_or(0, |h| karyozip::bedcoord(h.as_bytes(), "--halo is not a number"));
+            let feats = informed(&c, &mut ro, "decode ", None, aln::Lazy::OneSeq);
             let mut r = reader::Reader::open_with(track, &ro);
             if let Some(f) = &feats { f.check_hash(&r); }
             let cols = feats.as_ref().map_or(Vec::new(), |f| f.setcols(c.set.as_deref()));

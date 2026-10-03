@@ -5153,9 +5153,8 @@ int main(int argc, char **argv) {
             "  karyozip encode [-i IN.bed[.gz]] [-o OUT.kst] [-e low|medium|high]\n"
             "                  [-n drop|drop:FILE] [--sort[=MEM]]\n"
             "                  [-d features.tsv [--hier H] -i SET.bed ...] [-a P.paf --ref R.bed|R.kst [--aln-names F]]\n"
-            "  karyozip decode -i F [-o OUT.bed] [-n FILE|ordinal] [--raw]\n"
+            "  karyozip decode -i F [-o OUT.bed] [-r NAME[:START-END] [--halo N]] [-n FILE|ordinal] [--raw]\n"
             "                  [-d features.tsv [--hier H] [--set A,B] [--out-dir DIR]] [-a P.paf --ref R]\n"
-            "  karyozip region -i F -r NAME[:START-END] [--halo N] [-o OUT]\n"
             "  karyozip smooth -i F --hier H -f FEATURE_SET [-r NAME[:START-END]] [-o OUT]\n"
             "  karyozip index  -i F                  appends a name index to the track itself\n"
             "  karyozip aln-pack -a P.paf --ref REF.bed|REF.kst -o OUT   only what -a reads\n"
@@ -5165,11 +5164,12 @@ int main(int argc, char **argv) {
             "  encode:      -e, --effort: low is a quick encode with blocks and an index for fast\n"
             "               queries, medium the default, high the smallest file\n"
             "               -b N|all sets the blocks by hand\n"
-            "  -r NAME:START-END is BED, 0-based, END excluded; -r NAME alone is the whole sequence\n"
+            "  -r NAME:START-END is BED, 0-based, END excluded; -r NAME alone is the whole sequence;\n"
+            "               decode -r prints the runs overlapping it, --halo N more each side\n"
             "  readers:     -n, -d, --hier, -a, --ref as encode was given; -n FILE takes the names from\n"
             "               drop:FILE, a FASTA, FASTQ or list; -n ordinal accepts dropped names\n"
-            "               --set A,B picks feature sets of a -d track, default all; decode without\n"
-            "               --out-dir and region print them as columns, merged where they all agree\n"
+            "               --set A,B picks feature sets of a -d track, default all; without\n"
+            "               --out-dir decode prints them as columns, merged where they all agree\n"
             "               --raw shows what is stored, reversing no transform\n"
             "  with -a:     --aln-names FILE, on encode and decode, when the track names rows by ordinal\n"
             "  smooth:      --max-gap N  --v1\n"
@@ -5224,8 +5224,7 @@ int main(int argc, char **argv) {
     int enc = !strcmp(cmd, "encode");
     int sm = !strcmp(cmd, "smooth");
     int dec = !strcmp(cmd, "decode");
-    int rd = sm || dec || !strcmp(cmd, "region") || !strcmp(cmd, "index");
-    ONESEQ = !strcmp(cmd, "region");       /* decode and smooth walk every sequence */
+    int rd = sm || dec || !strcmp(cmd, "index");
     int inf = enc || rd;                   /* --db and --aln: every reader but index */
     if (!strcmp(cmd, "index")) inf = 0;
     int pack = !strcmp(cmd, "aln-pack");
@@ -5271,10 +5270,10 @@ int main(int argc, char **argv) {
             if (NIN == 64) die("too many input files");
             INS[NIN++] = v; take = 2; }
         else if (!strcmp(a, "--output")) { ok = strcmp(cmd, "index") != 0; OUTPUT = v; take = 2; }
-        else if (!strcmp(a, "--region")) { ok = sm || ONESEQ; REGA = (char *)v; take = 2; }
-        else if (!strcmp(a, "--halo")) { ok = ONESEQ; HALOA = v; take = 2; }
+        else if (!strcmp(a, "--region")) { ok = sm || dec; REGA = (char *)v; take = 2; }
+        else if (!strcmp(a, "--halo")) { ok = dec; HALOA = v; take = 2; }
         else if (!strcmp(a, "--feature-set")) { ok = sm; FSA = v; take = 2; }
-        else if (!strcmp(a, "--set")) { ok = dec || !strcmp(cmd, "region"); SETNAME = v; take = 2; }
+        else if (!strcmp(a, "--set")) { ok = dec; SETNAME = v; take = 2; }
         else if (!strcmp(a, "--raw")) { ok = dec; RAW = 1; take = 1; }
         if (take && !ok) { if (!*cmd) die(USAGE);   /* flags but no command */
             fprintf(stderr, "karyozip: %s does not apply to %s\n", a, cmd); exit(1); }
@@ -5328,18 +5327,21 @@ int main(int argc, char **argv) {
         } else { if (NIN) redirect(INS[0], 0); encode(); }
     }
     else if (!NIN) { fprintf(stderr, "karyozip: %s needs -i TRACK\n", cmd); exit(1); }
-    else if (dec) {
+    else if (dec && !REGA) {
+        if (HALOA) die("--halo needs -r NAME:START-END");
         loadinformed("decode ");
         if (DBFEATS) decode_db(INS[0], OUTDIR); else dump(INS[0]);
     }
-    /* one reader: -r NAME is the whole sequence, NAME:START-END the runs
+    /* one sequence: -r NAME is all of it, NAME:START-END the runs
        overlapping it, plus an optional halo */
-    else if (ONESEQ) {
-        if (!REGA) die("region needs -r NAME[:START-END]");
+    else if (dec) {
+        if (OUTDIR) die("-r and --out-dir: give one");
+        if (RAW) die("-r and --raw: give one");
         uint64_t rlo, rhi; const char *nm = regparse(REGA, &rlo, &rhi);
-        if (HALOA && !rhi) die("region: --halo needs -r NAME:START-END");
-        loadinformed("region ");
-        region(INS[0], nm, rlo, rhi, HALOA ? num_arg(HALOA, UINT64_MAX, "region: --halo is not a number") : 0);
+        if (HALOA && !rhi) die("--halo needs -r NAME:START-END");
+        ONESEQ = 1;   /* the answer needs one contig, not the whole reference */
+        loadinformed("decode ");
+        region(INS[0], nm, rlo, rhi, HALOA ? num_arg(HALOA, UINT64_MAX, "--halo is not a number") : 0);
     }
     else if (!strcmp(cmd, "index")) { INDEXING = 1; buildindex(INS[0]); }
     else if (sm) {

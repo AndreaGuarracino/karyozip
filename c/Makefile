@@ -41,7 +41,7 @@ build/libtest: build/libkaryozip.a ../tests/libtest.c
 # source changes, where each script used to compile its own every run
 build/karyozip-san: $(SRC) $(HDR)
 	mkdir -p build
-	$(CC) -O1 -g -fsanitize=address,undefined -std=gnu11 -fopenmp -D_GNU_SOURCE -DVERSION='"$(BZIP3_VERSION)"' -I. \
+	$(CC) -O1 -g -fsanitize=address,undefined -std=gnu11 -fopenmp -DVERSION='"$(BZIP3_VERSION)"' -I. \
 	  $(ZSTD_CFLAGS) -o $@ $(SRC) $(LDFLAGS) $(ZSTD_LIBS) -llzma -lm -lpthread -lz
 
 test: build/karyozip build/libtest build/karyozip-san

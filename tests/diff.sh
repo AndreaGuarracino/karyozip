@@ -70,7 +70,7 @@ for f in ls.bed s.bed db.rall.bed ord.bed; do
     "$C" $bl encode < "$D/$f" > "$W/t.kst" 2>/dev/null
     for seq in $(awk -F'\t' '{print $1}' "$D/$f" | uniq | head -3); do
       for q in "-r $seq" "-r $seq:50-51" "-r $seq:0-100" "-r $seq:0-100 --halo 2" "-r $seq:999999-1000000"; do
-        both "region $f [$bl] [$q]" region $q -i "$W/t.kst"
+        both "region $f [$bl] [$q]" decode $q -i "$W/t.kst"
       done
     done
   done
@@ -84,7 +84,7 @@ cp "$W/ci.kst" "$W/ri.kst"
 "$R" index -i "$W/ri.kst" >/dev/null 2>&1; irr=$?
 if [ $irc = 0 ] && [ $irr = 0 ] && cmp -s "$W/ci.kst" "$W/ri.kst"; then echo "index: byte-identical trailer"
 else echo "index: TRAILERS DIFFER (rc $irc/$irr)"; fail=1; fi
-both "index cross-read" region -i "$W/ci.kst" -r seq0005; tally "index cross-read"
+both "index cross-read" decode -i "$W/ci.kst" -r seq0005; tally "index cross-read"
 
 # 6b. a sorted track: the Rust must resolve the ranks the same way.
 for f in ls.bed s.bed db.rall.bed ord.bed; do
@@ -247,26 +247,27 @@ cli() {
 }
 cli; cli --help; cli -h; cli --version; cli --bogus; cli --bogus encode
 cli decode; cli encode extra; cli --profile; cli --threads; cli --threads 4
-cli badcmd; cli region; cli region -i f; cli index; cli smooth -i f; cli aln-pack
+cli badcmd; cli region; cli decode -i f; cli index; cli smooth -i f; cli aln-pack
 cli encode --names ordinal; cli decode --sort; cli index --effort low
 cli encode --block; cli encode --effort max; cli encode --block 0
 cli -t; cli -t 0; cli -t 99999; cli --tmp-dir; cli decode --raw x --raw
-cli index --block 0; cli aln-pack -a a --ref b; cli smooth -i f --hier h; cli region -i f -r s:5-5
+cli index --block 0; cli aln-pack -a a --ref b; cli smooth -i f --hier h; cli decode -i f -r s:5-5
 cli encode --sort=0; cli encode --names foo; cli --effort low; cli -r x
 cli aln-pack --names foo -a a --ref b -o c; cli encode --db; cli --version encode
 cli index -i f x; cli decode -i f x; cli smooth -i f --hier h -f fs -r s:9-3; cli aln-pack -a a --ref b -o c d
-cli smooth -i f --hier h -f fs -r s:1-2; cli region -i f -r s --halo 3; cli region -i f -r s:1-2
+cli smooth -i f --hier h -f fs -r s:1-2; cli decode -i f -r s --halo 3; cli decode -i f -r s:1-2
 cli smooth --max-gap x -i f --hier h -f fs
-cli decode --out-dir D; cli region -i f --halo 2; cli region -i f -r s:+1-5; cli region -i f -r s:99999999999999999999-1
+cli decode --out-dir D; cli decode -i f --halo 2; cli decode -i f -r s:+1-5; cli decode -i f -r s:99999999999999999999-1
 cli encode --block +5; cli encode --aln p; cli encode --ref r
 cli decode --aln-names f; cli index --names ordinal; cli encode --sort --sort=1M
 cli decode --aln p; cli decode --ref r; cli decode --aln p --ref r
 cli encode --names drop --aln p --ref r; cli decode --db f; cli encode --db f
 cli encode --names drop --names drop:x; cli encode --names drop:
 cli encode --sort --names drop --aln p --ref r --aln-names q
-cli decode -i a -i b; cli encode -i nosuch; cli index -i f -o x; cli region -i f -r s:2-1
+cli decode -i a -i b; cli encode -i nosuch; cli index -i f -o x; cli decode -i f -r s:2-1
+cli decode -i f -r s --out-dir d; cli decode -i f -r s --raw; cli decode -i f --halo 2; cli region -i f -r s
 cli --block=4 encode; cli -b4 encode; cli -t4 encode; cli --effort=low encode; cli -V; cli foo --raw
-cli decode -i f --max-gap -1; cli region -i f -r -x; cli encode -- -x; cli decode --sort=1Z; cli -o -i encode
+cli decode -i f --max-gap -1; cli decode -i f -r -x; cli encode -- -x; cli decode --sort=1Z; cli -o -i encode
 [ $cbad = 0 ] && echo "cli: $cok forms give the same words and code" \
   || { echo "cli: $cbad of $((cok+cbad)) DIFFER"; fail=1; }
 

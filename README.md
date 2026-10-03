@@ -100,7 +100,7 @@ Flags work on either side of the command name.
 ## Supplementary: technical notes
 
 **Two implementations.** `c/` and `rust/` write the same bytes, print the same `--help` and refuse the same inputs with the same words; `rust/build.rs` takes the usage text from `c/karyozip.c`.
-`make test` (64.5 s) runs the test suite, sanitizers and fuzzing on both and compares them encode by encode.
+`make test` (111 s) runs the shared suite in `tests/`, sanitizers and fuzzing on both and compares them encode by encode.
 The C finds zstd, liblzma, zlib and libgomp at the path in its rpath; the Rust bundles zstd.
 
 **How encode chooses.** The three efforts are one rule with two settings: `low` tries 8 of the 51 codecs plus zstd at 17 on 4 MB, `medium` all 51 plus zstd at 17 and 22 on 16 MB, `high` the same on the whole file.

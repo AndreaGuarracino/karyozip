@@ -34,8 +34,8 @@ build/libkaryozip.a: $(SRC) $(HDR)
 	$(CC) $(CFLAGS) $(ZSTD_CFLAGS) -Wno-unused-function -Wno-unused-variable -DKARYOZIP_LIB -c $(SRC) && mv *.o build/lib/
 	$(AR) rcs $@ build/lib/*.o
 
-build/libtest: build/libkaryozip.a tests/libtest.c
-	$(CC) $(CFLAGS) $(ZSTD_CFLAGS) -o $@ tests/libtest.c build/libkaryozip.a $(LDFLAGS) $(ZSTD_LIBS) -llzma -lm -lpthread -lz
+build/libtest: build/libkaryozip.a ../tests/libtest.c
+	$(CC) $(CFLAGS) $(ZSTD_CFLAGS) -o $@ ../tests/libtest.c build/libkaryozip.a $(LDFLAGS) $(ZSTD_LIBS) -llzma -lm -lpthread -lz
 
 # the memory-checked twin leaks.sh and fuzz.sh run: one build, kept until a
 # source changes, where each script used to compile its own every run
@@ -45,7 +45,7 @@ build/karyozip-san: $(SRC) $(HDR)
 	  $(ZSTD_CFLAGS) -o $@ $(SRC) $(LDFLAGS) $(ZSTD_LIBS) -llzma -lm -lpthread -lz
 
 test: build/karyozip build/libtest build/karyozip-san
-	KT=$(CURDIR)/build/karyozip KARYOZIP_SAN=$(CURDIR)/build/karyozip-san tests/run.sh
+	KT=$(CURDIR)/build/karyozip KARYOZIP_SAN=$(CURDIR)/build/karyozip-san bash ../tests/run.sh
 
 clean:
 	rm -rf build

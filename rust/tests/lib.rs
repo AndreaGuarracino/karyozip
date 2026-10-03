@@ -1,5 +1,5 @@
 //! The library must write the same bytes as the CLI, and refuse the same
-//! contract violations. This is the Rust half of c/tests/libtest.c.
+//! contract violations. This is the Rust half of tests/libtest.c.
 use karyozip::writer::{Options, Writer};
 use std::io::Write;
 

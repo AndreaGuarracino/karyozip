@@ -3,7 +3,7 @@
 set -u
 C=${1:-$(dirname "$0")/../c/build/karyozip}
 R=${2:-$(dirname "$0")/../rust/target/release/karyozip}
-D=$(cd "$(dirname "$0")/../c/tests" && pwd)
+D=$(cd "$(dirname "$0")" && pwd)
 [ -x "$C" ] && [ -x "$R" ] || { echo "build both first: make all rust"; exit 1; }
 C=$(realpath "$C"); R=$(realpath "$R")
 W=$(mktemp -d); trap 'rm -rf "$W"' EXIT

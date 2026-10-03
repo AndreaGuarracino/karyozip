@@ -5,15 +5,13 @@
 # byte flips and truncation. Truncation is what found the intnamesd overflow
 # that thousands of flips missed.
 set -u
-KT=${1:-$(dirname "$0")/../build/karyozip}
+KT=${1:-$(dirname "$0")/../c/build/karyozip}
 for t in python3 zstd; do command -v $t >/dev/null || { echo "fuzz: $t not on PATH"; exit 1; }; done
 "$KT" --help >/dev/null 2>&1 || { echo "fuzz: $KT does not run"; exit 1; }   # a binary that cannot run refuses everything
-# A sanitizer build is made here unless KARYOZIP_SAN names one, so the search
-# always runs with memory checking on, not only when someone remembers.
-# The C build gets a sanitizer twin; any other binary under test, the Rust,
-# is fuzzed as itself.
+# The C build is fuzzed through its sanitizer twin, KARYOZIP_SAN; any other
+# binary under test, the Rust, is fuzzed as itself.
 SAN=${KARYOZIP_SAN:-}
-if [ -z "$SAN" ] && ! [ "$KT" -ef "$(dirname "$0")/../build/karyozip" ]; then SAN=$KT; fi
+if ! [ -x "$SAN" ] && ! [ "$KT" -ef "$(dirname "$0")/../c/build/karyozip" ]; then SAN=$KT; fi
 [ -x "$SAN" ] || { echo "fuzz: FAILED, no sanitizer build: make -C c build/karyozip-san"; exit 1; }
 D=$(dirname "$0")
 W=$(mktemp -d); trap 'rm -rf "$W"' EXIT

@@ -9,7 +9,8 @@
 #   q4  50M20I50M, the insertion leaves query bases with no target
 #   q5  no alignment at all
 set -eu
-KT=${KT:-$(dirname $0)/../build/karyozip}
+KT=${KT:-$(dirname "$0")/../c/build/karyozip}
+export KARYOZIP_SAN=${KARYOZIP_SAN:-$(dirname "$KT")/karyozip-san}   # the C twin; fuzz.sh tests the Rust as itself
 D=$(dirname "$0")
 W=$(mktemp -d); trap 'rm -rf "$W"' EXIT
 fail=0
@@ -967,12 +968,13 @@ if [ -x "$LT" ]; then
   # contract the tool has. These are the twelve ways in.
   aok=1
   for c in 1 2 3 4 5 6 7 8 9 10 11 12; do
-    $LT -abuse $c >/dev/null 2>&1 && { aok=0; echo "  library accepted abuse case $c"; }
+    rc=0; $LT -abuse $c >/dev/null 2>"$W/ab.err" || rc=$?
+    [ $rc = 1 ] && grep -q '^karyozip: ' "$W/ab.err" || { aok=0; echo "  library abuse case $c: exit $rc, $(head -c 100 "$W/ab.err")"; }
   done
   [ $aok = 1 ] && echo "library API: every contract violation refused" \
     || { echo "library API: A CONTRACT VIOLATION WAS ACCEPTED"; fail=1; }
 else
-  echo "library API: skipped, build/libtest not built"
+  echo "library API: FAILED, $LT not built"; fail=1
 fi
 
 # Round 32, the phase 2 and 3 surfaces. The label cache is keyed on four

@@ -18,6 +18,7 @@
 #include <malloc.h>
 #include <signal.h>
 #include <unistd.h>
+#include <pthread.h>
 #include <math.h>
 #ifdef _OPENMP
 #include <omp.h>
@@ -763,32 +764,29 @@ static size_t tokbest(buf *in, uint8_t **out) {
     return best;
 }
 
-/* smallest of zstd, integer deltas, tokeniser; losers freed; kind 0/1/2 */
+/* zstd and integer deltas, on their own thread beside the tokeniser */
+typedef struct { buf *b; uint64_t n; uint8_t *a1, *a2; size_t s1, s2; } zjob;
+static void *zjob_run(void *p) {
+    zjob *j = p; j->s1 = zc(j->b, &j->a1); j->s2 = intnames(j->b, j->n, &j->a2); return NULL;
+}
+
+/* smallest of zstd, integer deltas, tokeniser, field deltas; losers freed */
 static size_t bestnames(buf *b, uint64_t n, uint8_t **out, int *kind) {
-    uint8_t *a1 = NULL, *a2 = NULL, *a3 = NULL;
-    size_t s1 = 0, s2 = 0, s3 = 0;
+    uint8_t *a3 = NULL; size_t s3 = 0;
     double _t0 = nowsec();
-    /* zstd and the tokeniser are independent and neither gains from threads
-       on a buffer this size, so run them side by side. tok3 overwrites every
-       separator with NUL and puts it back, so it cannot share the buffer with
-       a concurrent reader: it gets a copy. Past one tokeniser chunk the
-       two run in turn, so the tokeniser's own threads are not nested. */
+    /* A plain thread, not an OpenMP section: inside a section the
+       tokeniser's own parallel loop would be nested and run on one thread.
+       tok3 overwrites every separator with NUL and puts it back, so it
+       cannot share the buffer with a concurrent reader: it gets a copy. */
     buf tb = { xmalloc(b->n ? b->n : 1), b->n, b->n };
     memcpy(tb.d, b->d, b->n);
-#ifdef _OPENMP
-#pragma omp parallel sections num_threads(2) if(n <= TCAND[0])
-#endif
-    {
-#ifdef _OPENMP
-#pragma omp section
-#endif
-        { s1 = zc(b, &a1); s2 = intnames(b, n, &a2); }
-#ifdef _OPENMP
-#pragma omp section
-#endif
-        { s3 = tokbest(&tb, &a3); }
-    }
+    zjob zj = { b, n, NULL, NULL, 0, 0 };
+    pthread_t th; int spawned = !pthread_create(&th, NULL, zjob_run, &zj);
+    if (!spawned) zjob_run(&zj);
+    s3 = tokbest(&tb, &a3);
+    if (spawned) pthread_join(th, NULL);
     free(tb.d);
+    uint8_t *a1 = zj.a1, *a2 = zj.a2; size_t s1 = zj.s1, s2 = zj.s2;
     uint8_t *a4 = NULL; size_t s4 = fldnames(b, n, &a4);
     if (PROF) fprintf(stderr, "  names %zu B: candidates %.3f s\n", b->n, nowsec() - _t0);
     size_t best = s1; *kind = 0; *out = a1;

@@ -578,12 +578,15 @@ must_fail "a codec id with bit 31 set" $KT decode -i "$W/neg.kt"
 
 # a packed alignment indexes the reference by row order: another order or
 # another reference is refused rather than mislabelling every row
-$KT aln-pack -a "$D/p.paf" --ref "$D/ref.bed" -o "$W/p.kta" >/dev/null 2>&1
-tac "$D/ref.bed" | awk -F'\t' '{print}' > "$W/ref.rev"
-$KT encode --aln "$W/p.kta" --ref "$D/ref.bed" < "$D/s.bed" > "$W/pk.kt" 2>/dev/null \
-  && $KT decode --aln "$W/p.kta" --ref "$D/ref.bed" -i "$W/pk.kt" 2>/dev/null | cmp -s - "$D/s.bed" \
+{ cat "$D/ref.bed"; printf 'chr2\t0\t50\tB\n'; } > "$W/ref2.bed"; { printf 'chr2\t0\t50\tB\n'; cat "$D/ref.bed"; } > "$W/ref.rev"
+$KT aln-pack -a "$D/p.paf" --ref "$W/ref2.bed" -o "$W/p.kta" >/dev/null 2>&1
+$KT encode --aln "$W/p.kta" --ref "$W/ref2.bed" < "$D/s.bed" > "$W/pk.kt" 2>/dev/null \
+  && $KT decode --aln "$W/p.kta" --ref "$W/ref2.bed" -i "$W/pk.kt" 2>/dev/null | cmp -s - "$D/s.bed" \
   && echo "packed alignment: round-trip" || { echo "packed alignment: WRONG"; fail=1; }
 must_fail "packed alignment with a reordered reference" $KT decode --aln "$W/p.kta" --ref "$W/ref.rev" -i "$W/pk.kt"
+{ printf 'KSTAL2'; tail -c +7 "$W/p.kta"; } > "$W/old.kta"
+$KT decode --aln "$W/old.kta" --ref "$W/ref2.bed" -i "$W/pk.kt" 2>&1 >/dev/null | grep -q "older format" \
+  && echo "a KSTAL2 packed alignment: named as older" || { echo "a KSTAL2 packed alignment: WRONG"; fail=1; }
 
 # a label count with no label table skipped the count check, and smooth then
 # wrote a map sized by a wrapped multiply

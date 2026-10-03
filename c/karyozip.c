@@ -1359,7 +1359,7 @@ static void loadpaf(const char *path) {
 }
 
 /* --------------------------------------------------- packed alignment Only what --aln reads: */
-#define ALNMAGIC "KSTAL2\n"   /* carries the reference contig-order hash */
+#define ALNMAGIC "KSTAL3\n"   /* carries the reference contig-order hash */
 #define ALNMAGLEN 6
 #define ALNTOK 0x7fff0000   /* the name stream went through the tokeniser */
 
@@ -1369,12 +1369,32 @@ static uint64_t refhash(void) {   /* the reference contig names, in order */
     return h;
 }
 
+/* A gap pair as one varint: 0 none, 3k+1 an insertion of k+1, 3k+2 a
+   deletion of k+1, 3 both or a negative one, two zigzags after. */
+static void gapput(buf *b, int64_t dq, int64_t dt) {
+    if (!dq && !dt) bvar(b, 0);
+    else if (dq > 0 && !dt && dq < INT64_MAX / 3) bvar(b, 3 * (uint64_t)(dq - 1) + 1);
+    else if (dt > 0 && !dq && dt < INT64_MAX / 3) bvar(b, 3 * (uint64_t)(dt - 1) + 2);
+    else { bvar(b, 3); bvar(b, zz(dq)); bvar(b, zz(dt)); }
+}
+static void gapget(const uint8_t **p, const uint8_t *e, int64_t *dq, int64_t *dt) {
+    uint64_t v = vgetb(p, e);
+    *dq = *dt = 0;
+    if (v == 3) { *dq = unzz(vgetb(p, e)); *dt = unzz(vgetb(p, e)); }
+    else if (v % 3 == 1) *dq = (int64_t)(v / 3) + 1;
+    else if (v % 3 == 2) *dt = (int64_t)(v / 3) + 1;
+    else if (v) die("corrupt packed alignment: a bad gap code");
+}
+
 static void alnpack(const char *inpaf, const char *out) {
     loadpaf(inpaf);
     /* A block that starts a target run carries an absolute position: its
        query offset as a varint and its target position as four byte planes,
-       since a random genome coordinate does not shrink as a varint. Blocks
-       within a run carry zigzag deltas, interleaved. */
+       since a random genome coordinate does not shrink as a varint. A block
+       within a run carries the gap since the last: the query bases skipped
+       and the target bases skipped, measured from the block's own end on the
+       minus strand, so both are the indel sizes. One varint codes them,
+       since one is nearly always 0: gapcode. */
     buf names = {0}, cnt = {0}, pos = {0}, len = {0}, seg_ = {0}, fq = {0}, pl[4] = {{0}, {0}, {0}, {0}};
     for (size_t i = 0; i < nqs; i++) {
         const qseg *Q = QS + i;
@@ -1382,17 +1402,14 @@ static void alnpack(const char *inpaf, const char *out) {
         bput(&names, Q->name, strlen(Q->name)); bput(&names, "\n", 1);
         bvar(&cnt, Q->n);
 
-        uint64_t pq = 0, pt = 0; uint32_t px = 0; int prev_rev = -1; uint64_t run = 0;
+        uint64_t pq = 0, pt = 0, ps = 0; uint32_t px = 0; int prev_rev = -1; uint64_t run = 0;
         for (size_t j = 0; j < Q->n; j++) {
             const seg *g = Q->s + j;
             if (!j || g->t != px || g->rev != prev_rev) {   /* absolute */
                 if (g->tp > UINT32_MAX) die("a target position past 32 bits cannot be packed");
                 bvar(&fq, g->q);
                 for (int k = 0; k < 4; k++) { uint8_t b = (uint8_t)(g->tp >> (8 * k)); bput(&pl[k], &b, 1); }
-            } else {
-                bvar(&pos, zz((int64_t)(g->q - pq)));
-                bvar(&pos, zz((int64_t)(g->tp - pt)));
-            }
+            } else gapput(&pos, (int64_t)(g->q - pq), (int64_t)(g->rev ? ps - (g->tp + g->n) : g->tp - pt));
             if (g->t != px || g->rev != prev_rev) {
                 if (j) bvar(&seg_, run);
                 bvar(&seg_, (uint64_t)g->t * 2 + (g->rev ? 1 : 0));
@@ -1400,7 +1417,7 @@ static void alnpack(const char *inpaf, const char *out) {
             }
             run++;
             bvar(&len, g->n);
-            pq = g->q + g->n; pt = g->tp + g->n;
+            pq = g->q + g->n; pt = g->tp + g->n; ps = g->tp;
         }
         bvar(&seg_, run);                       /* close the last run */
     }
@@ -1457,7 +1474,7 @@ static int alnload(const char *path) {
     if (!f) return 0;
     char mg[ALNMAGLEN];
     if (fread(mg, 1, ALNMAGLEN, f) != ALNMAGLEN || memcmp(mg, ALNMAGIC, ALNMAGLEN)) {
-        if (!memcmp(mg, "KSTAL1", 6)) die("this packed alignment is an older format: pack it again with this version");
+        if (!memcmp(mg, "KSTAL", 5)) die("this packed alignment is an older format: pack it again with this version");
         fclose(f); return 0;                       /* not packed: it is a PAF */
     }
     uint64_t rh;
@@ -1511,10 +1528,11 @@ static int alnload(const char *path) {
         uint64_t cn = vgetb(&cp, cpe);
         if (!cn || cn > (uint64_t)(lpe - lp)) die("corrupt packed alignment: more blocks than lengths");
         Q->s = xrealloc(Q->s, mul((size_t)cn, sizeof *Q->s)); Q->cap = cn; Q->n = 0;
-        uint64_t pq = 0, pt = 0; uint32_t tx = 0; int rev = 0, fresh = 1;
+        uint64_t pq = 0, pt = 0, ps = 0; uint32_t tx = 0; int rev = 0, fresh = 1;
         uint64_t left = 0;
         for (uint64_t j = 0; j < cn; j++) {
-            uint64_t q, tp;
+            uint64_t q, tp, ln = vgetb(&lp, lpe);
+            if (!ln || ln > UINT32_MAX) die("corrupt packed alignment: a block of no length, or past 32 bits");
             if (!left) {                          /* next target/strand run */
                 uint64_t xr = vgetb(&sp, spe);
                 rev = (int)(xr & 1); tx = (uint32_t)(xr >> 1);
@@ -1530,13 +1548,12 @@ static int alnload(const char *path) {
                 m++; fresh = 0;
             }
             else {
-                q  = pq + (uint64_t)unzz(vgetb(&pp, ppe));
-                tp = pt + (uint64_t)unzz(vgetb(&pp, ppe));
+                int64_t dq, dt; gapget(&pp, ppe, &dq, &dt);
+                q = pq + (uint64_t)dq;
+                tp = rev ? ps - ln - (uint64_t)dt : pt + (uint64_t)dt;
             }
-            uint64_t ln = vgetb(&lp, lpe);
-            if (!ln || ln > UINT32_MAX) die("corrupt packed alignment: a block of no length, or past 32 bits");
             Q->s[Q->n++] = (seg){ q, tx, (uint32_t)ln, tp, rev };
-            pq = q + ln; pt = tp + ln; left--;
+            pq = q + ln; pt = tp + ln; ps = tp; left--;
         }
         if (left) die("corrupt packed alignment: a target run outlives its query");
         nm = nl + 1;

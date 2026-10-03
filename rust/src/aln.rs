@@ -290,8 +290,10 @@ impl Aln {
     /// reference's contig-order hash. Returns false when it is not one.
     fn load_packed(&mut self, path: &str) -> bool {
         let Ok(d) = std::fs::read(path) else { return false };
-        if d.len() >= 6 && &d[..6] == b"KSTAL1" { crate::bail("this packed alignment is an older format: pack it again with this version"); }
-        if d.len() < 6 || &d[..6] != b"KSTAL2" { return false; }
+        if d.len() < 6 || &d[..6] != b"KSTAL3" {
+            if d.len() >= 6 && &d[..5] == b"KSTAL" { crate::bail("this packed alignment is an older format: pack it again with this version"); }
+            return false;
+        }
         if d.len() < 14 { crate::bail("truncated packed alignment"); }
         let rh = u64::from_le_bytes(d[6..14].try_into().unwrap());
         if rh != refhash(self) {
@@ -340,9 +342,11 @@ impl Aln {
             let segs = &mut self.qs[qi].1;
             segs.clear();
             segs.reserve(cn as usize);
-            let (mut pq, mut pt, mut tx) = (0u64, 0u64, 0u32);
+            let (mut pq, mut pt, mut ps, mut tx) = (0u64, 0u64, 0u64, 0u32);
             let (mut rev, mut fresh, mut left) = (false, true, 0u64);
             for _ in 0..cn {
+                let (n, j) = vget(len, li); li = j;
+                if n == 0 || n > u32::MAX as u64 { crate::bail("corrupt packed alignment: a block of no length, or past 32 bits"); }
                 if left == 0 {
                     let (xr, j) = vget(tgt, si);
                     rev = xr & 1 != 0;
@@ -361,15 +365,12 @@ impl Aln {
                     tp = sec[6][m] as u64 | (sec[7][m] as u64) << 8 | (sec[8][m] as u64) << 16 | (sec[9][m] as u64) << 24;
                     m += 1; fresh = false;
                 } else {
-                    let (a, j) = vget(pos, pi);
-                    let (b, j2) = vget(pos, j); pi = j2;
-                    q = pq.wrapping_add(unzz(a));
-                    tp = pt.wrapping_add(unzz(b));
+                    let (dq, dt, j) = gap_get(pos, pi); pi = j;
+                    q = pq.wrapping_add(dq as u64);
+                    tp = if rev { ps.wrapping_sub(n).wrapping_sub(dt as u64) } else { pt.wrapping_add(dt as u64) };
                 }
-                let (n, j) = vget(len, li); li = j;
-                if n == 0 || n > u32::MAX as u64 { crate::bail("corrupt packed alignment: a block of no length, or past 32 bits"); }
                 segs.push(Seg { q, t: tx, n: n as u32, tp, rev });
-                pq = q + n; pt = tp + n; left -= 1;
+                pq = q + n; pt = tp + n; ps = tp; left -= 1;
             }
             if left != 0 { crate::bail("corrupt packed alignment: a target run outlives its query"); }
             nb += segs.len();
@@ -532,6 +533,27 @@ impl Aln {
 
 /// The packed alignment: five streams, each given its own codec search.
 /// A PAF is far larger than what --aln actually reads.
+/// A gap pair as one varint, as the C's gapput: 0 none, 3k+1 an insertion
+/// of k+1, 3k+2 a deletion of k+1, 3 both or a negative one, two zigzags after.
+fn gap_put(b: &mut Vec<u8>, dq: i64, dt: i64) {
+    match (dq, dt) {
+        (0, 0) => kst::put(b, 0),
+        (q, 0) if q > 0 && q < i64::MAX / 3 => kst::put(b, 3 * (q as u64 - 1) + 1),
+        (0, t) if t > 0 && t < i64::MAX / 3 => kst::put(b, 3 * (t as u64 - 1) + 2),
+        _ => { kst::put(b, 3); kst::put(b, kst::zz(dq)); kst::put(b, kst::zz(dt)); }
+    }
+}
+fn gap_get(b: &[u8], i: usize) -> (i64, i64, usize) {
+    let (v, i) = vget(b, i);
+    match v {
+        0 => (0, 0, i),
+        3 => { let (a, i) = vget(b, i); let (c, i) = vget(b, i); (unzz(a) as i64, unzz(c) as i64, i) }
+        _ if v % 3 == 1 => ((v / 3) as i64 + 1, 0, i),
+        _ if v % 3 == 2 => (0, (v / 3) as i64 + 1, i),
+        _ => crate::bail("corrupt packed alignment: a bad gap code"),
+    }
+}
+
 pub fn pack(a: &Aln, out: &str, refhash: u64) {
     use crate::ffi;
     // A block that starts a target run carries an absolute position: its
@@ -546,7 +568,7 @@ pub fn pack(a: &Aln, out: &str, refhash: u64) {
         names.extend_from_slice(nm);
         names.push(b'\n');
         kst::put(&mut cnt, segs.len() as u64);
-        let (mut pq, mut pt, mut px) = (0u64, 0u64, 0u32);
+        let (mut pq, mut pt, mut ps, mut px) = (0u64, 0u64, 0u64, 0u32);
         let mut prev_rev: i32 = -1;
         let mut run = 0u64;
         for (j, g) in segs.iter().enumerate() {
@@ -556,8 +578,8 @@ pub fn pack(a: &Aln, out: &str, refhash: u64) {
                 kst::put(&mut fq, g.q);
                 for (k, p) in pl.iter_mut().enumerate() { p.push((g.tp >> (8 * k)) as u8); }
             } else {
-                kst::put(&mut pos, kst::zz(g.q as i64 - pq as i64));
-                kst::put(&mut pos, kst::zz(g.tp as i64 - pt as i64));
+                let dt = if g.rev { ps.wrapping_sub(g.tp + g.n as u64) } else { g.tp.wrapping_sub(pt) };
+                gap_put(&mut pos, g.q.wrapping_sub(pq) as i64, dt as i64);
             }
             if newrun {
                 if j > 0 { kst::put(&mut seg_, run); }
@@ -568,6 +590,7 @@ pub fn pack(a: &Aln, out: &str, refhash: u64) {
             kst::put(&mut len, g.n as u64);
             pq = g.q + g.n as u64;
             pt = g.tp + g.n as u64;
+            ps = g.tp;
         }
         kst::put(&mut seg_, run);
         nb += segs.len();
@@ -602,7 +625,7 @@ pub fn pack(a: &Aln, out: &str, refhash: u64) {
         all.extend_from_slice(&best);
     }
     let mut f = Vec::with_capacity(all.len() + 16);
-    f.extend_from_slice(b"KSTAL2");
+    f.extend_from_slice(b"KSTAL3");
     f.extend_from_slice(&refhash.to_le_bytes());
     f.extend_from_slice(&all);
     std::fs::write(out, &f).unwrap_or_else(|_| crate::bail("cannot write the packed alignment"));

@@ -54,6 +54,7 @@ pub struct Writer {
     labtab: Vec<Vec<u8>>,
     labmap: HashMap<Vec<u8>, u32, kst::Fnv>,
     lastid: Option<u32>,
+    lcache: [u32; 512],   // label cache, u32::MAX empty
     cur: Vec<u8>,
     /// fnv of each label and of cur, for the row hash
     labh: Vec<u64>,
@@ -127,7 +128,7 @@ impl Writer {
         Ok(Writer {
             perm_on, alnname: None, held: 0, spill: Vec::new(), natn: 0,
             opt, lens: Vec::new(), ids: Vec::new(), names: Vec::new(), ibx: Vec::new(),
-            nidx: 0, ordok: true, labtab: Vec::new(), labmap: HashMap::default(), lastid: None,
+            nidx: 0, ordok: true, labtab: Vec::new(), labmap: HashMap::default(), lastid: None, lcache: [u32::MAX; 512],
             cur: Vec::new(), currun: 0, curbp: 0, blkbp0: 0, pend: 0, nblk: 0, rows: 0,
             plen: 0, pval: 0, phas: false, tailsamp: Vec::new(), tailpred: 0, tailon: None,
             srec: Vec::new(), sortbp: 0, natbuf: Vec::new(), natord: true, feathash: None, cart: false, rowhash: kst::FNV0, labh: Vec::new(), curnh: 0,
@@ -142,8 +143,17 @@ impl Writer {
         if let Some(id) = self.lastid {
             if self.labtab[id as usize] == label { return id; }
         }
+        // As the C's: labels cycle, so a direct-mapped cache on the length
+        // and three bytes answers most rows without hashing the label.
+        let n = label.len();
+        let mut ck = (n as u32).wrapping_mul(2654435761);
+        if n > 0 { ck ^= (label[0] as u32) << 7 ^ (label[n - 1] as u32) << 15 ^ (label[n >> 1] as u32) << 23; }
+        let ck = ((ck ^ (ck >> 13)) & 511) as usize;
+        let cid = self.lcache[ck];
+        if cid != u32::MAX && self.labtab[cid as usize] == label { self.lastid = Some(cid); return cid; }
         if let Some(&id) = self.labmap.get(label) {
             self.lastid = Some(id);
+            self.lcache[ck] = id;
             return id;
         }
         let id = self.labtab.len() as u32;
@@ -151,6 +161,7 @@ impl Writer {
         self.labh.push(kst::fnv(kst::FNV0, label));
         self.labmap.insert(label.to_vec(), id);
         self.lastid = Some(id);
+        self.lcache[ck] = id;
         id
     }
 
@@ -1377,22 +1388,18 @@ fn fld_names1(names: &[u8], n: u64, sep: u8) -> Option<Vec<u8>> {
     let mut seen = 0u64;
     for line in names.split(|&c| c == b'\n') {          // one pass to decide
         if seen == n { if line.is_empty() { break; } return None; }
-        let f: Vec<&[u8]> = line.split(|&c| c == sep).collect();
-        if f.len() != nf { return None; }
-        for k in 0..nf {
-            if same[k] && f[k] != first[k] { same[k] = false; }
-            if isnum[k] {
-                let g = f[k];
-                if g.is_empty() || g.len() > 18 || (g.len() > 1 && g[0] == b'0')
-                    || !g.iter().all(|c| c.is_ascii_digit()) { isnum[k] = false; }
-            }
-            if ishex[k] {
-                let g = f[k];
-                if g.len() != first[k].len()
-                    || !g.iter().all(|c| c.is_ascii_digit() || (*c >= b'a' && *c <= b'f')) { ishex[k] = false; }
-            }
+        let mut k = 0usize;
+        for g in line.split(|&c| c == sep) {             // in place: no vector a name
+            if k == nf { return None; }
+            if same[k] && g != first[k] { same[k] = false; }
+            if isnum[k] && (g.is_empty() || g.len() > 18 || (g.len() > 1 && g[0] == b'0')
+                            || !g.iter().all(|c| c.is_ascii_digit())) { isnum[k] = false; }
+            if ishex[k] && (g.len() != first[k].len()
+                            || !g.iter().all(|c| c.is_ascii_digit() || (*c >= b'a' && *c <= b'f'))) { ishex[k] = false; }
             if !same[k] && !isnum[k] && !ishex[k] { return None; }
+            k += 1;
         }
+        if k != nf { return None; }
         seen += 1;
     }
     if seen != n { return None; }
@@ -1460,7 +1467,7 @@ pub fn check_unique(names: &[u8]) -> Result<(), String> {
     // hashes collide. A set of 10,000,000 names was a sixth of an encode.
     let lines = names.split(|&c| c == b'\n').filter(|l| !l.is_empty());
     let mut hs: Vec<u64> = lines.clone().map(|l| kst::fnv(FNV0, l)).collect();
-    hs.sort_unstable();
+    hs.par_sort_unstable();
     let rep: HashSet<u64> = hs.windows(2).filter(|w| w[0] == w[1]).map(|w| w[0]).collect();
     if rep.is_empty() { return Ok(()); }
     let mut exact: HashSet<&[u8]> = HashSet::new();

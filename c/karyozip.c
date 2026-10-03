@@ -2745,12 +2745,31 @@ static size_t lensok(ZSTD_CCtx *tc, const uint8_t *src, size_t n) {
 
 static int u64cmp(const void *a, const void *b) {
     uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b; return x < y ? -1 : x > y; }
+/* 64-bit hashes sorted in place: one pass by the top byte into 256 buckets,
+   then the buckets side by side. glibc's qsort merges through a copy of the
+   array, 590 MB on 74M short-read names, on one thread. */
+static void u64sort(uint64_t *a, size_t n) {
+    size_t cnt[256] = {0}, beg[257], nx[256];
+    for (size_t i = 0; i < n; i++) cnt[a[i] >> 56]++;
+    beg[0] = 0; for (int b = 0; b < 256; b++) { beg[b + 1] = beg[b] + cnt[b]; nx[b] = beg[b]; }
+    for (int b = 0; b < 256; b++)
+        while (nx[b] < beg[b + 1]) {
+            uint64_t v = a[nx[b]]; int d = (int)(v >> 56);
+            while (d != b) { uint64_t t = a[nx[d]]; a[nx[d]++] = v; v = t; d = (int)(v >> 56); }
+            a[nx[b]++] = v;
+        }
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic, 1) num_threads(nthreads()) if (n > 1 << 16)
+#endif
+    for (int b = 0; b < 256; b++) qsort(a + beg[b], cnt[b], 8, u64cmp);
+}
+
 static void namesunique(const buf *names, size_t n) {
     uint64_t *hs = xmalloc(mul(n, 8)); size_t k = 0;
     const char *p = (const char *)names->d, *e = p + names->n;
     while (p < e && k < n) { const char *nl = memchr(p, '\n', (size_t)(e - p)); if (!nl) break;
                              hs[k++] = fnvbuf(FNV0, p, (size_t)(nl - p)); p = nl + 1; }
-    qsort(hs, k, 8, u64cmp);
+    u64sort(hs, k);
     size_t dup = 0; for (size_t i = 1; i < k; i++) if (hs[i] == hs[i - 1] && (i == 1 || hs[i] != hs[i - 2])) dup++;
     if (dup) {   /* the repeats: compare the names themselves */
         uint64_t *rep = xmalloc(mul(dup, 8)); size_t nr = 0;

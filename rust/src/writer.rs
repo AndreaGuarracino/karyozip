@@ -1185,19 +1185,35 @@ fn rank_all(src: &[&[u8]], n: &[usize], o: &Options) -> Vec<(i32, i32, usize)> {
     let (next, zs): (AtomicUsize, Vec<AtomicUsize>) = (AtomicUsize::new(0), jobs.iter().map(|_| AtomicUsize::new(0)).collect());
     // each stream's best so far (size, rank, job, bytes), kept for the read-back
     let best: Vec<std::sync::Mutex<Option<(usize, usize, usize, Vec<u8>)>>> = src.iter().map(|_| Default::default()).collect();
+    let prof = crate::prof::ON.load(Relaxed);
+    let jt: Vec<AtomicUsize> = jobs.iter().map(|_| AtomicUsize::new(0)).collect();   // ns, under --profile
+    let tp = std::time::Instant::now();
     rayon::broadcast(|_| loop {
         let j = next.fetch_add(1, Relaxed);
         let Some(&(_, t, r, c, lv)) = jobs.get(j) else { break };
-        if c == 0 { zs[j].store(ffi::zstd(src[t], lv).len(), Relaxed); continue; }
-        let Some(v) = ffi::paycomp(src[t], c) else { continue };
-        zs[j].store(v.len(), Relaxed);
-        let mut b = best[t].lock().unwrap_or_else(|e| e.into_inner());
-        if b.as_ref().is_none_or(|x| (v.len(), r) < (x.0, x.1)) { *b = Some((v.len(), r, j, v)); }
+        let t0 = std::time::Instant::now();
+        if c == 0 { zs[j].store(ffi::zstd(src[t], lv).len(), Relaxed); }
+        else if let Some(v) = ffi::paycomp(src[t], c) {
+            zs[j].store(v.len(), Relaxed);
+            let mut b = best[t].lock().unwrap_or_else(|e| e.into_inner());
+            if b.as_ref().is_none_or(|x| (v.len(), r) < (x.0, x.1)) { *b = Some((v.len(), r, j, v)); }
+        }
+        if prof { jt[j].store(t0.elapsed().as_nanos() as usize, Relaxed); }
     });
+    if prof {   // the slowest jobs set the pool's critical path
+        eprintln!("  rank pool: {} jobs, {:.3} s", jobs.len(), tp.elapsed().as_secs_f64());
+        let mut o: Vec<usize> = (0..jobs.len()).collect();
+        o.sort_by_key(|&j| std::cmp::Reverse(jt[j].load(Relaxed)));
+        for &j in o.iter().take(5).filter(|&&j| jt[j].load(Relaxed) > 0) {
+            eprintln!("  rank job: stream {} {} on {} B, {:.3} s", jobs[j].1, cname(jobs[j].3), src[jobs[j].1].len(),
+                      jt[j].load(Relaxed) as f64 * 1e-9);
+        }
+    }
+    let tp = std::time::Instant::now();
     let z: Vec<usize> = zs.into_iter().map(AtomicUsize::into_inner).collect();
     let mut kept: Vec<Option<(usize, Vec<u8>)>> = best.into_iter()
         .map(|m| m.into_inner().unwrap_or_else(|e| e.into_inner()).map(|x| (x.2, x.3))).collect();
-    kept.par_iter_mut().enumerate().map(|(t, k)| {
+    let picked: Vec<(i32, i32, usize)> = kept.par_iter_mut().enumerate().map(|(t, k)| {
         let mut live: Vec<usize> = (0..jobs.len()).filter(|&j| jobs[j].1 == t && z[j] > 0).collect();
         live.sort_by_key(|&j| (z[j], jobs[j].2));
         for j in live {
@@ -1210,7 +1226,9 @@ fn rank_all(src: &[&[u8]], n: &[usize], o: &Options) -> Vec<(i32, i32, usize)> {
             if ok { return (c, lv, z[j]); }
         }
         (0, -1, 0)
-    }).collect()
+    }).collect();
+    if prof { eprintln!("  rank read-back: {:.3} s", tp.elapsed().as_secs_f64()); }
+    picked
 }
 
 /// A respelt block is a different stream from the one the codec was chosen
@@ -1414,6 +1432,7 @@ fn fld_names1(names: &[u8], n: u64, sep: u8) -> Option<Vec<u8>> {
 }
 
 pub fn best_names(names: &[u8], n: u64, level: i32, slow: bool) -> BestNames {
+    let t0 = std::time::Instant::now();
     let (z, t) = rayon::join(
         || ffi::zstd(names, level),
         || tok_best(names, slow),
@@ -1428,6 +1447,9 @@ pub fn best_names(names: &[u8], n: u64, level: i32, slow: bool) -> BestNames {
     }
     if let Some(v) = fld_names(names, n) {
         if !v.is_empty() && v.len() < out.bytes.len() { out = BestNames { bytes: v, kind: 3, chunk: TCAND[0] }; }
+    }
+    if crate::prof::ON.load(std::sync::atomic::Ordering::Relaxed) {
+        eprintln!("  names {} B: candidates {:.3} s", names.len(), t0.elapsed().as_secs_f64());
     }
     out
 }

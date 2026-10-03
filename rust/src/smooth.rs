@@ -262,8 +262,8 @@ pub fn run(path: &str, hier: &str, fs: &[u8], seq: Option<&[u8]>,
         // written in turn, so nothing is held but a buffer per thread. A
         // window of eight chunks per thread held 2 GB against the C's 0.45 GB.
         use std::sync::atomic::{AtomicU64, Ordering};
+        let blk = r.share_block();   // one block: decoded once, for every thread, before the names
         let names = r.names_shared();
-        let blk = r.share_block();   // one block: decoded once, for every thread
         let nchunk = (last - first).div_ceil(chunk);
         let next = AtomicU64::new(0);
         let turn = std::sync::Mutex::new((0u64, out));

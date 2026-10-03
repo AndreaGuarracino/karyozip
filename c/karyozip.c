@@ -4922,6 +4922,7 @@ static void smoothcmd(const char *path, const char *hier, const char *fs,
                       const char *seq, uint64_t lo, uint64_t hi, int v1) {
     loadhier(hier, fs);
     R *r = ropen_informed(path);
+    if (r->nblk == 1) loadblk(r, 0);   /* the block before the names, as dump */
     ensurenames(r);   /* emit prints names */
     int *labmap = labnodes(r, fs);
     buildanc();   /* after labnodes: it adds the unknown labels */

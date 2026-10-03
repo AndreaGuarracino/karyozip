@@ -648,6 +648,7 @@ static char *fldnamesd(const uint8_t *b, size_t n, uint64_t cnt, size_t *outn) {
 }
 
 #define TOKMAX 9000000u
+#define TOKDEC 4
 
 static int V1 = 0;
 static const char *TMPD = NULL;         /* --tmp-dir, else TMPDIR, else /tmp */
@@ -730,7 +731,10 @@ static char *tokd(const uint8_t *b, size_t n, size_t *outn) {
     char *o = xmalloc(raw + 1);
     const uint8_t *p = b + hdr;
     _Atomic int failed = 0;
-    int nthr = nthreads();                 /* one chunk: no pool, a query pays for it */
+    /* at most TOKDEC chunks at once: each costs 127 MB in the decoder.
+       3000000 names, 8 threads: 8 at once 1.54 s 1136 MB, 4 1.60 s 570 MB,
+       2 2.28 s 352 MB. One chunk: no pool, a query pays for it. */
+    int nthr = nthreads() < TOKDEC ? nthreads() : TOKDEC;
     if (nthr > (int)nchunk) nthr = nchunk ? (int)nchunk : 1;
 #ifdef _OPENMP
 #pragma omp parallel for schedule(dynamic, 1) num_threads(nthr)

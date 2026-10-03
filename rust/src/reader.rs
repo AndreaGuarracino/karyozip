@@ -721,7 +721,10 @@ pub fn tok_d(b: &[u8]) -> Vec<u8> {
     let mut slots: Vec<&mut [u8]> = Vec::with_capacity(nchunk);
     let mut rest = out.as_mut_slice();
     for i in 0..nchunk { let (a, r) = rest.split_at_mut(woff[i + 1] - woff[i]); slots.push(a); rest = r; }
-    let ok = slots.into_par_iter().enumerate().all(|(i, slot)| {
+    // At most TOKDEC chunks at once, as the C: each costs 127 MB in the decoder.
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(rayon::current_num_threads().min(TOKDEC)).build()
+        .unwrap_or_else(|_| crate::bail("cannot start the name decode threads"));
+    let ok = pool.install(|| slots.into_par_iter().enumerate().all(|(i, slot)| {
         match ffi::tok_decode(&b[hdr + coff[i]..hdr + coff[i + 1]]) {
             Some(d) if d.len() == slot.len() => {
                 for (o, &c) in slot.iter_mut().zip(&d) { *o = if c == 0 { b'\n' } else { c }; }
@@ -729,12 +732,16 @@ pub fn tok_d(b: &[u8]) -> Vec<u8> {
             }
             _ => false,
         }
-    });
+    }));
     if !ok { crate::bail("name tokeniser decode failed"); }
     out
 }
 
 pub use crate::kst::{unzz, vget};
+
+/// Tokenised name chunks decoded at once; 2026-10-02, 3000000 names, 8 threads:
+/// 8 at once 1.54 s 1136 MB, 4 1.60 s 570 MB, 2 2.28 s 352 MB.
+const TOKDEC: usize = 4;
 
 /* ------------------------------------------------ one sequence at a time */
 

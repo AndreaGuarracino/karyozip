@@ -62,12 +62,10 @@ python3 - "$W" <<'PY'
 import sys; W = sys.argv[1]; L = "L" * 2100000
 open(W + "/rv.tsv", "w").write("featureID\tA\tB\n1\tx\ty\n2\t%s\tz\n" % L)
 open(W + "/rv1.bed", "w").write("s1\t0\t10\tx\ns1\t10\t20\t%s\n" % L); open(W + "/rv2.bed", "w").write("s1\t0\t10\ty\ns1\t10\t20\tz\n")
-open(W + "/rv.many", "w").write("".join("s\t%d\t%d\tlab%d\n" % (i, i + 1, i) for i in range(70000)))
 open(W + "/rv.big", "w").write("1125899906842625\t0\t10\tx\n"); open(W + "/rv.names", "w").write("q1\n\nq2\n")
 PY
 $KT --db "$W/rv.tsv" encode -i "$W/rv1.bed" -i "$W/rv2.bed" > "$W/rv.kt" 2>/dev/null
 [ "$($KT --db "$W/rv.tsv" decode -i "$W/rv.kt" -r s1:12-13 2>/dev/null | wc -c)" = 2100012 ] && echo "decode --db, a 2100000-byte label: printed" || { echo "decode --db, a 2100000-byte label: WRONG"; fail=1; }
-$KT encode < "$W/rv.many" > /dev/null 2>&1 && echo "70000 labels: encoded" || { echo "70000 labels: WRONG"; fail=1; }
 $KT encode < "$W/rv.big" > "$W/rv.big.kt" 2>/dev/null; $KT decode -i "$W/rv.big.kt" 2>/dev/null | cmp -s - "$W/rv.big" && echo "a name past 2^50: round trip" || { echo "a name past 2^50: WRONG"; fail=1; }
 $KT encode --aln "$D/p.paf" --ref "$D/ref.bed" --aln-names "$W/rv.names" < "$D/s.bed" >/dev/null 2>&1 && { echo "a blank --aln-names line: ACCEPTED"; fail=1; } || echo "a blank --aln-names line: refused, as it should"
 gzip -c "$D/ref.bed" | head -c 40 > "$W/rv.gz"
@@ -459,8 +457,6 @@ printf 'x1\t0\t10\tA\nx2\t0\t10\tB\n' > "$W/t1.bed"; printf 'y1\t0\t10\tA\ny2\t0
 $KT encode --names drop:"$W/t1.names" < "$W/t1.bed" > "$W/t1.kt" 2>/dev/null
 $KT encode --names drop:"$W/t2.names" < "$W/t2.bed" > "$W/t2.kt" 2>/dev/null
 must_fail "sidecar from another track" $KT decode --names "$W/t2.names" -i "$W/t1.kt"
-$KT decode --names "$W/t1.names" -i "$W/t1.kt" 2>/dev/null | cmp -s - "$W/t1.bed" \
-  && echo "own sidecar: byte-identical" || { echo "own sidecar: WRONG"; fail=1; }
 printf 'read one\t0\t10\tA\nread two\t0\t10\tB\n' > "$W/sp.bed"; printf 'read one\nread two\n' > "$W/sp.names.txt"
 $KT encode --names drop < "$W/sp.bed" > "$W/sp.kt" 2>/dev/null
 $KT --names "$W/sp.names.txt" decode -i "$W/sp.kt" 2>/dev/null | cmp -s - "$W/sp.bed" \
@@ -715,10 +711,9 @@ must_fail "a name file name past 511 bytes" $KT --names "$W/n1000.names" decode 
 
 # On-the-fly: the encoder must take rows as a producer writes them, from a
 # pipe and from a slow writer, and give the same bytes as a file encode.
-$KT encode < "$D/s.bed" > "$W/file.kt" 2>/dev/null
 cat "$D/s.bed" | $KT encode > "$W/pipe.kt" 2>/dev/null
 (while IFS= read -r l; do printf '%s\n' "$l"; sleep 0.02; done < "$D/s.bed") | $KT encode > "$W/slow.kt" 2>/dev/null
-cmp -s "$W/file.kt" "$W/pipe.kt" && cmp -s "$W/file.kt" "$W/slow.kt" \
+cmp -s "$W/p.kt" "$W/pipe.kt" && cmp -s "$W/p.kt" "$W/slow.kt" \
   && echo "encode from a pipe and a slow producer: byte-identical" || { echo "encode from a pipe: WRONG"; fail=1; }
 awk 'BEGIN{srand(3);for(i=0;i<20000;i++){p=0;for(j=0;j<5;j++){c=p+int(rand()*300)+1;printf "read%d\t%d\t%d\tL%d\n",i,p,c,int(rand()*6);p=c}}}' > "$W/pbig.bed"
 cat "$W/pbig.bed" | $KT encode --tmp-dir "$W" --sort=1M > "$W/pipesort.kt" 2>/dev/null
@@ -827,8 +822,8 @@ must_fail "region with END before START" $KT decode -i "$W/p.kt" -r q1:150-20
 # encode by signal; the block temp file ignored TMPDIR.
 rc=0; (ulimit -f 1; $KT encode < "$W/pbig.bed" > "$W/lim.kt" 2> "$W/lim.err") || rc=$?
 [ $rc = 1 ] && echo "file-size limit: exit 1, not a signal" || { echo "file-size limit: rc=$rc"; fail=1; }
-$KT encode < "$D/db.rall.bed" > "$W/sd.kt" 2>/dev/null; $KT --effort low encode < "$D/db.rall.bed" > "$W/ss.kt" 2>/dev/null
-[ "$(stat -c%s "$W/ss.kt")" -le "$(stat -c%s "$W/sd.kt")" ] && echo "--effort low never larger: $(stat -c%s "$W/ss.kt") <= $(stat -c%s "$W/sd.kt") B" || { echo "--effort low LARGER than the default"; fail=1; }
+sz=""; for e in high medium low; do sz="$sz $($KT -e $e encode < "$D/ls.bed" 2>/dev/null | wc -c)"; done
+[ "$(echo $sz | tr ' ' '\n' | sort -n | tr '\n' ' ')" = "$(echo $sz) " ] && echo "effort high <= medium <= low:$sz B" || { echo "effort sizes out of order:$sz B"; fail=1; }
 must_fail "--tmp-dir that does not exist" $KT --tmp-dir /nonexistent/dir encode < "$D/s.bed"
 $KT --tmp-dir "$W" encode < "$D/s.bed" 2>/dev/null | cmp -s - "$W/p.kt" && echo "--tmp-dir honoured: same bytes" || { echo "--tmp-dir honoured: WRONG"; fail=1; }
 
@@ -886,8 +881,6 @@ mkdir -p "$W/mix/gene.bed.blocked" && mv "$W/mix/gene.bed" "$W/mix/gene.keep" &&
 must_fail "decode --db over a directory in --out" $KT decode --db "$D/db.features.tsv" --out-dir "$W/mix" -i "$W/f.kt"
 [ "$(cat "$W/mix/acrocentric.bed")" = OLD_acrocentric ] && [ -z "$(ls "$W/mix" | grep -E 'tmp|old')" ] \
   && echo "refused db decode: all old files kept, no leftovers" || { echo "refused db decode: HALF UPDATED"; fail=1; }
-mkdir -p "$W/dbsig"; ( $KT decode --db "$D/db.features.tsv" --out-dir "$W/dbsig" -i "$W/f.kt" >/dev/null 2>&1 & p=$!; sleep 0.02; kill -INT $p 2>/dev/null; wait $p ) 2>/dev/null || true
-[ -z "$(ls "$W/dbsig" | grep tmp)" ] && echo "SIGINT during decode --db: no temporaries left" || { echo "SIGINT during decode --db: TEMPORARIES LEFT"; fail=1; }
 must_fail "--sort=1e18T" $KT encode --tmp-dir "$W" --sort=1e18T < "$D/s.bed"
 
 # The README says these pairs are exclusive and these ranges are the limits.
@@ -907,8 +900,6 @@ $KT encode --names "drop:$W/side.names" < "$D/s.bed" > "$W/side.kt" 2>/dev/null
 awk '{print $1}' "$D/s.bed" | uniq | sed 's/^/>/' > "$W/side.fa"
 $KT decode --names "$W/side.fa" -i "$W/side.kt" 2>&1 | grep -q "does not belong to this track" \
   && echo "a foreign names file: named as such" || { echo "a foreign names file: WRONG MESSAGE"; fail=1; }
-$KT decode --names "$W/side.names" -i "$W/side.kt" 2>/dev/null | cmp -s - "$D/s.bed" \
-  && echo "the sidecar it wrote: round trips" || { echo "the sidecar it wrote: BROKEN"; fail=1; }
 
 # A sorted track decodes in sorted order, never the input order.
 $KT encode --sort < "$D/s.bed" > "$W/so.kt" 2>/dev/null

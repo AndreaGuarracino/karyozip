@@ -18,7 +18,5 @@ releases, so that pin is what makes byte-identity testable.
 
 ## unsafe
 
-`src/ffi.rs` is the only `unsafe` in the crate.
-Every raw pointer and every length check lives there; callers see slices and
-`Option<Vec<u8>>`. Beyond that, `unsafe` needs a measured win recorded in
-`notes/log.md`, not an argument.
+`src/ffi.rs` holds the codec calls: every raw pointer and length check for them lives there, and callers see slices and `Option<Vec<u8>>`.
+Outside it, four hot loops write unchecked, each behind an assertion and each a measured win: the digit writer in `kst.rs`, the row writers in `reader.rs` and `smooth.rs`, and `smooth_one`.

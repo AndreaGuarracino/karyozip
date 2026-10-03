@@ -329,6 +329,30 @@ static FILE *zfopen(const char *path) {
     return f;
 }
 
+/* the digit count by compares, then one division a digit, in place: a
+   count by division doubles the divisions and a scratch array costs a
+   memcpy, and this writes every coordinate of every row */
+static inline char *putu64(char *o, uint64_t v) {
+    static const uint64_t P[19] = { 10ULL, 100ULL, 1000ULL, 10000ULL, 100000ULL,
+        1000000ULL, 10000000ULL, 100000000ULL, 1000000000ULL, 10000000000ULL,
+        100000000000ULL, 1000000000000ULL, 10000000000000ULL, 100000000000000ULL,
+        1000000000000000ULL, 10000000000000000ULL, 100000000000000000ULL,
+        1000000000000000000ULL, 10000000000000000000ULL };
+    static const char D2[201] =
+        "00010203040506070809101112131415161718192021222324"
+        "25262728293031323334353637383940414243444546474849"
+        "50515253545556575859606162636465666768697071727374"
+        "75767778798081828384858687888990919293949596979899";
+    int n = (int)((63 - __builtin_clzll(v | 1)) * 1233 >> 12) + 1;
+    n += (n <= 19 && v >= P[n - 1]);          /* the estimate is off by one */
+    int i = n;
+    while (v >= 100) { unsigned q = (unsigned)(v % 100); v /= 100; i -= 2;
+                       o[i] = D2[2 * q]; o[i + 1] = D2[2 * q + 1]; }
+    if (v < 10) o[--i] = (char)('0' + v);
+    else { i -= 2; o[i] = D2[2 * v]; o[i + 1] = D2[2 * v + 1]; }
+    return o + n;
+}
+
 /* ---------------------------------------------------------------- varint */
 static inline void vput(uint8_t **p, uint64_t v) {
     while (v >= 0x80) { *(*p)++ = (uint8_t)(v | 0x80); v >>= 7; }
@@ -559,7 +583,7 @@ static char *intnamesd(const uint8_t *b, size_t n, uint64_t cnt, size_t *outn) {
         uint64_t u = vgetb(&q, qe);
         cur += (uint64_t)((int64_t)(u >> 1) ^ -(int64_t)(u & 1));
         if (cur > (1ull << 50)) die("corrupt names: an integer name past 2^50");
-        w += (size_t)sprintf(o + w, "%llu\n", (unsigned long long)cur);
+        w = (size_t)(putu64(o + w, cur) - o); o[w++] = '\n';
     }
     if (q != qe) die("corrupt names: the integer stream has more than the count");
     free(v); o[w] = 0; *outn = w; return o;
@@ -776,7 +800,7 @@ static char *fldnamesd(const uint8_t *b, size_t n, uint64_t cnt, size_t *outn) {
                 uint64_t u = vgetb(&q, qe);
                 cur[i] += (int64_t)(u >> 1) ^ -(int64_t)(u & 1);
                 if (cur[i] < 0) die("corrupt names: a negative field");
-                w += (size_t)sprintf(o + w, "%lld", (long long)cur[i]);
+                w = (size_t)(putu64(o + w, (uint64_t)cur[i]) - o);   /* never negative, checked above */
             } else if (var[i] == 2) {
                 static const char HEX[] = "0123456789abcdef";
                 for (size_t j = 0; j < cl[i] / 2; j++) {
@@ -3734,13 +3758,13 @@ static void ensurenames(R *r) {
         names = xmalloc(mul(r->nreads, 21) + 1);
         size_t w = 0;
         for (uint64_t i = 0; i < r->nreads; i++)
-            w += (size_t)sprintf(names + w, "%llu\n", (unsigned long long)i);
+            { w = (size_t)(putu64(names + w, i) - names); names[w++] = '\n'; }
         names[w] = 0;
     } else if (!r->nzl_keep) {             /* ordinal: the name is the row */
         names = xmalloc(mul(r->nreads, 21) + 1);
         size_t w = 0;
         for (uint64_t i = 0; i < r->nreads; i++)
-            w += (size_t)sprintf(names + w, "%llu\n", (unsigned long long)i);
+            { w = (size_t)(putu64(names + w, i) - names); names[w++] = '\n'; }
         names[w] = 0;
     } else
     if (r->names_fld) {
@@ -4119,29 +4143,6 @@ static void seqdone(R *r, uint64_t ri, cur_t *c, const uint8_t *lp,
     c->lp = lp; c->ip = ip;
 }
 
-/* the digit count by compares, then one division a digit, in place: a
-   count by division doubles the divisions and a scratch array costs a
-   memcpy, and this writes every coordinate of every row */
-static inline char *putu64(char *o, uint64_t v) {
-    static const uint64_t P[19] = { 10ULL, 100ULL, 1000ULL, 10000ULL, 100000ULL,
-        1000000ULL, 10000000ULL, 100000000ULL, 1000000000ULL, 10000000000ULL,
-        100000000000ULL, 1000000000000ULL, 10000000000000ULL, 100000000000000ULL,
-        1000000000000000ULL, 10000000000000000ULL, 100000000000000000ULL,
-        1000000000000000000ULL, 10000000000000000000ULL };
-    static const char D2[201] =
-        "00010203040506070809101112131415161718192021222324"
-        "25262728293031323334353637383940414243444546474849"
-        "50515253545556575859606162636465666768697071727374"
-        "75767778798081828384858687888990919293949596979899";
-    int n = (int)((63 - __builtin_clzll(v | 1)) * 1233 >> 12) + 1;
-    n += (n <= 19 && v >= P[n - 1]);          /* the estimate is off by one */
-    int i = n;
-    while (v >= 100) { unsigned q = (unsigned)(v % 100); v /= 100; i -= 2;
-                       o[i] = D2[2 * q]; o[i + 1] = D2[2 * q + 1]; }
-    if (v < 10) o[--i] = (char)('0' + v);
-    else { i -= 2; o[i] = D2[2 * v]; o[i + 1] = D2[2 * v + 1]; }
-    return o + n;
-}
 
 static void setcols(void);
 /* --db and --aln companions, for every reader */

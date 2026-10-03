@@ -1199,6 +1199,11 @@ fn rank_all(src: &[&[u8]], n: &[usize], o: &Options) -> Vec<(i32, i32, usize)> {
     let prof = crate::prof::ON.load(Relaxed);
     let jt: Vec<AtomicUsize> = jobs.iter().map(|_| AtomicUsize::new(0)).collect();   // ns, under --profile
     let tp = std::time::Instant::now();
+    // As the C, whose jobs run inside an OpenMP region: a codec's own team
+    // (bzip3's blocks) stays one thread inside the pool, or every job
+    // holds several block states at once (short reads: 10.2 GB against 8.8)
+    let nt = rayon::current_num_threads();
+    rayon::broadcast(|_| ffi::omp_threads(1));
     rayon::broadcast(|_| loop {
         let j = next.fetch_add(1, Relaxed);
         let Some(&(_, t, r, c, lv)) = jobs.get(j) else { break };
@@ -1239,6 +1244,7 @@ fn rank_all(src: &[&[u8]], n: &[usize], o: &Options) -> Vec<(i32, i32, usize)> {
         (0, -1, 0)
     }).collect();
     if prof { eprintln!("  rank read-back: {:.3} s", tp.elapsed().as_secs_f64()); }
+    rayon::broadcast(|_| ffi::omp_threads(nt));
     picked
 }
 

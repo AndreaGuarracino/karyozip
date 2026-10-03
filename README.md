@@ -59,7 +59,7 @@ karyozip decode -d features.tsv -i s.all.kst --out-dir DIR      # every set's BE
 karyozip decode -d features.tsv -i s.all.kst --set gene         # one set
 ```
 
-- **Against a reference.** With the reads aligned to a reference (a PAF) and the reference's own track, `-a P.paf --ref ref.bed` stores only what differs from the reference. Every read of such a file takes the same `-a` and `--ref`.
+- **Against a reference.** With the reads aligned to a reference (a PAF) and the reference's own track, `-a P.paf --ref ref.bed` stores only what differs from the reference. Every read of such a file takes the same `-a` and `--ref`. Give `--ref` as a `.kst` track (`encode -e low`) for queries: a point query on the whole CHM13 reference takes 0.10 s against 13.0 s from the BED.
 
 ## Read names
 

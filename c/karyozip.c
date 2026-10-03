@@ -2503,10 +2503,13 @@ static size_t complens(ZSTD_CCtx *tc, const uint8_t *src, size_t n, uint8_t **ou
    on its sample wins, ties to the earlier of zstd, the table, zstd-22.
    m[s] bytes are ranked of a stream n[s] bytes whole. Out: cd[s], lv[s]
    the zstd level or -1, sz[s] 0 if none came back. */
-typedef struct { int s, c, lv, r, cls; size_t z; } rjob;
+typedef struct { int s, c, lv, r, cls; size_t z, m; } rjob;
+/* the slowest first, so no long job starts last: LZMA and zstd 17 and up,
+   then bzip3, then the rest; within a class the larger stream first */
 static int rjcmp(const void *a, const void *b) {
     const rjob *x = a, *y = b;
-    return x->cls != y->cls ? x->cls - y->cls : x->s != y->s ? x->s - y->s : x->r - y->r;
+    return x->cls != y->cls ? x->cls - y->cls : x->m != y->m ? (x->m < y->m) - (x->m > y->m)
+         : x->s != y->s ? x->s - y->s : x->r - y->r;
 }
 static void rankall(int ns, const uint8_t *const *src, const size_t *m, const size_t *n,
                     int *cd, int *lv, size_t *sz) {
@@ -2515,25 +2518,39 @@ static void rankall(int ns, const uint8_t *const *src, const size_t *m, const si
     for (int t = 0; t < ns; t++) {
         cd[t] = 0; lv[t] = -1; sz[t] = 0;
         if (!m[t]) continue;
-        jb[nj++] = (rjob){ t, 0, LEVEL, 0, 2, 0 };
+        jb[nj++] = (rjob){ t, 0, LEVEL, 0, LEVEL >= 17 ? 0 : 2, 0, m[t] };
         for (size_t k = 0; k < nc; k++) {
             if (packdup(cb[k], src[t], m[t]) || bz3dup(cb[k], m[t], n[t], cb, nc)) continue;
             if (n[t] >= 0x7fffffffu && !(cb[k] & (CODEC_BZIP3 | CODEC_LZMA))) continue;   /* rANS, arith: below INT_MAX */
-            jb[nj++] = (rjob){ t, cb[k], -1, (int)k + 1, cb[k] & CODEC_LZMA ? 0 : cb[k] & CODEC_BZIP3 ? 1 : 2, 0 };
+            jb[nj++] = (rjob){ t, cb[k], -1, (int)k + 1, cb[k] & CODEC_LZMA ? 0 : cb[k] & CODEC_BZIP3 ? 1 : 2, 0, m[t] };
         }
-        if (!FASTMODE && !LEVELSET) jb[nj++] = (rjob){ t, 0, 22, (int)nc + 1, 2, 0 };
+        if (!FASTMODE && !LEVELSET) jb[nj++] = (rjob){ t, 0, 22, (int)nc + 1, 0, 0, m[t] };
     }
     qsort(jb, nj, sizeof *jb, rjcmp);
+    double *jt = xcalloc(nj, sizeof *jt), tp = nowsec();   /* per job, under --profile */
 #ifdef _OPENMP
 #pragma omp parallel for schedule(dynamic, 1) num_threads(nthreads())
 #endif
     for (size_t j = 0; j < nj; j++) {
         const uint8_t *p = src[jb[j].s]; size_t k = m[jb[j].s]; uint8_t *o = NULL;
-        if (jb[j].c) { jb[j].z = paycomp(p, k, jb[j].c, &o); free(o); continue; }
-        size_t cap = ZSTD_compressBound(k); o = malloc(cap);
-        size_t z = o ? ZSTD_compress(o, cap, p, k, jb[j].lv) : 0;
-        jb[j].z = !o || ZSTD_isError(z) ? 0 : z; free(o);
+        double t0 = PROF ? nowsec() : 0;
+        if (jb[j].c) { jb[j].z = paycomp(p, k, jb[j].c, &o); free(o); }
+        else {
+            size_t cap = ZSTD_compressBound(k); o = malloc(cap);
+            size_t z = o ? ZSTD_compress(o, cap, p, k, jb[j].lv) : 0;
+            jb[j].z = !o || ZSTD_isError(z) ? 0 : z; free(o);
+        }
+        if (PROF) jt[j] = nowsec() - t0;
     }
+    if (PROF) fprintf(stderr, "  rank pool: %zu jobs, %.3f s\n", nj, nowsec() - tp);
+    tp = nowsec();
+    if (PROF)   /* the slowest jobs set the pool's critical path */
+        for (int top = 0; top < 5; top++) {
+            size_t q = 0; for (size_t j = 1; j < nj; j++) if (jt[j] > jt[q]) q = j;
+            if (jt[q] <= 0) break;
+            fprintf(stderr, "  rank job: stream %d %s on %zu B, %.3f s\n", jb[q].s, cname(jb[q].c ? jb[q].c : 0), m[jb[q].s], jt[q]);
+            jt[q] = -1;
+        }
 #ifdef _OPENMP
 #pragma omp parallel for schedule(dynamic, 1) num_threads(nthreads() < ns ? nthreads() : ns)
 #endif
@@ -2552,7 +2569,8 @@ static void rankall(int ns, const uint8_t *const *src, const size_t *m, const si
             if (ok) { cd[t] = jb[q].c; lv[t] = jb[q].lv; sz[t] = jb[q].z; break; }
             jb[q].z = 0;                          /* it does not come back: the next */
         }
-    free(jb);
+    if (PROF) fprintf(stderr, "  rank read-back: %.3f s\n", nowsec() - tp);
+    free(jb); free(jt);
 }
 
 static size_t lensok(ZSTD_CCtx *tc, const uint8_t *src, size_t n) {

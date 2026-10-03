@@ -1169,18 +1169,26 @@ fn rank_all(src: &[&[u8]], n: &[usize], o: &Options) -> Vec<(i32, i32, usize)> {
     let mut jobs: Vec<(u8, usize, usize, i32, i32)> = Vec::new();   // class, stream, rank, codec, level
     for (t, s) in src.iter().enumerate() {
         if s.is_empty() { continue; }
-        jobs.push((2, t, 0, 0, o.level));
+        jobs.push((if o.level >= 17 { 0 } else { 2 }, t, 0, 0, o.level));
         for (k, &c) in cand.iter().enumerate() {
             if pack_dup(c, s) || bz3_dup(c, s.len(), n[t], &cand) { continue; }
             if n[t] >= 0x7fff_ffff && c & (ffi::CODEC_BZIP3 | ffi::CODEC_LZMA) == 0 { continue; }   // rANS, arith: below INT_MAX
             let cls = if c & ffi::CODEC_LZMA != 0 { 0 } else if c & ffi::CODEC_BZIP3 != 0 { 1 } else { 2 };
             jobs.push((cls, t, k + 1, c, -1));
         }
-        if o.slow && !o.levelset { jobs.push((2, t, cand.len() + 1, 0, 22)); }
+        if o.slow && !o.levelset { jobs.push((0, t, cand.len() + 1, 0, 22)); }
     }
-    jobs.sort_unstable_by_key(|j| (j.0, j.1, j.2));
-    let z: Vec<usize> = jobs.par_iter().map(|&(_, t, _, c, lv)|
-        if c != 0 { ffi::paycomp(src[t], c).map_or(0, |v| v.len()) } else { ffi::zstd(src[t], lv).len() }).collect();
+    // the slowest first, as the C: LZMA and zstd 17 and up, then bzip3, then
+    // the rest, the larger stream first; taken in that order by every thread
+    jobs.sort_unstable_by_key(|j| (j.0, std::cmp::Reverse(src[j.1].len()), j.1, j.2));
+    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+    let (next, zs): (AtomicUsize, Vec<AtomicUsize>) = (AtomicUsize::new(0), jobs.iter().map(|_| AtomicUsize::new(0)).collect());
+    rayon::broadcast(|_| loop {
+        let j = next.fetch_add(1, Relaxed);
+        let Some(&(_, t, _, c, lv)) = jobs.get(j) else { break };
+        zs[j].store(if c != 0 { ffi::paycomp(src[t], c).map_or(0, |v| v.len()) } else { ffi::zstd(src[t], lv).len() }, Relaxed);
+    });
+    let z: Vec<usize> = zs.into_iter().map(AtomicUsize::into_inner).collect();
     (0..src.len()).into_par_iter().map(|t| {
         let mut live: Vec<usize> = (0..jobs.len()).filter(|&j| jobs[j].1 == t && z[j] > 0).collect();
         live.sort_by_key(|&j| (z[j], jobs[j].2));

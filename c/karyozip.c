@@ -63,7 +63,7 @@ static int nthreads(void) {
 #ifdef _OPENMP
     int m = omp_get_max_threads();
     if (m > THRCAP && !getenv("OMP_NUM_THREADS")) m = THRCAP;
-    return m;
+    return m < 1024 ? m : 1024;   /* libgomp keeps team state on the stack */
 #else
     return 1;
 #endif
@@ -4056,6 +4056,10 @@ static size_t maxlablen(const R *r) {   /* the longest label putlab writes */
 
 static void dump(const char *path) {
     R *r = ropen(path);
+    /* one block: decode it before the names, so the codec's working memory
+       is gone when the names arrive (74M short-read names: peak 7.16 GB was
+       the names held under a two-block bzip3 decode) */
+    if (r->nblk == 1) loadblk(r, 0);
     ensurenames(r);
     size_t OCAP = 1 << 22;
     char *ob = xmalloc(OCAP), *o = ob;
@@ -5300,7 +5304,7 @@ int main(int argc, char **argv) {
         exit(1); }
     if (NTHREADS > 1024) NTHREADS = 1024;   /* libgomp keeps team state on the stack */
 #ifdef _OPENMP
-    if (omp_get_max_threads() > 1024) omp_set_num_threads(1024);   /* OMP_NUM_THREADS too */
+    omp_set_num_threads(nthreads());   /* teams with no num_threads, bzip3's, follow -t too */
 #endif
 
 

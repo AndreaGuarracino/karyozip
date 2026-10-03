@@ -40,6 +40,7 @@ fn main() {
         },
     };
     ffi::pin_mmap_threshold();
+    ffi::omp_threads(n);
     rayon::ThreadPoolBuilder::new().num_threads(n).build_global().ok();
     let tmpdir = c.tmp_dir.clone()
         .or_else(|| std::env::var("TMPDIR").ok())

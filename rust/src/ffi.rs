@@ -56,6 +56,13 @@ pub fn ignore_sigxfsz() {
 /// heap and stays resident once freed: 55 MB against the C's 37 on a
 /// 300000-row encode. Pinned at the default, so big buffers are mapped and
 /// unmapped, as the C's allocation pattern leaves them.
+/// The OpenMP default team, which libbz3's block loop takes: -t, as the C.
+pub fn omp_threads(n: usize) {
+    unsafe extern "C" { fn omp_set_num_threads(n: c_int); }
+    // SAFETY: takes one int and only sets libgomp's default team size.
+    unsafe { omp_set_num_threads(n as c_int); }
+}
+
 pub fn pin_mmap_threshold() {
     unsafe extern "C" { fn mallopt(param: c_int, value: c_int) -> c_int; }
     // SAFETY: M_MMAP_THRESHOLD is -3; mallopt takes two ints.

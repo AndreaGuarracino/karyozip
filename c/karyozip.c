@@ -43,7 +43,6 @@ static inline double nowsec(void) {
     struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
     return t.tv_sec + 1e-9 * t.tv_nsec;
 }
-#define PH_RSS(i) do { if (PROF) PHRSS[i] = rss_now(); } while (0)
 /* the high-water mark is read from /proc at most every 10 ms: a span per
    sequence over 3,000,000 sequences made a 1.7 s smooth take 104 s */
 #define PH_ADD(i, t0) do { if (PROF) { double _n = nowsec(); PH[i] += _n - (t0); \
@@ -1550,12 +1549,12 @@ static void loadaln(const char *path) {
 
 static void loadordinals(const char *path) {
     FILE *f = zfopen(path);
-    if (!f) die("cannot open the file given to --names");
+    if (!f) die("cannot open the file given to --aln-names");
     char *ln = NULL; size_t cap = 0; ssize_t n; size_t c = 0;
     while ((n = getline(&ln, &cap, f)) > 0) {
         if (ln[n - 1] == '\n') ln[--n] = 0;
         if (n && ln[n - 1] == '\r') ln[--n] = 0;
-        if (!c && (ln[0] == '>' || ln[0] == '@')) die("--names on encode takes a plain list, one name a line");
+        if (!c && (ln[0] == '>' || ln[0] == '@')) die("--aln-names takes a plain list, one name a line");
         if (!n) die("--aln-names: an empty line: every line is one name");
         if (c == nord) { nord = nord ? nord * 2 : 1 << 16;
                          ORD = xrealloc(ORD, nord * sizeof *ORD); }
@@ -1631,7 +1630,7 @@ static size_t runat(const rcon *rc, uint64_t tpos, size_t lo, size_t hi, uint64_
     CR = rc; CRI = a;
     return a;
 }
-static int refwin(rcon *rc, uint64_t tpos, size_t *lo, size_t *hi, uint64_t *wend);
+static void refwin(rcon *rc, uint64_t tpos, size_t *lo, size_t *hi, uint64_t *wend);
 static int REFPERBLK;   /* one sequence asked for, no tail-encoded row: fill by block */
 static uint32_t reflabel(const qseg *Q, uint64_t pos) {
     const seg *g = segat(Q, pos);
@@ -2029,8 +2028,7 @@ static int srd_next(srun_rd *r) {
     if (fread(&r->idx, 4, 1, r->f) != 1) die("sort temp is corrupt");
     if (fread(r->nm, 1, nl, r->f) != nl) die("sort temp is corrupt");
     r->nm[nl] = 0;
-    if (r->nrun > r->cap) { r->cap = r->nrun; r->rs = xrealloc(r->rs, r->cap * sizeof *r->rs);
-                            if (!r->rs) die("oom"); }
+    if (r->nrun > r->cap) { r->cap = r->nrun; r->rs = xrealloc(r->rs, r->cap * sizeof *r->rs); }
     if (fread(r->rs, sizeof(srun), r->nrun, r->f) != r->nrun) die("sort temp is corrupt");
     return 1;
 }
@@ -2307,9 +2305,7 @@ static int fastenough(int codec) {
     return (codec & (CODEC_BZIP3 | CODEC_ARITH | CODEC_LZMA)) == 0;
 }
 
-static void pickcodecs(int rawfd, const blkmeta *bm, size_t nraw, int onelay) {
-
-    if (onelay) return;   /* the layout search ranks it all */
+static void pickcodecs(int rawfd, const blkmeta *bm, size_t nraw) {
 
         int CANDBUF[KCAND_N]; size_t NC = candlist(CANDBUF);
         const int *CAND = CANDBUF;
@@ -2647,7 +2643,7 @@ static void ktw_close(ktw *w) {
     const blkmeta *bm = w->bm; size_t nraw = w->nraw;
 
     double _ts = nowsec();
-    pickcodecs(w->rawfd, bm, nraw, nraw == 1 && w->ibx.n);
+    if (!(nraw == 1 && w->ibx.n)) pickcodecs(w->rawfd, bm, nraw);   /* else the layout search ranks it all */
     PH_ADD(8, _ts);
 
     size_t maxraw = 0;
@@ -3375,14 +3371,12 @@ static R *ropen(const char *path) {
         if (r->nichunk == SIZE_MAX) die("corrupt file: chunk count");
         r->coff = xmalloc(mul(r->nichunk + 1, 8));
         r->cpendv = xmalloc(mul(r->nichunk + 1, 8));
-        if (!r->coff || !r->cpendv) die("oom");
         const uint8_t *q = tbuf, *qe = tbuf + tb;
-        uint64_t acc = 0, mx = 0;
+        uint64_t acc = 0;
         for (uint64_t c = 0; c < r->nichunk; c++) {
             uint64_t cl = vgetb(&q, qe);
             r->cpendv[c] = vgetb(&q, qe);
             r->coff[c] = acc; acc += cl;
-            if (cl > mx) mx = cl;
         }
         r->coff[r->nichunk] = acc;
         if (acc != h[2]) die("index chunk table does not match the index");
@@ -3441,7 +3435,6 @@ static R *ropen(const char *path) {
           if (t > mx) mx = t; }
       r->blkcap = mx ? mx + 64 : (1 << 16); }
     r->blkbuf = xmalloc(r->blkcap + VGUARD);
-    if (!r->blkbuf) die("oom: block buffer");
     r->cached = UINT64_MAX;
     r->curblk = UINT64_MAX; r->curoff = 0; r->curlp = r->curip = NULL;
     return r;
@@ -3798,7 +3791,6 @@ static size_t ilv_split(R *r, uint8_t *b, size_t n, size_t nl, size_t ni) {
     } while (0)
     while (p < e) {
         const uint8_t *h0 = p;
-        if (p >= e) break;
         uint64_t k = vget(&p);
         if (p > e) die("corrupt block: a run count runs past the frame");
         if (!k || k > r->rows - seen) die("corrupt block: a run count is out of range");
@@ -4594,13 +4586,13 @@ static void refload(rcon *rc, uint64_t b, int prep) {
     LENDEC = ld; TAILDEC = td; TAILPRED_R = tp; TAILSKIP_R = ts; PAYEND = pe;
 }
 /* The decoded rows around tpos: [lo, hi) and the position after them. */
-static int refwin(rcon *rc, uint64_t tpos, size_t *lo, size_t *hi, uint64_t *wend) {
-    if (rc->filled) { *lo = 0; *hi = rc->n; *wend = rc->end; return 1; }
+static void refwin(rcon *rc, uint64_t tpos, size_t *lo, size_t *hi, uint64_t *wend) {
+    if (rc->filled) { *lo = 0; *hi = rc->n; *wend = rc->end; return; }
     static __thread rcon *WRC; static __thread size_t WLO, WHI;
     static __thread uint64_t WST, WEN;
     if (rc == WRC && tpos >= WST && tpos < WEN) {    /* the window last answered */
         *lo = WLO; *hi = WHI; *wend = WEN;
-        return 1;
+        return;
     }
     R *r = REFR;
     if (!rc->blkin) {
@@ -4622,7 +4614,6 @@ static int refwin(rcon *rc, uint64_t tpos, size_t *lo, size_t *hi, uint64_t *wen
     *hi = rc->row0 + rc->n <= (b + 1) * r->block ? rc->n : (size_t)((b + 1) * r->block - rc->row0);
     *wend = rc->bend[b];
     WRC = rc; WLO = *lo; WHI = *hi; WST = rc->st[*lo]; WEN = *wend;   /* per block: st stays 8 bytes */
-    return 1;
 }
 
 static char out[1 << 22];
@@ -4711,22 +4702,20 @@ static void smooth_mt(const char *path, R *r0, int64_t first, int64_t last,
 
     const int64_t CHUNK = 4096;
     int64_t nchunk = (last - first + CHUNK - 1) / CHUNK;
-    _Atomic int failed = 0, wfail = 0;
+    _Atomic int wfail = 0;
 #ifdef _OPENMP
 #pragma omp parallel num_threads(nthr)
 #endif
     {
         R *rr = ropen(path);
 
-        if (rr) { rr->name = r0->name; rr->names_ready = 1; rr->name_borrowed = 1; }
+        rr->name = r0->name; rr->names_ready = 1; rr->name_borrowed = 1;
         size_t cap = 1 << 20, len = 0;
-        char *ob = malloc(cap);
-        if (!ob || !rr) failed = 1;
+        char *ob = xmalloc(cap);
 #ifdef _OPENMP
 #pragma omp for ordered schedule(dynamic, 1)
 #endif
         for (int64_t c = 0; c < nchunk; c++) {
-            if (failed) continue;
             int64_t a = first + c * CHUNK, b = a + CHUNK;
             if (b > last) b = last;
             len = 0;
@@ -4745,21 +4734,19 @@ static void smooth_mt(const char *path, R *r0, int64_t first, int64_t last,
             }
         }
         free(ob);
-        if (rr) rclose(rr);
+        rclose(rr);
     }
     if (wfail) die("write failed");
-    if (failed) die("threaded smoothing failed");
 }
 
 /* smooth TRACK HIER FS [SEQ [START END]] */
 static void smoothcmd(const char *path, const char *hier, const char *fs,
                       const char *seq, uint64_t lo, uint64_t hi, int v1) {
     loadhier(hier, fs);
-    buildanc();
     R *r = ropen_informed(path);
     ensurenames(r);   /* emit prints names */
     int *labmap = labnodes(r, fs);
-    if (ANC) { free(ANC); free(LCA); buildanc(); }   /* unknown labels added above */
+    buildanc();   /* after labnodes: it adds the unknown labels */
 
     int64_t first = 0, last = (int64_t)r->nreads;
     if (seq) { first = idxlookup(r, path, seq); if (first < 0) first = rfind(r, seq);
@@ -4906,8 +4893,6 @@ static void encode_db(int nfiles, char **files) {
         }
         uint32_t id = UINT32_MAX;
         if (DBIDS) {                       /* the label column IS the id */
-            char *e3 = NULL;
-            (void)e3;
             if (b[0].lab[0] == '0' && b[0].lab[1]) die("--db: a featureID with a leading zero");
             uint64_t v = num_arg(b[0].lab, CARTON ? CARTBASE - 1 + VPROD : CARTBASE - 1, "--db: a label is not a featureID; give one BED per feature set instead");
             if (v < CARTBASE && (v >= nfid || (v && !fid2lab[v]))) die("--db: featureID not in the features table");

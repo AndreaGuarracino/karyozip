@@ -394,14 +394,14 @@ impl Aln {
 
     /// One name a line, in the order the annotator produced them.
     pub fn load_ordinals(&mut self, path: &str) {
-        let data = crate::slurp(path, "cannot open the file given to --names");
+        let data = crate::slurp(path, "cannot open the file given to --aln-names");
         let mut h = FNV0;
         let body = if data.last() == Some(&b'\n') { &data[..data.len() - 1] } else { &data[..] };
         for line in body.split(|&c| c == b'\n') {
             let mut l = line;
             if l.last() == Some(&b'\r') { l = &l[..l.len() - 1]; }
             if self.ord.is_empty() && (l.first() == Some(&b'>') || l.first() == Some(&b'@')) {
-                crate::bail("--names on encode takes a plain list, one name a line");
+                crate::bail("--aln-names takes a plain list, one name a line");
             }
             if l.is_empty() { crate::bail("--aln-names: an empty line: every line is one name"); }
             self.ord.push(l.to_vec());

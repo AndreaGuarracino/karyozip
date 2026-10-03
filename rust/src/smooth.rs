@@ -214,7 +214,6 @@ pub fn run(path: &str, hier: &str, fs: &[u8], seq: Option<&[u8]>,
            ro: &crate::reader::ReadOpts, feats: Option<&crate::db::Feats>,
            out: &mut (impl Write + Send)) {
     let mut h = Hier::load(hier, fs);
-    h.build();
     let mut r = Reader::open_with(path, ro);
     if let Some(f) = feats { f.check_hash(&r); }
     let setk = feats.map(|f| f.sets.iter().position(|s| s == fs)
@@ -233,7 +232,7 @@ pub fn run(path: &str, hier: &str, fs: &[u8], seq: Option<&[u8]>,
         novelid.push(u8::from(l == b"novel"));
         labmap.push(h.id(&l));
     }
-    h.build();
+    h.build();   // after the labels: they add the unknown nodes
 
     let (first, last) = match seq {
         Some(s) => { let i = r.find_seq(s); if i < 0 { crate::bail("sequence not found"); }

@@ -335,19 +335,25 @@ impl Writer {
             }
             if best == usize::MAX { break; }
             let r = head[best].take().unwrap();
-            let rank = r.idx.to_string();
-            let name: &[u8] = if self.perm_on { rank.as_bytes() } else { &r.nm };
-            self.alnname = Some(r.nm.clone());
-            let mut pos = 0u64;
-            for &(len, id) in &r.runs {
-                let l = self.labtab[id as usize].clone();
-                self.row_inner(name, len as u64, &l, pos)?;
-                pos += len as u64;
-            }
+            self.sort_emit(&r)?;
             out += 1;
             head[best] = srd_next(&mut files[best])?;
         }
         eprintln!("external sort: {out} records merged from {} runs", files.len());
+        Ok(())
+    }
+
+    /// One sorted record to the writer, under its rank when names are permuted.
+    fn sort_emit(&mut self, r: &SRec) -> Result<(), String> {
+        let rank = r.idx.to_string();
+        let name: &[u8] = if self.perm_on { rank.as_bytes() } else { &r.nm };
+        self.alnname = Some(r.nm.clone());
+        let mut pos = 0u64;
+        for &(len, id) in &r.runs {
+            let l = self.labtab[id as usize].clone();
+            self.row_inner(name, len as u64, &l, pos)?;
+            pos += len as u64;
+        }
         Ok(())
     }
 
@@ -360,17 +366,7 @@ impl Writer {
         let mut recs = std::mem::take(&mut self.srec);
         recs.sort_by(srec_cmp);
         let n = recs.len();
-        for r in &recs {
-            let rank = r.idx.to_string();
-            let name: &[u8] = if self.perm_on { rank.as_bytes() } else { &r.nm };
-            self.alnname = Some(r.nm.clone());
-            let mut pos = 0u64;
-            for &(len, id) in &r.runs {
-                let l = self.labtab[id as usize].clone();
-                self.row_inner(name, len as u64, &l, pos)?;
-                pos += len as u64;
-            }
-        }
+        for r in &recs { self.sort_emit(r)?; }
         eprintln!("sorted {n} records by label tuple then lengths");
         Ok(())
     }

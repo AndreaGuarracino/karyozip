@@ -100,6 +100,7 @@ static void profdump(void) {
     }
 }
 static void die(const char *m) { fprintf(stderr, "karyozip: %s\n", m); exit(1); }
+static void die2(const char *a, const char *b) { fprintf(stderr, "karyozip: %s%s\n", a, b); exit(1); }
 
 static __thread size_t ALLOCMAX = 0;
 static void ckalloc(size_t n) {
@@ -142,6 +143,12 @@ static FILE *zfopen(const char *path) {
     FILE *f = fopencookie(g, "r", io);
     if (!f) gzclose(g);
     return f;
+}
+
+/* a line read by getline, its \n and a \r before it gone */
+static void chomp(char *l, ssize_t *n) {
+    if (*n && l[*n - 1] == '\n') l[--*n] = 0;
+    if (*n && l[*n - 1] == '\r') l[--*n] = 0;
 }
 
 static uint64_t fnvbuf(uint64_t h, const void *p, size_t n) {
@@ -328,6 +335,15 @@ static size_t zcl(buf *in, uint8_t **out, int level) {
 }
 static size_t zc(buf *in, uint8_t **out) { return zcl(in, out, LEVEL); }
 
+/* one zstd frame, NUL-terminated; the refusals name what it held */
+static char *unz(const void *src, size_t n, size_t *len, const char *what) {
+    unsigned long long rb = ZSTD_getFrameContentSize(src, n);
+    if (rb == ZSTD_CONTENTSIZE_UNKNOWN || rb == ZSTD_CONTENTSIZE_ERROR) die2(what, " has no usable frame size");
+    char *o = xmalloc((size_t)rb + 1);
+    if (ZSTD_isError(ZSTD_decompress(o, rb, src, n))) die2(what, " decompress failed");
+    o[rb] = 0; *len = (size_t)rb; return o;
+}
+
 #define METALEVEL (LEVEL < 19 ? LEVEL : 19)
 
 #define ICHUNK 65536
@@ -420,11 +436,7 @@ static size_t intnames(buf *names, uint64_t n, uint8_t **out) {
 }
 
 static char *intnamesd(const uint8_t *b, size_t n, uint64_t cnt, size_t *outn) {
-    unsigned long long rb = ZSTD_getFrameContentSize(b, n);
-    if (rb == ZSTD_CONTENTSIZE_UNKNOWN || rb == ZSTD_CONTENTSIZE_ERROR)
-        die("int names have no usable frame size");
-    uint8_t *v = xmalloc((size_t)rb);
-    if (ZSTD_isError(ZSTD_decompress(v, rb, b, n))) die("int names decompress failed");
+    size_t rb; uint8_t *v = (uint8_t *)unz(b, n, &rb, "int names");
     char *o = xmalloc(mul(cnt, 21) + 1);
 
     const uint8_t *q = v, *qe = v + rb; size_t w = 0; uint64_t cur = 0;
@@ -1216,8 +1228,7 @@ static void loadref(const char *path) {
     rcon *cur = NULL; uint64_t badln = 0;
     uint64_t rh = FNV0, nh = 0;
     while ((n = getline(&ln, &cap, f)) > 0) {
-        if (ln[n - 1] == '\n') ln[--n] = 0;
-        if (n && ln[n - 1] == '\r') ln[--n] = 0;
+        chomp(ln, &n);
         char *t1 = memchr(ln, '\t', (size_t)n); if (!t1) { badln++; continue; }
         char *t2 = memchr(t1 + 1, '\t', (size_t)(n - (t1 + 1 - ln))); if (!t2) { badln++; continue; }
         char *t3 = memchr(t2 + 1, '\t', (size_t)(n - (t2 + 1 - ln))); if (!t3) { badln++; continue; }
@@ -1277,8 +1288,7 @@ static void loadpaf(const char *path) {
     char *ln = NULL; size_t cap = 0; ssize_t n;
     size_t nblk = 0; uint64_t badpaf = 0, nocg = 0, noref = 0;
     while ((n = getline(&ln, &cap, f)) > 0) {
-        if (ln[n - 1] == '\n') ln[--n] = 0;
-        if (n && ln[n - 1] == '\r') ln[--n] = 0;
+        chomp(ln, &n);
 
         char *fl[12]; int nf = 0;
         char *p = ln;
@@ -1552,8 +1562,7 @@ static void loadordinals(const char *path) {
     if (!f) die("cannot open the file given to --aln-names");
     char *ln = NULL; size_t cap = 0; ssize_t n; size_t c = 0;
     while ((n = getline(&ln, &cap, f)) > 0) {
-        if (ln[n - 1] == '\n') ln[--n] = 0;
-        if (n && ln[n - 1] == '\r') ln[--n] = 0;
+        chomp(ln, &n);
         if (!c && (ln[0] == '>' || ln[0] == '@')) die("--aln-names takes a plain list, one name a line");
         if (!n) die("--aln-names: an empty line: every line is one name");
         if (c == nord) { nord = nord ? nord * 2 : 1 << 16;
@@ -1790,8 +1799,7 @@ static void loadfeatures(const char *path) {
     uint32_t maxid = 0; FEATHASH = FNV0;
     while ((n = getline(&ln, &cap, f)) > 0) {
         FEATHASH = fnvbuf(FEATHASH, ln, (size_t)n);
-        if (n && ln[n - 1] == '\n') ln[--n] = 0;
-        if (n && ln[n - 1] == '\r') ln[--n] = 0;
+        chomp(ln, &n);
         if (!nfset) {                                  /* header */
             for (char *p = ln; (p = strchr(p, '\t')); p++) nfset++;
             if (!nfset) die("features.tsv: the first line must be the tab-separated header");
@@ -1874,8 +1882,7 @@ static void loadvocab(const char *path) {
     char *line = NULL; size_t cap = 0; ssize_t len; HIERHASH = FEATHASH;
     while ((len = getline(&line, &cap, f)) > 0) {
         HIERHASH = fnvbuf(HIERHASH, line, (size_t)len);
-        if (len && line[len - 1] == '\n') line[--len] = 0;
-        if (len && line[len - 1] == '\r') line[--len] = 0;
+        chomp(line, &len);
         if (!len) continue;
         char *t1 = memchr(line, '\t', (size_t)len); if (!t1) continue;
         char *t2 = memchr(t1 + 1, '\t', (size_t)(len - (t1 + 1 - line))); if (!t2) continue;
@@ -1924,18 +1931,32 @@ static uint8_t *PERMBLOB; static size_t PERMBLOBLEN; static int PERMBLOBTOK;
 
 static void psort(srec *v, size_t n);
 
-static int srec_cmp(const void *a, const void *b) {
-    const srec *x = a, *y = b;
-    uint32_t n = x->nrun < y->nrun ? x->nrun : y->nrun;
-    const srun *p = rrun + x->off, *q = rrun + y->off;
-    for (uint32_t i = 0; i < n; i++)                 /* labels lead */
+/* labels lead, then the run count, then lengths; 0 on a tie */
+static int runcmp(const srun *p, uint32_t pn, const srun *q, uint32_t qn) {
+    uint32_t n = pn < qn ? pn : qn;
+    for (uint32_t i = 0; i < n; i++)
         if (p[i].lab != q[i].lab) return p[i].lab < q[i].lab ? -1 : 1;
-    if (x->nrun != y->nrun) return x->nrun < y->nrun ? -1 : 1;
-    for (uint32_t i = 0; i < n; i++)                 /* then lengths */
+    if (pn != qn) return pn < qn ? -1 : 1;
+    for (uint32_t i = 0; i < n; i++)
         if (p[i].len != q[i].len) return p[i].len < q[i].len ? -1 : 1;
-
-    if (x->nam != y->nam) return x->nam < y->nam ? -1 : 1;
     return 0;
+}
+static int srec_cmp(const void *a, const void *b) {   /* a tie keeps input order */
+    const srec *x = a, *y = b;
+    int c = runcmp(rrun + x->off, x->nrun, rrun + y->off, y->nrun);
+    return c ? c : (x->nam > y->nam) - (x->nam < y->nam);
+}
+/* one sorted record to the writer, under its rank when names are permuted */
+static void sortemit(ktw *w, const char *nm, uint32_t idx, const srun *rs, uint32_t n) {
+    char ib[24]; size_t nl;
+    ALNNAME = nm;
+    if (PERMON) { nl = (size_t)sprintf(ib, "%u", idx); nm = ib; } else nl = strlen(nm);
+    uint64_t pos = 0;
+    for (uint32_t k = 0; k < n; k++) {
+        const char *lb = labtab[rs[k].lab];
+        ktw_row(w, nm, nl, rs[k].len, lb, strlen(lb), pos, 0);
+        pos += rs[k].len;
+    }
 }
 
 static void psort(srec *v, size_t n) {
@@ -1969,19 +1990,8 @@ static void psort(srec *v, size_t n) {
 
 static void sortflush(ktw *w) {
     psort(rrec, rrecn);
-    for (size_t i = 0; i < rrecn; i++) {
-        char ib[24]; const char *nm = rbuf + rrec[i].nam; size_t nl2;
-        ALNNAME = nm;
-        if (PERMON) { nl2 = (size_t)sprintf(ib, "%u", rrec[i].idx); nm = ib; }
-        else nl2 = strlen(nm);
-        uint64_t pos = 0;
-        for (uint32_t k = 0; k < rrec[i].nrun; k++) {
-            const srun *u = rrun + rrec[i].off + k;
-            const char *lb = labtab[u->lab];
-            ktw_row(w, nm, nl2, u->len, lb, strlen(lb), pos, 0);
-            pos += u->len;
-        }
-    }
+    for (size_t i = 0; i < rrecn; i++)
+        sortemit(w, rbuf + rrec[i].nam, rrec[i].idx, rrun + rrec[i].off, rrec[i].nrun);
     fprintf(stderr, "sorted %zu records by label tuple then lengths\n", rrecn);
     rrecn = 0; rrunn = 0; rbufn = 0;
 }
@@ -2034,15 +2044,8 @@ static int srd_next(srun_rd *r) {
 }
 
 static int srd_cmp(const srun_rd *a, const srun_rd *b) {
-    uint32_t n = a->nrun < b->nrun ? a->nrun : b->nrun;
-    for (uint32_t i = 0; i < n; i++)
-        if (a->rs[i].lab != b->rs[i].lab) return a->rs[i].lab < b->rs[i].lab ? -1 : 1;
-    if (a->nrun != b->nrun) return a->nrun < b->nrun ? -1 : 1;
-    for (uint32_t i = 0; i < n; i++)
-        if (a->rs[i].len != b->rs[i].len) return a->rs[i].len < b->rs[i].len ? -1 : 1;
-
-    if (a->idx != b->idx) return a->idx < b->idx ? -1 : 1;
-    return 0;
+    int c = runcmp(a->rs, a->nrun, b->rs, b->nrun);
+    return c ? c : (a->idx > b->idx) - (a->idx < b->idx);
 }
 
 static void spillmerge(ktw *w) {
@@ -2060,16 +2063,7 @@ static void spillmerge(ktw *w) {
         }
         if (best == nspill) break;
         srun_rd *r = &rd[best];
-        char ib[24]; const char *nmp = r->nm; size_t nl;
-        ALNNAME = r->nm;
-        if (PERMON) { nl = (size_t)sprintf(ib, "%u", r->idx); nmp = ib; }
-        else nl = strlen(r->nm);
-        uint64_t pos = 0;
-        for (uint32_t k = 0; k < r->nrun; k++) {
-            const char *lb = labtab[r->rs[k].lab];
-            ktw_row(w, nmp, nl, r->rs[k].len, lb, strlen(lb), pos, 0);
-            pos += r->rs[k].len;
-        }
+        sortemit(w, r->nm, r->idx, r->rs, r->nrun);
         out++;
         srd_next(r);
     }
@@ -3098,7 +3092,7 @@ typedef struct {
     char *namebuf, *natbufp;
     int name_borrowed;         /* the table belongs to another reader */
     int blk_borrowed;          /* so do the one block and its run counts */
-    uint8_t *ichunk; uint64_t nichunk, *coff, *cpendv, curchunk, ibcap;
+    uint8_t *ichunk; uint64_t nichunk, *coff, *cpendv, curchunk;
     uint64_t *sst, *sen; int *sfeat; uint8_t *snov; uint64_t scap;
     const uint8_t *payend;        /* the cached block's payload end, per reader */
     const uint8_t *curlp, *curip;
@@ -3110,15 +3104,7 @@ static void loadichunk(R *r, uint64_t c) {
     if (c >= r->nichunk) die("index chunk out of range");
     size_t cl = (size_t)(r->coff[c + 1] - r->coff[c]);
     const uint8_t *src = r->ichunk + r->coff[c];
-    unsigned long long rb = ZSTD_getFrameContentSize(src, cl);
-    if (rb == ZSTD_CONTENTSIZE_UNKNOWN || rb == ZSTD_CONTENTSIZE_ERROR)
-        die("index chunk has no usable frame size");
-    if (rb > r->ibcap) {
-        r->ibuf = xrealloc(r->ibuf, (size_t)rb);
-        r->ibcap = rb;
-    }
-    if (ZSTD_isError(ZSTD_decompress(r->ibuf, rb, src, cl)))
-        die("index chunk decompress failed");
+    size_t rb; free(r->ibuf); r->ibuf = (uint8_t *)unz(src, cl, &rb, "index chunk");
     r->curchunk = c;
     r->cp = r->ibuf; r->cpe = r->ibuf + (size_t)rb;
     r->ci = c * ICHUNK; r->cpend = r->cpendv[c];
@@ -3221,13 +3207,7 @@ static R *ropen(const char *path) {
         uint8_t *lz = xmalloc(lzl);
         if (fread(lz, 1, lzl, r->f) != lzl) die("short labels");
         lzraw = lz;   /* kept for the hash, freed there */
-        unsigned long long lb = ZSTD_getFrameContentSize(lz, lzl);
-        if (lb == ZSTD_CONTENTSIZE_UNKNOWN || lb == ZSTD_CONTENTSIZE_ERROR)
-            die("label table has no usable frame size");
-        char *lbuf = xmalloc((size_t)lb + 1);
-        if (ZSTD_isError(ZSTD_decompress(lbuf, lb, lz, lzl)))
-            die("label table decompress failed");
-        lbuf[lb] = 0;
+        size_t lb; char *lbuf = unz(lz, lzl, &lb, "label table");
 
         if (r->nlab > lb) die("label count exceeds the label table");
         if (!r->nlab) die("corrupt file: a label table with no labels");
@@ -3362,12 +3342,7 @@ static R *ropen(const char *path) {
     r->curchunk = UINT64_MAX;
     {   uint8_t *itz = xmalloc(h[11]);
         if (fread(itz, 1, h[11], r->f) != h[11]) die("short index table");
-        unsigned long long tb = ZSTD_getFrameContentSize(itz, h[11]);
-        if (tb == ZSTD_CONTENTSIZE_UNKNOWN || tb == ZSTD_CONTENTSIZE_ERROR)
-            die("index table has no usable frame size");
-        uint8_t *tbuf = xmalloc(tb);
-        if (ZSTD_isError(ZSTD_decompress(tbuf, tb, itz, h[11])))
-            die("index table decompress failed");
+        size_t tb; uint8_t *tbuf = (uint8_t *)unz(itz, h[11], &tb, "index table");
         free(itz);
         if (r->nichunk == SIZE_MAX) die("corrupt file: chunk count");
         r->coff = xmalloc(mul(r->nichunk + 1, 8));
@@ -3386,19 +3361,14 @@ static R *ropen(const char *path) {
         for (uint64_t c = 0; c < r->nichunk; c++)
             if (r->cpendv[c] > r->cpendv[c + 1] || (c == 0 && r->cpendv[0])) die("corrupt file: index chunk starts are not in order");
         free(tbuf);
-        r->ibcap = 0; r->ibuf = NULL;
+        r->ibuf = NULL;
     }
     r->lencodec = (int)(uint32_t)h[5]; r->idcodec = (int)(uint32_t)h[9];
     if (nosz(r->lencodec) || nosz(r->idcodec)) die("corrupt file: a NOSZ codec cannot be size-checked");
     if ((uint32_t)h[5] >> 31 || (uint32_t)h[9] >> 31) die("corrupt file: codec id out of range");
     r->ci = 0; r->cpend = 0; r->cvalid = 0;
 
-    unsigned long long sb = ZSTD_getFrameContentSize(sz, h[3]);
-    if (sb == ZSTD_CONTENTSIZE_UNKNOWN || sb == ZSTD_CONTENTSIZE_ERROR)
-        die("block sizes stream has no usable frame size");
-    uint8_t *sbuf = xmalloc((size_t)sb);
-    if (ZSTD_isError(ZSTD_decompress(sbuf, sb, sz, h[3])))
-        die("block sizes decompress failed");
+    size_t sb; uint8_t *sbuf = (uint8_t *)unz(sz, h[3], &sb, "block sizes");
     { const uint8_t *p = sbuf, *end = sbuf + sb; uint64_t n = 0, cap = 1 << 16;
       r->b = xmalloc(mul(cap, sizeof *r->b));
       uint64_t acc = 0;
@@ -3560,13 +3530,7 @@ static void ensurenames(R *r) {
     } else if (r->names_tok) {
         size_t nb; names = tokd(r->nz_keep, r->nzl_keep, &nb);
     } else {
-        unsigned long long nb = ZSTD_getFrameContentSize(r->nz_keep, r->nzl_keep);
-        if (nb == ZSTD_CONTENTSIZE_UNKNOWN || nb == ZSTD_CONTENTSIZE_ERROR)
-            die("names stream has no usable frame size");
-        names = xmalloc((size_t)nb + 1);
-        if (ZSTD_isError(ZSTD_decompress(names, nb, r->nz_keep, r->nzl_keep)))
-            die("names decompress failed");
-        names[nb] = 0;
+        size_t nb; names = unz(r->nz_keep, r->nzl_keep, &nb, "names");
     }
     r->namebuf = names;               /* r->name[] points into this */
     char *p = names;
@@ -3592,13 +3556,7 @@ static void ensurenames(R *r) {
         }
         else if (r->perm_tok) { size_t nb; nat = tokd(r->pz, r->pzl, &nb); }
         else {
-            unsigned long long nb = ZSTD_getFrameContentSize(r->pz, r->pzl);
-            if (nb == ZSTD_CONTENTSIZE_UNKNOWN || nb == ZSTD_CONTENTSIZE_ERROR)
-                die("input-order names have no usable frame size");
-            nat = xmalloc((size_t)nb + 1);
-            if (ZSTD_isError(ZSTD_decompress(nat, nb, r->pz, r->pzl)))
-                die("input-order names decompress failed");
-            nat[nb] = 0;
+            size_t nb; nat = unz(r->pz, r->pzl, &nb, "input-order names");
         }
         r->natbufp = nat;             /* after the remap r->name[] points here */
         char **tab = xmalloc(mul(r->nreads, sizeof(char *)));
@@ -4264,8 +4222,7 @@ static void loadhier(const char *path, const char *fs) {
     if (!f) die("cannot open the hierarchy file");
     char *line = NULL; size_t cap = 0; ssize_t len;
     while ((len = getline(&line, &cap, f)) > 0) {
-        if (len && line[len - 1] == '\n') line[--len] = 0;
-        if (len && line[len - 1] == '\r') line[--len] = 0;
+        chomp(line, &len);
         if (!len) continue;
         char *t1 = memchr(line, '\t', (size_t)len); if (!t1) continue;
         char *t2 = memchr(t1 + 1, '\t', (size_t)(len - (t1 + 1 - line))); if (!t2) continue;

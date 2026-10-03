@@ -29,7 +29,15 @@ pub fn put(out: &mut Vec<u8>, mut v: u64) {
 }
 
 /// LEB128 back out, with the bound the forged-file fuzzing needs.
-pub fn vget(b: &[u8], mut i: usize) -> (u64, usize) {
+#[inline]
+pub fn vget(b: &[u8], i: usize) -> (u64, usize) {
+    match b.get(i) {   // one byte is most values: no loop for it
+        Some(&c) if c < 0x80 => (c as u64, i + 1),
+        _ => vget_long(b, i),
+    }
+}
+#[cold]
+fn vget_long(b: &[u8], mut i: usize) -> (u64, usize) {
     let (mut v, mut s) = (0u64, 0u32);
     loop {
         if i >= b.len() || s > 63 { crate::bail("corrupt varint"); }

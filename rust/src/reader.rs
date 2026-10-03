@@ -115,7 +115,7 @@ pub struct Reader {
     /// the sequence index: chunk frames, their offsets, the run count each
     /// starts at, and the one chunk decoded now, as the C's loadichunk
     iz: Vec<u8>, coff: Vec<u64>, cpend: Vec<u64>, ibx: Vec<u8>, cur_chunk: u64,
-    runhead: bool, ilv: bool, grp: bool, rtab: Vec<u32>,   // run counts lifted out of the lengths
+    runhead: bool, ilv: bool, grp: bool, rtab: Vec<u64>,   // run-count prefix sums, lifted out of the lengths
     hasidx: bool,
     mhash: u64,
     cur_ri: u64,
@@ -156,9 +156,10 @@ impl Reader {
             let sh: String = m.iter()
                 .map(|&c| if (32..127).contains(&c) { c as char } else { '.' }).collect();
             if m[..3] == crate::writer::MAGIC[..3] {
-                eprintln!("karyozip: this is KST version {}, this build writes {}",
-                          String::from_utf8_lossy(&m[3..]),
-                          String::from_utf8_lossy(&crate::writer::MAGIC[3..]));
+                let mut e = b"karyozip: this is KST version ".to_vec();   // raw bytes, as the C prints them
+                e.extend_from_slice(&m[3..]); e.extend_from_slice(b", this build writes ");
+                e.extend_from_slice(&crate::writer::MAGIC[3..]); e.push(b'\n');
+                let _ = std::io::Write::write_all(&mut std::io::stderr(), &e);
             } else {
                 eprintln!("karyozip: file starts with \"{sh}\", not \"KST00001\"");
             }
@@ -192,35 +193,6 @@ impl Reader {
             || 8 + 128 + nml + h[2] + h[3] + h[6] + h[11] + h[14] > fsz {
             crate::bail("corrupt header: the stream sizes do not fit the file");
         }
-        let was_side = h[1] & SIDEFLAG != 0;
-        let dropped = h[1] & DROPPED != 0;
-        if !o.raw && !o.index {
-            if h[1] & ALNFLAG != 0 && o.aln.is_none() {
-                crate::bail("this track was written with --aln: decode it with --aln PAF --ref R, or --raw to see what is stored");
-            }
-            if h[1] & ALNFLAG == 0 && o.aln.is_some() {
-                crate::bail("this track was not written with --aln");
-            }
-            if h[1] & DBFLAG != 0 && !o.db {
-                crate::bail("this track holds featureIDs: decode it with --db features.tsv --out DIR, or --raw to see what is stored");
-            }
-            if h[1] & DBFLAG == 0 && o.db {
-                crate::bail("this track does not hold featureIDs");
-            }
-            if h[1] & CARTFLAG != 0 && h[1] & DBFLAG == 0 {
-                crate::bail("corrupt file: vocabulary featureIDs without --db");
-            }
-            if h[1] & LENFLAG != 0 && o.aln.is_none() {
-                crate::bail("this track leaves out every length the reference implies: decode it with --aln PAF --ref R");
-            }
-        }
-        if let Some(a) = &o.aln {
-            if h[1] & ALNFLAG != 0 && (h[13] >> 8) != (a.hash & ((1u64 << 56) - 1)) {
-                crate::bail("this PAF, reference or name map is not the one the track was encoded with");
-            }
-        }
-        let was_perm = h[1] & PERMFLAG != 0;
-        let perm_tok = h[1] & PERMTOK != 0;
         rd(f.seek(SeekFrom::Start(8 + 128)), "seek");
 
         let lzl = h[6] as usize;
@@ -231,13 +203,12 @@ impl Reader {
             let lbuf = zdec(&lzraw, "label table");
             if h[7] > lbuf.len() as u64 { crate::bail("label count exceeds the label table"); }
             if h[7] == 0 { crate::bail("corrupt file: a label table with no labels"); }
-            let mut it = lbuf.split(|&c| c == b'\n');
+            let mut q = 0;
             for _ in 0..h[7] {
-                lab.push(it.next().unwrap_or_else(|| crate::bail("bad label table")).to_vec());
+                let nl = memchr::memchr(b'\n', &lbuf[q..]).unwrap_or_else(|| crate::bail("bad label table"));
+                lab.push(lbuf[q..q + nl].to_vec()); q += nl + 1;
             }
-            if it.next() != Some(&[][..]) || it.next().is_some() {
-                crate::bail("corrupt file: the label table has more lines than its count");
-            }
+            if q != lbuf.len() { crate::bail("corrupt file: the label table has more lines than its count"); }
         } else if h[7] != 0 {
             crate::bail("corrupt file: a label count with no label table");
         }
@@ -245,14 +216,50 @@ impl Reader {
         let names_tok = h[1] & TOKFLAG != 0;
         let names_int = h[1] & INTFLAG != 0;
         let names_fld = h[1] & FLDFLAG != 0;
-        if names_tok && names_int {
-            crate::bail("corrupt file: names flagged both tokenised and integer");
+        if names_tok as u8 + names_int as u8 + names_fld as u8 > 1 {
+            crate::bail("corrupt file: names flagged more than one way");
         }
+        let was_side = h[1] & SIDEFLAG != 0;
+        let dropped = h[1] & DROPPED != 0;
+        if !o.raw && !o.index {
+            if h[1] & ALNFLAG != 0 && o.aln.is_none() {
+                crate::bail("this track was written with --aln: decode it with --aln PAF --ref R, or --raw to see what is stored");
+            }
+            if h[1] & ALNFLAG == 0 && o.aln.is_some() {
+                crate::bail("this track was not written with --aln");
+            }
+            if h[1] & DBFLAG != 0 && !o.db {
+                crate::bail("this track holds featureIDs: decode it with --db features.tsv --out-dir DIR, or --raw to see what is stored");
+            }
+            if h[1] & DBFLAG == 0 && o.db {
+                crate::bail("this track does not hold featureIDs");
+            }
+            if h[1] & LENFLAG != 0 && o.aln.is_none() {
+                crate::bail("this track leaves out every length the reference implies: decode it with --aln PAF --ref R");
+            }
+            if was_side && o.names_file.is_none()
+               && std::fs::metadata(format!("{path}.names")).is_err() {
+                crate::bail("the names of this track are in a sidecar: give it with --names FILE, or --raw to see the ordinals");
+            }
+        }
+        if let Some(a) = &o.aln {
+            if h[1] & ALNFLAG != 0 && (h[13] >> 8) != (a.hash & ((1u64 << 56) - 1)) {
+                crate::bail("this PAF, reference or name map is not the one the track was encoded with");
+            }
+        }
+        let was_perm = h[1] & PERMFLAG != 0;
+        let perm_tok = h[1] & PERMTOK != 0;
         let taildec = h[1] & TAILFLAG != 0;
         let runhead = h[1] & RUNFLAG != 0;
         let ilv = h[1] & ILVFLAG != 0;
         let grp = h[1] & GRPFLAG != 0;
         if grp && (ilv || !runhead) { crate::bail("corrupt file: grouped lengths without their run counts"); }
+        if runhead {   // the C allocates its u32 run table here
+            crate::ckalloc(h[0].max(1).checked_mul(4).unwrap_or_else(|| crate::bail("allocation size overflows")) as usize);
+        }
+        if h[1] & CARTFLAG != 0 && h[1] & DBFLAG == 0 {
+            crate::bail("corrupt file: vocabulary featureIDs without --db");
+        }
         if taildec && h[13] & 0xff != 64 {
             crate::bail("corrupt file: tail skip is not the format constant");
         }
@@ -538,19 +545,20 @@ impl Reader {
     /// the gap, so every walk below sees the layout it always saw.
     fn rmheads(&mut self, lens: Vec<u8>) -> Vec<u8> {
         let (mut out, mut i, mut seen) = (Vec::with_capacity(lens.len()), 0usize, 0u64);
-        let mut tab: Vec<u32> = Vec::with_capacity(self.nreads as usize);
+        let mut tab: Vec<u64> = Vec::with_capacity(self.nreads as usize + 1);
+        tab.push(0);
         while i < lens.len() {
-            if tab.len() as u64 >= self.nreads { crate::bail("corrupt block: more reads than the header claims"); }
+            if tab.len() as u64 > self.nreads { crate::bail("corrupt block: more reads than the header claims"); }
             let (k, n) = vget(&lens, i); i = n;
             if k == 0 || k > self.rows - seen { crate::bail("corrupt block: a run count is out of range"); }
-            tab.push(k as u32); seen += k;
+            seen += k; tab.push(seen);
             for _ in 0..k {
                 if i >= lens.len() { crate::bail("corrupt block: a read runs past its lengths"); }
                 let n2 = skip(&lens, i);
                 out.extend_from_slice(&lens[i..n2]); i = n2;
             }
         }
-        if tab.len() as u64 != self.nreads || seen != self.rows {
+        if tab.len() as u64 != self.nreads + 1 || seen != self.rows {
             crate::bail("corrupt block: the run counts do not add up to the row count");
         }
         self.rtab = tab;
@@ -565,8 +573,8 @@ impl Reader {
         let mut kv: Vec<u64> = Vec::new();
         let mut gv: Vec<(usize, usize)> = Vec::new();
         let mut lv: Vec<(usize, usize)> = Vec::new();
-        for i in 0..self.rtab.len() {
-            let k = self.rtab[i] as u64;
+        for w in self.rtab.windows(2) {
+            let k = w[1] - w[0];
             kv.clear(); gv.clear();
             for j in 0..k {
                 if p >= lens.len() || q >= ids.len() { crate::bail("corrupt block: a grouped read runs past its frames"); }
@@ -767,8 +775,8 @@ impl Reader {
         if self.runhead {
             if ri >= self.nreads { crate::bail("corrupt index: a sequence past the end"); }
             if self.rtab.is_empty() { self.load(0); }
-            let start: u64 = self.rtab[..ri as usize].iter().map(|&x| x as u64).sum();
-            let n = self.rtab[ri as usize] as u64;
+            let start = self.rtab[ri as usize];
+            let n = self.rtab[ri as usize + 1] - start;
             if start + n > self.rows { crate::bail("corrupt index: a sequence points outside the block table"); }
             return (0, start, n);
         }

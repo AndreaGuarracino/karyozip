@@ -78,7 +78,6 @@ with open(os.path.join(W, "ok.bed"), "w") as f:
 PY
 # A damaged file may error or may decode, but what it decodes must be the
 # original rows, and under a sanitizer build any report is a failure.
-$KT decode --names ordinal -i "$W/t.kt" 2>/dev/null | cut -f2,3,4 > "$W/want" 2>/dev/null || true
 check() {
   local f=$1 what=$2 rc out
   out=$(ASAN_OPTIONS=detect_leaks=0 timeout 30 ${SAN:-$KT} decode --names ordinal $NIN -i "$f" 2>"$W/err"); rc=$?
@@ -130,6 +129,10 @@ for kind in db al; do
     fi
     [ $rc -gt 1 ] && { echo "fuzz: $kind mutation crashed rc=$rc off=$off"; fail=1; }
     grep -qE "AddressSanitizer|runtime error" "$W/err" && { echo "fuzz: $kind mutation sanitizer report off=$off"; fail=1; }
+    if [ $rc = 0 ]; then   # what decodes must be the input
+      if [ $kind = db ]; then for f in $sets; do cmp -s "$W/o/$f.bed" "$D/db.$f.bed" || { echo "fuzz: db mutation decoded WRONG $f off=$off"; fail=1; }; done
+      else printf '%s\n' "$out" | cmp -s - "$D/s.bed" || { echo "fuzz: al mutation decoded WRONG rows off=$off"; fail=1; }; fi
+    fi
     d=$((d+1))
   done
 done

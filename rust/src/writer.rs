@@ -95,7 +95,7 @@ pub struct Writer {
     /// --sort=MEM: the bytes held, the runs already spilled, the next rank.
     held: u64,
     spill: Vec<std::fs::File>,
-    natn: u32,
+    natn: u64,
     natord: bool,
     feathash: Option<u64>,
     /// the input rows as text, stored so the track can serve as --ref
@@ -136,7 +136,6 @@ impl Writer {
         self.aln = Some(a);
     }
     pub fn aln_hash(&self) -> u64 { self.aln.as_ref().map_or(0, |a| a.hash) }
-    pub fn aln_hit(&self) -> u64 { self.alnhit }
 
     pub fn new(opt: Options, tmpdir: &std::path::Path) -> std::io::Result<Self> {
         let perm_on = opt.sort && opt.names_out.is_none();
@@ -279,19 +278,20 @@ impl Writer {
         self.sortbp = if newrec { run_len } else { self.sortbp + run_len };
         if newrec {
             if self.perm_on {
-                let want = self.srec.len().to_string();
+                let want = self.natn.to_string();
                 if self.natord && want.as_bytes() != name { self.natord = false; }
                 self.natbuf.extend_from_slice(name);
                 self.natbuf.push(b'\n');
             }
-            self.srec.push(SRec { nm: name.to_vec(), runs: Vec::new(), idx: self.natn });
+            if self.natn > u32::MAX as u64 { return Err("--sort takes at most 2^32 records".into()); }
+            self.srec.push(SRec { nm: name.to_vec(), runs: Vec::new(), idx: self.natn as u32 });
             self.natn += 1;
-            self.held += name.len() as u64 + 1 + 16;
+            self.held += name.len() as u64 + 1 + 24;   // the C's srec
             // Spill at a record boundary only, holding the one just opened.
             if self.opt.sortmem > 0 && self.held > self.opt.sortmem {
                 let last = self.srec.pop().unwrap();
                 self.spill_write()?;
-                self.held = last.nm.len() as u64 + 1 + 16;
+                self.held = last.nm.len() as u64 + 1 + 24;
                 self.srec.push(last);
             }
         }
@@ -368,9 +368,9 @@ impl Writer {
 
     /// Order by label tuple, then run count, then lengths, then input rank.
     fn sortflush(&mut self) -> Result<(), String> {
-        if !self.spill.is_empty() {
+        if self.opt.sortmem > 0 {   // the C always merges from disk
             self.spill_write()?;
-            return self.spillmerge();
+            return if self.spill.is_empty() { Ok(()) } else { self.spillmerge() };
         }
         let mut recs = std::mem::take(&mut self.srec);
         recs.sort_by(srec_cmp);
@@ -487,7 +487,7 @@ impl Writer {
         // The codec search samples the first, middle and last block, which is
         // why it cannot run until every row has arrived. -e high reads them all.
         let rawtot: usize = self.bm.iter().map(|b| b.len).sum();
-        let get = |i: usize| self.read_block(i).expect("staged block");
+        let get = |i: usize| self.read_block(i).unwrap_or_else(|_| crate::bail("cannot read back a staged block"));
         let _s = crate::prof::span(8);
         let maxstream = self.bm.iter().map(|m| m.lens.max(m.len - m.lens)).max().unwrap_or(0);
         let onelay = self.bm.len() == 1 && !self.ibx.is_empty();   // the layout search ranks it all
@@ -511,7 +511,7 @@ impl Writer {
         let mut altv: [Option<(Vec<u8>, usize)>; 3] = [None, None, None];
         let _l = crate::prof::span(9);
         if self.bm.len() == 1 && !self.ibx.is_empty() {
-            let (lens0, ids0) = self.read_block(0).expect("staged block");
+            let (lens0, ids0) = self.read_block(0).unwrap_or_else(|_| crate::bail("cannot read back a staged block"));
             // The layout is decided on the mode's sample, as the codec is: whole
             // reads up to 4 MB of lengths -e low, DEFSAMPLE MB the default, all
             // of them -e high. Each layout gets its own best codec there; only
@@ -591,7 +591,7 @@ impl Writer {
             let done: Vec<Done> = chunk
                 .par_iter()
                 .map(|&i| {
-                    let (lens, ids) = self.read_block(i).expect("staged block");
+                    let (lens, ids) = self.read_block(i).unwrap_or_else(|_| crate::bail("cannot read back a staged block"));
                     // Under --aln a block keeps the smallest of three length
                     // spellings: every sentinel, plus-strand sentinels only,
                     // or plain lengths. Zeros do not always compress better.
@@ -619,11 +619,11 @@ impl Writer {
                     let (mut best, mut bv, mut fa) = (0usize, usize::MAX, Vec::new());
                     for &v in &ORDER {
                         let Some(src) = vs[v] else { continue };
-                        let f = comp_lens(src, lencodec, lvl_len).expect("lens frame");
+                        let f = comp_lens(src, lencodec, lvl_len).unwrap_or_else(|| crate::bail("block compression failed"));
                         if bv == usize::MAX || f.len() < best { best = f.len(); bv = v; fa = f; }
                     }
                     let nl = if ilv { altv[bv].as_ref().unwrap().1 } else { vs[bv].unwrap().len() };
-                    let b = if ilv { Vec::new() } else { comp_ids(&ids, idc, lvl_id).expect("ids frame") };
+                    let b = if ilv { Vec::new() } else { comp_ids(&ids, idc, lvl_id).unwrap_or_else(|| crate::bail("block compression failed")) };
                     (fa, b, nl, ids.len(), m.rows, m.bp, bv as u64)
                 })
                 .collect();
@@ -854,7 +854,7 @@ impl Writer {
             rows: self.rows, reads: self.nidx, blocks: self.nblk,
             names: nz.len(), index: ichunks.len(), offs: sz.len(),
             lens: byt_lens, labs: byt_labs, raw: rawtot,
-            tokused, intused, fldused, ordinal, dropped: dropnames,
+            tokused, intused, fldused, ordinal, dropped: dropnames, alnhit: self.alnhit,
         })
     }
 
@@ -873,6 +873,7 @@ pub struct Stats {
     pub names: usize, pub index: usize, pub offs: usize,
     pub lens: u64, pub labs: u64, pub raw: usize,
     pub tokused: bool, pub intused: bool, pub fldused: bool, pub ordinal: bool, pub dropped: bool,
+    pub alnhit: u64,
 }
 
 use crate::kst::vget;
@@ -1364,7 +1365,7 @@ fn fld_names1(names: &[u8], n: u64, sep: u8) -> Option<Vec<u8>> {
     let nf = first.len();
     if nf == 0 || nf > FLDMAX { return None; }
     let (mut same, mut isnum) = (vec![true; nf], vec![true; nf]);
-    let mut ishex: Vec<bool> = first.iter().map(|f| !f.is_empty() && f.len() % 2 == 0).collect();
+    let mut ishex: Vec<bool> = first.iter().map(|f| !f.is_empty() && f.len() % 2 == 0 && f.len() <= 64).collect();
     let mut seen = 0u64;
     for line in names.split(|&c| c == b'\n') {          // one pass to decide
         if seen == n { if line.is_empty() { break; } return None; }

@@ -58,15 +58,11 @@ fn main() {
     if effort == "low" && c.block.is_none() { opt.block = 262144; }   // -e low: blocks and an index, for queries
     if let Some(m) = &c.sort {
         opt.sort = true;
-        // clap cannot tell "--sort" from "--sort=", and the C refuses the
-        // second, so the empty size is looked for in argv itself.
-        if m.is_empty() && std::env::args().any(|a| a == "--sort=") { mem_arg(""); }
         if !m.is_empty() { opt.sortmem = mem_arg(m); }
     }
 
     let Some(cmd) = c.cmd.as_ref() else { die(cli::USAGE) };
     prof::start(c.profile, n);
-    c.check_scope().unwrap_or_else(|m| die(&m));
     let mut ro = reader::ReadOpts { raw: c.raw, db: c.db.is_some(), ..Default::default() };
     // The C keeps a mode and a file separately, so a repeat of one does not
     // clear the other, and drop plus drop:FILE is a refusal.
@@ -82,11 +78,6 @@ fn main() {
         }
     }
 
-    // every argument is a flag: what clap left positional is refused
-    let rest = match cmd { Cmd::Encode { rest } | Cmd::Decode { rest } | Cmd::Region { rest }
-                         | Cmd::Smooth { rest } | Cmd::Index { rest } | Cmd::AlnPack { rest } => &rest[..],
-                           Cmd::Codecs { .. } => &[] };
-    if let Some(a) = rest.first() { die(&format!("unexpected argument {a}")); }
     let name = c.name();
     let pack = name == "aln-pack";
     if c.input.len() > 1 && !(name == "encode" && c.db.is_some()) { die("give one -i"); }
@@ -94,7 +85,7 @@ fn main() {
     let track = || c.input.first().map(|s| s.as_str())
         .unwrap_or_else(|| die(&format!("{name} needs -i TRACK")));
     match cmd {
-        Cmd::Encode { .. } => {
+        Cmd::Encode => {
             if opt.drop_names && opt.names_out.is_some() {
                 die("--names drop and --names drop:FILE are exclusive");
             }
@@ -127,7 +118,7 @@ fn main() {
                 }
             }
         }
-        Cmd::Decode { .. } => {
+        Cmd::Decode => {
             let track = track();
             let feats = informed(&c, &mut ro, "decode ", None, aln::Lazy::Contig);
             let mut r = reader::Reader::open_with(track, &ro);
@@ -142,7 +133,7 @@ fn main() {
                 }
             }
         }
-        Cmd::Region { .. } => {
+        Cmd::Region => {
             let track = track();
             let r = c.region.as_deref().unwrap_or_else(|| die("region needs -r NAME[:START-END]"));
             let (seq, lo, hi) = regparse(r);
@@ -157,7 +148,7 @@ fn main() {
             r.region(seq.as_bytes(), lo, hi, hlo, feats.as_ref(), &cols, &mut o);
             o.flush().unwrap_or_else(|e| die(&e.to_string()));
         }
-        Cmd::Smooth { .. } => {
+        Cmd::Smooth => {
             let track = track();
             let (Some(hier), Some(fs)) = (c.hier.as_deref(), c.feature_set.as_deref())
                 else { die("smooth needs --hier HIER and -f FEATURE_SET") };
@@ -171,13 +162,13 @@ fn main() {
                         lo, hi, c.v1, maxgap, &ro, feats.as_ref(), &mut o);
             o.flush().unwrap_or_else(|e| die(&e.to_string()));
         }
-        Cmd::Index { .. } => {
+        Cmd::Index => {
             let track = track();
             ro.index = true;
             reader::Reader::open_with(track, &ro).build_index(track)
         }
         Cmd::Codecs { file } => probe(need(file)),
-        Cmd::AlnPack { .. } => {
+        Cmd::AlnPack => {
             let (Some(paf), Some(rbed), Some(dest)) = (&c.aln, &c.refbed, &c.output)
                 else { die("usage: karyozip aln-pack -a P.paf --ref REF.bed|REF.kst -o OUT") };
             let mut a = aln::Aln::default();
@@ -192,14 +183,13 @@ fn main() {
 
 /// Writes the file and reports, for both encode paths.
 fn finish(w: writer::Writer, aln_on: bool) {
-    let hits = w.aln_hit();
     let so = std::io::stdout();
     let mut o = BufWriter::new(so.lock());
     let st = w.close(&mut o).unwrap_or_else(|m| die(&m));
     o.flush().unwrap_or_else(|e| die(&e.to_string()));
     if aln_on {
-        eprintln!("aln: {hits} of {} rows matched the reference ({:.1}%)",
-                  st.rows, if st.rows > 0 { 100.0 * hits as f64 / st.rows as f64 } else { 0.0 });
+        eprintln!("aln: {} of {} rows matched the reference ({:.1}%)", st.alnhit,
+                  st.rows, if st.rows > 0 { 100.0 * st.alnhit as f64 / st.rows as f64 } else { 0.0 });
     }
     report(&st);
 }
@@ -401,13 +391,13 @@ fn parse_chunk(s: &[u8], from: usize, to: usize) -> Result<Vec<Row>, &'static st
 
 fn probe(path: &str) {
     let mut src = Vec::new();
-    std::fs::File::open(path).unwrap().read_to_end(&mut src).unwrap();
+    std::fs::File::open(path).and_then(|mut f| f.read_to_end(&mut src)).unwrap_or_else(|e| die(&format!("{path}: {e}")));
     let mut out = std::io::stdout().lock();
     for lvl in [1, 3, 17, 19, 22] {
         let z = ffi::zstd(&src, lvl);
         writeln!(out, "zstd:{lvl}\t{}\t{:016x}", z.len(), kst::fnv(kst::FNV0, &z)).unwrap();
     }
-    for c in writer::candlist(false) {
+    for c in writer::candlist(true) {
         match ffi::paycomp(&src, c) {
             Some(v) => {
                 let ok = ffi::paydecomp(&v, c, src.len()).as_deref() == Some(&src[..]);

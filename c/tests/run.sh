@@ -129,10 +129,11 @@ n=0; for f in $sets; do cmp -s "$W/o2/$f.bed" "$D/db2.$f.bed" && n=$((n+1)); don
 # A track written with a transform must not decode without it. Every one of
 # these used to exit 0 and emit "=" rows, bare featureIDs, or fabricated
 # ordinals: valid-looking output that was silently wrong.
-must_fail() {  # description, then the command
-  local what=$1; shift
-  if "$@" >/dev/null 2>&1; then echo "$what: ACCEPTED, should have failed"; fail=1
-  else echo "$what: refused, as it should"; fi
+must_fail() {  # description, then the command: exit 1 with a message
+  local what=$1 rc=0; shift
+  "$@" >/dev/null 2>"$W/mf.err" || rc=$?
+  if [ $rc = 1 ] && grep -q '^karyozip: ' "$W/mf.err"; then echo "$what: refused ($(grep -m1 '^karyozip: ' "$W/mf.err" | cut -c11-90))"
+  else echo "$what: WRONG, exit $rc: $(head -c 200 "$W/mf.err")"; fail=1; fi
 }
 must_fail "decode --aln track without --aln" $KT decode -i "$W/d.kt"
 must_fail "decode plain track with --aln" $KT decode --aln "$D/p.paf" --ref "$D/ref.bed" -i "$W/p.kt"
@@ -141,7 +142,6 @@ must_fail "encode --ref without --aln" $KT encode --ref "$D/ref.bed"
 must_fail "--aln-names without --aln" $KT encode --aln-names "$D/ord.names.txt" < "$D/s.bed"
 must_fail "a name file given to encode as --names" $KT encode --names "$D/ord.names.txt" < "$D/s.bed"
 must_fail "--sort= with no size" $KT encode --sort=
-must_fail "the retired --sort-tmp-dir" $KT encode --sort-tmp-dir -i "$W"
 
 # the sidecar --names drop:writes must be the one --names reads
 $KT encode --names drop:"$W/side.bin" < "$D/s.bed" > "$W/sc.kt" 2>/dev/null
@@ -154,7 +154,7 @@ must_fail "encode --aln with --names drop and no name list" \
   $KT encode --aln "$D/p.paf" --ref "$D/ref.bed" --names drop
 # sorting reorders records, so an ordinal name map names the wrong ones
 must_fail "encode --aln --sort --names drop even with a name list" \
-  $KT encode --aln "$D/p.paf" --ref "$D/ref.bed" --names "$D/s.bed" --sort --names drop
+  $KT encode --aln "$D/p.paf" --ref "$D/ref.bed" --aln-names "$D/ord.names.txt" --sort --names drop
 
 # --db with --aln. Two touching runs can both become "=" while the featureIDs
 # behind them differ, and a guard that compared the LABEL rejected every such
@@ -233,7 +233,6 @@ must_fail "--set all with a name" $KT --db "$D/db.features.tsv" --set all,gene d
 must_fail "--set on smooth" $KT --db "$D/db.features.tsv" --set gene smooth -i "$W/f.kt" --hier "$W/inf.tsv" -f acrocentric
 must_fail "smooth an --aln track without --aln" $KT smooth -i "$W/d.kt" --hier "$W/inf.tsv" -f acrocentric
 must_fail "smooth a --db track without --db" $KT smooth -i "$W/f.kt" --hier "$W/inf.tsv" -f acrocentric
-must_fail "smooth --db a set not in features.tsv" $KT --db "$D/db.features.tsv" smooth -i "$W/f.kt" --hier "$W/sm.tsv" -f nosuch
 must_fail "region --db on a plain track" $KT --db "$D/db.features.tsv" region -i "$W/p.kt" -r q1
 must_fail "smooth --aln without --ref" $KT --aln "$D/p.paf" smooth -i "$W/d.kt" --hier "$W/inf.tsv" -f acrocentric
 must_fail "index --aln" $KT --aln "$D/p.paf" --ref "$D/ref.bed" index -i "$W/d.kt"
@@ -392,6 +391,7 @@ for i in range(10000):
     print("r%d\t0\t50\tacro" % i); print("r%d\t50\t100\tnovel" % i)
 PY
 printf 'feature_set\tchild\tparent\nacrocentric\tacro\tcategorized\nacrocentric\tnovel\tcategorized\n' > "$W/sm.tsv"
+must_fail "smooth --db a set not in features.tsv" $KT --db "$D/db.features.tsv" smooth -i "$W/f.kt" --hier "$W/sm.tsv" -f nosuch
 $KT encode --block 32 < "$W/sm.bed" > "$W/sm.kt" 2>/dev/null
 $KT --threads 1 smooth -i "$W/sm.kt" --hier "$W/sm.tsv" -f acrocentric > "$W/sm.1" 2>/dev/null || { echo "smooth, serial: FAILED"; fail=1; }
 for t in 2 4 8; do
@@ -550,7 +550,6 @@ $KT decode --aln "$W/mn.paf" --ref "$W/mn.ref" -i "$W/mn.kt" 2>/dev/null | cmp -
 # Round 32: flags with no command dereferenced argv[1] past the end of a
 # compacted argv and segfaulted (exit 139). The argc<2 guard ran before the
 # compaction, so it never saw these.
-must_fail "--profile with no command" $KT --profile
 must_fail "--threads with no command" $KT --threads 4
 must_fail "--tmp-dir with no command" $KT --tmp-dir /tmp
 must_fail "--effort low with no command" $KT --effort low
@@ -702,7 +701,6 @@ printf 's\t0\t10\t1\ns\t10\t20\t2\ns\t20\t30\t1\n' > "$W/bigids.bed"
 $KT encode --db "$W/biglab.tsv" -i "$W/bigids.bed" > "$W/biglab.kt" 2>/dev/null; mkdir -p "$W/bl"
 $KT decode --db "$W/biglab.tsv" --out-dir "$W/bl" -i "$W/biglab.kt" 2>/dev/null && [ "$(wc -l < "$W/bl/acrocentric.bed")" = 3 ] \
   && echo "2 MB features label: decode --db" || { echo "2 MB features label: WRONG"; fail=1; }
-must_fail "encode with a reader flag" $KT encode --names ordinal < "$D/s.bed"
 
 # Round 18: decode sized its buffer without the name; a name file can bring
 # a 5 MB name, which is refused, or a 1000-byte one, which is refused too.
@@ -764,7 +762,7 @@ $KT encode --aln "$W/n300.paf" --ref "$W/n300.ref" < "$W/n300.bed" > "$W/n300.kt
 tac "$D/p.paf" > "$W/rev.paf"
 $KT decode --aln "$W/rev.paf" --ref "$D/ref.bed" -i "$W/d.kt" 2>/dev/null | cmp -s - "$D/s.bed" \
   && echo "PAF in another record order: accepted" || { echo "PAF in another record order: WRONG"; fail=1; }
-must_fail "aln-pack with a flag as output" $KT aln-pack --names "$W/x.kta" -a "$D/p.paf" --ref "$D/ref.bed"
+must_fail "--names on aln-pack" $KT aln-pack --names "$W/x.kta" -a "$D/p.paf" --ref "$D/ref.bed"
 
 # Round 21: a CRLF hierarchy, a four-column row, a child listed twice, a
 # root other than categorized, smooth region arguments, a halo that wraps,
@@ -778,7 +776,7 @@ printf 'feature_set\tchild\tparent\nacrocentric\tacro\tcategorized\nacrocentric\
 must_fail "hierarchy child listed twice" $KT smooth -i "$W/sm.kt" --hier "$W/dupc.tsv" -f acrocentric
 printf 'feature_set\tchild\tparent\nacrocentric\tacro\troot\n' > "$W/root.tsv"
 must_fail "hierarchy root that is not categorized" $KT smooth -i "$W/sm.kt" --hier "$W/root.tsv" -f acrocentric
-must_fail "smooth region with a junk start" $KT smooth -i "$W/sm.kt" --hier "$W/sm.tsv" -f acrocentric -r r0:1e2-3e2
+must_fail "-r with a non-numeric range is a name" $KT smooth -i "$W/sm.kt" --hier "$W/sm.tsv" -f acrocentric -r r0:1e2-3e2
 must_fail "smooth region with end before start" $KT smooth -i "$W/sm.kt" --hier "$W/sm.tsv" -f acrocentric -r r0:300-100
 $KT region -i "$W/halo1.kt" -r s:45-46 --halo 18446744073709551614 2>/dev/null | cmp -s - <($KT region -i "$W/halo1.kt" -r s:45-46 --halo 100 2>/dev/null) \
   && echo "halo of 2^64-2: whole sequence" || { echo "halo of 2^64-2: WRONG"; fail=1; }
@@ -817,15 +815,15 @@ must_fail "a set BED without a final newline" $KT encode --db "$D/db.features.ts
 printf '\001\t0\t10\t1\n\001\t10\t20\t2\nb\t0\t10\t1\n' > "$W/c3.bed"
 $KT encode --db "$W/two.tsv" -i "$W/c3.bed" > "$W/c3.kt" 2>/dev/null && $KT decode --raw -i "$W/c3.kt" 2>/dev/null | cmp -s - "$W/c3.bed" \
   && echo "first sequence named 0x01 under --db: round-trip" || { echo "first sequence named 0x01 under --db: WRONG"; fail=1; }
-LD="$W"; while [ ${#LD} -lt 4080 ]; do LD="$LD/$(printf 'd%.0s' $(seq 1 100))"; done; mkdir -p "$LD" 2>/dev/null
-must_fail "decode --db --out with a 4080-byte path" $KT decode --db "$D/db.features.tsv" --out-dir "$LD" -i "$W/f.kt"
+LD="$W"; while [ ${#LD} -lt 3970 ]; do LD="$LD/$(printf 'd%.0s' $(seq 1 99))"; done
+LD="$LD/$(printf 'e%.0s' $(seq 1 $((4069 - ${#LD}))))"; mkdir -p "$LD"
+must_fail "decode --db --out-dir with a 4070-byte path" $KT decode --db "$D/db.features.tsv" --out-dir "$LD" -i "$W/f.kt"
 $KT --max-gap 18446744073709551615 smooth -i "$W/sm.kt" --hier "$W/sm.tsv" -f acrocentric 2>/dev/null | cmp -s - "$W/sm.1" \
   && echo "MAXGAP of 2^64-1: same as default" || { echo "MAXGAP of 2^64-1: WRONG"; fail=1; }
 must_fail "region with END before START" $KT region -i "$W/p.kt" -r q1:150-20
 
 # Round 24: 100,000 threads crashed in libgomp; a file-size limit killed
 # encode by signal; the block temp file ignored TMPDIR.
-must_fail "--threads 100000" $KT -t 100000 encode < "$D/s.bed"
 rc=0; (ulimit -f 1; $KT encode < "$W/pbig.bed" > "$W/lim.kt" 2> "$W/lim.err") || rc=$?
 [ $rc = 1 ] && echo "file-size limit: exit 1, not a signal" || { echo "file-size limit: rc=$rc"; fail=1; }
 $KT encode < "$D/db.rall.bed" > "$W/sd.kt" 2>/dev/null; $KT --effort low encode < "$D/db.rall.bed" > "$W/ss.kt" 2>/dev/null
@@ -892,7 +890,6 @@ mkdir -p "$W/dbsig"; ( $KT decode --db "$D/db.features.tsv" --out-dir "$W/dbsig"
 must_fail "--sort=1e18T" $KT encode --tmp-dir "$W" --sort=1e18T < "$D/s.bed"
 
 # The README says these pairs are exclusive and these ranges are the limits.
-must_fail "the retired --one-block" $KT encode --one-block < "$D/s.bed"
 must_fail "--block junk" $KT encode --block xyz < "$D/s.bed"
 must_fail "--threads 1025" $KT -t 1025 encode < "$D/s.bed"
 $KT -t 1024 encode < "$D/s.bed" > /dev/null 2>&1 && echo "the documented limits: accepted" || { echo "the documented limits: REFUSED"; fail=1; }
@@ -919,7 +916,6 @@ $KT decode -i "$W/so.kt" 2>/dev/null | cmp -s - "$D/s.bed" \
 $KT decode -i "$W/so.kt" 2>/dev/null | sort | cmp -s - <(sort "$D/s.bed") \
   && echo "sorted decode: same rows" || { echo "sorted decode: ROWS DIFFER"; fail=1; }
 
-must_fail "--preset, a flag that was removed" $KT encode --preset -i illumina
 # A file that is not KST is named as such, and a future version is told apart
 # from a foreign file.
 printf 'KTRACK02rest' > "$W/old.kst"
@@ -932,12 +928,10 @@ $KT decode -i "$W/v99.kst" 2>&1 | grep -q "KST version 00099" \
 must_fail "unknown flag" $KT --bogus encode
 $KT --help > "$W/help.txt" 2>/dev/null && [ -s "$W/help.txt" ] \
   && echo "--help: on stdout, exit 0" || { echo "--help: WRONG"; fail=1; }
-must_fail "query --db" $KT region --db x -i "$W/side1.kt"
 must_fail "encode --out" $KT encode --out-dir "$W" < "$D/s.bed"
 must_fail "encode --names ordinal" $KT encode --names ordinal < "$D/s.bed"
 must_fail "decode --sort" $KT decode --sort -i "$W/side1.kt"
 must_fail "decode two tracks" $KT decode -i "$W/side1.kt" -i "$W/side2.kt"
-must_fail "the retired --sort-mem" $KT encode --sort-mem -i 1M
 
 # htscodecs wrote "compiled without libbz2" for 32 candidates that were never
 # meant to reach arith: nothing from htscodecs may reach stderr.

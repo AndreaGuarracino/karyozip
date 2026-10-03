@@ -1,197 +1,164 @@
-//! The command line, in clap. Every flag is global, so it works on either
-//! side of the command name as the C does, and the scope check afterwards
-//! gives the C's own refusal for a flag on the wrong command.
+//! The command line, parsed as the C parses it: the same flag table, flags
+//! on either side of the command, short forms rewritten to long ones, and
+//! the C's own refusal for each mistake, in the same order.
 
-use clap::{Parser, Subcommand};
+use karyozip::bail as die;
 
 /// The C's own usage text, lifted from karyozip.c by build.rs.
 pub const USAGE: &str = include_str!(concat!(env!("OUT_DIR"), "/usage.txt"));
 
-/// What --version prints: the tool, the format, and the linked codecs.
-fn version_text() -> &'static str {
-    static V: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    V.get_or_init(|| format!("{}, format KST00001\n  zstd       {}\n  libbz3     {}\n  htscodecs  {}",
-            env!("CARGO_PKG_VERSION"), karyozip::ffi::zstd_version(),
-            karyozip::ffi::bzip3_version(), karyozip::ffi::HTSCODECS_VERSION))
-}
+pub enum Cmd { Encode, Decode, Region, Smooth, Index, AlnPack, Codecs { file: Option<String> } }
 
-#[derive(Parser)]
-#[command(name = "karyozip", version = version_text(), disable_help_flag = true,
-          disable_help_subcommand = true, args_override_self = true,
-          about = "Reads and writes the KaryoScope Track (KST) format")]
+#[derive(Default)]
 pub struct Cli {
-    #[command(subcommand)]
     pub cmd: Option<Cmd>,
-
-    /// encode: the BED, repeated under --db; readers: the track
-    #[arg(long, short = 'i', global = true, value_name = "FILE")]
     pub input: Vec<String>,
-    /// where the output goes, else stdout
-    #[arg(long, short = 'o', global = true, value_name = "FILE")]
     pub output: Option<String>,
-    /// region, smooth: NAME or NAME:START-END
-    #[arg(long, short = 'r', global = true, value_name = "NAME[:START-END]")]
     pub region: Option<String>,
-    /// region: runs each side of --start --end
-    #[arg(long, global = true, value_name = "N")]
     pub halo: Option<String>,
-    /// smooth: the feature set
-    #[arg(long = "feature-set", short = 'f', global = true, value_name = "FS")]
     pub feature_set: Option<String>,
-    /// rows per block, or "all" for one block
-    #[arg(long, short = 'b', global = true, value_name = "N|all")]
     pub block: Option<String>,
-    /// low: quick, with blocks and an index; medium; high: the smallest
-    #[arg(long, short = 'e', global = true, value_name = "low|medium|high")]
     pub effort: Option<String>,
-    /// order by label tuple, then lengths
-    #[arg(long, global = true, num_args = 0..=1, require_equals = true,
-          default_missing_value = "", value_name = "MEM")]
-    pub sort: Option<String>,
-    /// drop|drop:FILE on encode, a file or "ordinal" on the readers
-    #[arg(long, short = 'n', global = true, value_name = "WHAT")]
+    pub sort: Option<String>,        // "" for a bare --sort
     pub names: Vec<String>,
-    /// one BED per feature set, or one merged featureID track
-    #[arg(long, short = 'd', global = true, value_name = "features.tsv")]
     pub db: Option<String>,
-    /// with --db: label tuples outside features.tsv get an id from the hierarchy
-    #[arg(long, global = true, value_name = "hierarchy.tsv")]
     pub hier: Option<String>,
-    /// per-set BEDs go here
-    #[arg(long = "out-dir", global = true, value_name = "DIR")]
     pub out: Option<String>,
-    /// decode, region: one set of a --db track
-    #[arg(long, global = true, value_name = "NAME")]
     pub set: Option<String>,
-    /// do not store what the reference already gives
-    #[arg(long, short = 'a', global = true, value_name = "P.paf")]
     pub aln: Option<String>,
-    /// the reference track --aln deltas against
-    #[arg(long = "ref", global = true, value_name = "R")]
     pub refbed: Option<String>,
-    /// ordinal N is line N+1 of this file
-    #[arg(long = "aln-names", global = true, value_name = "F")]
     pub aln_names: Option<String>,
-    /// show what is stored, reversing no transform
-    #[arg(long, global = true)]
     pub raw: bool,
-    /// smooth: the largest gap two runs may span
-    #[arg(long = "max-gap", global = true, value_name = "N")]
     pub max_gap: Option<String>,
-    /// smooth: v1 label names, dropping the _specific suffix
-    #[arg(long, global = true)]
     pub v1: bool,
-    /// threads, 1 to 1024
-    #[arg(long, short = 't', global = true, value_name = "N")]
     pub threads: Option<String>,
-    /// where temp files go, else TMPDIR, else /tmp
-    #[arg(long = "tmp-dir", global = true, value_name = "DIR")]
     pub tmp_dir: Option<String>,
-    /// phase times and peak memory on stderr
-    #[arg(long, global = true)]
     pub profile: bool,
 }
 
-#[derive(Subcommand)]
-pub enum Cmd {
-    /// compress a BED-like track
-    Encode { rest: Vec<String> },
-    /// give the track back
-    Decode { rest: Vec<String> },
-    /// the whole sequence, the run at a position, or an overlap
-    Region { rest: Vec<String> },
-    /// promote noisy runs through a hierarchy
-    Smooth { rest: Vec<String> },
-    /// append a name index to the track
-    Index { rest: Vec<String> },
-    /// pack a PAF to only what --aln reads
-    #[command(name = "aln-pack")]
-    AlnPack { rest: Vec<String> },
-    /// every candidate codec over one file, for tests/diff.sh
-    #[command(hide = true)]
-    Codecs { file: Option<String> },
+/// Every flag and whether it takes a value, as the C's FLAGS.
+const FLAGS: &[(&str, bool)] = &[
+    ("--version", false), ("--threads", true), ("-t", true), ("--profile", false), ("--tmp-dir", true),
+    ("--names", true), ("--max-gap", true), ("--v1", false), ("--aln-names", true), ("--sort", false),
+    ("--effort", true), ("--block", true), ("--db", true), ("--aln", true), ("--ref", true),
+    ("--out-dir", true), ("--set", true), ("--raw", false), ("--hier", true), ("--input", true),
+    ("--output", true), ("--region", true), ("--halo", true), ("--feature-set", true),
+];
+const SHORT: &[(&str, &str)] = &[
+    ("-i", "--input"), ("-o", "--output"), ("-r", "--region"), ("-f", "--feature-set"),
+    ("-b", "--block"), ("-e", "--effort"), ("-n", "--names"), ("-d", "--db"), ("-a", "--aln"),
+];
+
+fn long(a: String) -> String {
+    SHORT.iter().find(|(s, _)| *s == a).map_or(a, |(_, l)| l.to_string())
 }
 
 impl Cli {
-    /// clap, then the C's wording for what clap refuses. --help and -h win
-    /// from either side of the command name, as they do in the C.
     pub fn get() -> Cli {
-        use clap::error::{ContextKind, ContextValue, ErrorKind};
-        if std::env::args().skip(1).any(|a| a == "--help" || a == "-h") {
-            println!("{USAGE}");
-            std::process::exit(0);
+        let mut av: Vec<String> = std::env::args().skip(1).collect();
+        for a in &av {
+            if a == "--help" || a == "-h" { println!("{USAGE}"); std::process::exit(0); }
+            if a == "--version" {
+                println!("karyozip {}, format KST00001\n  zstd       {}\n  libbz3     {}\n  htscodecs  {}",
+                         env!("CARGO_PKG_VERSION"), karyozip::ffi::zstd_version(),
+                         karyozip::ffi::bzip3_version(), karyozip::ffi::HTSCODECS_VERSION);
+                std::process::exit(0);
+            }
         }
-        Cli::try_parse().unwrap_or_else(|e| {
-            if e.kind() == ErrorKind::DisplayVersion { print!("{e}"); std::process::exit(0); }
-            let arg = match e.get(ContextKind::InvalidArg) {
-                Some(ContextValue::String(f)) => f.split_whitespace().next().unwrap_or(""),
-                _ => "",
+        if av.is_empty() { die(USAGE); }
+        // the command: the first word that is not a flag or its value
+        let mut cmd = String::new();
+        let mut i = 0;
+        while i < av.len() {
+            let a = long(av[i].clone());
+            if !a.starts_with('-') || a.len() == 1 { cmd = a; break; }
+            let nv = if a.starts_with("--sort=") { Some(false) }
+                     else { FLAGS.iter().find(|(f, _)| *f == a).map(|f| f.1) };
+            match nv { Some(v) => i += 1 + v as usize, None => die(&format!("unknown flag {a}")) }
+        }
+        av = av.into_iter().map(long).collect();
+        let c = cmd.as_str();
+        let (enc, dec, sm, reg) = (c == "encode", c == "decode", c == "smooth", c == "region");
+        let rd = sm || dec || reg || c == "index";
+        let inf = enc || sm || dec || reg;
+        let pack = c == "aln-pack";
+        let mut o = Cli::default();
+        let mut i = 0;
+        while i < av.len() {
+            let a = av[i].clone();
+            let v = av.get(i + 1).cloned();
+            if FLAGS.iter().any(|(f, nv)| *f == a && *nv) && v.is_none() { die(&format!("{a} needs a value")); }
+            let val = || v.clone().unwrap();
+            let ok = match a.as_str() {
+                "--threads" | "-t" => { crate::count(&val(), 1, 1024, "--threads is a number of 1 to 1024"); o.threads = Some(val()); true }
+                "--profile" => { o.profile = true; true }
+                "--tmp-dir" => { o.tmp_dir = Some(val()); true }
+                "--names" => {
+                    let n = val();
+                    let ok = if n == "drop" || n.starts_with("drop:") {
+                        if n == "drop:" { die("--names drop:FILE needs a file"); }
+                        enc
+                    } else if enc {
+                        die(if n == "ordinal" { "encode takes --names drop or drop:FILE" }
+                            else { "encode takes --names drop or drop:FILE; a name file is --aln-names" })
+                    } else { rd };
+                    o.names.push(n); ok
+                }
+                "--max-gap" => { crate::num(&v, 0, u64::MAX, "--max-gap needs a number"); o.max_gap = Some(val()); sm }
+                "--v1" => { o.v1 = true; sm }
+                "--aln-names" => { o.aln_names = Some(val()); inf }
+                "--sort" => { o.sort = Some(String::new()); enc }
+                s if s.starts_with("--sort=") => {
+                    crate::mem_arg(&s[7..]);
+                    o.sort = Some(s[7..].to_string()); enc
+                }
+                "--effort" => {
+                    if !["low", "medium", "high"].contains(&val().as_str()) { die("--effort is low, medium or high"); }
+                    o.effort = Some(val()); enc
+                }
+                "--block" => {
+                    if val() != "all" { crate::count(&val(), 1, i64::MAX as u64, "--block is a number of runs, 1 or more, or \"all\""); }
+                    o.block = Some(val()); enc
+                }
+                "--db" => { o.db = Some(val()); inf }
+                "--hier" => { o.hier = Some(val()); inf }
+                "--aln" => { o.aln = Some(val()); inf || pack }
+                "--ref" => { o.refbed = Some(val()); inf || pack }
+                "--out-dir" => { o.out = Some(val()); dec }
+                "--input" => { o.input.push(val()); !pack }
+                "--output" => { o.output = Some(val()); c != "index" }
+                "--region" => { o.region = Some(val()); sm || reg }
+                "--halo" => { o.halo = Some(val()); reg }
+                "--feature-set" => { o.feature_set = Some(val()); sm }
+                "--set" => { o.set = Some(val()); dec || reg }
+                "--raw" => { o.raw = true; dec }
+                _ => { i += 1; continue; }
             };
-            // The C echoes the spelling that was used, and -t is the one short.
-            let arg = if arg == "--threads" && std::env::args().any(|a| a == "-t")
-                { "-t" } else { arg };
-            karyozip::bail(&match e.kind() {
-                ErrorKind::UnknownArgument => format!("unknown flag {arg}"),
-                ErrorKind::InvalidValue if !arg.is_empty() => format!("{arg} needs a value"),
-                _ => "bad command or missing arguments".to_string(),
-            })
-        })
+            if !ok {
+                if cmd.is_empty() { die(USAGE); }
+                die(&format!("{a} does not apply to {cmd}"));
+            }
+            av.drain(i..i + if matches!(a.as_str(), "--profile" | "--v1" | "--raw") || a.starts_with("--sort") { 1 } else { 2 });
+        }
+        if cmd.is_empty() { die(USAGE); }
+        o.cmd = Some(match c {
+            "encode" => Cmd::Encode, "decode" => Cmd::Decode, "region" => Cmd::Region,
+            "smooth" => Cmd::Smooth, "index" => Cmd::Index, "aln-pack" => Cmd::AlnPack,
+            "codecs" => Cmd::Codecs { file: if av.len() > 1 { Some(av.remove(1)) } else { None } },
+            _ => die("bad command or missing arguments"),
+        });
+        if let Some(a) = av.get(1) {   // every argument is a flag now
+            die(&if a.starts_with('-') && a.len() > 1 { format!("unknown flag {a}") }
+                 else { format!("unexpected argument {a}") });
+        }
+        o
     }
 
     pub fn name(&self) -> &'static str {
         match self.cmd.as_ref().unwrap() {
-            Cmd::Encode { .. } => "encode",
-            Cmd::Decode { .. } => "decode",
-            Cmd::Region { .. } => "region",
-            Cmd::Smooth { .. } => "smooth",
-            Cmd::Index { .. } => "index",
-            Cmd::AlnPack { .. } => "aln-pack",
+            Cmd::Encode => "encode", Cmd::Decode => "decode", Cmd::Region => "region",
+            Cmd::Smooth => "smooth", Cmd::Index => "index", Cmd::AlnPack => "aln-pack",
             Cmd::Codecs { .. } => "codecs",
         }
-    }
-
-    /// A flag on the wrong command is refused by name, as the C does.
-    pub fn check_scope(&self) -> Result<(), String> {
-        let c = self.name();
-        let enc = c == "encode";
-        let dec = c == "decode";
-        let sm = c == "smooth";
-        let rd = sm || dec || c == "region" || c == "index";
-        let bad = |f: &str| -> Result<(), String> {
-            Err(format!("{f} does not apply to {c}"))
-        };
-        if self.block.is_some() && !enc { bad("--block")?; }
-        if self.effort.is_some() && !enc { bad("--effort")?; }
-        if self.sort.is_some() && !enc { bad("--sort")?; }
-        if self.out.is_some() && !dec { bad("--out-dir")?; }
-        let (pack, reg) = (c == "aln-pack", c == "region");
-        if !self.input.is_empty() && pack { bad("--input")?; }
-        if self.output.is_some() && c == "index" { bad("--output")?; }
-        if self.region.is_some() && !(sm || reg) { bad("--region")?; }
-        if self.halo.is_some() && !reg { bad("--halo")?; }
-        if self.feature_set.is_some() && !sm { bad("--feature-set")?; }
-        if self.set.is_some() && !(dec || c == "region") { bad("--set")?; }
-        if self.raw && !dec { bad("--raw")?; }
-        let inf = enc || dec || sm || c == "region";
-        if self.db.is_some() && !inf { bad("--db")?; }
-        if self.hier.is_some() && !inf { bad("--hier")?; }
-        if self.aln.is_some() && !(inf || pack) { bad("--aln")?; }
-        if self.refbed.is_some() && !(inf || pack) { bad("--ref")?; }
-        if self.aln_names.is_some() && !inf { bad("--aln-names")?; }
-        if self.max_gap.is_some() && !sm { bad("--max-gap")?; }
-        if self.v1 && !sm { bad("--v1")?; }
-        for n in &self.names {
-            let enc_form = n == "drop" || n.starts_with("drop:");
-            if enc && !enc_form {
-                return Err(if n == "ordinal" {
-                    "encode takes --names drop or drop:FILE".into()
-                } else {
-                    "encode takes --names drop or drop:FILE; a name file is --aln-names".into()
-                });
-            }
-            if !enc && enc_form { bad("--names")?; }
-            if !enc && !rd { bad("--names")?; }
-        }
-        Ok(())
     }
 }

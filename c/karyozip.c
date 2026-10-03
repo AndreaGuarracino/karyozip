@@ -283,9 +283,8 @@ static int intern(const char *s, size_t n) {
         return lastid;
     if (!lcache_init) { for (int i = 0; i < LCACHE; i++) lcache[i] = -1; lcache_init = 1; }
     uint32_t ck = (uint32_t)n * 2654435761u;
-    ck ^= (uint32_t)(uint8_t)s[0] << 7;
-    ck ^= (uint32_t)(uint8_t)s[n - 1] << 15;
-    ck ^= (uint32_t)(uint8_t)s[n >> 1] << 23;
+    if (n) ck ^= (uint32_t)(uint8_t)s[0] << 7 ^ (uint32_t)(uint8_t)s[n - 1] << 15
+                ^ (uint32_t)(uint8_t)s[n >> 1] << 23;   /* the library allows an empty label */
     ck = (ck ^ (ck >> 13)) & (LCACHE - 1);
     int cid = lcache[ck];
     if (cid >= 0 && labnlen[cid] == n && !memcmp(labtab[cid], s, n)) return lastid = cid;
@@ -385,7 +384,7 @@ static const char *ALNPAF = NULL;     /* --aln alignment.paf */
 static uint64_t ALNHIT = 0;           /* rows the reference already answered */
 static size_t RAWHELD = 0;            /* raw block payload held in memory at the peak */
 static int RAW = 0;
-static const char *OUTDIR = NULL;   /* --out DIR, for decode --db */
+static const char *OUTDIR = NULL;   /* --out-dir DIR, for decode --db */
 static const char *SETNAME = NULL;  /* --set NAME: one set of a --db track */
 static int INDEXING = 0;            /* the index command: names only, no companions */
 static int ORDNAMES = 0;              /* --names ordinal: accept dropped names */
@@ -509,7 +508,7 @@ static size_t fldnames1(buf *names, uint64_t n, uint8_t **out) {
         }
     }
     int ishex[FLDMAX];
-    for (int i = 0; i < nf; i++) { isnum[i] = 1; ishex[i] = !(l0[i] & 1) && l0[i] > 0; }
+    for (int i = 0; i < nf; i++) { isnum[i] = 1; ishex[i] = !(l0[i] & 1) && l0[i] > 0 && l0[i] <= 64; }   /* the reader takes 64 */
     int *same = xmalloc((size_t)nf * sizeof *same);
     for (int i = 0; i < nf; i++) same[i] = 1;
     int64_t *prev = xcalloc((size_t)nf, sizeof *prev);
@@ -2116,6 +2115,7 @@ static void sortpush(const char *nm, size_t nlen, uint64_t st, uint64_t len,
         rrec[rrecn].nam = rbufn;
         memcpy(rbuf + rbufn, nm, nlen); rbuf[rbufn + nlen] = 0;
         rbufn += nlen + 1;
+        if (NATN > UINT32_MAX) die("--sort takes at most 2^32 records");
         rrec[rrecn].idx = (uint32_t)NATN;
         if (PERMON) {
             char ob[24];
@@ -2141,6 +2141,7 @@ static void sortpush(const char *nm, size_t nlen, uint64_t st, uint64_t len,
         rrecn = 1; rrunn = 0;
     }
     if (!rrecn) die("a sequence does not start at 0");
+    if (rrunn == UINT32_MAX) die("--sort=MEM: more than 2^32 runs held; give a smaller MEM");
     if (rrunn == rrunc) { rrunc = rrunc ? rrunc * 2 : 1 << 20;
         rrun = xrealloc(rrun, rrunc * sizeof *rrun); }
     if (len > 0xffffffffu) die("run longer than 4 GB");
@@ -2777,9 +2778,10 @@ static void ktw_close(ktw *w) {
                     vs[v + 1] = alt; vn[v + 1] = an;
                 }
                 if (RUNHEAD || ILV)
-                    for (int v = 0; v < 3; v++)
+                    for (int v = 0; v < 3; v++) {
                         if (altv[v]) { vs[v] = altv[v]; vn[v] = altvn[v]; }
                         else if (v) vs[v] = NULL;
+                    }
                 static const int ORDER[3] = { 1, 2, 0 };
                 size_t best = 0; int bv = -1;
                 for (int k = 0; k < 3; k++) {
@@ -2790,14 +2792,14 @@ static void ktw_close(ktw *w) {
                     if (bv < 0 || a2 < best) { free(fa); fa = f2; best = a2; bv = v; }
                     else free(f2);
                 }
-                if (failed) { free(o); free(fa); continue; }
+                if (failed) { free(fa); continue; }
                 a = best; nl = ILV ? altvl[bv] : vn[bv]; nosent = (uint64_t)bv;
                 if (ILV) { b2 = 0; fb = NULL; o[0] = 0; }
                 else if (IDCODEC) { b2 = paycomp(idsrc, ni, IDCODEC, &fb);
-                               if (!b2) { failed = 1; free(fa); free(o); continue; } }
+                               if (!b2) { failed = 1; free(fa); continue; } }
                 else
                 { b2 = ZSTD_compressCCtx(tc, o, obound, idsrc, ni, LEVEL_I < 0 ? LEVEL : LEVEL_I);
-                  if (ZSTD_isError(b2)) { failed = 1; free(fa); free(o); continue; } }
+                  if (ZSTD_isError(b2)) { failed = 1; free(fa); continue; } }
 #ifdef _OPENMP
 #pragma omp atomic
 #endif
@@ -3255,7 +3257,7 @@ static R *ropen(const char *path) {
         if (!was_aln && ALNPAF)
             die("this track was not written with --aln");
         if (was_db && !DBFEATS)
-            die("this track holds featureIDs: decode it with --db features.tsv --out DIR, "
+            die("this track holds featureIDs: decode it with --db features.tsv --out-dir DIR, "
                 "or --raw to see what is stored");
         if (!was_db && DBFEATS)
             die("this track does not hold featureIDs");
@@ -3876,7 +3878,7 @@ static void loadblk(R *r, uint64_t b) {
     else
     { g = ZSTD_decompressDCtx(r->d, r->blkbuf, r->blkcap, cb, la);
       if (ZSTD_isError(g)) die(ZSTD_getErrorName(g)); }
-    (void)want;
+    if (g != want) die("corrupt block: a stream decodes to a size the index does not claim");
     if (r->ilv) h2 = 0;                     /* the one frame carried both */
     else if (r->idcodec) { h2 = paydecomp(cb + la, lb, r->idcodec, r->blkbuf + g, r->b[b].raw);
                       if (!h2 && r->b[b].raw) die("frame decode failed"); }
@@ -3885,11 +3887,10 @@ static void loadblk(R *r, uint64_t b) {
       if (ZSTD_isError(h2)) die(ZSTD_getErrorName(h2)); }
     free(cb);
     if (r->ilv) {
-        if (g != r->b[b].lraw + r->b[b].raw || h2)
-            die("corrupt block: a stream decodes to a size the index does not claim");
+        if (h2) die("corrupt block: a stream decodes to a size the index does not claim");
         g = ilv_split(r, r->blkbuf, g, r->b[b].lraw, r->b[b].raw);
         h2 = r->b[b].raw;
-    } else if (g != r->b[b].lraw || h2 != r->b[b].raw)
+    } else if (h2 != r->b[b].raw)
         die("corrupt block: a stream decodes to a size the index does not claim");
     if (r->runhead) {
         size_t g2 = rmheads(r, r->blkbuf, g);
@@ -4998,8 +4999,8 @@ static void dbtmpclean(void) { for (size_t i = 0; i < ndbtmp; i++) if (DBTMP[i])
 static void dbtmpsig(int s) { dbtmpclean(); (void)s; _exit(1); }   /* atexit does not run on a signal */
 
 static void decode_db(const char *path, const char *dir) {
-    /* --out DIR: one BED per selected set, staged then swapped in together.
-       No --out: the selected columns, tab-joined, merged where they all
+    /* --out-dir DIR: one BED per selected set, staged then swapped in together.
+       No --out-dir: the selected columns, tab-joined, merged where they all
        agree, on stdout; one set gives that set's own track. */
     int tostd = !dir;
     size_t nout = tostd ? 1 : NSETK;
@@ -5022,14 +5023,14 @@ static void decode_db(const char *path, const char *dir) {
         free(d);
         for (size_t i = 0; i < NSETK; i++) {
             struct stat ts; int pn = snprintf(pb, sizeof pb, "%s/%s.bed", dir, fset[SETK[i]]);
-            if (pn < 0 || (size_t)pn >= sizeof pb - 16) die("--out: the output path is too long");
-            if (!lstat(pb, &ts) && !S_ISREG(ts.st_mode)) die("--out: a set's BED exists and is not a regular file");
+            if (pn < 0 || (size_t)pn >= sizeof pb - 16) die("--out-dir: the output path is too long");
+            if (!lstat(pb, &ts) && !S_ISREG(ts.st_mode)) die("--out-dir: a set's BED exists and is not a regular file");
         }
         DBTMP = xcalloc(NSETK, sizeof *DBTMP); ndbtmp = NSETK; atexit(dbtmpclean);
         signal(SIGINT, dbtmpsig); signal(SIGTERM, dbtmpsig); signal(SIGHUP, dbtmpsig);
         for (size_t i = 0; i < NSETK; i++) {
             int pn = snprintf(pb, sizeof pb, "%s/%s.bed.tmp.%d", dir, fset[SETK[i]], (int)getpid());
-            if (pn < 0 || (size_t)pn >= sizeof pb - 16) die("--out: the output path is too long");
+            if (pn < 0 || (size_t)pn >= sizeof pb - 16) die("--out-dir: the output path is too long");
             DBTMP[i] = xstrdup(pb);
             o[i].f = fopen(pb, "w");
             if (!o[i].f) die("cannot write a derived BED");
@@ -5290,10 +5291,11 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--feature-set")) { ok = sm; FSA = v; take = 2; }
         else if (!strcmp(a, "--set")) { ok = dec || !strcmp(cmd, "region"); SETNAME = v; take = 2; }
         else if (!strcmp(a, "--raw")) { ok = dec; RAW = 1; take = 1; }
-        if (take && !ok) { fprintf(stderr, "karyozip: %s does not apply to %s\n", a, cmd); exit(1); }
+        if (take && !ok) { if (!*cmd) die(USAGE);   /* flags but no command */
+            fprintf(stderr, "karyozip: %s does not apply to %s\n", a, cmd); exit(1); }
         if (take) { for (int j = i; j + take <= argc; j++) argv[j] = argv[j + take]; argc -= take; i--; }
     }
-    if (!*cmd) die(USAGE);   /* flags but no command: argv[1] is now past the end */
+    if (!*cmd) die(USAGE);   /* argv[1] is now past the end */
     if (!enc && !rd && !pack) die("bad command or missing arguments");
     if (FASTMODE && !BLOCKSET) BLOCK = 262144;   /* -e low: blocks and an index, for queries */
     for (int i = 2; i < argc; i++) {   /* every argument is a flag now */

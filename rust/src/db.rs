@@ -326,7 +326,7 @@ pub fn encode(files: &[String], feats: &Feats, w: &mut crate::writer::Writer) ->
     cart_used
 }
 
-/// decode --db --out DIR: one BED per feature set, the featureIDs expanded.
+/// decode --db --out-dir DIR: one BED per feature set, the featureIDs expanded.
 /// The staged BEDs of a decode in flight, removed by `die` and on the way
 /// out, so a failed run never leaves half an output behind.
 static TMP: std::sync::Mutex<Vec<std::path::PathBuf>> = std::sync::Mutex::new(Vec::new());
@@ -356,9 +356,9 @@ pub fn decode(r: &mut crate::reader::Reader, feats: &Feats, dir: Option<&str>, c
         std::fs::create_dir_all(dir).unwrap_or_else(|_| crate::bail("cannot create the output directory"));
         for s in &sets {
             let p = setpath(dir, s, ".bed");
-            if p.as_os_str().len() + 16 >= 4096 { crate::bail("--out: the output path is too long"); }
+            if p.as_os_str().len() + 16 >= 4096 { crate::bail("--out-dir: the output path is too long"); }
             if let Ok(m) = std::fs::symlink_metadata(&p) {
-                if !m.is_file() { crate::bail("--out: a set's BED exists and is not a regular file"); }
+                if !m.is_file() { crate::bail("--out-dir: a set's BED exists and is not a regular file"); }
             }
         }
         // Write beside the old BEDs, then swap them in together.

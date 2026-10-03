@@ -31,7 +31,7 @@ build/karyozip: $(SRC) $(HDR)
 # the same sources, minus main: an annotator can write .kst without a BED
 build/libkaryozip.a: $(SRC) $(HDR)
 	mkdir -p build/lib
-	$(CC) $(CFLAGS) $(ZSTD_CFLAGS) -DKARYOZIP_LIB -c $(SRC) && mv *.o build/lib/
+	$(CC) $(CFLAGS) $(ZSTD_CFLAGS) -Wno-unused-function -Wno-unused-variable -DKARYOZIP_LIB -c $(SRC) && mv *.o build/lib/
 	$(AR) rcs $@ build/lib/*.o
 
 build/libtest: build/libkaryozip.a tests/libtest.c

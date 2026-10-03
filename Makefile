@@ -15,6 +15,7 @@ test: all rust
 test-c:
 	@$(MAKE) --no-print-directory -C c test
 test-rust:
+	@cd rust && cargo test --release -q --test lib
 	@KT=$(CURDIR)/rust/target/release/karyozip LT=$(CURDIR)/c/build/libtest bash c/tests/run.sh
 test-diff:
 	@bash tests/diff.sh

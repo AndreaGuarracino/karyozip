@@ -5,6 +5,7 @@ C=${1:-$(dirname "$0")/../c/build/karyozip}
 R=${2:-$(dirname "$0")/../rust/target/release/karyozip}
 D=$(cd "$(dirname "$0")/../c/tests" && pwd)
 [ -x "$C" ] && [ -x "$R" ] || { echo "build both first: make all rust"; exit 1; }
+C=$(realpath "$C"); R=$(realpath "$R")
 W=$(mktemp -d); trap 'rm -rf "$W"' EXIT
 fail=0
 
@@ -13,22 +14,22 @@ rv=$("$R" --version | awk '/zstd|libbz3/{print $1"="$2}' | tr '\n' ' ')
 if [ "$cv" = "$rv" ]; then echo "codec versions: $cv"
 else echo "codec versions DIFFER: c=[$cv] rust=[$rv]"; fail=1; fi
 
-# Run both on the same input and arguments: stdout bytes and exit code must
-# match. IN names the stdin file. Every section below tallies with these.
+# Run both on the same input and arguments: stdout, stderr and exit code
+# must match. IN names the stdin file. Every section below tallies with these.
 ok=0; bad=0; EXPECT=ok
 both() {  # both LABEL args...  a shared refusal passes only where EXPECT=fail
   local l=$1; shift
-  "$C" "$@" < "${IN:-/dev/null}" > "$W/c.out" 2>/dev/null; local a=$?
-  "$R" "$@" < "${IN:-/dev/null}" > "$W/r.out" 2>/dev/null; local b=$?
-  if cmp -s "$W/c.out" "$W/r.out" && [ $a = $b ] && { [ $a = 0 ] || [ $EXPECT = fail ]; }; then ok=$((ok+1))
-  else bad=$((bad+1)); echo "  differs: $l (rc $a/$b)"; fi
+  "$C" "$@" < "${IN:-/dev/null}" > "$W/c.out" 2>"$W/c.err"; local a=$?
+  "$R" "$@" < "${IN:-/dev/null}" > "$W/r.out" 2>"$W/r.err"; local b=$?
+  if cmp -s "$W/c.out" "$W/r.out" && cmp -s "$W/c.err" "$W/r.err" && [ $a = $b ] && { [ $a = 0 ] || [ $EXPECT = fail ]; }; then ok=$((ok+1))
+  else bad=$((bad+1)); echo "  differs: $l (rc $a/$b)"; diff "$W/c.err" "$W/r.err" | head -4; fi
 }
 tally() { [ $bad = 0 ] && echo "$1: $ok forms identical" || { echo "$1: $bad of $((ok+bad)) DIFFER"; fail=1; }; ok=0; bad=0; }
 
-# 1. every codec gives the same bytes from both, and round-trips.
+# 1. every codec round-trips in the Rust; section 2 compares the bytes.
 for f in db.rall.bed db.chromosome.bed ls.bed; do
-  "$R" codecs "$D/$f" 2>/dev/null | grep -q 'roundtrip=false' \
-    && { echo "codecs: a round trip failed on $f"; fail=1; }
+  o=$("$R" codecs "$D/$f" 2>&1) && ! grep -q 'roundtrip=false' <<<"$o" && grep -q 'roundtrip=true' <<<"$o" \
+    || { echo "codecs: a round trip failed on $f"; fail=1; }
 done
 echo "codecs: every candidate round-trips"
 
@@ -238,8 +239,8 @@ done
 # every malformed form, including --help and --version.
 cok=0; cbad=0
 cli() {
-  "$C" "$@" </dev/null > "$W/cliout.c" 2>&1; local cr=$?
-  "$R" "$@" </dev/null > "$W/cliout.r" 2>&1; local rr=$?
+  (cd "$W" && "$C" "$@" </dev/null > cliout.c 2>&1); local cr=$?   # in $W: a form may write a file
+  (cd "$W" && "$R" "$@" </dev/null > cliout.r 2>&1); local rr=$?
   if cmp -s "$W/cliout.c" "$W/cliout.r" && [ "$cr" = "$rr" ]; then cok=$((cok+1)); return; fi
   cbad=$((cbad+1)); echo "  cli differs: [$*] rc $cr/$rr"; echo "    c=[$(head -c 200 "$W/cliout.c" | tr -d '\0' | head -1)]"
   echo "    rust=[$(head -c 200 "$W/cliout.r" | tr -d '\0' | head -1)]"
@@ -251,7 +252,7 @@ cli encode --names ordinal; cli decode --sort; cli index --effort low
 cli encode --block; cli encode --effort max; cli encode --block 0
 cli -t; cli -t 0; cli -t 99999; cli --tmp-dir; cli decode --raw x --raw
 cli index --block 0; cli aln-pack -a a --ref b; cli smooth -i f --hier h; cli region -i f -r s:5-5
-cli encode --sort=0; cli encode --names foo; cli decode --names keep
+cli encode --sort=0; cli encode --names foo; cli --effort low; cli -r x
 cli aln-pack --names foo -a a --ref b -o c; cli encode --db; cli --version encode
 cli index -i f x; cli decode -i f x; cli smooth -i f --hier h -f fs -r s:9-3; cli aln-pack -a a --ref b -o c d
 cli smooth -i f --hier h -f fs -r s:1-2; cli region -i f -r s --halo 3; cli region -i f -r s:1-2
@@ -264,6 +265,8 @@ cli encode --names drop --aln p --ref r; cli decode --db f; cli encode --db f
 cli encode --names drop --names drop:x; cli encode --names drop:
 cli encode --sort --names drop --aln p --ref r --aln-names q
 cli decode -i a -i b; cli encode -i nosuch; cli index -i f -o x; cli region -i f -r s:2-1
+cli --block=4 encode; cli -b4 encode; cli -t4 encode; cli --effort=low encode; cli -V; cli foo --raw
+cli decode -i f --max-gap -1; cli region -i f -r -x; cli encode -- -x; cli decode --sort=1Z; cli -o -i encode
 [ $cbad = 0 ] && echo "cli: $cok forms give the same words and code" \
   || { echo "cli: $cbad of $((cok+cbad)) DIFFER"; fail=1; }
 

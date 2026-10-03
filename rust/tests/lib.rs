@@ -52,7 +52,7 @@ fn same_bytes_as_the_cli() {
         (vec![], Options::default()),
         (vec!["--block", "4"], Options { block: 4, ..Options::default() }),
         (vec!["--block", "all"], Options { block: u64::MAX, ..Options::default() }),
-        (vec!["--names", "keep"], Options { keep_names: true, ..Options::default() }),
+        (vec!["--names", "drop"], Options { drop_names: true, ..Options::default() }),
     ] {
         assert_eq!(build(&bed, opt), cli(&args, &bed), "differs for {args:?}");
     }

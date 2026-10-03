@@ -1,7 +1,7 @@
 """Forging helpers for the suite: parse a track, patch it, re-sign its hashes."""
 import struct, subprocess, sys, random, os
 FNV0 = 0xcbf29ce484222325; P = 0x100000001b3; M = (1 << 64) - 1
-FLAGS = sum(1 << b for b in (63, 62, 60, 59, 58, 57, 56, 55, 54, 53))
+FLAGS = M ^ ((1 << 49) - 1)   # bits 49 to 63 are flags, below them the names length
 def fnv(h, b):
     for x in b: h = ((h ^ x) * P) & M
     return h

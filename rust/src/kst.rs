@@ -1,5 +1,24 @@
-//! Format primitives shared by the writer and, later, the reader.
+//! Format primitives shared by the writer and the reader.
 //! The format's number encoding: LEB128 unsigned, and zigzag for signed.
+
+/// The header flags in h[1], above the 49-bit names length.
+pub const TOKFLAG: u64 = 1 << 63;   // names through the tokeniser
+pub const INTFLAG: u64 = 1 << 62;   // names as integer deltas
+pub const RUNFLAG: u64 = 1 << 61;   // run counts head each read's lengths
+pub const DROPPED: u64 = 1 << 60;   // names not stored
+pub const ALNFLAG: u64 = 1 << 59;   // rows deltaed against a reference
+pub const DBFLAG: u64 = 1 << 58;    // labels are featureIDs
+pub const SIDEFLAG: u64 = 1 << 57;  // names in a sidecar
+pub const LENFLAG: u64 = 1 << 56;   // lengths the reference implies are 0
+pub const TAILFLAG: u64 = 1 << 55;  // last run lengths predicted
+pub const PERMFLAG: u64 = 1 << 54;  // names in input order plus a permutation
+pub const PERMTOK: u64 = 1 << 53;   // that permutation tokenised
+pub const CARTFLAG: u64 = 1 << 52;  // vocabulary featureIDs
+pub const ILVFLAG: u64 = 1 << 51;   // labels interleaved with lengths
+pub const FLDFLAG: u64 = 1 << 50;   // names as field deltas
+pub const GRPFLAG: u64 = 1 << 49;   // lengths grouped by label
+pub const FLAGS: u64 = !((1 << 49) - 1);
+pub const ICHUNK: u64 = 65536;      // sequences per index chunk
 
 pub fn put(out: &mut Vec<u8>, mut v: u64) {
     while v >= 0x80 {

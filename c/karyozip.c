@@ -3097,6 +3097,7 @@ typedef struct {
     uint8_t *pz; size_t pzl; int perm_tok, perm_ext;  /* names in input order */
     char *namebuf, *natbufp;
     int name_borrowed;         /* the table belongs to another reader */
+    int blk_borrowed;          /* so do the one block and its run counts */
     uint8_t *ichunk; uint64_t nichunk, *coff, *cpendv, curchunk, ibcap;
     uint64_t *sst, *sen; int *sfeat; uint8_t *snov; uint64_t scap;
     const uint8_t *payend;        /* the cached block's payload end, per reader */
@@ -4690,9 +4691,10 @@ static void rclose(R *r) {
     if (r->d) ZSTD_freeDCtx(r->d);
     if (!r->name_borrowed) { free(r->namebuf); free(r->natbufp); free(r->name); }
     if (r->lab) { free(r->lab[0]); free(r->lab); }
-    free(r->blkbuf); free(r->b);
+    if (!r->blk_borrowed) { free(r->blkbuf); free(r->rtab); }
+    free(r->b);
     free(r->nz_keep); free(r->pz); free(r->ibuf); free(r->ichunk);
-    free(r->coff); free(r->cpendv); free(r->htab); free(r->rtab);
+    free(r->coff); free(r->cpendv); free(r->htab);
     free(r->sst); free(r->sen); free(r->sfeat); free(r->snov);
     free(r);
 }
@@ -4703,13 +4705,18 @@ static void smooth_mt(const char *path, R *r0, int64_t first, int64_t last,
     const int64_t CHUNK = 4096;
     int64_t nchunk = (last - first + CHUNK - 1) / CHUNK;
     _Atomic int wfail = 0;
+    if (r0->nblk == 1) loadblk(r0, 0);   /* one block: decode it once, for every thread */
 #ifdef _OPENMP
 #pragma omp parallel num_threads(nthr)
 #endif
     {
         R *rr = ropen(path);
-
         rr->name = r0->name; rr->names_ready = 1; rr->name_borrowed = 1;
+        if (r0->nblk == 1) {
+            free(rr->blkbuf); free(rr->rtab); rr->blk_borrowed = 1;
+            rr->blkbuf = r0->blkbuf; rr->rtab = r0->rtab; rr->rfilled = r0->rfilled;
+            rr->lp0 = r0->lp0; rr->ip0 = r0->ip0; rr->payend = r0->payend; rr->cached = 0;
+        }
         size_t cap = 1 << 20, len = 0;
         char *ob = xmalloc(cap);
 #ifdef _OPENMP

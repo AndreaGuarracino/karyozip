@@ -266,6 +266,7 @@ cli encode --names drop --names drop:x; cli encode --names drop:
 cli encode --sort --names drop --aln p --ref r --aln-names q
 cli decode -i a -i b; cli encode -i nosuch; cli index -i f -o x; cli decode -i f -r s:2-1
 cli decode -i f -r s --out-dir d; cli decode -i f -r s --raw; cli decode -i f --halo 2; cli region -i f -r s
+cli --tmp-dir /nonexistent encode; cli --tmp-dir /nonexistent --db $D/db.features.tsv encode -i $D/db.gene.bed
 cli --block=4 encode; cli -b4 encode; cli -t4 encode; cli --effort=low encode; cli -V; cli foo --raw
 cli decode -i f --max-gap -1; cli decode -i f -r -x; cli encode -- -x; cli decode --sort=1Z; cli -o -i encode
 [ $cbad = 0 ] && echo "cli: $cok forms give the same words and code" \

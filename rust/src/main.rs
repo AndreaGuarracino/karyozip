@@ -103,8 +103,7 @@ fn main() {
             match &c.db {
                 Some(fp) => {
                     let feats = load_feats(fp, c.hier.as_deref());
-                    let mut w = writer::Writer::new(opt, std::path::Path::new(&tmpdir))
-                        .unwrap_or_else(|e| die(&e.to_string()));
+                    let mut w = new_writer(opt, std::path::Path::new(&tmpdir));
                     let aln_on = a.is_some();
                     if let Some(x) = a { w.set_aln(x); }
                     let used = db::encode(&c.input, &feats, &mut w);
@@ -279,9 +278,14 @@ fn load_aln(paf: &Option<String>, refbed: &Option<String>,
     }
 }
 
+/// The staging file goes under tmpdir; the C's words if it cannot.
+fn new_writer(opt: writer::Options, tmpdir: &std::path::Path) -> writer::Writer {
+    writer::Writer::new(opt, tmpdir).unwrap_or_else(|_| die(&format!(
+        "cannot create a temp file under {} (set TMPDIR)", tmpdir.display())))
+}
+
 fn encode(opt: writer::Options, tmpdir: &std::path::Path, a: Option<aln::Aln>) {
-    let mut w = writer::Writer::new(opt, tmpdir)
-        .unwrap_or_else(|e| die(&format!("cannot create a temp file under {}: {e}", tmpdir.display())));
+    let mut w = new_writer(opt, tmpdir);
     let aln_on = a.is_some();
     if let Some(x) = a { w.set_aln(x); }
     // A slab at a time, like the C. Reading the whole input first would cost

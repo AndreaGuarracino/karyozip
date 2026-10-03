@@ -1,30 +1,16 @@
-//! Reading a KST track. Plain tracks only for now: no --aln, no --db, no
-//! sidecar, no permutation. Every refusal message is the C's, because the
-//! two are meant to be interchangeable.
+//! Reading a KST track. Every refusal message is the C's, because the two
+//! are meant to be interchangeable.
 
 use crate::ffi;
-use crate::kst::{self, FNV0};
+use crate::kst::{self, FNV0, TOKFLAG, INTFLAG, FLDFLAG, DROPPED, ALNFLAG, DBFLAG, SIDEFLAG, LENFLAG,
+                 TAILFLAG, RUNFLAG, ILVFLAG, GRPFLAG, PERMFLAG, PERMTOK, CARTFLAG, ICHUNK, FLAGS};
 use std::io::{Read, Seek, SeekFrom};
 
-const TOKFLAG: u64 = 1 << 63;
-const INTFLAG: u64 = 1 << 62;
-const FLDFLAG: u64 = 1 << 50;
-const DROPPED: u64 = 1 << 60;
-const ALNFLAG: u64 = 1 << 59;
-const DBFLAG: u64 = 1 << 58;
-const SIDEFLAG: u64 = 1 << 57;
-const LENFLAG: u64 = 1 << 56;
-const TAILFLAG: u64 = 1 << 55;
-const RUNFLAG: u64 = 1 << 61;
-const ILVFLAG: u64 = 1 << 51;
-const GRPFLAG: u64 = 1 << 49;
-const PERMFLAG: u64 = 1 << 54;
-const PERMTOK: u64 = 1 << 53;
-const CARTFLAG: u64 = 1 << 52;
-const FLAGS: u64 = TOKFLAG | INTFLAG | FLDFLAG | DROPPED | ALNFLAG | DBFLAG | SIDEFLAG
-                 | LENFLAG | TAILFLAG | PERMFLAG | PERMTOK | CARTFLAG | RUNFLAG | ILVFLAG | GRPFLAG;
 const IDXMAGIC: u64 = 0x3130_5844_4954_534b;   // "KSTIDX01"
-const ICHUNK: u64 = 65536;
+
+/// A decoded block: its number, bytes, where the labels start, rows.
+type Cached = (usize, std::sync::Arc<Vec<u8>>, usize, u64);
+pub type Shared = (Cached, std::sync::Arc<Vec<u64>>);
 
 fn ordinals(n: u64) -> Vec<u8> {
     let mut v = Vec::with_capacity(crate::ckalloc(n as usize * 8));
@@ -115,13 +101,13 @@ pub struct Reader {
     /// the sequence index: chunk frames, their offsets, the run count each
     /// starts at, and the one chunk decoded now, as the C's loadichunk
     iz: Vec<u8>, coff: Vec<u64>, cpend: Vec<u64>, ibx: Vec<u8>, cur_chunk: u64,
-    runhead: bool, ilv: bool, grp: bool, rtab: Vec<u64>,   // run-count prefix sums, lifted out of the lengths
+    runhead: bool, ilv: bool, grp: bool, rtab: std::sync::Arc<Vec<u64>>,   // run-count prefix sums, lifted out of the lengths
     hasidx: bool,
     mhash: u64,
     cur_ri: u64,
     cur_q: usize,
     cur_pend: u64,
-    cached: Option<(usize, std::sync::Arc<Vec<u8>>, usize, u64)>,
+    cached: Option<Cached>,
     /// the rows as text, what binds this track when it serves as --ref
     pub rowhash: u64,
     /// not --aln, --db, --sort, --names drop, names in the file: fit for --ref
@@ -264,7 +250,6 @@ impl Reader {
             crate::bail("corrupt file: tail skip is not the format constant");
         }
         let nzl = nml as usize;
-        let nz_off = 8 + 128 + lzl as u64;
         let mut nz = vec![0u8; crate::ckalloc(nzl)];
         if nzl > 0 { rd(f.read_exact(&mut nz), "short names"); }
         let mut iz = vec![0u8; crate::ckalloc(h[2] as usize)];
@@ -317,7 +302,6 @@ impl Reader {
         if was_side && nzl == 0 && o.raw {
             eprintln!("sidecar missing: names are ordinals and the metadata hash is unchecked");
         }
-        let _ = nz_off;
 
         // The block table.
         let was_len = h[1] & LENFLAG != 0;
@@ -403,7 +387,7 @@ impl Reader {
             nameix: std::cell::OnceCell::new(),
             idcodec: idc, lencodec: lenc,
             taildec, tailpred: h[12], tailskip: h[13] & 0xff, iz, coff, cpend, ibx: Vec::new(), cur_chunk: u64::MAX,
-            runhead, ilv, grp, rtab: Vec::new(),
+            runhead, ilv, grp, rtab: Default::default(),
             names: std::cell::OnceCell::new(), nz, pz, names_file: o.names_file.clone(),
             ordnames: o.ordnames, nf, idx,
             hasidx, mhash: h[15], cur_ri: 0, cur_q: 0, cur_pend: 0, cached: None, sc: None,
@@ -504,6 +488,14 @@ impl Reader {
     /// One block's two frames back to back, the split, its rows. The last
     /// block stays decoded: without that, a track whose sequences share a
     /// block is decompressed once per sequence.
+    /// A one-block track's decoded block, for another reader of the same file.
+    pub fn share_block(&mut self) -> Option<Shared> {
+        if self.b.len() != 1 { return None; }
+        self.load(0);
+        Some((self.cached.clone().unwrap(), self.rtab.clone()))
+    }
+    pub fn adopt_block(&mut self, s: Shared) { self.cached = Some(s.0); self.rtab = s.1; }
+
     fn load(&mut self, b: usize) -> (std::sync::Arc<Vec<u8>>, usize, u64) {
         if let Some((cb, d, sp, r)) = &self.cached {
             if *cb == b { return (d.clone(), *sp, *r); }
@@ -561,7 +553,7 @@ impl Reader {
         if tab.len() as u64 != self.nreads + 1 || seen != self.rows {
             crate::bail("corrupt block: the run counts do not add up to the row count");
         }
-        self.rtab = tab;
+        self.rtab = std::sync::Arc::new(tab);
         out
     }
 
@@ -970,7 +962,7 @@ impl Reader {
         hits.into_iter().find(|&o| self.name_at(o) == nm).map_or(-1, |o| o as i64)
     }
 
-    fn find(&self, seq: &[u8]) -> i64 {
+    pub fn find(&self, seq: &[u8]) -> i64 {
         let hit = self.idxlookup(seq);
         if hit >= 0 { return hit; }
         let (tab, mask) = self.nameix.get_or_init(|| {
@@ -1196,7 +1188,6 @@ impl Reader {
         self.names.get_or_init(|| std::sync::Arc::new(self.decode_names())).clone()
     }
     pub fn adopt_names(&mut self, n: std::sync::Arc<(Vec<u8>, Vec<u64>)>) { let _ = self.names.set(n); }
-    pub fn find_seq(&self, s: &[u8]) -> i64 { self.find(s) }
     pub fn labels(&self) -> &[Vec<u8>] { &self.lab }
     /// run count of sequence `ri`, from the index alone
     pub fn nruns_of(&mut self, ri: u64) -> u64 { self.locate(ri).2 }

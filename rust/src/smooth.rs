@@ -235,7 +235,7 @@ pub fn run(path: &str, hier: &str, fs: &[u8], seq: Option<&[u8]>,
     h.build();   // after the labels: they add the unknown nodes
 
     let (first, last) = match seq {
-        Some(s) => { let i = r.find_seq(s); if i < 0 { crate::bail("sequence not found"); }
+        Some(s) => { let i = r.find(s); if i < 0 { crate::bail("sequence not found"); }
                      (i as u64, i as u64 + 1) }
         None => (0, r.nreads),
     };
@@ -258,11 +258,12 @@ pub fn run(path: &str, hier: &str, fs: &[u8], seq: Option<&[u8]>,
     let (nthr, chunk) = (rayon::current_num_threads() as u64, 4096u64);
     if nthr > 1 && last - first >= 64 {
         // As the C's smooth_mt: chunks of sequences on worker threads, each
-        // with its own reader and one buffer it reuses, taken in order and
+        // with its own reader (sharing a one-block track's block) and one buffer it reuses, taken in order and
         // written in turn, so nothing is held but a buffer per thread. A
         // window of eight chunks per thread held 2 GB against the C's 0.45 GB.
         use std::sync::atomic::{AtomicU64, Ordering};
         let names = r.names_shared();
+        let blk = r.share_block();   // one block: decoded once, for every thread
         let nchunk = (last - first).div_ceil(chunk);
         let next = AtomicU64::new(0);
         let turn = std::sync::Mutex::new((0u64, out));
@@ -270,10 +271,11 @@ pub fn run(path: &str, hier: &str, fs: &[u8], seq: Option<&[u8]>,
         let one = &one;
         std::thread::scope(|sc| {
             for _ in 0..nthr {
-                let (names, next, turn, bell) = (names.clone(), &next, &turn, &bell);
+                let (names, blk, next, turn, bell) = (names.clone(), blk.clone(), &next, &turn, &bell);
                 sc.spawn(move || {
                     let mut r = Reader::open_with(path, ro);
                     r.adopt_names(names);
+                    if let Some(b) = blk { r.adopt_block(b); }
                     let mut buf = Vec::with_capacity(1 << 20);
                     let mut sr = crate::reader::SeqRows::default();
                     loop {

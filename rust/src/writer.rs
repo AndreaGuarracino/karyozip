@@ -4,29 +4,14 @@
 //! the same bytes.
 
 use crate::ffi;
-use crate::kst::{self, FNV0};
+use crate::kst::{self, FNV0, TOKFLAG, INTFLAG, FLDFLAG, DROPPED, ALNFLAG, DBFLAG, SIDEFLAG, LENFLAG,
+                 TAILFLAG, RUNFLAG, ILVFLAG, GRPFLAG, PERMFLAG, PERMTOK, CARTFLAG, ICHUNK};
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::io::{Read, Seek, SeekFrom, Write};
 
 pub const MAGIC: &[u8; 8] = b"KST00001";
-const TOKFLAG: u64 = 1 << 63;
-const INTFLAG: u64 = 1 << 62;
-const DROPPED: u64 = 1 << 60;
-const SIDEFLAG: u64 = 1 << 57;
-const ALNFLAG: u64 = 1 << 59;
-const DBFLAG: u64 = 1 << 58;
-const CARTFLAG: u64 = 1 << 52;
-const LENFLAG: u64 = 1 << 56;
-const PERMFLAG: u64 = 1 << 54;
-const PERMTOK: u64 = 1 << 53;
-const TAILFLAG: u64 = 1 << 55;
-const RUNFLAG: u64 = 1 << 61;
-const FLDFLAG: u64 = 1 << 50;
-const ILVFLAG: u64 = 1 << 51;
-const GRPFLAG: u64 = 1 << 49;
-const ICHUNK: u64 = 65536;
 const TAILSKIP: usize = 64;
 
 pub struct Options {
@@ -619,11 +604,11 @@ impl Writer {
                     let (mut best, mut bv, mut fa) = (0usize, usize::MAX, Vec::new());
                     for &v in &ORDER {
                         let Some(src) = vs[v] else { continue };
-                        let f = comp_lens(src, lencodec, lvl_len).unwrap_or_else(|| crate::bail("block compression failed"));
+                        let f = comp_frame(src, lencodec, lvl_len).unwrap_or_else(|| crate::bail("block compression failed"));
                         if bv == usize::MAX || f.len() < best { best = f.len(); bv = v; fa = f; }
                     }
                     let nl = if ilv { altv[bv].as_ref().unwrap().1 } else { vs[bv].unwrap().len() };
-                    let b = if ilv { Vec::new() } else { comp_ids(&ids, idc, lvl_id).unwrap_or_else(|| crate::bail("block compression failed")) };
+                    let b = if ilv { Vec::new() } else { comp_frame(&ids, idc, lvl_id).unwrap_or_else(|| crate::bail("block compression failed")) };
                     (fa, b, nl, ids.len(), m.rows, m.bp, bv as u64)
                 })
                 .collect();
@@ -990,13 +975,6 @@ pub fn pick(all: &dyn Fn(usize) -> (Vec<u8>, Vec<u8>), nraw: usize, rawtot: usiz
     // such size stands for all of them
     // hts_pack and its arith twin refuse above 16 distinct bytes and the
     // encoder then clears the PACK bit, so such a candidate is its plain sibling
-    let packdup = |c: i32, p: &[u8]| -> bool {
-        if c & 0x80 == 0 || c & ffi::CODEC_BZIP3 != 0 { return false; }
-        let mut seen = [false; 256];
-        let mut d = 0;
-        for &b in p { if !seen[b as usize] { seen[b as usize] = true; d += 1; if d > 16 { return true; } } }
-        false
-    };
     let bz3dup = |c: i32, n: usize| bz3_dup(c, n, maxstream, &cand);
     let (mut zi, mut zl, mut z22i, mut z22l) = (0usize, 0usize, 0usize, 0usize);
     let mut ci = vec![0usize; nc];
@@ -1010,10 +988,10 @@ pub fn pick(all: &dyn Fn(usize) -> (Vec<u8>, Vec<u8>), nraw: usize, rawtot: usiz
         let step: Vec<(usize, usize)> = (0..nc + 2).into_par_iter()
             .map(|k| match k {
                 _ if k < nc => if usable(cand[k]) && !bz3dup(cand[k], ni.max(nl)) {
-                        (if packdup(cand[k], &ids[..ni]) { BAD }
-                         else { accumulate(0, &ids[..ni], cand[k], BAD) },
-                         if packdup(cand[k], &lens[..nl]) { BAD }
-                         else { accumulate(0, &lens[..nl], cand[k], BAD) })
+                        (if pack_dup(cand[k], &ids[..ni]) { BAD }
+                         else { packsize(&ids[..ni], cand[k], BAD) },
+                         if pack_dup(cand[k], &lens[..nl]) { BAD }
+                         else { packsize(&lens[..nl], cand[k], BAD) })
                     } else { (BAD, BAD) },
                 _ if k == nc => (if ni > 0 { ffi::zstd(&ids[..ni], level).len() } else { 0 },
                                  if nl > 0 { ffi::zstd(&lens[..nl], level).len() } else { 0 }),
@@ -1221,7 +1199,7 @@ fn rank_all(src: &[&[u8]], n: &[usize], o: &Options) -> Vec<(i32, i32, usize)> {
 /// A respelt block is a different stream from the one the codec was chosen
 /// on, so it counts only at the size it comes back at.
 fn lens_ok(src: &[u8], codec: i32, level: i32) -> Option<usize> {
-    let c = comp_lens(src, codec, level)?;
+    let c = comp_frame(src, codec, level)?;
     let v = if codec != 0 { ffi::paydecomp(&c, codec, src.len())? } else { ffi::zstd_decompress(&c, src.len())? };
     if v == src { Some(c.len()) } else { None }
 }
@@ -1237,18 +1215,13 @@ fn idxsize(ibx: &[u8], meta: i32) -> usize {
     (0..cb.len() - 1).into_par_iter().map(|i| ffi::zstd(&ibx[cb[i]..cb[i + 1]], meta).len()).sum()
 }
 
-fn accumulate(acc: usize, src: &[u8], codec: i32, bad: usize) -> usize {
-    if src.is_empty() || acc >= bad { return bad; }
-    ffi::paycomp(src, codec).map_or(bad, |t| acc + t.len())
+fn packsize(src: &[u8], codec: i32, bad: usize) -> usize {
+    if src.is_empty() { return bad; }
+    ffi::paycomp(src, codec).map_or(bad, |t| t.len())
 }
 
-/// The lengths frame: a forced codec, else zstd.
-pub fn comp_lens(src: &[u8], codec: i32, level: i32) -> Option<Vec<u8>> {
-    if codec != 0 { ffi::paycomp(src, codec) } else { Some(ffi::zstd(src, level)) }
-}
-
-/// The ids frame, same rule.
-pub fn comp_ids(src: &[u8], codec: i32, level: i32) -> Option<Vec<u8>> {
+/// A lengths or labels frame: the chosen codec, else zstd.
+pub fn comp_frame(src: &[u8], codec: i32, level: i32) -> Option<Vec<u8>> {
     if codec != 0 { ffi::paycomp(src, codec) } else { Some(ffi::zstd(src, level)) }
 }
 

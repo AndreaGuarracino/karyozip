@@ -303,7 +303,7 @@ fn encode(opt: writer::Options, tmpdir: &std::path::Path, a: Option<aln::Aln>) {
             match stdin.read(&mut slab[have..]) {
                 Ok(0) => eof = true,
                 Ok(n) => have += n,
-                Err(e) => die(&e.to_string()),
+                Err(_) => die("read error on stdin"),   // the C's words, a cut .gz included
             }
         }
         let end = match slab[..have].iter().rposition(|&c| c == b'\n') {

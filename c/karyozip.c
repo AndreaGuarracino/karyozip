@@ -135,24 +135,6 @@ static uint64_t bedcoord(const char *p, const char *end, const char *what) {
     return v;
 }
 
-/* Every text input goes through zlib, which reads a plain file transparently
-   and a .gz on the fly. fopencookie wraps it in a FILE*, so getline, fgets
-   and fread below are unchanged. A path of NULL means stdin. */
-static ssize_t zread_(void *c, char *b, size_t n) {
-    int g = gzread((gzFile)c, b, (unsigned)n), e;
-    gzerror((gzFile)c, &e);              /* a cut .gz hands over what it has with Z_BUF_ERROR: refuse it */
-    return g < 0 || (e != Z_OK && e != Z_STREAM_END) ? -1 : g;
-}
-static int zclose_(void *c) { return gzclose((gzFile)c) == Z_OK ? 0 : -1; }
-static FILE *zfopen(const char *path) {
-    gzFile g = path ? gzopen(path, "rb") : gzdopen(dup(0), "rb");
-    if (!g) return NULL;
-    cookie_io_functions_t io = { zread_, NULL, NULL, zclose_ };
-    FILE *f = fopencookie(g, "r", io);
-    if (!f) gzclose(g);
-    return f;
-}
-
 /* a line read by getline, its \n and a \r before it gone */
 static void chomp(char *l, ssize_t *n) {
     if (*n && l[*n - 1] == '\n') l[--*n] = 0;
@@ -221,6 +203,131 @@ static void *xcalloc(size_t n, size_t sz) {
     ckalloc(n * sz); void *p = calloc(n, sz); if (!p) die("oom"); return p; }
 static void *xrealloc(void *p, size_t n) { ckalloc(n); void *q = realloc(p, n); if (!q) die("oom"); return q; }
 static char *xstrdup(const char *s) { char *p = strdup(s); if (!p) die("oom"); return p; }
+
+/* Every text input goes through one reader, a FILE* by fopencookie so
+   getline, fgets and fread are unchanged; a path of NULL means stdin. Plain
+   text passes through. BGZF, what bgzip and KaryoScope write, is many
+   independent gzip blocks: 8 MB of them at a time are inflated side by side,
+   each checked against its CRC32 and size. Any other gzip streams through
+   zlib, member after member. A cut file is refused, in every mode. */
+#define ZCHUNK (8u << 20)
+typedef struct {
+    int fd, mode, reof, zend;           /* mode: 0 undecided, 1 plain, 2 BGZF, 3 gzip stream */
+    uint8_t *raw; size_t rn, rp, rc;    /* compressed bytes read, [rp, rn) not yet used */
+    uint8_t *out; size_t on, op;        /* BGZF: inflated bytes, [op, on) not yet handed over */
+    z_stream zs;
+} zrd;
+static int rawfill(zrd *z, size_t want) {   /* at least want unused bytes, or the end */
+    if (z->rp) { memmove(z->raw, z->raw + z->rp, z->rn - z->rp); z->rn -= z->rp; z->rp = 0; }
+    if (want > z->rc) { z->rc = want; z->raw = xrealloc(z->raw, z->rc); }
+    while (z->rn < want && !z->reof) {
+        ssize_t k = read(z->fd, z->raw + z->rn, z->rc - z->rn);
+        if (k < 0) { if (errno == EINTR) continue; return -1; }
+        if (!k) z->reof = 1; else z->rn += (size_t)k;
+    }
+    return 0;
+}
+static size_t bgzfsize(const uint8_t *p, size_t n) {   /* one BGZF block's size, 0 if it is not one */
+    if (n < 18 || p[0] != 0x1f || p[1] != 0x8b || p[2] != 8 || !(p[3] & 4)) return 0;
+    size_t xl = p[10] | (size_t)p[11] << 8, i = 12;
+    for (; i + 4 <= 12 + xl && i + 4 <= n; i += 4 + (p[i + 2] | (size_t)p[i + 3] << 8))
+        if (p[i] == 'B' && p[i + 1] == 'C' && p[i + 2] == 2 && p[i + 3] == 0)
+            return (p[i + 4] | (size_t)p[i + 5] << 8) + 1;
+    return 0;
+}
+static int bgzfread(zrd *z) {   /* the next run of whole blocks into out; -1 on a bad or cut one */
+    if (rawfill(z, ZCHUNK) < 0) return -1;
+    size_t nb = 0, cap = 256, *bo = xmalloc(cap * sizeof *bo), q = z->rp, tot = 0;
+    while (q < z->rn) {
+        size_t bs = bgzfsize(z->raw + q, z->rn - q);
+        if (!bs || bs < 26 || q + bs > z->rn) break;
+        if (nb + 1 >= cap) { cap *= 2; bo = xrealloc(bo, cap * sizeof *bo); }
+        bo[nb++] = q; q += bs;
+        tot += z->raw[q - 4] | (size_t)z->raw[q - 3] << 8 | (size_t)z->raw[q - 2] << 16 | (size_t)z->raw[q - 1] << 24;
+    }
+    bo[nb] = q;
+    if (!nb) { free(bo); return z->rp < z->rn ? -2 : 0; }   /* -2: not a whole BGZF block here */
+    free(z->out); z->out = xmalloc(tot ? tot : 1); z->on = tot; z->op = 0;
+    size_t *oo = xmalloc((nb + 1) * sizeof *oo); oo[0] = 0;
+    for (size_t i = 0; i < nb; i++) { const uint8_t *t = z->raw + bo[i + 1] - 4;
+        oo[i + 1] = oo[i] + (t[0] | (size_t)t[1] << 8 | (size_t)t[2] << 16 | (size_t)t[3] << 24); }
+    _Atomic int bad = 0;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic, 16) num_threads(nthreads()) if (nb > 16)
+#endif
+    for (size_t i = 0; i < nb; i++) {
+        const uint8_t *b = z->raw + bo[i]; size_t bs = bo[i + 1] - bo[i], xl = b[10] | (size_t)b[11] << 8;
+        size_t isz = oo[i + 1] - oo[i];
+        if (isz > 65536 || 12 + xl + 8 > bs) { bad = 1; continue; }
+        z_stream s; memset(&s, 0, sizeof s);
+        if (inflateInit2(&s, -15) != Z_OK) { bad = 1; continue; }
+        s.next_in = (Bytef *)b + 12 + xl; s.avail_in = (uInt)(bs - 12 - xl - 8);
+        s.next_out = z->out + oo[i]; s.avail_out = (uInt)isz;
+        int r = inflate(&s, Z_FINISH); size_t got = s.total_out; inflateEnd(&s);
+        const uint8_t *t = b + bs - 8;
+        uint32_t crc = t[0] | (uint32_t)t[1] << 8 | (uint32_t)t[2] << 16 | (uint32_t)t[3] << 24;
+        if (r != Z_STREAM_END || got != isz || crc32(0, z->out + oo[i], (uInt)isz) != crc) bad = 1;
+    }
+    z->rp = q; free(bo); free(oo);
+    return bad ? -1 : 1;
+}
+static ssize_t zread_(void *c, char *b, size_t n) {
+    zrd *z = c;
+    if (!z->mode) {
+        if (rawfill(z, 18) < 0) return -1;
+        const uint8_t *p = z->raw;
+        z->mode = z->rn < 2 || p[0] != 0x1f || p[1] != 0x8b ? 1 : bgzfsize(p, z->rn) ? 2 : 3;
+        if (z->mode == 3 && inflateInit2(&z->zs, 15 + 16) != Z_OK) return -1;
+    }
+    if (z->mode == 1) {                       /* plain: what was peeked, then the fd */
+        if (z->rp < z->rn) { size_t k = z->rn - z->rp < n ? z->rn - z->rp : n;
+                             memcpy(b, z->raw + z->rp, k); z->rp += k; return (ssize_t)k; }
+        for (;;) { ssize_t k = read(z->fd, b, n); if (k >= 0 || errno != EINTR) return k; }
+    }
+    while (z->mode == 2 && z->op == z->on) {
+        int r = bgzfread(z);
+        if (r == 0) return 0;                 /* the end, every block whole */
+        if (r == -1) return -1;
+        if (r == -2) {                        /* the rest is not BGZF: stream it */
+            if (z->reof && z->rn - z->rp < 18) return -1;   /* a cut block */
+            z->mode = 3; if (inflateInit2(&z->zs, 15 + 16) != Z_OK) return -1;
+        }
+    }
+    if (z->mode == 2) { size_t k = z->on - z->op < n ? z->on - z->op : n;
+                        memcpy(b, z->out + z->op, k); z->op += k; return (ssize_t)k; }
+    z->zs.next_out = (Bytef *)b; z->zs.avail_out = (uInt)(n > 1u << 30 ? 1u << 30 : n);
+    while (z->zs.avail_out == (uInt)(n > 1u << 30 ? 1u << 30 : n)) {   /* until something comes out */
+        if (z->rp == z->rn) {
+            if (rawfill(z, 1 << 16) < 0) return -1;
+            if (z->rp == z->rn) return z->zend ? 0 : -1;   /* the end: refused if a member is open */
+        }
+        if (z->zend) {                        /* another member, or trailing bytes */
+            if (inflateReset(&z->zs) != Z_OK) return -1;
+            z->zend = 0;
+        }
+        z->zs.next_in = z->raw + z->rp; z->zs.avail_in = (uInt)(z->rn - z->rp);
+        int r = inflate(&z->zs, Z_NO_FLUSH);
+        z->rp = (size_t)(z->zs.next_in - z->raw);
+        if (r == Z_STREAM_END) z->zend = 1;
+        else if (r != Z_OK && r != Z_BUF_ERROR) return -1;
+        if (r == Z_BUF_ERROR && z->rp == z->rn && z->reof) return -1;
+    }
+    return (ssize_t)((n > 1u << 30 ? 1u << 30 : n) - z->zs.avail_out);
+}
+static int zclose_(void *c) {
+    zrd *z = c; int r = close(z->fd);
+    if (z->mode == 3) inflateEnd(&z->zs);
+    free(z->raw); free(z->out); free(z); return r ? -1 : 0;
+}
+static FILE *zfopen(const char *path) {
+    int fd = path ? open(path, O_RDONLY) : dup(0);
+    if (fd < 0) return NULL;
+    zrd *z = xcalloc(1, sizeof *z); z->fd = fd;
+    cookie_io_functions_t io = { zread_, NULL, NULL, zclose_ };
+    FILE *f = fopencookie(z, "r", io);
+    if (!f) { close(fd); free(z); }
+    return f;
+}
 
 /* ---------------------------------------------------------------- varint */
 static inline void vput(uint8_t **p, uint64_t v) {
@@ -2805,7 +2912,7 @@ static void ktw_close(ktw *w) {
         int nthr = nthreads();
         _Atomic int failed = 0, wfail = 0;
 #ifdef _OPENMP
-#pragma omp parallel num_threads(nthr)
+#pragma omp parallel num_threads(nthr) if (nraw > 1)   /* one block: bzip3 runs its own blocks in parallel */
 #endif
         {
             ZSTD_CCtx *tc = ZSTD_createCCtx();

@@ -232,6 +232,23 @@ for b in "$C" "$R"; do
   if cmp -s "$W/a.plain" "$W/a.gz.kst"; then gok=$((gok+1))
   else gbad=$((gbad+1)); echo "  gz --aln differs: $b"; fi
 done
+# BGZF, inflated block by block in parallel: many blocks, from a file and a pipe
+awk 'BEGIN{for(i=0;i<60000;i++){p=0;for(j=0;j<5;j++){printf "read%d\t%d\t%d\tL%d\n",i,p,p+j+7,j%3;p+=j+7}}}' > "$W/bz.bed"
+python3 "$D/kt.py" bgzf "$W/bz.bed" "$W/bz.bgz"
+"$C" encode < "$W/bz.bed" > "$W/bz.plain" 2>/dev/null
+for b in "$C" "$R"; do
+  for how in file pipe; do
+    if [ $how = file ]; then "$b" encode -i "$W/bz.bgz" > "$W/bz.kst" 2>/dev/null; else "$b" encode < "$W/bz.bgz" > "$W/bz.kst" 2>/dev/null; fi
+    if cmp -s "$W/bz.plain" "$W/bz.kst"; then gok=$((gok+1)); else gbad=$((gbad+1)); echo "  bgzf differs: $b $how"; fi
+  done
+done
+sz=$(stat -c%s "$W/bz.bgz"); head -c $((sz / 2)) "$W/bz.bgz" > "$W/bzcut.bgz"   # cut, and a bit flipped inside a block
+cp "$W/bz.bgz" "$W/bzflip.bgz"; printf 'U' | dd of="$W/bzflip.bgz" bs=1 seek=$((sz / 3)) conv=notrunc status=none
+for f in bzcut bzflip; do
+  "$C" encode -i "$W/$f.bgz" 2> "$W/ce" >/dev/null; c1=$?; cm=$(tail -1 "$W/ce")
+  "$R" encode -i "$W/$f.bgz" 2> "$W/re" >/dev/null; r1=$?; rm2=$(tail -1 "$W/re")
+  [ "$cm" = "$rm2" ] && [ "$c1" = 1 ] && [ "$r1" = 1 ] && gok=$((gok+1)) || { gbad=$((gbad+1)); echo "  $f refusal differs: c=[$cm] rc $c1, rust=[$rm2] rc $r1"; }
+done
 [ $gbad = 0 ] && echo "gzip input: $gok forms match the plain track" \
   || { echo "gzip input: $gbad DIFFER"; fail=1; }
 

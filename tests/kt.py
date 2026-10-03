@@ -52,8 +52,18 @@ def gen(W, N):   # valid input of every awkward shape: fuzz.sh 1b and diff.sh 12
                 rows.append(n + b"\t%d\t%d\t" % (p, p + L) + lab + b"\n"); p += L
         open(os.path.join(W, "ok%d.bed" % f), "wb").write(b"".join(rows))
 
+def bgzf(src, dst):   # BGZF as bgzip writes it: 65280-byte blocks, each a gzip member with a BC field, then the empty block
+    import zlib
+    d = open(src, "rb").read(); o = bytearray()
+    for i in list(range(0, len(d), 65280)) + [len(d)]:
+        c = d[i:i + 65280]; z = zlib.compressobj(6, zlib.DEFLATED, -15); x = z.compress(c) + z.flush()
+        o += b"\x1f\x8b\x08\x04" + bytes(6) + struct.pack("<HBBHH", 6, 66, 67, 2, len(x) + 25) + x
+        o += struct.pack("<II", zlib.crc32(c), len(c))
+    open(dst, "wb").write(o)
+
 if __name__ == "__main__":   # kt.py IN OUT IDX VALUE ...   (IDX "lo9" keeps the high 32 bits)
     if sys.argv[1] == "gen": gen(sys.argv[2], int(sys.argv[3])); sys.exit(0)
+    if sys.argv[1] == "bgzf": bgzf(sys.argv[2], sys.argv[3]); sys.exit(0)
     d, h = load(sys.argv[1])
     for i, v in zip(sys.argv[3::2], sys.argv[4::2]):
         v = int(v, 0)

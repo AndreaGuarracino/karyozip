@@ -309,7 +309,7 @@ fn encode(opt: writer::Options, tmpdir: &std::path::Path, a: Option<aln::Aln>) {
             let _s = prof::span(6);
             for r in a.rows.iter().flatten() {
                 w.push(&a.b[r.nm.0 as usize..r.nm.1 as usize], r.en - r.st,
-                      &a.b[r.lab.0 as usize..r.lab.1 as usize], r.st)
+                      &a.b[r.lab.0 as usize..r.lab.1 as usize], r.st, r.same)
                     .unwrap_or_else(|m| die(&m));
             }
             drop(_s);
@@ -338,7 +338,8 @@ fn report(st: &writer::Stats) {
 /// One parsed row: byte ranges into the slab, and the coordinates.
 /// Offsets into the slab, which is 16 MB, so u32 is enough and the row is
 /// 32 bytes instead of 48.
-struct Row { nm: (u32, u32), lab: (u32, u32), st: u64, en: u64 }
+/// `same`: the name equals the row before's, found on the split threads.
+struct Row { nm: (u32, u32), lab: (u32, u32), st: u64, en: u64, same: bool }
 
 const SLAB: usize = 1 << 24;
 /// One slab of whole lines and its rows. The fault is kept, not raised:
@@ -430,8 +431,9 @@ fn parse_chunk(s: &[u8], from: usize, to: usize, out: &mut Vec<Row>) -> Result<(
         if en < st { return Err("end is before start"); }
         if en == st { return Err("end equals start: a run must cover at least one base"); }
         if t1 == 0 { return Err("empty sequence name"); }
+        let same = out.last().is_some_and(|q| s[q.nm.0 as usize..q.nm.1 as usize] == line[..t1]);
         out.push(Row { nm: (p as u32, (p + t1) as u32),
-                       lab: ((p + t3 + 1) as u32, nl as u32), st, en });
+                       lab: ((p + t3 + 1) as u32, nl as u32), st, en, same });
         p = nl + 1;
     }
     Ok(())

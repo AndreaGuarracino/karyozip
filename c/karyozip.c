@@ -415,8 +415,12 @@ static void bput(buf *b, const void *s, size_t n) {
     memcpy(b->d + b->n, s, n);
     b->n += n;
 }
-static void bvar(buf *b, uint64_t v) {
-    uint8_t t[10], *p = t; vput(&p, v); bput(b, t, (size_t)(p - t));
+static inline void bvar(buf *b, uint64_t v) {   /* straight into the buffer, as the Rust's */
+    if (b->n + 10 > b->cap) {
+        while (b->n + 10 > b->cap) b->cap = b->cap ? b->cap * 2 : 4096;
+        b->d = xrealloc(b->d, b->cap);
+    }
+    uint8_t *p = b->d + b->n; vput(&p, v); b->n = (size_t)(p - b->d);
 }
 
 /* --------------------------------------------------------------- encoding */

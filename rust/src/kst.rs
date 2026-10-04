@@ -20,6 +20,7 @@ pub const GRPFLAG: u64 = 1 << 49;   // lengths grouped by label
 pub const FLAGS: u64 = !((1 << 49) - 1);
 pub const ICHUNK: u64 = 65536;      // sequences per index chunk
 
+#[inline]
 pub fn put(out: &mut Vec<u8>, mut v: u64) {
     while v >= 0x80 {
         out.push((v as u8 & 0x7f) | 0x80);

@@ -166,6 +166,7 @@ impl Writer {
     }
 
     /// The lengths frame, plus the two alternate spellings --aln keeps.
+    #[inline]
     fn lensput(&mut self, v: u64) {
         kst::put(&mut self.lens, v);
         if self.aln.is_some() {
@@ -362,7 +363,7 @@ impl Writer {
         let mut pos = 0u64;
         for &(len, id) in &r.runs {
             let l = self.labtab[id as usize].clone();
-            self.row_inner(name, len as u64, &l, pos)?;
+            self.row_inner(name, len as u64, &l, pos, false)?;
             pos += len as u64;
         }
         Ok(())
@@ -398,18 +399,20 @@ impl Writer {
             Some(_) => return Err("a tab inside a sequence name".into()),
             None => {}
         }
-        self.push(name, run_len, label, start)
+        self.push(name, run_len, label, start, false)
     }
 
     /// The same row without those checks, for callers whose parser already
     /// split on tabs and newlines. This is the CLI's path, as it is the C's.
-    pub fn push(&mut self, name: &[u8], run_len: u64, label: &[u8], start: u64)
+    /// `same`: the caller knows the name equals the row before's.
+    pub fn push(&mut self, name: &[u8], run_len: u64, label: &[u8], start: u64, same: bool)
         -> Result<(), String> {
         if self.opt.sort { return self.sortpush(name, run_len, label, start); }
-        self.row_inner(name, run_len, label, start)
+        self.row_inner(name, run_len, label, start, same)
     }
 
-    fn row_inner(&mut self, name: &[u8], run_len: u64, label: &[u8], start: u64)
+    #[inline(always)]
+    fn row_inner(&mut self, name: &[u8], run_len: u64, label: &[u8], start: u64, same: bool)
         -> Result<(), String> {
         if name.is_empty() { return Err("empty sequence name".into()); }
         if run_len == 0 {
@@ -418,7 +421,7 @@ impl Writer {
         if start > u64::MAX - run_len {
             return Err("a coordinate does not fit in 64 bits".into());
         }
-        if name != self.cur.as_slice() {
+        if !same && name != self.cur.as_slice() {
             if start != 0 { return Err("a sequence does not start at 0".into()); }
             if name.len() >= 512 { return Err("name too long".into()); }
             self.tail();

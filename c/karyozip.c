@@ -696,7 +696,8 @@ static size_t fldnames1(buf *names, uint64_t n, uint8_t **out) {
 #pragma omp parallel for num_threads(T)
 #endif
     for (int t = 0; t < T; t++) {
-        uint8_t *same = cs[t], *isnum = cnum[t], *ishex = chex[t]; uint64_t seen = 0; int bad = 0;
+        /* locals, copied out once: the rows of cs share cache lines across threads */
+        uint8_t same[FLDMAX], isnum[FLDMAX], ishex[FLDMAX]; uint64_t seen = 0; int bad = 0;
         for (int k = 0; k < nf; k++) { same[k] = 1; isnum[k] = 1; ishex[k] = !(l0[k] & 1) && l0[k] > 0 && l0[k] <= 64; }   /* the reader takes 64 */
         for (const char *q = p + cut[t], *ce = p + cut[t + 1]; q < ce && !bad; ) {
             const char *nl = memchr(q, '\n', (size_t)(ce - q)), *c = q; int k = 0;
@@ -722,6 +723,7 @@ static size_t fldnames1(buf *names, uint64_t n, uint8_t **out) {
             seen++; q = nl + 1;
         }
         cseen[t] = seen; cbad[t] = bad;
+        memcpy(cs[t], same, FLDMAX); memcpy(cnum[t], isnum, FLDMAX); memcpy(chex[t], ishex, FLDMAX);
     }
     int same[FLDMAX], isnum[FLDMAX]; uint64_t seen = 0;
     for (int k = 0; k < nf; k++) { same[k] = 1; isnum[k] = 1; }
@@ -747,6 +749,7 @@ static size_t fldnames1(buf *names, uint64_t n, uint8_t **out) {
 #pragma omp parallel for num_threads(T)
 #endif
     for (int t = 0; t < T; t++) {
+        buf wt = {0};     /* a local, stored once: the w[t] headers share cache lines */
         int64_t prev[FLDMAX] = {0};
         if (cut[t]) {                                  /* the last name before the chunk */
             const char *nl = p + cut[t] - 1, *c = nl;
@@ -765,18 +768,19 @@ static size_t fldnames1(buf *names, uint64_t n, uint8_t **out) {
                     int64_t x = 0;
                     for (const char *j = c; j < e2; j++) x = x * 10 + (*j - '0');
                     int64_t d = x - prev[k]; prev[k] = x;
-                    bvar(&w[t], ((uint64_t)d << 1) ^ (uint64_t)(d >> 63));
+                    bvar(&wt, ((uint64_t)d << 1) ^ (uint64_t)(d >> 63));
                 } else if (!same[k]) {                     /* hex, two nibbles a byte */
                     for (size_t j = 0; j + 1 < l0[k]; j += 2) {
                         int hi = c[j] <= '9' ? c[j] - '0' : c[j] - 'a' + 10;
                         int lo = c[j + 1] <= '9' ? c[j + 1] - '0' : c[j + 1] - 'a' + 10;
-                        uint8_t b8 = (uint8_t)(hi << 4 | lo); bput(&w[t], &b8, 1);
+                        uint8_t b8 = (uint8_t)(hi << 4 | lo); bput(&wt, &b8, 1);
                     }
                 }
                 c = e2 + 1;
             }
             q = nl + 1;
         }
+        w[t] = wt;
     }
     for (int t = 0; t < T; t++) { bput(&v, w[t].d, w[t].n); free(w[t].d); }
     free(w);

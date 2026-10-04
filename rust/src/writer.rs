@@ -647,15 +647,27 @@ impl Writer {
                 }
             }
             const ORDER: [usize; 3] = [1, 2, 0];
-            let (mut best, mut bv, mut fa) = (0usize, usize::MAX, Vec::new());
-            for &v in &ORDER {
-                let Some(src) = vs[v] else { continue };
-                let kept = if v == 0 { lz.lock().unwrap().take() } else { None };   // the one lens_ok made
-                let f = kept.or_else(|| comp_frame(src, lencodec, lvl_len)).unwrap_or_else(|| crate::bail("block compression failed"));
-                if bv == usize::MAX || f.len() < best { best = f.len(); bv = v; fa = f; }
-            }
+            let lens_job = || {
+                let (mut best, mut bv, mut fa) = (0usize, usize::MAX, Vec::new());
+                for &v in &ORDER {
+                    let Some(src) = vs[v] else { continue };
+                    let kept = if v == 0 { lz.lock().unwrap().take() } else { None };   // the one lens_ok made
+                    let f = kept.or_else(|| comp_frame(src, lencodec, lvl_len)).unwrap_or_else(|| crate::bail("block compression failed"));
+                    if bv == usize::MAX || f.len() < best { best = f.len(); bv = v; fa = f; }
+                }
+                (bv, fa)
+            };
+            let ids_job = || if ilv { Vec::new() } else { comp_frame(&ids, idc, lvl_id).unwrap_or_else(|| crate::bail("block compression failed")) };
+            // Labels beside a lengths frame that takes one thread, as the C's:
+            // the rest of the threads, or 2 beside LZMA, an hour on 3 GB, so
+            // bzip3 holds 2 block states, not 8
+            let nt = rayon::current_num_threads();
+            let lone = lencodec & ffi::CODEC_BZIP3 == 0 || lens.len() <= ((lencodec & 0xffff) as usize) << 20;
+            let lt = if lencodec & ffi::CODEC_LZMA != 0 { 2 } else { (nt - 1).max(1) };
+            let ((bv, fa), b) = if nb == 1 && !ilv && lone {
+                rayon::join(lens_job, || { ffi::omp_threads(lt); let b = ids_job(); ffi::omp_threads(nt); b })
+            } else { (lens_job(), ids_job()) };
             let nl = if ilv { altv[bv].as_ref().unwrap().1 } else { vs[bv].unwrap().len() };
-            let b = if ilv { Vec::new() } else { comp_frame(&ids, idc, lvl_id).unwrap_or_else(|| crate::bail("block compression failed")) };
             (fa, b, nl, ids.len(), m.rows, m.bp, bv as u64)
         };
         std::thread::scope(|ts| -> Result<(), String> {

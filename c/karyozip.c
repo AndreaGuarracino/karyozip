@@ -3003,6 +3003,22 @@ static uint64_t idxbuild(const buf *ib, buf *ichunks, buf *itab) {
     return nichunk;
 }
 
+/* Labels beside a lengths frame that takes one thread: the rest of
+   the threads, or 2 beside LZMA, an hour on 3 GB, so bzip3 holds 2
+   block states, not 8. */
+typedef struct { const uint8_t *s; size_t n; uint8_t *o; size_t z; int t; } ljob;
+static void *labjob(void *p) {
+    ljob *j = p;
+#ifdef _OPENMP
+    omp_set_num_threads(j->t);
+#endif
+    if (IDCODEC) j->z = paycomp(j->s, j->n, IDCODEC, &j->o);
+    else { size_t zb = ZSTD_compressBound(j->n); j->o = xmalloc(zb);
+           j->z = ZSTD_compress(j->o, zb, j->s, j->n, LEVEL_I < 0 ? LEVEL : LEVEL_I);
+           if (ZSTD_isError(j->z)) j->z = 0; }
+    return NULL;
+}
+
 /* a compressed block waiting its turn; ok last */
 typedef struct { uint8_t *fa, *fb; size_t a, b, ni, nl; uint64_t ns; _Atomic int ok; } cslot;
 /* every ready block from the oldest on, in order */
@@ -3176,6 +3192,9 @@ static void ktw_close(ktw *w) {
                         if (altv[v]) { vs[v] = altv[v]; vn[v] = altvn[v]; }
                         else if (v) vs[v] = NULL;
                     }
+                int lone = !(LENCODEC & CODEC_BZIP3) || nl <= (size_t)(LENCODEC & 0xffff) << 20;   /* one thread */
+                ljob lj = { idsrc, ni, NULL, 0, LENCODEC & CODEC_LZMA ? 2 : nthr > 1 ? nthr - 1 : 1 }; pthread_t lth;
+                int lon = nraw == 1 && !ILV && lone && !pthread_create(&lth, NULL, labjob, &lj);
                 static const int ORDER[3] = { 1, 2, 0 };
                 size_t best = 0; int bv = -1;
                 for (int k = 0; k < 3; k++) {
@@ -3187,9 +3206,12 @@ static void ktw_close(ktw *w) {
                     if (bv < 0 || a2 < best) { free(fa); fa = f2; best = a2; bv = v; }
                     else free(f2);
                 }
-                if (failed) { free(fa); break; }
+                if (lon) pthread_join(lth, NULL);
+                if (failed) { free(fa); free(lj.o); break; }
                 a = best; nl = ILV ? altvl[bv] : vn[bv]; nosent = (uint64_t)bv;
                 if (ILV) { b2 = 0; fb = NULL; }
+                else if (lon) { fb = lj.o; b2 = lj.z;
+                                if (!b2) { failed = 1; free(fa); free(fb); break; } }
                 else if (IDCODEC) { b2 = paycomp(idsrc, ni, IDCODEC, &fb);
                                if (!b2) { failed = 1; free(fa); break; } }
                 else

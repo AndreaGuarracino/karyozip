@@ -613,49 +613,66 @@ impl Writer {
         let mut sizes = Vec::new();
         let mut body = tmpfile(&self.tmpdir).map_err(io)?;
         let (mut byt_lens, mut byt_labs) = (0u64, 0u64);
-        let batch = rayon::current_num_threads() * 4;
-        for chunk in (0..self.bm.len()).collect::<Vec<_>>().chunks(batch) {
-            let done: Vec<Done> = chunk
-                .par_iter()
-                .map(|&i| {
-                    let (lens, ids) = self.read_block(i).unwrap_or_else(|_| crate::bail("cannot read back a staged block"));
-                    // Under --aln a block keeps the smallest of three length
-                    // spellings: every sentinel, plus-strand sentinels only,
-                    // or plain lengths. Zeros do not always compress better.
-                    let m = &self.bm[i];
-                    let mut vs: [Option<&[u8]>; 3] = [Some(&lens), None, None];
-                    if aln_on {
-                        for v in 0..2 {
-                            let alt = &self.rawalt[v][m.aoff[v]..m.aoff[v] + m.alen[v]];
-                            if alt.is_empty() || (alt.len() == lens.len() && alt == &lens[..]) { continue; }
-                            if v == 1 {
-                                if let Some(x) = vs[1] { if x == alt { continue; } }
-                            }
-                            vs[v + 1] = Some(alt);
-                        }
+        // As the C's ordered loop: every pool thread takes the next block,
+        // this thread writes them in order. The window bounds what waits.
+        let (nb, win) = (self.bm.len(), 4 * rayon::current_num_threads());
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let st = (std::sync::Mutex::new((0usize, std::collections::BTreeMap::<usize, Done>::new())), std::sync::Condvar::new());
+        let work = |i: usize| -> Done {
+            let (lens, ids) = self.read_block(i).unwrap_or_else(|_| crate::bail("cannot read back a staged block"));
+            // Under --aln a block keeps the smallest of three length
+            // spellings: every sentinel, plus-strand sentinels only,
+            // or plain lengths. Zeros do not always compress better.
+            let m = &self.bm[i];
+            let mut vs: [Option<&[u8]>; 3] = [Some(&lens), None, None];
+            if aln_on {
+                for v in 0..2 {
+                    let alt = &self.rawalt[v][m.aoff[v]..m.aoff[v] + m.alen[v]];
+                    if alt.is_empty() || (alt.len() == lens.len() && alt == &lens[..]) { continue; }
+                    if v == 1 {
+                        if let Some(x) = vs[1] { if x == alt { continue; } }
                     }
-                    if runhead || ilv {
-                        for v in 0..3 {
-                            match &altv[v] {
-                                Some((b, _)) => vs[v] = Some(b),
-                                None => if v > 0 { vs[v] = None; },
-                            }
-                        }
+                    vs[v + 1] = Some(alt);
+                }
+            }
+            if runhead || ilv {
+                for v in 0..3 {
+                    match &altv[v] {
+                        Some((b, _)) => vs[v] = Some(b),
+                        None => if v > 0 { vs[v] = None; },
                     }
-                    const ORDER: [usize; 3] = [1, 2, 0];
-                    let (mut best, mut bv, mut fa) = (0usize, usize::MAX, Vec::new());
-                    for &v in &ORDER {
-                        let Some(src) = vs[v] else { continue };
-                        let kept = if v == 0 { lz.lock().unwrap().take() } else { None };   // the one lens_ok made
-                        let f = kept.or_else(|| comp_frame(src, lencodec, lvl_len)).unwrap_or_else(|| crate::bail("block compression failed"));
-                        if bv == usize::MAX || f.len() < best { best = f.len(); bv = v; fa = f; }
-                    }
-                    let nl = if ilv { altv[bv].as_ref().unwrap().1 } else { vs[bv].unwrap().len() };
-                    let b = if ilv { Vec::new() } else { comp_frame(&ids, idc, lvl_id).unwrap_or_else(|| crate::bail("block compression failed")) };
-                    (fa, b, nl, ids.len(), m.rows, m.bp, bv as u64)
-                })
-                .collect();
-            for (a, b, nl, ni, rows, bp, nosent) in &done {
+                }
+            }
+            const ORDER: [usize; 3] = [1, 2, 0];
+            let (mut best, mut bv, mut fa) = (0usize, usize::MAX, Vec::new());
+            for &v in &ORDER {
+                let Some(src) = vs[v] else { continue };
+                let kept = if v == 0 { lz.lock().unwrap().take() } else { None };   // the one lens_ok made
+                let f = kept.or_else(|| comp_frame(src, lencodec, lvl_len)).unwrap_or_else(|| crate::bail("block compression failed"));
+                if bv == usize::MAX || f.len() < best { best = f.len(); bv = v; fa = f; }
+            }
+            let nl = if ilv { altv[bv].as_ref().unwrap().1 } else { vs[bv].unwrap().len() };
+            let b = if ilv { Vec::new() } else { comp_frame(&ids, idc, lvl_id).unwrap_or_else(|| crate::bail("block compression failed")) };
+            (fa, b, nl, ids.len(), m.rows, m.bp, bv as u64)
+        };
+        std::thread::scope(|ts| -> Result<(), String> {
+            ts.spawn(|| rayon::broadcast(|_| loop {
+                let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if i >= nb { break; }
+                let mut g = st.0.lock().unwrap();
+                while i >= g.0 + win { g = st.1.wait(g).unwrap(); }
+                drop(g);
+                let d = work(i);
+                st.0.lock().unwrap().1.insert(i, d);
+                st.1.notify_all();
+            }));
+            for i in 0..nb {
+                let (a, b, nl, ni, rows, bp, nosent) = {
+                    let mut g = st.0.lock().unwrap();
+                    loop { if let Some(d) = g.1.remove(&i) { g.0 = i + 1; break d; } g = st.1.wait(g).unwrap(); }
+                };
+                st.1.notify_all();
+                let (a, b, nl, ni, rows, bp, nosent) = (&a, &b, &nl, &ni, &rows, &bp, &nosent);
                 body.write_all(a).map_err(io)?;
                 body.write_all(b).map_err(io)?;
                 byt_lens += a.len() as u64;
@@ -668,7 +685,8 @@ impl Writer {
                 kst::put(&mut sizes, *bp);
                 kst::put(&mut sizes, kst::fnv(kst::fnv(FNV0, a), b));
             }
-        }
+            Ok(())
+        })?;
 
         drop(_s);
         let _s = crate::prof::span(2);

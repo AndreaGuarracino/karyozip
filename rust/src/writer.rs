@@ -1210,7 +1210,25 @@ fn rank_all(src: &[&[u8]], n: &[usize], o: &Options) -> Vec<(i32, i32, usize)> {
     // holds several block states at once (short reads: 10.2 GB against 8.8)
     let nt = rayon::current_num_threads();
     rayon::broadcast(|_| ffi::omp_threads(1));
+    // A stream whose jobs are all done has its best: the next free thread
+    // reads it back before taking a job, not after the pool, as the C's.
+    // left: jobs to go; vq: the job read back, plus one; vf[j]: it came back.
+    let left: Vec<AtomicUsize> = src.iter().map(|_| AtomicUsize::new(0)).collect();
+    for j in &jobs { left[j.1].fetch_add(1, Relaxed); }
+    let vq: Vec<AtomicUsize> = src.iter().map(|_| AtomicUsize::new(0)).collect();
+    let vf: Vec<std::sync::atomic::AtomicBool> = jobs.iter().map(|_| Default::default()).collect();
     rayon::broadcast(|_| loop {
+        let ready = (0..src.len()).find_map(|t| {
+            if left[t].load(std::sync::atomic::Ordering::Acquire) > 0 { return None; }
+            let b = best[t].lock().unwrap_or_else(|e| e.into_inner());
+            let j = b.as_ref()?.2;
+            (vq[t].swap(j + 1, Relaxed) != j + 1).then_some((t, j, b))
+        });
+        if let Some((t, j, mut b)) = ready {   // nothing replaces it now
+            let ok = ffi::paydecomp(&b.as_ref().unwrap().3, jobs[j].3, src[t].len()).as_deref() == Some(src[t]);
+            if ok { vf[j].store(true, Relaxed); } else { zs[j].store(0, Relaxed); *b = None; }   // else the read-back tries the next
+            continue;
+        }
         let j = next.fetch_add(1, Relaxed);
         let Some(&(_, t, r, c, lv)) = jobs.get(j) else { break };
         let t0 = std::time::Instant::now();
@@ -1220,6 +1238,7 @@ fn rank_all(src: &[&[u8]], n: &[usize], o: &Options) -> Vec<(i32, i32, usize)> {
             let mut b = best[t].lock().unwrap_or_else(|e| e.into_inner());
             if b.as_ref().is_none_or(|x| (v.len(), r) < (x.0, x.1)) { *b = Some((v.len(), r, j, v)); }
         }
+        left[t].fetch_sub(1, std::sync::atomic::Ordering::Release);
         if prof { jt[j].store(t0.elapsed().as_nanos() as usize, Relaxed); }
     });
     if prof {   // the slowest jobs set the pool's critical path
@@ -1241,7 +1260,7 @@ fn rank_all(src: &[&[u8]], n: &[usize], o: &Options) -> Vec<(i32, i32, usize)> {
         for j in live {
             let (_, _, _, c, lv) = jobs[j];
             // zstd is trusted, the rest read back; the pool's bytes when it kept them
-            let ok = c == 0 || match k.take() {
+            let ok = c == 0 || vf[j].load(Relaxed) || match k.take() {
                 Some((kj, v)) if kj == j => ffi::paydecomp(&v, c, src[t].len()).as_deref() == Some(src[t]),
                 _ => verifies(src[t], c),
             };

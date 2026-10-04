@@ -498,16 +498,17 @@ impl Writer {
         // them, as the C's: no permutation, no ordinals, none dropped, at
         // most 64 MB. Their own pool: in the global one they would queue
         // behind the layout search's.
-        let bg = (!self.perm_on && !(self.ordok && self.nidx > 0) && !self.opt.drop_names
-                  && !self.names.is_empty() && self.names.len() <= 64 << 20).then(|| {
-            let (nm, n, whole, slow, e) = (std::mem::take(&mut self.names), self.nidx, self.opt.whole, self.opt.slow, early.take());
+        let nok = !self.perm_on && !(self.ordok && self.nidx > 0) && !self.opt.drop_names && !self.names.is_empty();
+        let names_bg = |w: &mut Self, early: &mut Option<(BestNames, usize)>| {
+            let (nm, n, whole, slow, e) = (std::mem::take(&mut w.names), w.nidx, w.opt.whole, w.opt.slow, early.take());
             let t = rayon::current_num_threads();
             std::thread::spawn(move || {
                 let pool = rayon::ThreadPoolBuilder::new().num_threads(t).build().unwrap_or_else(|_| crate::bail("cannot start the names threads"));
                 let r = pool.install(|| names_pick(&nm, n, level, whole, slow, e));
                 (nm, r)
             })
-        });
+        };
+        let mut bg = (nok && self.names.len() <= 64 << 20).then(|| names_bg(&mut self, &mut early));
 
         // The codec search samples the first, middle and last block, which is
         // why it cannot run until every row has arrived. -e high reads them all.
@@ -564,6 +565,9 @@ impl Writer {
             let scale = |m: usize| if pl > 0 { (m as u128 * lens0.len() as u128 / pl as u128) as usize } else { m };
             let n5 = [ids0.len(), lens0.len(), scale(src[2].len()), scale(src[3].len()), scale(src[4].len())];
             let r = rank_all(&src, &n5, &self.opt);
+            // bigger names wait for the pool's peak to pass: lens_ok, below,
+            // keeps two cores busy, bzip3's two 256 MB blocks on short reads
+            if nok && bg.is_none() { bg = Some(names_bg(&mut self, &mut early)); }
             let idok = pi == 0 || r[0].2 > 0;
             let mut sz = [0usize; 4];
             if r[1].2 > 0 && idok { sz[0] = r[1].2 + r[0].2 + idx; }   // plain pays its index

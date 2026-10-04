@@ -3010,8 +3010,8 @@ static void ktw_close(ktw *w) {
         nj.z = w->ej.z; nj.zl = w->ej.zl; nj.sn = w->ej.sn; nj.pick = w->ej.pick; nj.early = 1;
     }
     pthread_t nth;
-    int nbg = !PERMON && !(w->ordok && nidx > 0) && NAMEMODE != 1 && names.n && names.n <= 64u << 20
-              && !pthread_create(&nth, NULL, namespick, &nj);
+    int nok = !PERMON && !(w->ordok && nidx > 0) && NAMEMODE != 1 && names.n;
+    int nbg = nok && names.n <= 64u << 20 && !pthread_create(&nth, NULL, namespick, &nj);
 
     double _ts = nowsec();
     if (!(nraw == 1 && w->ibx.n)) pickcodecs(w->rawfd, bm, nraw);   /* else the layout search ranks it all */
@@ -3065,6 +3065,9 @@ static void ktw_close(ktw *w) {
         for (int k = 2; k < 5; k++) n5[k] = pl ? (size_t)((unsigned __int128)m5[k] * nl0 / pl) : m5[k];
         int c5[5], l5[5];
         rankall(5, src, m5, n5, c5, l5, r5);
+        /* bigger names wait for the pool's peak to pass: lensok, below,
+           keeps two cores busy, bzip3's two 256 MB blocks on short reads */
+        if (nok && !nbg) nbg = !pthread_create(&nth, NULL, namespick, &nj);
         int idok = !pi || r5[0];
         if (r5[1] && idok) sz[0] = r5[1] + r5[0] + ic.n;      /* plain pays its index */
         if (r5[2] && idok) sz[1] = r5[2] + r5[0];

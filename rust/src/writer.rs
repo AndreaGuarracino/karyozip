@@ -1237,7 +1237,7 @@ fn rank_all(src: &[&[u8]], n: &[usize], o: &Options) -> Vec<(i32, i32, usize)> {
     rayon::broadcast(|_| loop {
         let ready = (0..src.len()).find_map(|t| {
             if left[t].load(std::sync::atomic::Ordering::Acquire) > 0 { return None; }
-            let b = best[t].lock().unwrap_or_else(|e| e.into_inner());
+            let b = best[t].try_lock().ok()?;   // held: under its read-back, skip it
             let j = b.as_ref()?.2;
             (vq[t].swap(j + 1, Relaxed) != j + 1).then_some((t, j, b))
         });

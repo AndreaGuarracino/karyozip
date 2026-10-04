@@ -964,24 +964,30 @@ static void *zjob_run(void *p) {
     zjob *j = p; j->s1 = zc(j->b, &j->a1); j->s2 = intnames(j->b, j->n, &j->a2); return NULL;
 }
 
-/* smallest of zstd, integer deltas, tokeniser, field deltas; losers freed */
-static size_t bestnames(buf *b, uint64_t n, uint8_t **out, int *kind) {
+/* smallest of zstd, integer deltas, tokeniser, field deltas, ranked on
+   b; losers freed. With full, the winner then runs on full, and the best
+   known runs on it early, while zstd, the slow one, still ranks. */
+static size_t bestnames(buf *b, uint64_t n, buf *full, uint64_t fn, uint8_t **out, int *kind) {
     uint8_t *a3 = NULL; size_t s3 = 0;
     double _t0 = nowsec();
     /* A plain thread, not an OpenMP section: inside a section the
        tokeniser's own parallel loop would be nested and run on one thread.
        tok3 overwrites every separator with NUL and puts it back, so it
-       cannot share the buffer with a concurrent reader: it gets a copy. */
-    buf tb = { xmalloc(b->n ? b->n : 1), b->n, b->n };
-    memcpy(tb.d, b->d, b->n);
-    zjob zj = { b, n, NULL, NULL, 0, 0 };
+       cannot share the buffer with a concurrent reader: zstd gets a copy,
+       and b and full, one buffer, stay on this thread. */
+    buf zb = { xmalloc(b->n ? b->n : 1), b->n, b->n };
+    memcpy(zb.d, b->d, b->n);
+    zjob zj = { &zb, n, NULL, NULL, 0, 0 };
     pthread_t th; int spawned = !pthread_create(&th, NULL, zjob_run, &zj);
     if (!spawned) zjob_run(&zj);
-    s3 = tokbest(&tb, &a3);
-    if (spawned) pthread_join(th, NULL);
-    free(tb.d);
-    uint8_t *a1 = zj.a1, *a2 = zj.a2; size_t s1 = zj.s1, s2 = zj.s2;
+    s3 = tokbest(b, &a3);
     uint8_t *a4 = NULL; size_t s4 = fldnames(b, n, &a4);
+    int spec = !full ? -1 : s4 && (!s3 || s4 < s3) ? 3 : s3 ? 2 : -1;
+    uint8_t *fz = NULL;
+    size_t fzl = spec == 2 ? tokc(full, &fz, TOKPICK) : spec == 3 ? fldnames(full, fn, &fz) : 0;
+    if (spawned) pthread_join(th, NULL);
+    free(zb.d);
+    uint8_t *a1 = zj.a1, *a2 = zj.a2; size_t s1 = zj.s1, s2 = zj.s2;
     if (PROF) fprintf(stderr, "  names %zu B: candidates %.3f s\n", b->n, nowsec() - _t0);
     size_t best = s1; *kind = 0; *out = a1;
     if (s2 && s2 < best) { best = s2; *kind = 1; *out = a2; }
@@ -991,6 +997,13 @@ static size_t bestnames(buf *b, uint64_t n, uint8_t **out, int *kind) {
     if (*out != a1) free(a1);
     if (*out != a2) free(a2);
     if (*out != a3) free(a3);
+    if (full) {
+        free(*out); *out = NULL;
+        if (*kind == spec) { *out = fz; return fzl; }
+        free(fz);
+        return *kind == 1 ? intnames(full, fn, out) : *kind == 2 ? tokc(full, out, TOKPICK)
+             : *kind == 3 ? fldnames(full, fn, out) : 0;   /* 0: zstd, by the caller */
+    }
     return best;
 }
 
@@ -3156,17 +3169,10 @@ static void ktw_close(ktw *w) {
               q = nl + 1; smpn++; }
           smp.n = smp.cap = (size_t)((const uint8_t *)q - names.d); }
         uint8_t *smpz = NULL; int pick;               /* rank on the sample, run the winner */
-        size_t smpl = bestnames(&smp, smpn, &smpz, &pick);
-        if (smp.n == names.n) {                       /* the sample was the whole
-                                                         buffer: the winner is done */
-            nz = smpz; nzl = smpl;
-            intused = pick == 1; tokused = pick == 2; fldused = pick == 3;
-        } else {
-            free(smpz);
-            if (pick == 1) { nzl = intnames(&names, nidx, &nz); intused = nzl != 0; }
-            else if (pick == 2) { nzl = tokc(&names, &nz, TOKPICK); tokused = nzl != 0; }
-            else if (pick == 3) { nzl = fldnames(&names, nidx, &nz); fldused = nzl != 0; }
-        }
+        /* the sample was the whole buffer: the winner is done */
+        nzl = bestnames(&smp, smpn, smp.n == names.n ? NULL : &names, nidx, &smpz, &pick);
+        nz = smpz;
+        intused = pick == 1 && nzl; tokused = pick == 2 && nzl; fldused = pick == 3 && nzl;
         if (!nzl) { nzl = zc(&names, &nz); tokused = intused = fldused = 0; }  /* refused */
         { static const char *NK[4] = { "zstd", "integers", "tokeniser", "fields" };
           int k = intused ? 1 : tokused ? 2 : fldused ? 3 : 0;
@@ -3198,7 +3204,7 @@ static void ktw_close(ktw *w) {
                chunk and tok3 refuses it, which cost 6.7% on 20547946 reads */
             for (uint64_t k5 = 0; k5 < nidx; k5++) nt[k5][strlen(nt[k5])] = '\n';
             uint8_t *bp = NULL; int bpick;
-            size_t best = bestnames(&srt, nidx, &bp, &bpick);
+            size_t best = bestnames(&srt, nidx, NULL, 0, &bp, &bpick);
             uint8_t *na = NULL, *nb2 = NULL;
             size_t p1 = zc(&natbuf, &na), p2 = tokbest(&natbuf, &nb2);
             size_t pbest = p1; uint8_t *pp = na; int ptok = 0;

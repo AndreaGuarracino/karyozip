@@ -691,21 +691,11 @@ impl Writer {
                     None => break,
                 }
             }
-            let b = best_names(&self.names[..q], smpn, level, self.opt.slow);
-            let r = if q == self.names.len() {
-                (b.bytes, b.kind == 2, b.kind == 1, b.kind == 3)   // the sample was all of it
-            } else {
-                let whole = match b.kind {
-                    1 => int_names(&self.names, self.nidx).map(|v| ffi::zstd(&v, level)),
-                    2 => tok_chunked(&self.names, b.chunk),
-                    3 => fld_names(&self.names, self.nidx),
-                    _ => None,
-                };
-                match whole {
-                    Some(v) if !v.is_empty() => (v, b.kind == 2, b.kind == 1, b.kind == 3),
-                    _ => (ffi::zstd(&self.names, level), false, false, false),   // refused
-                }
-            };
+            // the sample was all of it: the winner is done
+            let full = (q < self.names.len()).then_some((&self.names[..], self.nidx));
+            let b = best_names(&self.names[..q], smpn, full, level, self.opt.slow);
+            let r = if !b.bytes.is_empty() { (b.bytes, b.kind == 2, b.kind == 1, b.kind == 3) }
+                    else { (ffi::zstd(&self.names, level), false, false, false) };   // refused
             let k = if r.2 { "integers" } else if r.1 { "tokeniser" } else if r.3 { "fields" } else { "zstd" };
             let ck = if r.1 { format!(" chunk {}", b.chunk) } else { String::new() };
             eprintln!("names: {k}{ck}, decided on {q} of {} B", self.names.len());
@@ -733,7 +723,7 @@ impl Writer {
                 srt.extend_from_slice(nt[v as usize]);
                 srt.push(b'\n');
             }
-            let b = best_names(&srt, self.nidx, level, self.opt.slow);
+            let b = best_names(&srt, self.nidx, None, level, self.opt.slow);
             let p1 = ffi::zstd(&self.natbuf, level);
             let p2 = tok_best(&self.natbuf, self.opt.slow).map(|t| t.0);
             let (pbest, ptok) = match p2 {
@@ -1476,13 +1466,23 @@ fn fld_names1(names: &[u8], n: u64, sep: u8) -> Option<Vec<u8>> {
     Some(out)
 }
 
-pub fn best_names(names: &[u8], n: u64, level: i32, slow: bool) -> BestNames {
+pub fn best_names(names: &[u8], n: u64, full: Option<(&[u8], u64)>, level: i32, slow: bool) -> BestNames {
     let t0 = std::time::Instant::now();
-    let (z, t) = rayon::join(
-        || ffi::zstd(names, level),
-        || tok_best(names, slow),
+    // zstd, the slow one, ranks beside the rest, and the best known
+    // meanwhile runs on the whole buffer, as the C's
+    let ((z, i), (t, f, spec)) = rayon::join(
+        || (ffi::zstd(names, level), int_names(names, n).map(|v| ffi::zstd(&v, level))),
+        || {
+            let t = tok_best(names, slow);
+            let f = fld_names(names, n);
+            let (tl, fl) = (t.as_ref().map_or(0, |x| x.0.len()), f.as_ref().map_or(0, |x| x.len()));
+            let sk = if fl > 0 && (tl == 0 || fl < tl) { 3 } else if tl > 0 { 2 } else { 0 };
+            let spec = full.and_then(|(w, wn)| match sk {
+                2 => tok_chunked(w, t.as_ref().unwrap().1), 3 => fld_names(w, wn), _ => None,
+            }).map(|v| (sk, v));
+            (t, f, spec)
+        },
     );
-    let i = int_names(names, n).map(|v| ffi::zstd(&v, level));
     let mut out = BestNames { bytes: z, kind: 0, chunk: TCAND[0] };
     if let Some(v) = i {
         if !v.is_empty() && v.len() < out.bytes.len() { out = BestNames { bytes: v, kind: 1, chunk: TCAND[0] }; }
@@ -1490,11 +1490,23 @@ pub fn best_names(names: &[u8], n: u64, level: i32, slow: bool) -> BestNames {
     if let Some((v, c)) = t {
         if !v.is_empty() && v.len() < out.bytes.len() { out = BestNames { bytes: v, kind: 2, chunk: c }; }
     }
-    if let Some(v) = fld_names(names, n) {
+    if let Some(v) = f {
         if !v.is_empty() && v.len() < out.bytes.len() { out = BestNames { bytes: v, kind: 3, chunk: TCAND[0] }; }
     }
     if crate::prof::ON.load(std::sync::atomic::Ordering::Relaxed) {
         eprintln!("  names {} B: candidates {:.3} s", names.len(), t0.elapsed().as_secs_f64());
+    }
+    // with full, the winner on all of it; empty: zstd, by the caller
+    if let Some((w, wn)) = full {
+        out.bytes = match spec {
+            Some((k, v)) if k == out.kind => Some(v),
+            _ => match out.kind {
+                1 => int_names(w, wn).map(|v| ffi::zstd(&v, level)),
+                2 => tok_chunked(w, out.chunk),
+                3 => fld_names(w, wn),
+                _ => None,
+            },
+        }.unwrap_or_default();
     }
     out
 }

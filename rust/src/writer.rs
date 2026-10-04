@@ -501,6 +501,7 @@ impl Writer {
         // index. One block only, since a split read has no count to head it,
         // and measured against the index it would replace.
         let mut altbuf: Vec<u8> = Vec::new();
+        let mut lz: Option<Vec<u8>> = None;   // the checked lengths frame
         let (mut runhead, mut ilv, mut grp, mut alt_lens) = (false, false, false, 0usize);
         let mut ilvcodec = p.len;
         let mut altv: [Option<(Vec<u8>, usize)>; 3] = [None, None, None];
@@ -551,7 +552,7 @@ impl Writer {
                 _ => {}
             }
             runhead = l > 0;
-            if l > 0 && lens_ok(&altbuf, ilvcodec, lvl_len).is_none() { ilvcodec = 0; }   // zstd comes back
+            if l > 0 { lz = lens_ok(&altbuf, ilvcodec, lvl_len); if lz.is_none() { ilvcodec = 0; } }   // zstd comes back
             let labels = if l == 3 { String::new() } else { format!(", labels {}", cname(idc)) };
             eprintln!("layout: {}, lengths {}{labels}, decided on {pl} of {} B of lengths",
                       ["plain", "headed", "grouped", "interleaved"][l], cname(ilvcodec), lens0.len());
@@ -575,6 +576,7 @@ impl Writer {
         }
         drop(_l);
         let lencodec = ilvcodec;
+        let lz = std::sync::Mutex::new(lz);
         if runhead { self.ibx.clear(); }
 
         let _s = crate::prof::span(1);
@@ -614,7 +616,8 @@ impl Writer {
                     let (mut best, mut bv, mut fa) = (0usize, usize::MAX, Vec::new());
                     for &v in &ORDER {
                         let Some(src) = vs[v] else { continue };
-                        let f = comp_frame(src, lencodec, lvl_len).unwrap_or_else(|| crate::bail("block compression failed"));
+                        let kept = if v == 0 { lz.lock().unwrap().take() } else { None };   // the one lens_ok made
+                        let f = kept.or_else(|| comp_frame(src, lencodec, lvl_len)).unwrap_or_else(|| crate::bail("block compression failed"));
                         if bv == usize::MAX || f.len() < best { best = f.len(); bv = v; fa = f; }
                     }
                     let nl = if ilv { altv[bv].as_ref().unwrap().1 } else { vs[bv].unwrap().len() };
@@ -1244,10 +1247,11 @@ fn rank_all(src: &[&[u8]], n: &[usize], o: &Options) -> Vec<(i32, i32, usize)> {
 
 /// A respelt block is a different stream from the one the codec was chosen
 /// on, so it counts only at the size it comes back at.
-fn lens_ok(src: &[u8], codec: i32, level: i32) -> Option<usize> {
+/// The frame, if it comes back: the compress phase would make the same.
+fn lens_ok(src: &[u8], codec: i32, level: i32) -> Option<Vec<u8>> {
     let c = comp_frame(src, codec, level)?;
     let v = if codec != 0 { ffi::paydecomp(&c, codec, src.len())? } else { ffi::zstd_decompress(&c, src.len())? };
-    if v == src { Some(c.len()) } else { None }
+    if v == src { Some(c) } else { None }
 }
 
 /// what the index blob costs, so the two spellings can be compared

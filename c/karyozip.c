@@ -2833,7 +2833,8 @@ static void rankall(int ns, const uint8_t *const *src, const size_t *m, const si
     free(jb); free(jt); free(bo); free(bj);
 }
 
-static size_t lensok(ZSTD_CCtx *tc, const uint8_t *src, size_t n) {
+/* the checked frame is kept in *keep: the compress phase would make the same */
+static size_t lensok(ZSTD_CCtx *tc, const uint8_t *src, size_t n, uint8_t **keep) {
     uint8_t *c = NULL; size_t z = complens(tc, src, n, &c, ZSTD_compressBound(n));
     size_t ok = 0;
     if (z) {
@@ -2846,7 +2847,7 @@ static size_t lensok(ZSTD_CCtx *tc, const uint8_t *src, size_t n) {
         }
         free(v);
     }
-    free(c);
+    if (ok) *keep = c; else free(c);
     return ok;
 }
 
@@ -2950,7 +2951,7 @@ static void ktw_close(ktw *w) {
        empties the index; the two frames interleaved into one, where a
        repeated read pattern is a single string; and both. One block only,
        since a split read has no count to head it. */
-    uint8_t *altbuf = NULL; size_t altlen = 0, alt_lens = 0;
+    uint8_t *altbuf = NULL, *lk = NULL; size_t altlen = 0, alt_lens = 0, lkn = 0;
     uint8_t *altv[3] = {0}; size_t altvn[3] = {0}, altvl[3] = {0};
     double _tl = nowsec();
     if (nraw == 1 && w->ibx.n) {
@@ -3002,7 +3003,7 @@ static void ktw_close(ktw *w) {
         if (L == 3) { altlen = ilv_pack(rb0, nl0, rb0 + nl0, ni0, w->ibx.d, w->ibx.n, &altbuf); alt_lens = hn; ILV = 1; }
         free(hb);
         RUNHEAD = L > 0;
-        if (L && !lensok(mc, altbuf, altlen)) LENCODEC = 0;  /* it does not come back: zstd does */
+        if (L && !(lkn = lensok(mc, altbuf, altlen, &lk))) LENCODEC = 0;  /* it does not come back: zstd does */
         static const char *LN[4] = {"plain", "headed", "grouped", "interleaved"};
         fprintf(stderr, "layout: %s, lengths %s", LN[L], cname(LENCODEC));
         fprintf(stderr, "%s%s, decided on %zu of %zu B of lengths\n", L == 3 ? "" : ", labels ", L == 3 ? "" : cname(IDCODEC), pl, nl0);
@@ -3074,7 +3075,8 @@ static void ktw_close(ktw *w) {
                 for (int k = 0; k < 3; k++) {
                     int v = ORDER[k]; if (!vs[v]) continue;
                     uint8_t *f2 = NULL; size_t a2;
-                    a2 = complens(tc, vs[v], vn[v], &f2, ZSTD_compressBound(vn[v]));
+                    if (!v && lk) { f2 = lk; a2 = lkn; lk = NULL; }   /* the one lensok made */
+                    else a2 = complens(tc, vs[v], vn[v], &f2, ZSTD_compressBound(vn[v]));
                     if (!a2) { failed = 1; break; }
                     if (bv < 0 || a2 < best) { free(fa); fa = f2; best = a2; bv = v; }
                     else free(f2);
@@ -3291,7 +3293,7 @@ static void ktw_close(ktw *w) {
             nzl, dropnames ? " (dropped, needs --names FILE)" : ordinal ? " (ordinal, not stored)" : tokused ? " (tokenised)" : intused ? " (int deltas)" : fldused ? " (field deltas)" : "", izl, szl,
             (unsigned long long)BYT_LENS, (unsigned long long)BYT_LABS, RAWHELD);
 
-    free(itab.d); free(ichunks.d); free(altbuf);
+    free(itab.d); free(ichunks.d); free(altbuf); free(lk);
     for (int v = 1; v < 3; v++) free(altv[v]);
     free(lz); free(nz); free(sz); free(itz); free(npz);
     free(names.d); free(sizes.d); free(labs.d);

@@ -335,3 +335,7 @@ impl Inflater {
 }
 impl Drop for Inflater { fn drop(&mut self) { unsafe { libdeflate_free_decompressor(self.0) } } }
 pub fn crc32(b: &[u8]) -> u32 { unsafe { libdeflate_crc32(0, b.as_ptr(), b.len()) } }
+
+unsafe extern "C" { fn lseek(fd: i32, off: i64, whence: i32) -> i64; }
+/// Where stdin's file offset is; None for a pipe.
+pub fn stdin_at() -> Option<u64> { u64::try_from(unsafe { lseek(0, 0, 1) }).ok() }

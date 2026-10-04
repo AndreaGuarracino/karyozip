@@ -234,7 +234,10 @@ impl Writer {
         // complete, a copy is ranked on a thread while the rows still come,
         // when nothing at the close can change the names, as the C's.
         let ncap = (if self.opt.slow { DEFSAMPLE } else { 4 }) << 20;
-        if self.early.is_none() && !self.opt.whole && !self.perm_on && !self.opt.drop_names && self.names.len() >= ncap {
+        // Late in the input it would only overlap the parse buffers: then
+        // the close ranks them. 57 MB is zstd 17's state on a 4 MB sample.
+        if self.early.is_none() && !INHALF.load(std::sync::atomic::Ordering::Relaxed)
+           && !self.opt.whole && !self.perm_on && !self.opt.drop_names && self.names.len() >= ncap {
             let (mut q, mut sn) = (0usize, 0u64);
             while q < ncap { q += crate::ffi::find(b'\n', &self.names[q..]).map_or(self.names.len() - q, |k| k + 1); sn += 1; }
             let (copy, level, slow, t) = (self.names[..q].to_vec(), self.opt.level, self.opt.slow, rayon::current_num_threads());
@@ -961,6 +964,8 @@ fn cname(c: i32) -> String {
 /// the mode's candidates
 /// MB the default ranks every codec on
 pub const DEFSAMPLE: usize = 16;
+/// stdin, a file, is read past its half: set by the reading thread.
+pub static INHALF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 pub fn candlist(slow: bool) -> Vec<i32> {
     KCAND.iter().filter(|(_, f)| slow || *f).map(|(c, _)| *c).collect()

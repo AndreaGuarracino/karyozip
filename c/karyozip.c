@@ -540,6 +540,7 @@ static int GRP = 0;                   /* and whether the lengths are grouped */
 
 static int NAMEMODE = 0;              /* 0 store, 1 drop */
 static int PERMON;                    /* --sort keeps names: store a permutation */
+static _Atomic int INHALF;            /* stdin, a file, is read past its half */
 static const char *NAMEFILE = NULL;
 static const char *NAMESIN = NULL;
 /* One flag, two kinds of file: the blob "--names drop:F" wrote, or the
@@ -1331,7 +1332,9 @@ static void ktw_pushread(ktw *w) {
        complete, a copy is ranked on a thread while the rows still come,
        when nothing at the close can change the names. */
     size_t ncap = (size_t)(FASTMODE ? 4 : DEFSAMPLE) << 20;
-    if (!w->eon && !SLOW && !PERMON && NAMEMODE != 1 && w->names.n >= ncap) {
+    /* Late in the input it would only overlap the parse buffers: then the
+       close ranks them. 57 MB is zstd 17's state on a 4 MB sample. */
+    if (!w->eon && !INHALF && !SLOW && !PERMON && NAMEMODE != 1 && w->names.n >= ncap) {
         w->eon = 1;
         const char *q = (const char *)w->names.d, *e2 = q + w->names.n; uint64_t sn = 0;
         while (q < e2 && (size_t)(q - (const char *)w->names.d) < ncap) { q = memchr(q, '\n', (size_t)(e2 - q)) + 1; sn++; }
@@ -2434,6 +2437,8 @@ static void *slabfill(void *a) {
         S->have += got;
         if (got == 0) { if (ferror(S->in)) { S->err = "read error on stdin"; return NULL; } S->eof = 1; }
     }
+    struct stat st; off_t at;
+    if (!INHALF && !fstat(0, &st) && S_ISREG(st.st_mode) && (at = lseek(0, 0, SEEK_CUR)) >= 0 && 2 * at > st.st_size) INHALF = 1;
     char *last = S->have ? memrchr(S->b, '\n', S->have) : NULL;
     if (!last) {
         if (S->eof && S->have) S->err = "input does not end with a newline";

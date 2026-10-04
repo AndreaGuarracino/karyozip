@@ -355,6 +355,9 @@ impl Slab {
                 Err(_) => { self.err = Some("read error on stdin"); return; }   // the C's words, a cut .gz included
             }
         }
+        if let (Ok(m), Some(at)) = (std::fs::metadata("/dev/stdin"), ffi::stdin_at()) {
+            if m.is_file() && 2 * at > m.len() { writer::INHALF.store(true, std::sync::atomic::Ordering::Relaxed); }
+        }
         let Some(end) = ffi::rfind(b'\n', &self.b[..self.have]).map(|i| i + 1) else {
             if self.eof && self.have > 0 { self.err = Some("input does not end with a newline"); }
             else if !self.eof { self.err = Some("a BED line is longer than the read buffer"); }

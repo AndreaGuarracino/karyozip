@@ -623,8 +623,9 @@ impl Writer {
         let (nb, win) = (self.bm.len(), 4 * rayon::current_num_threads());
         let next = std::sync::atomic::AtomicUsize::new(0);
         let st = (std::sync::Mutex::new((0usize, std::collections::BTreeMap::<usize, Done>::new())), std::sync::Condvar::new());
-        let work = |i: usize| -> Done {
-            let (lens, ids) = self.read_block(i).unwrap_or_else(|_| crate::bail("cannot read back a staged block"));
+        let work = |i: usize, lens: &mut Vec<u8>, ids: &mut Vec<u8>| -> Done {
+            self.read_into(i, lens, ids).unwrap_or_else(|_| crate::bail("cannot read back a staged block"));
+            let (lens, ids): (&Vec<u8>, &Vec<u8>) = (lens, ids);
             // Under --aln a block keeps the smallest of three length
             // spellings: every sentinel, plus-strand sentinels only,
             // or plain lengths. Zeros do not always compress better.
@@ -673,16 +674,18 @@ impl Writer {
             (fa, b, nl, ids.len(), m.rows, m.bp, bv as u64)
         };
         std::thread::scope(|ts| -> Result<(), String> {
-            ts.spawn(|| rayon::broadcast(|_| loop {
+            // a buffer pair a thread, kept, as the C's rb: fresh ones a block
+            // faulted their pages in again (asm: 465,000 faults against 387,000)
+            ts.spawn(|| rayon::broadcast(|_| { let (mut lb, mut ib) = (Vec::new(), Vec::new()); loop {
                 let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if i >= nb { break; }
                 let mut g = st.0.lock().unwrap();
                 while i >= g.0 + win { g = st.1.wait(g).unwrap(); }
                 drop(g);
-                let d = work(i);
+                let d = work(i, &mut lb, &mut ib);
                 st.0.lock().unwrap().1.insert(i, d);
                 st.1.notify_all();
-            }));
+            } }));
             for i in 0..nb {
                 let (a, b, nl, ni, rows, bp, nosent) = {
                     let mut g = st.0.lock().unwrap();
@@ -908,13 +911,18 @@ impl Writer {
     }
 
     fn read_block(&self, i: usize) -> std::io::Result<(Vec<u8>, Vec<u8>)> {
+        let (mut lens, mut ids) = (Vec::new(), Vec::new());
+        self.read_into(i, &mut lens, &mut ids)?;
+        Ok((lens, ids))
+    }
+    /// Into two buffers the caller keeps: one read then split_off kept the
+    /// labels twice.
+    fn read_into(&self, i: usize, lens: &mut Vec<u8>, ids: &mut Vec<u8>) -> std::io::Result<()> {
         use std::os::unix::fs::FileExt;
         let m = &self.bm[i];
-        // two buffers read in place: one read then split_off kept the labels twice
-        let (mut lens, mut ids) = (vec![0u8; m.lens], vec![0u8; m.len - m.lens]);
-        self.raw.read_exact_at(&mut lens, m.off)?;
-        self.raw.read_exact_at(&mut ids, m.off + m.lens as u64)?;
-        Ok((lens, ids))
+        lens.resize(m.lens, 0); ids.resize(m.len - m.lens, 0);
+        self.raw.read_exact_at(lens, m.off)?;
+        self.raw.read_exact_at(ids, m.off + m.lens as u64)
     }
 }
 

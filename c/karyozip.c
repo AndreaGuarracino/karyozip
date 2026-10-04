@@ -1007,6 +1007,23 @@ static size_t bestnames(buf *b, uint64_t n, buf *full, uint64_t fn, uint8_t **ou
     return best;
 }
 
+/* ranked on whole names up to 4 MB -e low, DEFSAMPLE MB the default, all
+   -e high; the winner run on all. 0: zstd, by the caller */
+typedef struct { buf *names; uint64_t n; uint8_t *z; size_t zl, sn; int pick; } njob;
+static void *namespick(void *p) {
+    njob *j = p;
+    buf smp = { j->names->d, 0, 0 }; uint64_t smpn = 0;   /* a view, not a copy */
+    size_t ncap = SLOW ? SIZE_MAX : (size_t)(FASTMODE ? 4 : DEFSAMPLE) << 20;
+    const char *q = (const char *)j->names->d, *e2 = q + j->names->n;
+    while (q < e2 && (size_t)(q - (const char *)j->names->d) < ncap) {
+        const char *nl = memchr(q, '\n', (size_t)(e2 - q));
+        if (!nl) break;
+        q = nl + 1; smpn++; }
+    smp.n = smp.cap = j->sn = (size_t)((const uint8_t *)q - j->names->d);
+    j->zl = bestnames(&smp, smpn, smp.n == j->names->n ? NULL : j->names, j->n, &j->z, &j->pick);
+    return NULL;
+}
+
 
 static int nosz(int c) { unsigned u = (unsigned)c; return u && !(u & CODEC_BZIP3) && (u & 0x10); }
 
@@ -2933,6 +2950,14 @@ static void ktw_close(ktw *w) {
     uint64_t nblk = w->nblk, rows = w->rows;
     FILE *tmp = w->tmp;
     const blkmeta *bm = w->bm; size_t nraw = w->nraw;
+    /* The names rank beside the searches when nothing below changes them:
+       no permutation, no ordinals, none dropped, and at most 64 MB, since
+       their working memory adds to the search's. Joined before
+       namesunique, which reads the buffer tok3 rewrites in place. */
+    njob nj = { &names, nidx, NULL, 0, 0, 0 };
+    pthread_t nth;
+    int nbg = !PERMON && !(w->ordok && nidx > 0) && NAMEMODE != 1 && names.n && names.n <= 64u << 20
+              && !pthread_create(&nth, NULL, namespick, &nj);
 
     double _ts = nowsec();
     if (!(nraw == 1 && w->ibx.n)) pickcodecs(w->rawfd, bm, nraw);   /* else the layout search ranks it all */
@@ -3127,6 +3152,7 @@ static void ktw_close(ktw *w) {
     uint8_t *nz = NULL, *lz = NULL;
 
     int ordinal = w->ordok && nidx > 0;   /* the writer tracked this */
+    if (nbg) pthread_join(nth, NULL);
     if (NAMEMODE != 1 && nidx > 1) namesunique(PERMON ? &natbuf : &names, PERMON ? NATN : nidx);
 
     int dropnames = NAMEMODE == 1;
@@ -3161,18 +3187,8 @@ static void ktw_close(ktw *w) {
     size_t nzl = 0; int tokused = 0, intused = 0, fldused = 0;
     double _tn = nowsec();
     if (!ordinal) {
-        /* whole names up to 4 MB -e low, DEFSAMPLE MB the default, all -e high */
-        buf smp = { names.d, 0, 0 }; uint64_t smpn = 0;   /* a view, not a copy */
-        size_t ncap = SLOW ? SIZE_MAX : (size_t)(FASTMODE ? 4 : DEFSAMPLE) << 20;
-        { const char *q = (const char *)names.d, *e2 = q + names.n;
-          while (q < e2 && (size_t)(q - (const char *)names.d) < ncap) {
-              const char *nl = memchr(q, '\n', (size_t)(e2 - q));
-              if (!nl) break;
-              q = nl + 1; smpn++; }
-          smp.n = smp.cap = (size_t)((const uint8_t *)q - names.d); }
-        uint8_t *smpz = NULL; int pick;               /* rank on the sample, run the winner */
-        /* the sample was the whole buffer: the winner is done */
-        nzl = bestnames(&smp, smpn, smp.n == names.n ? NULL : &names, nidx, &smpz, &pick);
+        if (!nbg) { nj.names = &names; nj.n = nidx; namespick(&nj); }
+        nzl = nj.zl; int pick = nj.pick; uint8_t *smpz = nj.z;
         nz = smpz;
         intused = pick == 1 && nzl; tokused = pick == 2 && nzl; fldused = pick == 3 && nzl;
         if (!nzl) { nzl = zc(&names, &nz); tokused = intused = fldused = 0; }  /* refused */
@@ -3180,7 +3196,7 @@ static void ktw_close(ktw *w) {
           int k = intused ? 1 : tokused ? 2 : fldused ? 3 : 0;
           fprintf(stderr, "names: %s", NK[k]);
           if (k == 2) fprintf(stderr, " chunk %u", TOKPICK);
-          fprintf(stderr, ", decided on %zu of %zu B\n", smp.n, names.n); }
+          fprintf(stderr, ", decided on %zu of %zu B\n", nj.sn, names.n); }
         /* The rows carry a rank per record. */
         if (PERMON && NAMEMODE == 1) { free(natbuf.d); natbuf.n = 0; natbuf.d = NULL; }
         else if (PERMON && !NATORD && natbuf.n) {

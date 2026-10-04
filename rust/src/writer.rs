@@ -478,6 +478,20 @@ impl Writer {
         self.pushread();
         self.flush().map_err(io)?;
         let level = self.opt.level;
+        // The names rank beside the searches when nothing below changes
+        // them, as the C's: no permutation, no ordinals, none dropped, at
+        // most 64 MB. Their own pool: in the global one they would queue
+        // behind the layout search's.
+        let bg = (!self.perm_on && !(self.ordok && self.nidx > 0) && !self.opt.drop_names
+                  && !self.names.is_empty() && self.names.len() <= 64 << 20).then(|| {
+            let (nm, n, whole, slow) = (std::mem::take(&mut self.names), self.nidx, self.opt.whole, self.opt.slow);
+            let t = rayon::current_num_threads();
+            std::thread::spawn(move || {
+                let pool = rayon::ThreadPoolBuilder::new().num_threads(t).build().unwrap_or_else(|_| crate::bail("cannot start the names threads"));
+                let r = pool.install(|| names_pick(&nm, n, level, whole, slow));
+                (nm, r)
+            })
+        });
 
         // The codec search samples the first, middle and last block, which is
         // why it cannot run until every row has arrived. -e high reads them all.
@@ -649,6 +663,11 @@ impl Writer {
         // as text, as ordinals, in a sidecar, or as ranks plus a blob.
         let mut perm_on = self.perm_on;
         let mut ordinal = self.ordok && self.nidx > 0;
+        let mut pre = None;
+        if let Some(h) = bg {   // before check_unique, as the C's join
+            let (nm, r) = h.join().unwrap_or_else(|_| crate::bail("the names thread failed"));
+            self.names = nm; pre = Some(r);
+        }
         if !self.opt.drop_names && self.nidx > 1 {
             check_unique(if perm_on { &self.natbuf } else { &self.names })?;
         }
@@ -686,17 +705,7 @@ impl Writer {
         let (mut nz, mut tokused, mut intused, mut fldused) = if ordinal {
             (Vec::new(), false, false, false)
         } else {
-            let (mut q, mut smpn) = (0usize, 0u64);
-            let ncap = if self.opt.whole { usize::MAX } else { (if self.opt.slow { DEFSAMPLE } else { 4 }) << 20 };
-            while q < self.names.len() && q < ncap {
-                match crate::ffi::find(b'\n', &self.names[q..]) {
-                    Some(k) => { q += k + 1; smpn += 1; }
-                    None => break,
-                }
-            }
-            // the sample was all of it: the winner is done
-            let full = (q < self.names.len()).then_some((&self.names[..], self.nidx));
-            let b = best_names(&self.names[..q], smpn, full, level, self.opt.slow);
+            let (b, q) = pre.take().unwrap_or_else(|| names_pick(&self.names, self.nidx, level, self.opt.whole, self.opt.slow));
             let r = if !b.bytes.is_empty() { (b.bytes, b.kind == 2, b.kind == 1, b.kind == 3) }
                     else { (ffi::zstd(&self.names, level), false, false, false) };   // refused
             let k = if r.2 { "integers" } else if r.1 { "tokeniser" } else if r.3 { "fields" } else { "zstd" };
@@ -1468,6 +1477,22 @@ fn fld_names1(names: &[u8], n: u64, sep: u8) -> Option<Vec<u8>> {
     kst::put(&mut out, v.len() as u64);
     out.extend_from_slice(&z);
     Some(out)
+}
+
+/// Ranked on whole names up to 4 MB -e low, DEFSAMPLE MB the default, all
+/// -e high; the winner run on all. Empty bytes: zstd, by the caller.
+fn names_pick(names: &[u8], n: u64, level: i32, whole: bool, slow: bool) -> (BestNames, usize) {
+    let (mut q, mut smpn) = (0usize, 0u64);
+    let ncap = if whole { usize::MAX } else { (if slow { DEFSAMPLE } else { 4 }) << 20 };
+    while q < names.len() && q < ncap {
+        match crate::ffi::find(b'\n', &names[q..]) {
+            Some(k) => { q += k + 1; smpn += 1; }
+            None => break,
+        }
+    }
+    // the sample was all of it: the winner is done
+    let full = (q < names.len()).then_some((names, n));
+    (best_names(&names[..q], smpn, full, level, slow), q)
 }
 
 pub fn best_names(names: &[u8], n: u64, full: Option<(&[u8], u64)>, level: i32, slow: bool) -> BestNames {

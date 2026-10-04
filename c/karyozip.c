@@ -20,6 +20,7 @@
 #include <signal.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <sched.h>
 #include <math.h>
 #ifdef _OPENMP
 #include <omp.h>
@@ -2997,6 +2998,22 @@ static uint64_t idxbuild(const buf *ib, buf *ichunks, buf *itab) {
     return nichunk;
 }
 
+/* a compressed block waiting its turn; ok last */
+typedef struct { uint8_t *fa, *fb; size_t a, b, ni, nl; uint64_t ns; _Atomic int ok; } cslot;
+/* every ready block from the oldest on, in order */
+static void cflush(cslot *cs, size_t nraw, _Atomic size_t *wrote, const blkmeta *bm, FILE *tmp, buf *sizes, _Atomic int *wfail) {
+    for (cslot *c; *wrote < nraw && (c = &cs[*wrote])->ok; (*wrote)++) {
+        static const uint8_t z0 = 0;
+        const uint8_t *ids = c->fb ? c->fb : &z0;
+        if (fwrite(c->fa, 1, c->a, tmp) != c->a || fwrite(ids, 1, c->b, tmp) != c->b) *wfail = 1;
+        bvar(sizes, c->a); bvar(sizes, c->b);
+        bvar(sizes, c->ni); bvar(sizes, ALNPAF ? c->nl << 2 | c->ns : c->nl);
+        bvar(sizes, bm[*wrote].rows); bvar(sizes, bm[*wrote].bp);
+        bvar(sizes, fnvbuf(fnvbuf(FNV0, c->fa, c->a), ids, c->b));
+        free(c->fa); free(c->fb);
+    }
+}
+
 static void ktw_close(ktw *w) {
     buf names = w->names, sizes = w->sizes;
     size_t nidx = w->nidx;
@@ -3023,7 +3040,6 @@ static void ktw_close(ktw *w) {
         for (int v = 0; ALNPAF && v < 2; v++)
             if (bm[i].alen[v] + (bm[i].len - bm[i].lens) > maxraw) maxraw = bm[i].alen[v] + (bm[i].len - bm[i].lens);
     }
-    size_t obound = ZSTD_compressBound(maxraw ? maxraw : 1);
 
     /* Four spellings of one block, all measured, the smallest kept: the two
        frames as they are; the run count heading each read's lengths, which
@@ -3113,23 +3129,29 @@ static void ktw_close(ktw *w) {
     if (RUNHEAD) { free(w->ibx.d); w->ibx.d = NULL; w->ibx.n = 0; }
 
     {
-        /* Parallel: compress apart, write in order. */
+        /* Compress apart, write in order, as the Rust's: a thread takes
+           the next block up to 4 a thread past the last written, and
+           whoever finishes the oldest writes every ready one. An ordered
+           loop held each thread until its block's turn. */
         double _tc = nowsec();
         int nthr = nthreads();
         _Atomic int failed = 0, wfail = 0;
+        cslot *cs = xcalloc(nraw ? nraw : 1, sizeof *cs);
+        _Atomic size_t nextb = 0, wrote = 0; size_t win = 4 * (size_t)nthr;
+        pthread_mutex_t cwm = PTHREAD_MUTEX_INITIALIZER;
 #ifdef _OPENMP
 #pragma omp parallel num_threads(nthr) if (nraw > 1)   /* one block: bzip3 runs its own blocks in parallel */
 #endif
         {
             ZSTD_CCtx *tc = ZSTD_createCCtx();
-            uint8_t *o = malloc(2 * obound + 64);        /* one per thread */
             uint8_t *rb = malloc(maxraw ? maxraw : 1);   /* the block, read back */
-            if (!tc || !o || !rb) failed = 1;
-#ifdef _OPENMP
-#pragma omp for ordered schedule(dynamic, 1)
-#endif
-            for (size_t i = 0; i < nraw; i++) {
-                if (failed) continue;
+            if (!tc || !rb) failed = 1;
+            for (;;) {
+                size_t i = nextb++;
+                if (i >= nraw || failed) break;
+                while (i >= wrote + win && !failed)   /* a waiting thread writes, or none might */
+                    if (!pthread_mutex_trylock(&cwm)) { cflush(cs, nraw, &wrote, bm, tmp, &sizes, &wfail); pthread_mutex_unlock(&cwm); }
+                    else sched_yield();
                 rawget(w->rawfd, (off_t)bm[i].off, rb, bm[i].len);
                 const uint8_t *src = rb;
                 size_t nl = bm[i].lens, ni = bm[i].len - nl;
@@ -3160,14 +3182,15 @@ static void ktw_close(ktw *w) {
                     if (bv < 0 || a2 < best) { free(fa); fa = f2; best = a2; bv = v; }
                     else free(f2);
                 }
-                if (failed) { free(fa); continue; }
+                if (failed) { free(fa); break; }
                 a = best; nl = ILV ? altvl[bv] : vn[bv]; nosent = (uint64_t)bv;
-                if (ILV) { b2 = 0; fb = NULL; o[0] = 0; }
+                if (ILV) { b2 = 0; fb = NULL; }
                 else if (IDCODEC) { b2 = paycomp(idsrc, ni, IDCODEC, &fb);
-                               if (!b2) { failed = 1; free(fa); continue; } }
+                               if (!b2) { failed = 1; free(fa); break; } }
                 else
-                { b2 = ZSTD_compressCCtx(tc, o, obound, idsrc, ni, LEVEL_I < 0 ? LEVEL : LEVEL_I);
-                  if (ZSTD_isError(b2)) { failed = 1; free(fa); continue; } }
+                { size_t zb = ZSTD_compressBound(ni); fb = xmalloc(zb);
+                  b2 = ZSTD_compressCCtx(tc, fb, zb, idsrc, ni, LEVEL_I < 0 ? LEVEL : LEVEL_I);
+                  if (ZSTD_isError(b2)) { failed = 1; free(fa); free(fb); break; } }
 #ifdef _OPENMP
 #pragma omp atomic
 #endif
@@ -3176,22 +3199,21 @@ static void ktw_close(ktw *w) {
 #pragma omp atomic
 #endif
                 BYT_LABS += b2;
-                const uint8_t *ids = fb ? fb : o;
-#ifdef _OPENMP
-#pragma omp ordered
-#endif
-                {
-                    if (fwrite(fa, 1, a, tmp) != a || fwrite(ids, 1, b2, tmp) != b2) wfail = 1;
-                    bvar(&sizes, a); bvar(&sizes, b2);
-                    bvar(&sizes, ni); bvar(&sizes, ALNPAF ? nl << 2 | nosent : nl);
-                    bvar(&sizes, bm[i].rows); bvar(&sizes, bm[i].bp);
-                    bvar(&sizes, fnvbuf(fnvbuf(FNV0, fa, a), ids, b2));
+                cs[i].fa = fa; cs[i].fb = fb; cs[i].a = a; cs[i].b = b2;
+                cs[i].ni = ni; cs[i].nl = nl; cs[i].ns = nosent;
+                cs[i].ok = 1;                     /* last: an atomic store after the fields */
+                /* a busy writer takes this one too; the last flush below */
+                if (!pthread_mutex_trylock(&cwm)) {
+                    cflush(cs, nraw, &wrote, bm, tmp, &sizes, &wfail);
+                    pthread_mutex_unlock(&cwm);
                 }
-                free(fa); free(fb);
             }
-            free(o); free(rb);
+            free(rb);
             ZSTD_freeCCtx(tc);
         }
+        cflush(cs, nraw, &wrote, bm, tmp, &sizes, &wfail);
+        for (size_t i = wrote; i < nraw; i++) { free(cs[i].fa); free(cs[i].fb); }   /* left by a failure */
+        free(cs);
         if (wfail) die("tmp write");
         if (failed) die("block compression failed");
         RAWHELD = nraw ? bm[nraw - 1].off + bm[nraw - 1].len : 0;   /* staged, not held */

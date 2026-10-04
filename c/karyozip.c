@@ -1016,10 +1016,13 @@ static size_t bestnames(buf *b, uint64_t n, buf *full, uint64_t fn, uint8_t **ou
 
 /* ranked on whole names up to 4 MB -e low, DEFSAMPLE MB the default, all
    -e high; the winner run on all. 0: zstd, by the caller */
-typedef struct { buf *names; uint64_t n; uint8_t *z; size_t zl, sn; int pick, early; } njob;
+typedef struct njob { buf *names; uint64_t n; uint8_t *z; size_t zl, sn; int pick, early;
+                     struct njob *ej; pthread_t eth; buf *ec; } njob;   /* ej: the early ranking, joined here */
 static void *namespick(void *p) {
     njob *j = p;
     if (j->early) {                       /* ranked during the parse, on the sample */
+        pthread_join(j->eth, NULL); free(j->ec->d);
+        j->z = j->ej->z; j->zl = j->ej->zl; j->sn = j->ej->sn; j->pick = j->ej->pick;
         if (j->sn < j->names->n) { free(j->z); j->zl = namesrun(j->pick, j->names, j->n, &j->z); }
         return NULL;
     }
@@ -1333,7 +1336,7 @@ static void ktw_pushread(ktw *w) {
         while (q < e2 && (size_t)(q - (const char *)w->names.d) < ncap) { q = memchr(q, '\n', (size_t)(e2 - q)) + 1; sn++; }
         size_t m = (size_t)((const uint8_t *)q - w->names.d);
         w->ecopy = (buf){ xmalloc(m), m, m }; memcpy(w->ecopy.d, w->names.d, m);
-        w->ej = (njob){ &w->ecopy, sn, NULL, 0, 0, 0, 0 };
+        w->ej = (njob){ .names = &w->ecopy, .n = sn };
         if (pthread_create(&w->eth, NULL, namespick, &w->ej)) w->eon = 0, free(w->ecopy.d);
     }
 }
@@ -3004,11 +3007,8 @@ static void ktw_close(ktw *w) {
        no permutation, no ordinals, none dropped, and at most 64 MB, since
        their working memory adds to the search's. Joined before
        namesunique, which reads the buffer tok3 rewrites in place. */
-    njob nj = { &names, nidx, NULL, 0, 0, 0, 0 };
-    if (w->eon) {                         /* its ranking holds for these names */
-        pthread_join(w->eth, NULL); free(w->ecopy.d);
-        nj.z = w->ej.z; nj.zl = w->ej.zl; nj.sn = w->ej.sn; nj.pick = w->ej.pick; nj.early = 1;
-    }
+    njob nj = { .names = &names, .n = nidx };
+    if (w->eon) { nj.early = 1; nj.ej = &w->ej; nj.eth = w->eth; nj.ec = &w->ecopy; }   /* its ranking holds for these names */
     pthread_t nth;
     int nbg = !PERMON && !(w->ordok && nidx > 0) && NAMEMODE != 1 && names.n && names.n <= 64u << 20
               && !pthread_create(&nth, NULL, namespick, &nj);

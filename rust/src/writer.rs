@@ -493,7 +493,7 @@ impl Writer {
         self.pushread();
         self.flush().map_err(io)?;
         let level = self.opt.level;
-        let mut early = self.early.take().map(|h| h.join().unwrap_or_else(|_| crate::bail("the names thread failed")));
+        let mut early = self.early.take();   // joined by the names job
         // The names rank beside the searches when nothing below changes
         // them, as the C's: no permutation, no ordinals, none dropped, at
         // most 64 MB. Their own pool: in the global one they would queue
@@ -1517,8 +1517,10 @@ fn fld_names1(names: &[u8], n: u64, sep: u8) -> Option<Vec<u8>> {
 
 /// Ranked on whole names up to 4 MB -e low, DEFSAMPLE MB the default, all
 /// -e high; the winner run on all. Empty bytes: zstd, by the caller.
-fn names_pick(names: &[u8], n: u64, level: i32, whole: bool, slow: bool, early: Option<(BestNames, usize)>) -> (BestNames, usize) {
-    if let Some((mut b, sn)) = early {   // ranked during the parse, on the sample
+fn names_pick(names: &[u8], n: u64, level: i32, whole: bool, slow: bool,
+              early: Option<std::thread::JoinHandle<(BestNames, usize)>>) -> (BestNames, usize) {
+    if let Some(h) = early {   // ranked during the parse, on the sample
+        let (mut b, sn) = h.join().unwrap_or_else(|_| crate::bail("the names thread failed"));
         if sn < names.len() { b.bytes = names_run(b.kind, b.chunk, names, n, level); }
         return (b, sn);
     }

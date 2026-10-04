@@ -7,6 +7,7 @@
 #include <limits.h>
 #include <stdint.h>
 #include <zlib.h>
+#include "libdeflate/libdeflate.h"
 #include <time.h>
 #include <zstd.h>
 #include <lzma.h>
@@ -277,14 +278,13 @@ static int bgzfread(zrd *z) {   /* the next run of whole blocks into out; -1 on 
         const uint8_t *b = z->raw + bo[i]; size_t bs = bo[i + 1] - bo[i], xl = b[10] | (size_t)b[11] << 8;
         size_t isz = oo[i + 1] - oo[i];
         if (isz > 65536 || 12 + xl + 8 > bs) { bad = 1; continue; }
-        z_stream s; memset(&s, 0, sizeof s);
-        if (inflateInit2(&s, -15) != Z_OK) { bad = 1; continue; }
-        s.next_in = (Bytef *)b + 12 + xl; s.avail_in = (uInt)(bs - 12 - xl - 8);
-        s.next_out = z->out + oo[i]; s.avail_out = (uInt)isz;
-        int r = inflate(&s, Z_FINISH); size_t got = s.total_out; inflateEnd(&s);
+        static __thread struct libdeflate_decompressor *ld;   /* one a thread, kept */
+        if (!ld && !(ld = libdeflate_alloc_decompressor())) { bad = 1; continue; }
+        size_t got = 0;
+        int r = libdeflate_deflate_decompress(ld, b + 12 + xl, bs - 12 - xl - 8, z->out + oo[i], isz, &got);
         const uint8_t *t = b + bs - 8;
         uint32_t crc = t[0] | (uint32_t)t[1] << 8 | (uint32_t)t[2] << 16 | (uint32_t)t[3] << 24;
-        if (r != Z_STREAM_END || got != isz || crc32(0, z->out + oo[i], (uInt)isz) != crc) bad = 1;
+        if (r != LIBDEFLATE_SUCCESS || got != isz || libdeflate_crc32(0, z->out + oo[i], isz) != crc) bad = 1;
     }
     z->rp = q; free(bo); free(oo);
     return bad ? -1 : 1;
@@ -5384,6 +5384,7 @@ int main(int argc, char **argv) {
             printf("  zstd       %s\n", ZSTD_versionString());
             printf("  libbz3     %s\n", bz3_version());
             printf("  htscodecs  %s\n", HTSCODECS_VERSION_TEXT);
+            printf("  libdeflate %s\n", LIBDEFLATE_VERSION_STRING);
             return 0;
         }
     }

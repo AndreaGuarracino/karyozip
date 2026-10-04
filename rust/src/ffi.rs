@@ -85,6 +85,7 @@ extern "C" fn check_stdfds() {
 
 /// The vendored htscodecs, from its own version.h at build time.
 pub const HTSCODECS_VERSION: &str = env!("HTSCODECS_VERSION");
+pub const LIBDEFLATE_VERSION: &str = env!("LIBDEFLATE_VERSION");
 
 /// libbz3's version string, as the C `--version` prints it.
 pub fn bzip3_version() -> String {
@@ -312,3 +313,25 @@ pub fn line_end(s: &[u8]) -> usize {
     assert_eq!(s.last(), Some(&b'\n'));
     unsafe { c_strchrnul(s.as_ptr(), b'\n' as i32) as usize - s.as_ptr() as usize }
 }
+
+// BGZF blocks state their size: libdeflate's whole-buffer inflate and
+// PCLMUL CRC32, vendored in c/, as the C's
+#[repr(C)] struct LdDec { _p: [u8; 0] }
+unsafe extern "C" {
+    fn libdeflate_alloc_decompressor() -> *mut LdDec;
+    fn libdeflate_free_decompressor(d: *mut LdDec);
+    fn libdeflate_deflate_decompress(d: *mut LdDec, i: *const u8, il: usize, o: *mut u8, ol: usize, got: *mut usize) -> i32;
+    fn libdeflate_crc32(crc: u32, b: *const u8, n: usize) -> u32;
+}
+pub struct Inflater(*mut LdDec);
+unsafe impl Send for Inflater {}
+impl Inflater {
+    pub fn new() -> Inflater { let d = unsafe { libdeflate_alloc_decompressor() }; assert!(!d.is_null(), "out of memory"); Inflater(d) }
+    /// Inflates raw deflate `i` into all of `o`: true when it fills `o` exactly.
+    pub fn inflate(&mut self, i: &[u8], o: &mut [u8]) -> bool {
+        let mut got = 0usize;
+        (unsafe { libdeflate_deflate_decompress(self.0, i.as_ptr(), i.len(), o.as_mut_ptr(), o.len(), &mut got) }) == 0 && got == o.len()
+    }
+}
+impl Drop for Inflater { fn drop(&mut self) { unsafe { libdeflate_free_decompressor(self.0) } } }
+pub fn crc32(b: &[u8]) -> u32 { unsafe { libdeflate_crc32(0, b.as_ptr(), b.len()) } }

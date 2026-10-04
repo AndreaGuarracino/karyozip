@@ -17,22 +17,27 @@ SRC := karyozip.c \
        htscodecs/tokenise_name3.c htscodecs/rANS_static4x16pr.c \
        htscodecs/rANS_static32x16pr.c htscodecs/arith_dynamic.c \
        htscodecs/rle.c htscodecs/pack.c htscodecs/utils.c \
-       bzip3/libbz3.c
+       bzip3/libbz3.c \
+       libdeflate/lib/deflate_decompress.c libdeflate/lib/crc32.c libdeflate/lib/utils.c \
+       libdeflate/lib/x86/cpu_features.c libdeflate/lib/arm/cpu_features.c
 
 # libtest is in all on purpose: a stale one silently compares the wrong
 # binary and every library check "differs".
 all: build/karyozip build/libkaryozip.a build/libtest
 
-HDR := karyozip.h $(wildcard htscodecs/*.h bzip3/*.h)
+HDR := karyozip.h $(wildcard htscodecs/*.h bzip3/*.h libdeflate/*.h libdeflate/lib/*.h libdeflate/lib/*/*.h)
 build/karyozip: $(SRC) $(HDR)
 	mkdir -p build
 	$(CC) $(CFLAGS) $(ZSTD_CFLAGS) -o $@ $(SRC) $(LDFLAGS) $(ZSTD_LIBS) -llzma -lm -lpthread -lz
 
-# the same sources, minus main: an annotator can write .kst without a BED
-build/libkaryozip.a: $(SRC) $(HDR)
-	mkdir -p build/lib
-	$(CC) $(CFLAGS) $(ZSTD_CFLAGS) -Wno-unused-function -Wno-unused-variable -DKARYOZIP_LIB -c $(SRC) && mv *.o build/lib/
-	$(AR) rcs $@ build/lib/*.o
+# the same sources, minus main: an annotator can write .kst without a BED.
+# Objects keep their paths: two vendored trees both have a utils.c.
+OBJ := $(SRC:%.c=build/lib/%.o)
+build/lib/%.o: %.c $(HDR)
+	mkdir -p $(@D)
+	$(CC) $(CFLAGS) $(ZSTD_CFLAGS) -Wno-unused-function -Wno-unused-variable -DKARYOZIP_LIB -c $< -o $@
+build/libkaryozip.a: $(OBJ)
+	rm -f $@ && $(AR) rcs $@ $(OBJ)
 
 build/libtest: build/libkaryozip.a ../tests/libtest.c
 	$(CC) $(CFLAGS) $(ZSTD_CFLAGS) -o $@ ../tests/libtest.c build/libkaryozip.a $(LDFLAGS) $(ZSTD_LIBS) -llzma -lm -lpthread -lz

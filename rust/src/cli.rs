@@ -59,9 +59,9 @@ impl Cli {
         for a in &av {
             if a == "--help" || a == "-h" { println!("{USAGE}"); std::process::exit(0); }
             if a == "--version" {
-                println!("karyozip {}, format KST00001\n  zstd       {}\n  libbz3     {}\n  htscodecs  {}",
+                println!("karyozip {}, format KST00001\n  zstd       {}\n  libbz3     {}\n  htscodecs  {}\n  libdeflate {}",
                          env!("CARGO_PKG_VERSION"), karyozip::ffi::zstd_version(),
-                         karyozip::ffi::bzip3_version(), karyozip::ffi::HTSCODECS_VERSION);
+                         karyozip::ffi::bzip3_version(), karyozip::ffi::HTSCODECS_VERSION, karyozip::ffi::LIBDEFLATE_VERSION);
                 std::process::exit(0);
             }
         }

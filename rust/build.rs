@@ -1,5 +1,5 @@
 // The codecs are the C ones, from ../c: htscodecs because no Rust port
-// exists, and bzip3 because our copy carries two fixes upstream still
+// exists, libdeflate so both inflate BGZF with one code, and bzip3 because our copy carries two fixes upstream still
 // lacks, one of which silently loses half the data on an aligned input.
 // See c/bzip3/PROVENANCE.
 fn main() {
@@ -7,6 +7,7 @@ fn main() {
     println!("cargo:rerun-if-changed=../c");
     // The two vendored versions come from the vendored trees, never a copy.
     println!("cargo:rustc-env=HTSCODECS_VERSION={}", grab(&c.join("htscodecs/version.h"), "HTSCODECS_VERSION_TEXT"));
+    println!("cargo:rustc-env=LIBDEFLATE_VERSION={}", grab(&c.join("libdeflate/libdeflate.h"), "LIBDEFLATE_VERSION_STRING"));
     let bz3 = grab(&c.join("Makefile"), "BZIP3_VERSION ?=");
     // The usage text is the C's own, so the two cannot drift apart.
     let out = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap());
@@ -21,6 +22,11 @@ fn main() {
             c.join("htscodecs/pack.c"),
             c.join("htscodecs/utils.c"),
             c.join("bzip3/libbz3.c"),
+            c.join("libdeflate/lib/deflate_decompress.c"),
+            c.join("libdeflate/lib/crc32.c"),
+            c.join("libdeflate/lib/utils.c"),
+            c.join("libdeflate/lib/x86/cpu_features.c"),
+            c.join("libdeflate/lib/arm/cpu_features.c"),
         ])
         .include(c)
         .define("VERSION", format!("{bz3:?}").as_str())

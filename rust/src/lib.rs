@@ -114,15 +114,13 @@ impl Zr {
         let mut rest = self.out.as_mut_slice();
         for w in oo.windows(2) { let (a, r) = rest.split_at_mut(w[1] - w[0]); slots.push(a); rest = r; }
         let raw = &self.raw;
-        let ok = slots.into_par_iter().enumerate().with_min_len(16).all(|(i, o)| {
+        // libdeflate, one decompressor a thread, as the C's
+        let ok = slots.into_par_iter().enumerate().with_min_len(16).map_init(ffi::Inflater::new, |d, (i, o)| {
             let b = &raw[bo[i]..bo[i + 1]];
             let xl = b[10] as usize | (b[11] as usize) << 8;
             if o.len() > 65536 || 12 + xl + 8 > b.len() { return false; }
-            let mut d = flate2::Decompress::new(false);
-            let st = d.decompress(&b[12 + xl..b.len() - 8], o, flate2::FlushDecompress::Finish);
-            let mut c = flate2::Crc::new(); c.update(o);
-            matches!(st, Ok(flate2::Status::StreamEnd)) && d.total_out() as usize == o.len() && c.sum() as usize == le32(&b[b.len() - 8..])
-        });
+            d.inflate(&b[12 + xl..b.len() - 8], o) && ffi::crc32(o) as usize == le32(&b[b.len() - 8..])
+        }).all(|x| x);
         self.rp = q;
         if ok { Ok(1) } else { Err(zbad()) }
     }

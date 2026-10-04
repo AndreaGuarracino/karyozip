@@ -1472,9 +1472,22 @@ pub fn fld_names(names: &[u8], n: u64) -> Option<Vec<u8>> {
     }
 }
 
+/// The pieces of `s` between `c`s, as `split`, found with glibc's memchr,
+/// as the C's field scan: split's closure walks a byte at a time.
+fn pieces(s: &[u8], c: u8) -> impl Iterator<Item = &[u8]> {
+    let mut rest = Some(s);
+    std::iter::from_fn(move || {
+        let r = rest?;
+        match crate::ffi::find(c, r) {
+            Some(k) => { rest = Some(&r[k + 1..]); Some(&r[..k]) }
+            None => { rest = None; Some(r) }
+        }
+    })
+}
+
 fn fld_names1(names: &[u8], n: u64, sep: u8) -> Option<Vec<u8>> {
     if n == 0 { return None; }
-    let first: Vec<&[u8]> = names.split(|&c| c == b'\n').next()?.split(|&c| c == sep).collect();
+    let first: Vec<&[u8]> = pieces(pieces(names, b'\n').next()?, sep).collect();
     let nf = first.len();
     if nf == 0 || nf > FLDMAX { return None; }
     // one chunk a thread, cut at line ends: each decides its fields, then
@@ -1491,10 +1504,10 @@ fn fld_names1(names: &[u8], n: u64, sep: u8) -> Option<Vec<u8>> {
         let (mut same, mut isnum) = (vec![true; nf], vec![true; nf]);
         let mut ishex: Vec<bool> = first.iter().map(|f| !f.is_empty() && f.len() % 2 == 0 && f.len() <= 64).collect();
         let mut seen = 0u64;
-        for line in names[a..b].split(|&c| c == b'\n') {
+        for line in pieces(&names[a..b], b'\n') {
             if line.is_empty() && seen > 0 { continue; }
             let mut k = 0usize;
-            for g in line.split(|&c| c == sep) {             // in place: no vector a name
+            for g in pieces(line, sep) {             // in place: no vector a name
                 if k == nf { return None; }
                 if same[k] && g != first[k] { same[k] = false; }
                 if isnum[k] && (g.is_empty() || g.len() > 18 || (g.len() > 1 && g[0] == b'0')
@@ -1535,11 +1548,11 @@ fn fld_names1(names: &[u8], n: u64, sep: u8) -> Option<Vec<u8>> {
         let mut prev = vec![0i64; nf];
         if a > 0 {   // the last name before this chunk seeds the deltas
             let s0 = crate::ffi::rfind(b'\n', &names[..a - 1]).map_or(0, |k| k + 1);
-            for (k, f) in names[s0..a - 1].split(|&c| c == sep).enumerate() { if isnum[k] { prev[k] = num(f); } }
+            for (k, f) in pieces(&names[s0..a - 1], sep).enumerate() { if isnum[k] { prev[k] = num(f); } }
         }
-        for line in names[a..b].split(|&c| c == b'\n') {
+        for line in pieces(&names[a..b], b'\n') {
             if line.is_empty() { continue; }
-            for (k, f) in line.split(|&c| c == sep).enumerate() {
+            for (k, f) in pieces(line, sep).enumerate() {
                 if !same[k] && isnum[k] {
                     let x = num(f); let d = x - prev[k]; prev[k] = x;
                     kst::put(&mut w, ((d << 1) ^ (d >> 63)) as u64);

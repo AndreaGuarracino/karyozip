@@ -410,12 +410,23 @@ fn dig_tab(l: &[u8], mut p: usize) -> Option<(usize, u64)> {
 }
 
 #[inline(never)]
-fn parse_chunk(s: &[u8], from: usize, to: usize, out: &mut Vec<Row>) -> Result<(), &'static str> {
+fn parse_chunk(s: &[u8], from: usize, to: usize, buf: &mut Vec<Row>) -> Result<(), &'static str> {
+    // Moved out while it fills: the per-thread vectors sit side by side,
+    // and a push to one header stalled the other threads on its cache line
+    let mut out = std::mem::take(buf);
+    let r = fill_rows(s, from, to, &mut out);
+    *buf = out;
+    r
+}
+
+fn fill_rows(s: &[u8], from: usize, to: usize, out: &mut Vec<Row>) -> Result<(), &'static str> {
     // a row is at least 8 bytes: sized once and reused, so no doubling copy
     // and no fresh pages each slab, as the C's per-thread arrays
     out.clear();
     out.reserve((to - from) / 8 + 1);
-    let mut p = from;
+    // the name before, in registers: reading it back from the row just
+    // pushed stalled each row on a store-to-load forward
+    let (mut p, mut prev) = (from, 0..0);
     while p < to {
         // the newline and a NUL in one pass; a chunk ends in a newline
         let nl = p + ffi::line_end(&s[p..to]);
@@ -434,7 +445,8 @@ fn parse_chunk(s: &[u8], from: usize, to: usize, out: &mut Vec<Row>) -> Result<(
         if en < st { return Err("end is before start"); }
         if en == st { return Err("end equals start: a run must cover at least one base"); }
         if t1 == 0 { return Err("empty sequence name"); }
-        let same = out.last().is_some_and(|q| s[q.nm.0 as usize..q.nm.1 as usize] == line[..t1]);
+        let same = !prev.is_empty() && s[prev.clone()] == line[..t1];
+        prev = p..p + t1;
         out.push(Row { nm: (p as u32, (p + t1) as u32),
                        lab: ((p + t3 + 1) as u32, nl as u32), st, en, same });
         p = nl + 1;

@@ -2354,115 +2354,127 @@ static void sortpush(const char *nm, size_t nlen, uint64_t st, uint64_t len,
     rrunn++; rrec[rrecn - 1].nrun++;
 }
 
+typedef struct { const char *nm; uint32_t nlen, llen; const char *lab;
+                 uint64_t st, len; int same; } prow;   /* same: name equals the row before */
+/* One slab of whole lines, split into rows by T threads. The fault
+   is kept, not raised: the slab before must append first. */
+typedef struct {
+    FILE *in; char *b; size_t have, span; int eof, T;
+    prow *pr[32]; size_t prn[32], prc[32];
+    const char *err;
+} pslab;
+static void *slabfill(void *a) {
+    pslab *S = a;
+    const size_t SLAB = 1 << 24;
+    S->span = 0;
+    while (!S->eof && S->have < SLAB) {
+        size_t got = fread(S->b + S->have, 1, SLAB - S->have, S->in);
+        S->have += got;
+        if (got == 0) { if (ferror(S->in)) { S->err = "read error on stdin"; return NULL; } S->eof = 1; }
+    }
+    char *last = S->have ? memrchr(S->b, '\n', S->have) : NULL;
+    if (!last) {
+        if (S->eof && S->have) S->err = "input does not end with a newline";
+        else if (!S->eof) S->err = "a BED line is longer than the read buffer";
+        return NULL;
+    }
+    size_t span2 = (size_t)(last + 1 - S->b), cb[33];
+    int T = S->T;
+    cb[0] = 0;
+    for (int t = 1; t < T; t++) {
+        size_t g = span2 * (size_t)t / (size_t)T;
+        while (g < span2 && S->b[g] != '\n') g++;
+        cb[t] = g < span2 ? g + 1 : span2;
+    }
+    cb[T] = span2;
+    for (int t = 1; t <= T; t++) if (cb[t] < cb[t - 1]) cb[t] = cb[t - 1];
+    const char *perr[33] = {0};   /* a worker records, the first one wins */
+    char *slab = S->b; prow **pr = S->pr; size_t *prc = S->prc;
+    double _tpar = nowsec();
+#pragma omp parallel for schedule(static) num_threads(T)
+    for (int t = 0; t < T; t++) {
+        size_t n = 0;
+        const char *e = NULL;
+        char *p = slab + cb[t], *e2 = slab + cb[t + 1], *nlp;
+        /* a chunk ends in a newline, so strchrnul stays inside */
+        while (p < e2) {
+            nlp = strchrnul(p, '\n');
+            if (!*nlp) { e = "a NUL byte inside a row"; break; }
+            *nlp = 0;
+            ssize_t len = (ssize_t)(nlp - p);
+            char *line = p;
+            p = nlp + 1;
+            char *t1 = memchr(line, '\t', (size_t)len), *t2, *t3;
+            uint64_t st = 0, en = 0;
+            if (!t1 || !(t2 = digtab(t1 + 1, nlp, &st)) || !(t3 = digtab(t2 + 1, nlp, &en))) {
+                /* the slow path names the fault */
+                if (!t1) { e = "bad line"; break; }
+                t2 = memchr(t1 + 1, '\t', (size_t)(len - (t1 + 1 - line))); if (!t2) { e = "bad line"; break; }
+                t3 = memchr(t2 + 1, '\t', (size_t)(len - (t2 + 1 - line))); if (!t3) { e = "bad line"; break; }
+                if (t1 + 1 == t2 || t2 + 1 == t3) { e = "empty start or end column"; break; }
+                st = bedcoord_e(t1 + 1, t2, "start is not a number", &e); if (e) break;
+                en = bedcoord_e(t2 + 1, t3, "end is not a number", &e); if (e) break;
+            }
+            if (en < st) { e = "end is before start"; break; }
+
+            if (en == st) { e = "end equals start: a run must cover at least one base"; break; }
+            if (t1 == line) { e = "empty sequence name"; break; }
+            if (n == prc[t]) {
+                prc[t] = prc[t] ? prc[t] * 2 : 1 << 16;
+                pr[t] = realloc(pr[t], prc[t] * sizeof **pr);
+                if (!pr[t]) { e = "oom"; break; }
+            }
+            pr[t][n].same = n && pr[t][n - 1].nlen == (uint32_t)(t1 - line)
+                            && !memcmp(pr[t][n - 1].nm, line, (size_t)(t1 - line));
+            pr[t][n].nm = line; pr[t][n].nlen = (uint32_t)(t1 - line);
+            pr[t][n].lab = t3 + 1; pr[t][n].llen = (uint32_t)(len - (t3 + 1 - line));
+            pr[t][n].st = st; pr[t][n].len = en - st;
+            n++;
+        }
+        S->prn[t] = n; perr[t] = e;
+    }
+    PH_ADD(5, _tpar);                       /* threaded: split the lines */
+    for (int t = 0; t < T; t++) if (perr[t]) { S->err = perr[t]; break; }
+    S->span = span2;
+    return NULL;
+}
+
 static void encode(void) {
     ktw *w = ktw_open(stdout);
-
-    typedef struct { const char *nm; uint32_t nlen, llen; const char *lab;
-                     uint64_t st, len; int same; } prow;   /* same: name equals the row before */
     const size_t SLAB = 1 << 24;
-    char *slab = xmalloc(SLAB + 1);
     int T = nthreads();
     if (T > 32) T = 32;
-    prow **pr = xcalloc((size_t)T, sizeof *pr);
-    size_t *prn = xcalloc((size_t)T, sizeof *prn), *prc = xcalloc((size_t)T, sizeof *prc);
-    size_t have = 0; int eof = 0;
     FILE *IN = zfopen(NULL);            /* plain or .gz, decided by the bytes */
     if (!IN) die("read error on stdin");
+    /* Two slabs: one thread reads and splits the next while this one
+       appends the rows of the last, which must stay serial. */
+    pslab sb[2];
+    memset(sb, 0, sizeof sb);
+    for (int k = 0; k < 2; k++) { sb[k].in = IN; sb[k].T = T; sb[k].b = xmalloc(SLAB + 1); }
     double _tp = nowsec();
-    while (!eof || have) {
-        if (!eof) {
-            size_t got = fread(slab + have, 1, SLAB - have, IN);
-            have += got;
-            if (got == 0) { if (ferror(IN)) die("read error on stdin"); eof = 1; }
-        }
-        char *end = slab + have;
-        char *last = have ? memrchr(slab, '\n', have) : NULL;
-        if (!last) {
-            if (eof && have) die("input does not end with a newline");
-            if (!eof && have == SLAB) die("a BED line is longer than the read buffer");
-
-            if (!eof) continue;
-            break;
-        }
-        end = last + 1;                       /* parse whole lines only */
-        size_t span2 = (size_t)(end - slab);
-
-        size_t cb[33];
-        cb[0] = 0;
-        for (int t = 1; t < T; t++) {
-            size_t g = span2 * (size_t)t / (size_t)T;
-            while (g < span2 && slab[g] != '\n') g++;
-            cb[t] = g < span2 ? g + 1 : span2;
-        }
-        cb[T] = span2;
-        for (int t = 1; t <= T; t++) if (cb[t] < cb[t - 1]) cb[t] = cb[t - 1];
-        const char *perr[33] = {0};   /* a worker records, main dies after the region */
-        double _tpar = nowsec();
-#pragma omp parallel for schedule(static) num_threads(T)
-        for (int t = 0; t < T; t++) {
-            size_t n = 0;
-            const char *e = NULL;
-            char *p = slab + cb[t], *e2 = slab + cb[t + 1], *nlp;
-            /* a chunk ends in a newline, so strchrnul stays inside */
-            while (p < e2) {
-                nlp = strchrnul(p, '\n');
-                if (!*nlp) { e = "a NUL byte inside a row"; break; }
-                *nlp = 0;
-                ssize_t len = (ssize_t)(nlp - p);
-                char *line = p;
-                p = nlp + 1;
-                char *t1 = memchr(line, '\t', (size_t)len), *t2, *t3;
-                uint64_t st = 0, en = 0;
-                if (!t1 || !(t2 = digtab(t1 + 1, nlp, &st)) || !(t3 = digtab(t2 + 1, nlp, &en))) {
-                    /* the slow path names the fault */
-                    if (!t1) { e = "bad line"; break; }
-                    t2 = memchr(t1 + 1, '\t', (size_t)(len - (t1 + 1 - line))); if (!t2) { e = "bad line"; break; }
-                    t3 = memchr(t2 + 1, '\t', (size_t)(len - (t2 + 1 - line))); if (!t3) { e = "bad line"; break; }
-                    if (t1 + 1 == t2 || t2 + 1 == t3) { e = "empty start or end column"; break; }
-                    st = bedcoord_e(t1 + 1, t2, "start is not a number", &e); if (e) break;
-                    en = bedcoord_e(t2 + 1, t3, "end is not a number", &e); if (e) break;
-                }
-                if (en < st) { e = "end is before start"; break; }
-
-                if (en == st) { e = "end equals start: a run must cover at least one base"; break; }
-                if (t1 == line) { e = "empty sequence name"; break; }
-                if (n == prc[t]) {
-                    prc[t] = prc[t] ? prc[t] * 2 : 1 << 16;
-                    pr[t] = realloc(pr[t], prc[t] * sizeof **pr);
-                    if (!pr[t]) { e = "oom"; break; }
-                }
-                pr[t][n].same = n && pr[t][n - 1].nlen == (uint32_t)(t1 - line)
-                                && !memcmp(pr[t][n - 1].nm, line, (size_t)(t1 - line));
-                pr[t][n].nm = line; pr[t][n].nlen = (uint32_t)(t1 - line);
-                pr[t][n].lab = t3 + 1; pr[t][n].llen = (uint32_t)(len - (t3 + 1 - line));
-                pr[t][n].st = st; pr[t][n].len = en - st;
-                n++;
-            }
-            prn[t] = n; perr[t] = e;
-        }
-        PH_ADD(5, _tpar);                       /* threaded: split the lines */
-        /* Pipelining this loop, so the workers parse slab N+1 while one
-           thread drains slab N, has a ceiling of parse:lines, 0.25 s against
-           parse:append's 1.004 s. Append is the larger of the pair, so it
-           stays on the critical path whatever overlaps it. 3% of encode, on
-           the loop that carries every input-side refusal. Declined. */
-        for (int t = 0; t < T; t++) if (perr[t]) die(perr[t]);
+    slabfill(&sb[0]);
+    for (int cur = 0;; cur ^= 1) {
+        pslab *A = &sb[cur], *B = &sb[cur ^ 1];
+        if (A->err) die(A->err);
+        B->have = A->have - A->span; B->eof = A->eof; B->err = NULL;
+        memcpy(B->b, A->b + A->span, B->have);
+        pthread_t th; int more = A->span && (!A->eof || B->have);
+        if (more && pthread_create(&th, NULL, slabfill, B)) die("cannot start a thread");
         double _tser = nowsec();
         for (int t = 0; t < T; t++)
-            for (size_t k = 0; k < prn[t]; k++) {
-                prow *q = &pr[t][k];
+            for (size_t k = 0; k < A->prn[t]; k++) {
+                prow *q = &A->pr[t][k];
                 const char *lab = q->lab; size_t llen = q->llen;
                 if (ALNPAF && llen == 1 && *lab == '=') die("a label \"=\" is reserved under --aln");
                 if (SORT) sortpush(q->nm, q->nlen, q->st, q->len, lab, llen);
                 else ktw_row(w, q->nm, q->nlen, q->len, lab, llen, q->st, q->same);
             }
         PH_ADD(6, _tser);                       /* serial: append the rows */
-        have -= span2;
-        if (have) memmove(slab, slab + span2, have);
-        if (!eof && have == SLAB) die("a BED line is longer than the read buffer");
+        if (!more) break;
+        pthread_join(th, NULL);
     }
-    for (int t = 0; t < T; t++) free(pr[t]);
-    free(pr); free(prn); free(prc); free(slab); fclose(IN);
+    for (int k = 0; k < 2; k++) { for (int t = 0; t < T; t++) free(sb[k].pr[t]); free(sb[k].b); }
+    fclose(IN);
     sortfinish(w);
     PH_ADD(0, _tp);
     ktw_tail(w);

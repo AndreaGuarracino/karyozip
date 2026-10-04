@@ -56,13 +56,13 @@ pub fn slurp(path: &str, what: &'static str) -> Vec<u8> {
 /// what bgzip and KaryoScope write, is inflated 8 MB of blocks at a time
 /// side by side, each block checked against its CRC32 and size; any other
 /// gzip streams, member after member. A cut file is an error in every mode.
-pub fn unzip(r: impl std::io::Read + 'static) -> Box<dyn std::io::Read> {
+pub fn unzip(r: impl std::io::Read + Send + 'static) -> Box<dyn std::io::Read + Send> {
     Box::new(Zr { r: Box::new(r), mode: 0, reof: false, raw: Vec::new(), rp: 0, out: Vec::new(), op: 0, gz: None })
 }
 
 const ZCHUNK: usize = 8 << 20;
-type Gz = flate2::read::MultiGzDecoder<std::io::Chain<std::io::Cursor<Vec<u8>>, Box<dyn std::io::Read>>>;
-struct Zr { r: Box<dyn std::io::Read>, mode: u8, reof: bool, raw: Vec<u8>, rp: usize, out: Vec<u8>, op: usize, gz: Option<Gz> }
+type Gz = flate2::read::MultiGzDecoder<std::io::Chain<std::io::Cursor<Vec<u8>>, Box<dyn std::io::Read + Send>>>;
+struct Zr { r: Box<dyn std::io::Read + Send>, mode: u8, reof: bool, raw: Vec<u8>, rp: usize, out: Vec<u8>, op: usize, gz: Option<Gz> }
 
 /// One BGZF block's size, 0 if it is not one.
 fn bgzf_size(p: &[u8]) -> usize {
@@ -166,13 +166,13 @@ impl std::io::Read for Zr {
 
 /// A text input one line at a time, plain or gzipped, without holding the
 /// file: a reference track is a gigabyte of text for 24 million runs.
-pub struct Lines { r: std::io::BufReader<Box<dyn std::io::Read>>, buf: Vec<u8>, pub nl: bool, pub err: &'static str }
+pub struct Lines { r: std::io::BufReader<Box<dyn std::io::Read + Send>>, buf: Vec<u8>, pub nl: bool, pub err: &'static str }
 impl Lines {
     pub fn open(path: &str, what: &'static str) -> Lines {
         let f = std::fs::File::open(path).unwrap_or_else(|_| bail(what));
         Lines::new(f)
     }
-    pub fn new(r: impl std::io::Read + 'static) -> Lines {
+    pub fn new(r: impl std::io::Read + Send + 'static) -> Lines {
         Lines { r: std::io::BufReader::with_capacity(1 << 20, unzip(r)), buf: Vec::new(), nl: true, err: "read error" }
     }
     /// The next line without its newline, or None at the end; `nl` says

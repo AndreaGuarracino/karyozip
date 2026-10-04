@@ -290,50 +290,37 @@ fn encode(opt: writer::Options, tmpdir: &std::path::Path, a: Option<aln::Aln>) {
     let aln_on = a.is_some();
     if let Some(x) = a { w.set_aln(x); }
     // A slab at a time, like the C. Reading the whole input first would cost
-    // the input's size in memory, 2.3 GB on the benchmark track.
-    const SLAB: usize = 1 << 24;
-    let mut slab = vec![0u8; SLAB];
-    let mut have = 0usize;
+    // the input's size in memory, 2.3 GB on the benchmark track. Two slabs:
+    // one thread reads and splits the next while this one appends the rows
+    // of the last, which must stay serial.
     let nthr = rayon::current_num_threads().min(32);
     let mut stdin = karyozip::unzip(std::io::stdin());   // plain or .gz
-    let mut eof = false;
-    let mut rows: Vec<Vec<Row>> = (0..nthr).map(|_| Vec::new()).collect();   // kept across slabs, as the C's pr
+    let new = || Slab { b: vec![0u8; SLAB], have: 0, span: 0, eof: false, rows: (0..nthr).map(|_| Vec::new()).collect(), err: None };
+    let (mut a, mut b) = (new(), new());
     let _p = prof::span(0);
+    a.fill(&mut stdin);
     loop {
-        while !eof && have < SLAB {
-            match stdin.read(&mut slab[have..]) {
-                Ok(0) => eof = true,
-                Ok(n) => have += n,
-                Err(_) => die("read error on stdin"),   // the C's words, a cut .gz included
+        if let Some(e) = a.err { die(e); }
+        b.have = a.have - a.span; b.eof = a.eof; b.err = None;
+        b.b[..b.have].copy_from_slice(&a.b[a.span..a.have]);
+        let more = a.span > 0 && (!a.eof || b.have > 0);
+        std::thread::scope(|sc| {
+            let h = more.then(|| sc.spawn(|| b.fill(&mut stdin)));
+            let _s = prof::span(6);
+            for r in a.rows.iter().flatten() {
+                w.push(&a.b[r.nm.0 as usize..r.nm.1 as usize], r.en - r.st,
+                      &a.b[r.lab.0 as usize..r.lab.1 as usize], r.st)
+                    .unwrap_or_else(|m| die(&m));
             }
-        }
-        let end = match slab[..have].iter().rposition(|&c| c == b'\n') {
-            Some(i) => i + 1,
-            None => {
-                if eof && have > 0 { die("input does not end with a newline"); }
-                if !eof && have == SLAB { die("a BED line is longer than the read buffer"); }
-                break;
-            }
-        };
-        // Split the lines on threads, append in order. The append is
-        // serial because the streams come out in row order.
-        let _s = prof::span(5);
-        parse_slab(&slab[..end], &mut rows);
-        drop(_s);
-        let _s = prof::span(6);
-        for r in rows.iter().flatten() {
-            w.push(&slab[r.nm.0 as usize..r.nm.1 as usize], r.en - r.st,
-                  &slab[r.lab.0 as usize..r.lab.1 as usize], r.st)
-                .unwrap_or_else(|m| die(&m));
-        }
-        drop(_s);
-        slab.copy_within(end..have, 0);
-        have -= end;
-        if eof && have == 0 { break; }
+            drop(_s);
+            if let Some(h) = h { h.join().unwrap_or_else(|_| die("the reader thread failed")); }
+        });
+        if !more { break; }
+        std::mem::swap(&mut a, &mut b);
     }
 
     drop(_p);
-    drop(slab); drop(stdin);   // the input buffers go before the close, as the C's
+    drop((a, b, stdin));   // the input buffers go before the close, as the C's
     finish(w, aln_on);
 }
 
@@ -353,10 +340,35 @@ fn report(st: &writer::Stats) {
 /// 32 bytes instead of 48.
 struct Row { nm: (u32, u32), lab: (u32, u32), st: u64, en: u64 }
 
+const SLAB: usize = 1 << 24;
+/// One slab of whole lines and its rows. The fault is kept, not raised:
+/// the slab before must append first.
+struct Slab { b: Vec<u8>, have: usize, span: usize, eof: bool, rows: Vec<Vec<Row>>, err: Option<&'static str> }
+impl Slab {
+    fn fill(&mut self, r: &mut impl Read) {
+        self.span = 0;
+        while !self.eof && self.have < SLAB {
+            match r.read(&mut self.b[self.have..]) {
+                Ok(0) => self.eof = true,
+                Ok(n) => self.have += n,
+                Err(_) => { self.err = Some("read error on stdin"); return; }   // the C's words, a cut .gz included
+            }
+        }
+        let Some(end) = ffi::rfind(b'\n', &self.b[..self.have]).map(|i| i + 1) else {
+            if self.eof && self.have > 0 { self.err = Some("input does not end with a newline"); }
+            else if !self.eof { self.err = Some("a BED line is longer than the read buffer"); }
+            return;
+        };
+        let _s = prof::span(5);
+        self.err = parse_slab(&self.b[..end], &mut self.rows).err();
+        self.span = end;
+    }
+}
+
 /// Splits `s` at line boundaries into one chunk per buffer, parses each on
 /// its own thread into its buffer, in order. A worker records the first
-/// thing it refuses; main reports the earliest chunk's.
-fn parse_slab(s: &[u8], bufs: &mut [Vec<Row>]) {
+/// thing it refuses; the earliest chunk's is returned.
+fn parse_slab(s: &[u8], bufs: &mut [Vec<Row>]) -> Result<(), &'static str> {
     use rayon::prelude::*;
     let t = bufs.len();
     let mut cut = vec![0usize];
@@ -370,7 +382,7 @@ fn parse_slab(s: &[u8], bufs: &mut [Vec<Row>]) {
     let errs: Vec<Result<(), &'static str>> = bufs.par_iter_mut().enumerate()
         .map(|(k, out)| parse_chunk(s, cut[k], cut[k + 1], out))
         .collect();
-    for e in errs { e.unwrap_or_else(|m| die(m)); }
+    errs.into_iter().collect()
 }
 
 /// Digits then a tab, from `p`: the tab's index and the value.

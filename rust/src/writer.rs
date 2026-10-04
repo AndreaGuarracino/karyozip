@@ -141,6 +141,7 @@ impl Writer {
         })
     }
 
+    #[inline(always)]
     fn intern(&mut self, label: &[u8]) -> u32 {
         if let Some(id) = self.lastid {
             if self.labtab[id as usize] == label { return id; }
@@ -168,7 +169,7 @@ impl Writer {
     }
 
     /// The lengths frame, plus the two alternate spellings --aln keeps.
-    #[inline]
+    #[inline(always)]
     fn lensput(&mut self, v: u64) {
         kst::put(&mut self.lens, v);
         if self.aln.is_some() {
@@ -423,6 +424,7 @@ impl Writer {
     /// The same row without those checks, for callers whose parser already
     /// split on tabs and newlines. This is the CLI's path, as it is the C's.
     /// `same`: the caller knows the name equals the row before's.
+    #[inline(always)]
     pub fn push(&mut self, name: &[u8], run_len: u64, label: &[u8], start: u64, same: bool)
         -> Result<(), String> {
         if self.opt.sort { return self.sortpush(name, run_len, label, start); }

@@ -3152,6 +3152,7 @@ static void ktw_close(ktw *w) {
     uint8_t *nz = NULL, *lz = NULL;
 
     int ordinal = w->ordok && nidx > 0;   /* the writer tracked this */
+    double _tn = nowsec();                /* the check counts, as the Rust's */
     if (nbg) pthread_join(nth, NULL);
     if (NAMEMODE != 1 && nidx > 1) namesunique(PERMON ? &natbuf : &names, PERMON ? NATN : nidx);
 
@@ -3185,7 +3186,6 @@ static void ktw_close(ktw *w) {
     if (ordinal) { names.n = 0; NAMES_OUT = NULL; }
 
     size_t nzl = 0; int tokused = 0, intused = 0, fldused = 0;
-    double _tn = nowsec();
     if (!ordinal) {
         if (!nbg) { nj.names = &names; nj.n = nidx; namespick(&nj); }
         nzl = nj.zl; int pick = nj.pick; uint8_t *smpz = nj.z;

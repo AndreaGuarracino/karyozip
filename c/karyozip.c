@@ -538,6 +538,7 @@ static int ILV = 0;                   /* and whether the two frames are one */
 static int GRP = 0;                   /* and whether the lengths are grouped */
 
 static int NAMEMODE = 0;              /* 0 store, 1 drop */
+static int PERMON;                    /* --sort keeps names: store a permutation */
 static const char *NAMEFILE = NULL;
 static const char *NAMESIN = NULL;
 /* One flag, two kinds of file: the blob "--names drop:F" wrote, or the
@@ -964,6 +965,13 @@ static void *zjob_run(void *p) {
     zjob *j = p; j->s1 = zc(j->b, &j->a1); j->s2 = intnames(j->b, j->n, &j->a2); return NULL;
 }
 
+/* the ranked winner on all the names; 0: zstd, by the caller */
+static size_t namesrun(int kind, buf *full, uint64_t fn, uint8_t **out) {
+    *out = NULL;
+    return kind == 1 ? intnames(full, fn, out) : kind == 2 ? tokc(full, out, TOKPICK)
+         : kind == 3 ? fldnames(full, fn, out) : 0;
+}
+
 /* smallest of zstd, integer deltas, tokeniser, field deltas, ranked on
    b; losers freed. With full, the winner then runs on full, and the best
    known runs on it early, while zstd, the slow one, still ranks. */
@@ -1001,17 +1009,20 @@ static size_t bestnames(buf *b, uint64_t n, buf *full, uint64_t fn, uint8_t **ou
         free(*out); *out = NULL;
         if (*kind == spec) { *out = fz; return fzl; }
         free(fz);
-        return *kind == 1 ? intnames(full, fn, out) : *kind == 2 ? tokc(full, out, TOKPICK)
-             : *kind == 3 ? fldnames(full, fn, out) : 0;   /* 0: zstd, by the caller */
+        return namesrun(*kind, full, fn, out);
     }
     return best;
 }
 
 /* ranked on whole names up to 4 MB -e low, DEFSAMPLE MB the default, all
    -e high; the winner run on all. 0: zstd, by the caller */
-typedef struct { buf *names; uint64_t n; uint8_t *z; size_t zl, sn; int pick; } njob;
+typedef struct { buf *names; uint64_t n; uint8_t *z; size_t zl, sn; int pick, early; } njob;
 static void *namespick(void *p) {
     njob *j = p;
+    if (j->early) {                       /* ranked during the parse, on the sample */
+        if (j->sn < j->names->n) { free(j->z); j->zl = namesrun(j->pick, j->names, j->n, &j->z); }
+        return NULL;
+    }
     buf smp = { j->names->d, 0, 0 }; uint64_t smpn = 0;   /* a view, not a copy */
     size_t ncap = SLOW ? SIZE_MAX : (size_t)(FASTMODE ? 4 : DEFSAMPLE) << 20;
     const char *q = (const char *)j->names->d, *e2 = q + j->names->n;
@@ -1129,6 +1140,7 @@ typedef struct ktw {
     buf lalt[2], rawalt[2];       /* plain; plus-strand sentinels only */
     uint64_t plen, pval; int phas, prev;
     uint64_t curnh;               /* fnv of cur, for the row hash */
+    njob ej; buf ecopy; pthread_t eth; int eon;   /* the names sample, ranked early */
 } ktw;
 
 /* the same lengths with each read's run count in front of its own */
@@ -1311,6 +1323,19 @@ static void ktw_pushread(ktw *w) {
     }
     w->nidx++;
     bput(&w->names, w->cur, w->curlen); bput(&w->names, "\n", 1);
+    /* The sample is whole names starting below the mode's cap. Once
+       complete, a copy is ranked on a thread while the rows still come,
+       when nothing at the close can change the names. */
+    size_t ncap = (size_t)(FASTMODE ? 4 : DEFSAMPLE) << 20;
+    if (!w->eon && !SLOW && !PERMON && NAMEMODE != 1 && w->names.n >= ncap) {
+        w->eon = 1;
+        const char *q = (const char *)w->names.d, *e2 = q + w->names.n; uint64_t sn = 0;
+        while (q < e2 && (size_t)(q - (const char *)w->names.d) < ncap) { q = memchr(q, '\n', (size_t)(e2 - q)) + 1; sn++; }
+        size_t m = (size_t)((const uint8_t *)q - w->names.d);
+        w->ecopy = (buf){ xmalloc(m), m, m }; memcpy(w->ecopy.d, w->names.d, m);
+        w->ej = (njob){ &w->ecopy, sn, NULL, 0, 0, 0, 0 };
+        if (pthread_create(&w->eth, NULL, namespick, &w->ej)) w->eon = 0, free(w->ecopy.d);
+    }
 }
 
 static void ktw_close(ktw *w);
@@ -2171,7 +2196,6 @@ static char *rbuf; static size_t rbufn, rbufc;      /* names, NUL separated */
 static srun *rrun; static size_t rrunn, rrunc;      /* runs of every record */
 static srec *rrec; static size_t rrecn, rrecc;
 static buf natbuf; static uint64_t NATN;            /* names, input order */
-static int PERMON;                    /* --sort keeps names: store a permutation */
 static int NATORD = 1;
 static uint8_t *PERMBLOB; static size_t PERMBLOBLEN; static int PERMBLOBTOK;
 
@@ -2980,7 +3004,11 @@ static void ktw_close(ktw *w) {
        no permutation, no ordinals, none dropped, and at most 64 MB, since
        their working memory adds to the search's. Joined before
        namesunique, which reads the buffer tok3 rewrites in place. */
-    njob nj = { &names, nidx, NULL, 0, 0, 0 };
+    njob nj = { &names, nidx, NULL, 0, 0, 0, 0 };
+    if (w->eon) {                         /* its ranking holds for these names */
+        pthread_join(w->eth, NULL); free(w->ecopy.d);
+        nj.z = w->ej.z; nj.zl = w->ej.zl; nj.sn = w->ej.sn; nj.pick = w->ej.pick; nj.early = 1;
+    }
     pthread_t nth;
     int nbg = !PERMON && !(w->ordok && nidx > 0) && NAMEMODE != 1 && names.n && names.n <= 64u << 20
               && !pthread_create(&nth, NULL, namespick, &nj);
@@ -3213,7 +3241,7 @@ static void ktw_close(ktw *w) {
 
     size_t nzl = 0; int tokused = 0, intused = 0, fldused = 0;
     if (!ordinal) {
-        if (!nbg) { nj.names = &names; nj.n = nidx; namespick(&nj); }
+        if (!nbg) { nj.names = &names; nj.n = nidx; namespick(&nj); }   /* names unchanged when early */
         nzl = nj.zl; int pick = nj.pick; uint8_t *smpz = nj.z;
         nz = smpz;
         intused = pick == 1 && nzl; tokused = pick == 2 && nzl; fldused = pick == 3 && nzl;

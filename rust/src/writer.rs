@@ -76,6 +76,8 @@ pub struct Writer {
     sortbp: u64,
     natbuf: Vec<u8>,
     perm_on: bool,
+    /// The names sample, ranked during the parse: the winner, the sample's bytes.
+    early: Option<std::thread::JoinHandle<(BestNames, usize)>>,
     /// --sort writes ranks; the PAF still wants the real name.
     alnname: Option<Vec<u8>>,
     /// --sort=MEM: the bytes held, the runs already spilled, the next rank.
@@ -126,7 +128,7 @@ impl Writer {
     pub fn new(opt: Options, tmpdir: &std::path::Path) -> std::io::Result<Self> {
         let perm_on = opt.sort && opt.names_out.is_none();
         Ok(Writer {
-            perm_on, alnname: None, held: 0, spill: Vec::new(), natn: 0,
+            perm_on, early: None, alnname: None, held: 0, spill: Vec::new(), natn: 0,
             opt, lens: Vec::new(), ids: Vec::new(), names: Vec::new(), ibx: Vec::new(),
             nidx: 0, ordok: true, labtab: Vec::new(), labmap: HashMap::default(), lastid: None, lcache: [u32::MAX; 512],
             cur: Vec::new(), currun: 0, curbp: 0, blkbp0: 0, pend: 0, nblk: 0, rows: 0,
@@ -228,6 +230,19 @@ impl Writer {
         self.nidx += 1;
         self.names.extend_from_slice(&self.cur);
         self.names.push(b'\n');
+        // The sample is whole names starting below the mode's cap. Once
+        // complete, a copy is ranked on a thread while the rows still come,
+        // when nothing at the close can change the names, as the C's.
+        let ncap = (if self.opt.slow { DEFSAMPLE } else { 4 }) << 20;
+        if self.early.is_none() && !self.opt.whole && !self.perm_on && !self.opt.drop_names && self.names.len() >= ncap {
+            let (mut q, mut sn) = (0usize, 0u64);
+            while q < ncap { q += crate::ffi::find(b'\n', &self.names[q..]).map_or(self.names.len() - q, |k| k + 1); sn += 1; }
+            let (copy, level, slow, t) = (self.names[..q].to_vec(), self.opt.level, self.opt.slow, rayon::current_num_threads());
+            self.early = Some(std::thread::spawn(move || {
+                let pool = rayon::ThreadPoolBuilder::new().num_threads(t).build().unwrap_or_else(|_| crate::bail("cannot start the names threads"));
+                (pool.install(|| best_names(&copy, sn, None, level, slow)), copy.len())
+            }));
+        }
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
@@ -478,17 +493,18 @@ impl Writer {
         self.pushread();
         self.flush().map_err(io)?;
         let level = self.opt.level;
+        let mut early = self.early.take().map(|h| h.join().unwrap_or_else(|_| crate::bail("the names thread failed")));
         // The names rank beside the searches when nothing below changes
         // them, as the C's: no permutation, no ordinals, none dropped, at
         // most 64 MB. Their own pool: in the global one they would queue
         // behind the layout search's.
         let bg = (!self.perm_on && !(self.ordok && self.nidx > 0) && !self.opt.drop_names
                   && !self.names.is_empty() && self.names.len() <= 64 << 20).then(|| {
-            let (nm, n, whole, slow) = (std::mem::take(&mut self.names), self.nidx, self.opt.whole, self.opt.slow);
+            let (nm, n, whole, slow, e) = (std::mem::take(&mut self.names), self.nidx, self.opt.whole, self.opt.slow, early.take());
             let t = rayon::current_num_threads();
             std::thread::spawn(move || {
                 let pool = rayon::ThreadPoolBuilder::new().num_threads(t).build().unwrap_or_else(|_| crate::bail("cannot start the names threads"));
-                let r = pool.install(|| names_pick(&nm, n, level, whole, slow));
+                let r = pool.install(|| names_pick(&nm, n, level, whole, slow, e));
                 (nm, r)
             })
         });
@@ -705,7 +721,8 @@ impl Writer {
         let (mut nz, mut tokused, mut intused, mut fldused) = if ordinal {
             (Vec::new(), false, false, false)
         } else {
-            let (b, q) = pre.take().unwrap_or_else(|| names_pick(&self.names, self.nidx, level, self.opt.whole, self.opt.slow));
+            // the names are unchanged when ranked early
+            let (b, q) = pre.take().unwrap_or_else(|| names_pick(&self.names, self.nidx, level, self.opt.whole, self.opt.slow, early.take()));
             let r = if !b.bytes.is_empty() { (b.bytes, b.kind == 2, b.kind == 1, b.kind == 3) }
                     else { (ffi::zstd(&self.names, level), false, false, false) };   // refused
             let k = if r.2 { "integers" } else if r.1 { "tokeniser" } else if r.3 { "fields" } else { "zstd" };
@@ -1500,7 +1517,11 @@ fn fld_names1(names: &[u8], n: u64, sep: u8) -> Option<Vec<u8>> {
 
 /// Ranked on whole names up to 4 MB -e low, DEFSAMPLE MB the default, all
 /// -e high; the winner run on all. Empty bytes: zstd, by the caller.
-fn names_pick(names: &[u8], n: u64, level: i32, whole: bool, slow: bool) -> (BestNames, usize) {
+fn names_pick(names: &[u8], n: u64, level: i32, whole: bool, slow: bool, early: Option<(BestNames, usize)>) -> (BestNames, usize) {
+    if let Some((mut b, sn)) = early {   // ranked during the parse, on the sample
+        if sn < names.len() { b.bytes = names_run(b.kind, b.chunk, names, n, level); }
+        return (b, sn);
+    }
     let (mut q, mut smpn) = (0usize, 0u64);
     let ncap = if whole { usize::MAX } else { (if slow { DEFSAMPLE } else { 4 }) << 20 };
     while q < names.len() && q < ncap {
@@ -1547,16 +1568,21 @@ pub fn best_names(names: &[u8], n: u64, full: Option<(&[u8], u64)>, level: i32, 
     // with full, the winner on all of it; empty: zstd, by the caller
     if let Some((w, wn)) = full {
         out.bytes = match spec {
-            Some((k, v)) if k == out.kind => Some(v),
-            _ => match out.kind {
-                1 => int_names(w, wn).map(|v| ffi::zstd(&v, level)),
-                2 => tok_chunked(w, out.chunk),
-                3 => fld_names(w, wn),
-                _ => None,
-            },
-        }.unwrap_or_default();
+            Some((k, v)) if k == out.kind => v,
+            _ => names_run(out.kind, out.chunk, w, wn, level),
+        };
     }
     out
+}
+
+/// The ranked winner on all the names; empty: zstd, by the caller.
+fn names_run(kind: u8, chunk: usize, w: &[u8], wn: u64, level: i32) -> Vec<u8> {
+    match kind {
+        1 => int_names(w, wn).map(|v| ffi::zstd(&v, level)),
+        2 => tok_chunked(w, chunk),
+        3 => fld_names(w, wn),
+        _ => None,
+    }.unwrap_or_default()
 }
 
 /// A repeated sequence name would make the index ambiguous, so it is refused.

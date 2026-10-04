@@ -32,6 +32,7 @@ fn main() {
         .define("VERSION", format!("{bz3:?}").as_str())
         .opt_level(3)
         .flag("-fopenmp")                        // libbz3's blocks, side by side
+        .flag("-fno-semantic-interposition")     // cc builds -fPIC: let calls inline, as the C's -fPIE
         .warnings(false)
         .compile("kzcodecs");
     println!("cargo:rustc-link-lib=gomp");

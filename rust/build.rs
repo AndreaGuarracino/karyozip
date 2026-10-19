@@ -35,6 +35,21 @@ fn main() {
         .flag("-fno-semantic-interposition")     // cc builds -fPIC: let calls inline, as the C's -fPIE
         .warnings(false)
         .compile("kzcodecs");
+    // liblzma 5.8.4 on its own: its config.h, common.h and version.h share
+    // names with htscodecs' and bzip3's. The file list is the C Makefile's.
+    let mk = std::fs::read_to_string(c.join("Makefile")).unwrap();
+    let key = "$(addprefix xz/src/liblzma/,";
+    let i = mk.find(key).expect("no liblzma list in c/Makefile") + key.len();
+    let mut xz = cc::Build::new();
+    for f in mk[i..i + mk[i..].find(')').unwrap()].split_whitespace().filter(|w| *w != "\\") {
+        xz.file(c.join("xz/src/liblzma").join(f));
+    }
+    xz.file(c.join("xz/kzlzma.c"));
+    xz.define("HAVE_CONFIG_H", None).include(c.join("xz")).include(c.join("xz/src/common"));
+    for d in ["api", "common", "check", "lz", "lzma", "rangecoder", "delta", "simple"] {
+        xz.include(c.join("xz/src/liblzma").join(d));
+    }
+    xz.opt_level(3).flag("-std=gnu11").flag("-fno-semantic-interposition").warnings(false).compile("kzxz");
     println!("cargo:rustc-link-lib=gomp");
 }
 

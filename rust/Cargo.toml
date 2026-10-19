@@ -15,19 +15,16 @@ path = "src/main.rs"
 # bindgen is a default feature and needs libclang, which a cluster node does
 # not have; the pregenerated bindings are the same API. legacy (pre-1.0
 # frames) and the dictionary builder are not used either.
-zstd-sys = { version = "=2.0.16", default-features = false }
+zstd-sys = { version = "=2.1.2", default-features = false }
 
 # The real tracks are .bed.gz, so every reader inflates on the fly. zlib-rs
 # is the Rust rewrite of zlib: no system library, and far faster at inflate
 # than the miniz_oxide default.
 flate2   = { version = "1.1.10", default-features = false, features = ["zlib-rs"] }
 rayon    = "1.12.0"
-# The LZMA candidate. It links the system liblzma, the one c/ links, so the
-# two write the same bytes; the settings are pinned in ffi::lzma_filt.
-lzma-sys = "0.1.20"
 
 [build-dependencies]
-cc = "1.4.5"
+cc = "1.9.0"
 
 [profile.release]
 opt-level = 3

@@ -1,35 +1,18 @@
-kspalaiologos/bzip3, release 1.5.3, plus two fixes.
+kspalaiologos/bzip3, release 1.5.4, plus one local change.
 Upstream: https://github.com/kspalaiologos/bzip3
 
-libbz3.h, common.h and libsais.h are byte-identical to 1.5.3.
-libbz3.c is 1.5.3 with two changes, both inside bz3_compress and
-bz3_decompress, the only bzip3 entry points karyozip calls. Applying
-these two to a fresh 1.5.3 reproduces this file byte for byte; that was
-checked, not assumed.
+libbz3.h, common.h and libsais.h are byte-identical to 1.5.4.
+libbz3.c is 1.5.4 with one change, inside bz3_compress and
+bz3_decompress, the only bzip3 entry points karyozip calls: the
+independent blocks are encoded and decoded side by side under OpenMP,
+each with its own state, and written in order, so the bytes are the
+same. Diffed against 1.5.4 on 2026-10-19: no other line differs.
 
-1. bz3_compress, the size of the last block
-     ours:     size = (i == n_blocks - 1 ? in_size - in_offset : block_size)
-     upstream: size = block_size; if (i == n_blocks - 1) size = in_size % block_size;
-   The upstream form yields 0 whenever in_size is an exact multiple of
-   block_size. karyozip drives bzip3 at 8 to 256 MB block sizes, so an
-   aligned payload is reachable. Reproduced with lastblock_check.c:
-   133120 bytes at the 65 KiB minimum block size gives, on stock 1.5.3,
-   out=1133 and 66560 bytes back, with rc=0 from both calls. Half the
-   input, silently. With this fix all 133120 come back and match.
-
-2. bz3_decompress, the per-block size check
-     ours:     if (size < 0 || size > (s32)bz3_bound(block_size)) ...
-     upstream: if (size < 0 || size > block_size) ...
-   A block that compresses larger than its raw size is legal and fits
-   bz3_bound; the upstream bound rejects it, so the decoder can refuse a
-   block the encoder just wrote.
-
-A third fix this tree used to carry, block_size = bz3_bound(in_size)
-rather than in_size + 16, upstream adopted in 1.5.3.
-
-Checked 2026-09-04 against 1.5.3, the current release. Re-check on the
-next one with lastblock_check.c; if upstream takes these two, resync and
-delete this note. Neither is reported upstream yet.
+1.5.4 took the two fixes this tree carried against 1.5.3, with the same
+lines: the last block's size in bz3_compress (#175; 1.5.3 lost half the
+data on an input that is an exact multiple of the block size) and the
+bz3_bound check in bz3_decompress (#174). lastblock_check.c still
+reproduces the first; on this tree it must print all bytes back:
 
   gcc -O2 -DVERSION='"x"' -Ibzip3 -o lbc bzip3/lastblock_check.c \
       bzip3/libbz3.c -lpthread && ./lbc

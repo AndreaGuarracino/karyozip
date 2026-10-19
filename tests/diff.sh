@@ -9,8 +9,8 @@ C=$(realpath "$C"); R=$(realpath "$R")
 W=$(mktemp -d); trap 'rm -rf "$W"' EXIT
 fail=0
 
-cv=$("$C" --version | awk '/zstd|libbz3/{print $1"="$2}' | tr '\n' ' ')
-rv=$("$R" --version | awk '/zstd|libbz3/{print $1"="$2}' | tr '\n' ' ')
+cv=$("$C" --version | awk '/zstd|libbz3|liblzma/{print $1"="$2}' | tr '\n' ' ')
+rv=$("$R" --version | awk '/zstd|libbz3|liblzma/{print $1"="$2}' | tr '\n' ' ')
 if [ "$cv" = "$rv" ]; then echo "codec versions: $cv"
 else echo "codec versions DIFFER: c=[$cv] rust=[$rv]"; fail=1; fi
 

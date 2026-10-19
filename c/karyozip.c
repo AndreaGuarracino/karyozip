@@ -10,7 +10,7 @@
 #include "libdeflate/libdeflate.h"
 #include <time.h>
 #include <zstd.h>
-#include <lzma.h>
+#include "xz/kzlzma.h"
 #include "karyozip.h"
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -514,7 +514,7 @@ static char *unz(const void *src, size_t n, size_t *len, const char *what) {
 
 #define CODEC_ARITH 0x10000
 #define CODEC_BZIP3 0x20000           /* 0x20000|MB: bzip3, block size in MB */
-#define CODEC_LZMA  0x40000           /* LZMA2, the settings lzmafilt pins */
+#define CODEC_LZMA  0x40000           /* LZMA2, the settings xz/kzlzma.c pins */
 #define DROPPED (1ULL << 60)          /* names deliberately not stored */
 #define ALNFLAG (1ULL << 59)          /* rows deltaed against a reference */
 #define DBFLAG  (1ULL << 58)          /* labels are featureIDs, not labels */
@@ -1047,25 +1047,12 @@ static void *namespick(void *p) {
 
 static int nosz(int c) { unsigned u = (unsigned)c; return u && !(u & CODEC_BZIP3) && (u & 0x10); }
 
-/* every field pinned: a preset that moved between liblzma releases would
-   change the bytes, and the C and the Rust must write the same ones */
-static void lzmafilt(lzma_filter *f, lzma_options_lzma *o) {
-    memset(o, 0, sizeof *o);
-    o->dict_size = 64u << 20; o->lc = 3; o->lp = 0; o->pb = 0;
-    o->mode = LZMA_MODE_NORMAL; o->nice_len = 273;
-    o->mf = LZMA_MF_BT4; o->depth = 0;
-    f[0].id = LZMA_FILTER_LZMA2; f[0].options = o;
-    f[1].id = LZMA_VLI_UNKNOWN;  f[1].options = NULL;
-}
-
 static size_t paycomp(const uint8_t *src, size_t n, int codec, uint8_t **out) {
     unsigned int ol;
     if (codec & CODEC_LZMA) {
-        lzma_filter f[2]; lzma_options_lzma o; lzmafilt(f, &o);
-        size_t ob = n + n / 16 + 4096, op = 0;
+        size_t ob = n + n / 16 + 4096, op;
         *out = malloc(ob);
-        if (!*out || lzma_raw_buffer_encode(f, NULL, src, n, *out, &op, ob) != LZMA_OK) {
-            free(*out); *out = NULL; return 0; }
+        if (!*out || !(op = kz_lzma_encode(src, n, *out, ob))) { free(*out); *out = NULL; return 0; }
         return op;
     }
     /* htscodecs is 32-bit throughout; bzip3 is not */
@@ -1098,11 +1085,7 @@ static size_t paycomp(const uint8_t *src, size_t n, int codec, uint8_t **out) {
 
 static size_t paydecomp(const uint8_t *src, size_t n, int codec, uint8_t *dst, size_t raw) {
     if (codec & CODEC_LZMA) {
-        lzma_filter f[2]; lzma_options_lzma o; lzmafilt(f, &o);
-        size_t ip = 0, op = 0;
-        if (lzma_raw_buffer_decode(f, NULL, src, &ip, n, dst, &op, raw) != LZMA_OK
-            || op != raw) return 0;
-        return op;
+        return kz_lzma_decode(src, n, dst, raw) ? raw : 0;
     }
     if (codec & CODEC_BZIP3) {
         size_t got = raw;
@@ -5505,7 +5488,7 @@ int main(int argc, char **argv) {
             "  karyozip aln-pack -a P.paf --ref REF.bed|REF.kst -o OUT   only what -a reads\n"
             "  encode reads stdin without -i; every command but index writes stdout without -o\n"
             "  any command: -t N, --threads N  --profile  --tmp-dir DIR  -h, --help\n"
-            "               --version prints the zstd, libbz3 and htscodecs versions\n"
+            "               --version prints the codec versions\n"
             "  encode:      -e, --effort: low is a quick encode with blocks and an index for fast\n"
             "               queries, medium the default, high the smallest file\n"
             "               -b N|all sets the blocks by hand\n"
@@ -5532,6 +5515,7 @@ int main(int argc, char **argv) {
             printf("  libbz3     %s\n", bz3_version());
             printf("  htscodecs  %s\n", HTSCODECS_VERSION_TEXT);
             printf("  libdeflate %s\n", LIBDEFLATE_VERSION_STRING);
+            printf("  liblzma    %s\n", kz_lzma_version());
             return 0;
         }
     }

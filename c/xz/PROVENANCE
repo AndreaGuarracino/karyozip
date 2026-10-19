@@ -1,0 +1,11 @@
+tukaani-project/xz, release v5.8.4 (2026-09-09), liblzma only.
+Upstream: https://github.com/tukaani-project/xz
+Tarball xz-5.8.4.tar.gz, sha256 0014c7886930454fe8bd4228665b51af55eeae560ea135c9c4cd33f55b2591d9,
+signature checked against Lasse Collin's key 3690C240CE51B4670D30AD1C38EE757D69184620.
+
+Only the files lzma_raw_buffer_encode and lzma_raw_buffer_decode reach
+with the LZMA2 encoder and decoder and the BT4 match finder, and the
+headers they include, are kept, at their upstream paths and unchanged.
+config.h is written by hand for that subset, in place of configure's.
+kzlzma.c is ours: the LZMA2 settings, pinned, for the C and the Rust.
+liblzma is 0BSD (COPYING.0BSD).

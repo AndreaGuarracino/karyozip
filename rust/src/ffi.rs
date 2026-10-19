@@ -38,6 +38,10 @@ unsafe extern "C" {
                     in_size: usize, out_size: *mut usize) -> c_int;
     fn bz3_decompress(inp: *const c_uchar, out: *mut c_uchar,
                       in_size: usize, out_size: *mut usize) -> c_int;
+    // c/xz/kzlzma.c: LZMA2 with every setting pinned there, for both binaries
+    fn kz_lzma_encode(src: *const c_uchar, n: usize, out: *mut c_uchar, ob: usize) -> usize;
+    fn kz_lzma_decode(src: *const c_uchar, n: usize, dst: *mut c_uchar, raw: usize) -> c_int;
+    fn kz_lzma_version() -> *const c_char;
     fn bz3_version() -> *const c_char;
     fn free(p: *mut c_void);
 }
@@ -134,6 +138,11 @@ pub fn zstd_decompress(src: &[u8], raw: usize) -> Option<Vec<u8>> {
     }
 }
 
+pub fn lzma_version() -> String {
+    // SAFETY: a static string from the vendored liblzma.
+    unsafe { std::ffi::CStr::from_ptr(kz_lzma_version()).to_string_lossy().into_owned() }
+}
+
 pub fn zstd_version() -> String {
     // SAFETY: a static string from the linked libzstd.
     unsafe { std::ffi::CStr::from_ptr(zstd_sys::ZSTD_versionString()).to_string_lossy().into_owned() }
@@ -142,31 +151,15 @@ pub fn zstd_version() -> String {
 /// One payload codec, chosen by `codec`, exactly as the C `paycomp` does.
 /// Returns None when the codec refuses, which the caller treats as "did not
 /// win" rather than as an error.
-/// every field pinned: a preset that moved between liblzma releases would
-/// change the bytes, and the C and the Rust must write the same ones
-fn lzma_filt(o: &mut lzma_sys::lzma_options_lzma) -> [lzma_sys::lzma_filter; 2] {
-    o.dict_size = 64 << 20; o.lc = 3; o.lp = 0; o.pb = 0;
-    o.mode = lzma_sys::LZMA_MODE_NORMAL; o.nice_len = 273;
-    o.mf = lzma_sys::LZMA_MF_BT4; o.depth = 0;
-    [lzma_sys::lzma_filter { id: lzma_sys::LZMA_FILTER_LZMA2,
-                             options: o as *mut _ as *mut std::ffi::c_void },
-     lzma_sys::lzma_filter { id: lzma_sys::LZMA_VLI_UNKNOWN, options: std::ptr::null_mut() }]
-}
-
 pub fn paycomp(src: &[u8], codec: i32) -> Option<Vec<u8>> {
     let n = src.len();
     if codec & CODEC_LZMA != 0 {
-        let mut o: lzma_sys::lzma_options_lzma = unsafe { std::mem::zeroed() };
-        let f = lzma_filt(&mut o);
         let ob = n + n / 16 + 4096;
-        // SAFETY: out is ob bytes and op is where the encoder stopped.
+        // SAFETY: out is ob bytes and the encoder reports how many it wrote.
         unsafe {
             let mut out = raw_buf(ob);
-            let mut op = 0usize;
-            if lzma_sys::lzma_raw_buffer_encode(f.as_ptr(), std::ptr::null(),
-                    src.as_ptr(), n, out.as_mut_ptr(), &mut op, ob) != lzma_sys::LZMA_OK {
-                return None;
-            }
+            let op = kz_lzma_encode(src.as_ptr(), n, out.as_mut_ptr(), ob);
+            if op == 0 { return None; }
             out.set_len(op);
             return Some(out);
         }
@@ -215,15 +208,10 @@ pub fn paycomp(src: &[u8], codec: i32) -> Option<Vec<u8>> {
 pub fn paydecomp(src: &[u8], codec: i32, raw: usize) -> Option<Vec<u8>> {
     crate::ckalloc(raw);
     if codec & CODEC_LZMA != 0 {
-        let mut o: lzma_sys::lzma_options_lzma = unsafe { std::mem::zeroed() };
-        let f = lzma_filt(&mut o);
-        // SAFETY: out is the claimed length and op is checked against it.
+        // SAFETY: out is the claimed length; the decoder checks it came back whole.
         unsafe {
             let mut out = raw_buf(raw);
-            let (mut ip, mut op) = (0usize, 0usize);
-            if lzma_sys::lzma_raw_buffer_decode(f.as_ptr(), std::ptr::null(),
-                    src.as_ptr(), &mut ip, src.len(), out.as_mut_ptr(), &mut op, raw)
-                    != lzma_sys::LZMA_OK || op != raw { return None; }
+            if kz_lzma_decode(src.as_ptr(), src.len(), out.as_mut_ptr(), raw) == 0 { return None; }
             out.set_len(raw);
             return Some(out);
         }

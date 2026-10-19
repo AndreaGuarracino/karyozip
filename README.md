@@ -9,7 +9,7 @@ make            # builds c/build/karyozip
 make rust       # builds rust/target/release/karyozip
 ```
 
-The C needs zstd, liblzma, zlib and an OpenMP compiler; the Rust needs cargo, liblzma and libgomp.
+The C needs zstd, zlib and an OpenMP compiler; the Rust needs cargo and libgomp. liblzma is vendored in `c/xz`.
 
 ## Quick start
 
@@ -106,7 +106,7 @@ Flags work on either side of the command name.
 
 **Two implementations.** `c/` and `rust/` write the same bytes, print the same `--help` and refuse the same inputs with the same words; `rust/build.rs` takes the usage text from `c/karyozip.c`.
 `make test` (111 s) runs the shared suite in `tests/`, sanitizers and fuzzing on both and compares them encode by encode.
-The C finds zstd, liblzma, zlib and libgomp at the path in its rpath; the Rust bundles zstd.
+The C finds zstd, zlib and libgomp at the path in its rpath; the Rust bundles zstd. Both compile the same liblzma from `c/xz`.
 
 **How encode chooses.** The three efforts are one rule with two settings: `low` tries 8 of the 51 codecs plus zstd at 17 on 4 MB, `medium` all 51 plus zstd at 17 and 22 on 16 MB, `high` the same on the whole file.
 The smallest wins, with no margin, and must read back what it was ranked on.
@@ -128,5 +128,5 @@ kt_row(w, name, nlen, run_len, label, llen, start);   /* once per run */
 kt_close(w);
 ```
 
-**Vendored code.** htscodecs and bzip3 under `c/` are pinned; `c/htscodecs/PROVENANCE` and `c/bzip3/PROVENANCE` name the release and every local patch.
-Upstream bzip3 1.5.3 loses half the data on an input that is an exact multiple of the block size, which `c/bzip3/lastblock_check.c` reproduces; the vendored copy also runs its independent blocks in parallel, writing the same bytes.
+**Vendored code.** htscodecs, bzip3, libdeflate and liblzma under `c/` are pinned; each `PROVENANCE` names the release and every local patch.
+The vendored bzip3 runs its independent blocks in parallel, writing the same bytes; `c/bzip3/lastblock_check.c` guards the last-block fix that bzip3 1.5.4 took from this tree.

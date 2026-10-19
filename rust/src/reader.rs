@@ -448,12 +448,6 @@ impl Reader {
             for k in 0..nruns {
                 let (len, f) = self.step(&mut c, st, k + 1 == nruns && i >= tskip);
                 let en = st + len;
-                let mut nb = [0u8; 44];        // \tSTART\tEND\t in one piece
-                nb[0] = b'\t';
-                let mut nl = 1 + kst::putu64_at(&mut nb[1..], st);
-                nb[nl] = b'\t'; nl += 1;
-                nl += kst::putu64_at(&mut nb[nl..], en);
-                nb[nl] = b'\t'; nl += 1;
                 if self.aln.is_some() && self.lab.get(f as usize).is_some_and(|l| l == b"=") { restored += 1; }
                 let lab = self.label_at2(f, st, len);
                 // the C's flush point, before a row that would not fit: a
@@ -466,12 +460,19 @@ impl Reader {
                 match lab {
                     // one reserve for the whole row, then one pointer
                     // through it, as the C writes it
+                    // the numbers straight into the buffer, as the C's
+                    // putu64: a scratch copy was a third memmove a row
                     Some(l) => unsafe {
-                        buf.reserve(name.len() + nl + l.len() + 1);
+                        buf.reserve(name.len() + 44 + l.len() + 1);
                         let n0 = buf.len();
                         let p = buf.as_mut_ptr().add(n0);
                         std::ptr::copy_nonoverlapping(name.as_ptr(), p, name.len());
-                        std::ptr::copy_nonoverlapping(nb.as_ptr(), p.add(name.len()), nl);
+                        let row = std::slice::from_raw_parts_mut(p.add(name.len()), 44);
+                        row[0] = b'\t';
+                        let mut nl = 1 + kst::putu64_at(&mut row[1..], st);
+                        row[nl] = b'\t'; nl += 1;
+                        nl += kst::putu64_at(&mut row[nl..], en);
+                        row[nl] = b'\t'; nl += 1;
                         let q = p.add(name.len() + nl);
                         std::ptr::copy_nonoverlapping(l.as_ptr(), q, l.len());
                         *q.add(l.len()) = b'\n';
@@ -479,8 +480,9 @@ impl Reader {
                     },
                     None => {
                         buf.extend_from_slice(&name);
-                        buf.extend_from_slice(&nb[..nl]);
-                        kst::putu64(&mut buf, f); buf.push(b'\n');
+                        buf.push(b'\t'); kst::putu64(&mut buf, st);
+                        buf.push(b'\t'); kst::putu64(&mut buf, en);
+                        buf.push(b'\t'); kst::putu64(&mut buf, f); buf.push(b'\n');
                     }
                 }
                 st = en;
@@ -512,7 +514,9 @@ impl Reader {
         }
         let (d, sp, r) = self.load_raw(b);
         let d = std::sync::Arc::new(d);
-        self.cached = Some((b, d.clone(), sp, r));
+        if let Some((_, old, _, _)) = self.cached.replace((b, d.clone(), sp, r)) {
+            if let Ok(v) = std::sync::Arc::try_unwrap(old) { ffi::recycle(v); }   // the cursor let it go first
+        }
         (d, sp, r)
     }
 
@@ -616,7 +620,8 @@ impl Reader {
     fn load_raw(&mut self, b: usize) -> (Vec<u8>, usize, u64) {
         if b >= self.b.len() { crate::bail("corrupt index: a block number is past the end"); }
         let m = self.b[b].clone();
-        let mut cb = vec![0u8; crate::ckalloc(m.size as usize)];
+        let mut cb = ffi::raw_buf(crate::ckalloc(m.size as usize));
+        cb.resize(m.size as usize, 0);
         rd(self.f.seek(SeekFrom::Start(self.data0 + m.off)), "seek");
         rd(self.f.read_exact(&mut cb), "file is truncated: a block is missing or short");
         if kst::fnv(FNV0, &cb) != m.hash {
@@ -626,7 +631,9 @@ impl Reader {
         let want = if self.ilv { (m.lraw + m.raw) as usize } else { m.lraw as usize };
         let lens = frame(&cb[..la], self.lencodec, want);
         let ids = if self.ilv { Vec::new() } else { frame(&cb[la..la + lb], self.idcodec, m.raw as usize) };
-        drop(cb);   // as the C frees it: the compressed block is not needed past its frames
+        // as the C frees it: not needed past its frames; kept for the next
+        // block only when there is one, or a one-block decode holds it to the end
+        if self.b.len() > 1 { ffi::recycle(cb); } else { drop(cb); }
         let lens = if self.ilv { self.ilv_split(lens, m.lraw as usize, m.raw as usize) } else { lens };
         let (lens, ids) = if self.ilv {
             let mut l = lens; let t = l.split_off(m.lraw as usize); (l, t)
@@ -638,6 +645,7 @@ impl Reader {
         let mut data = lens;
         data.reserve_exact(ids.len());   // doubling would leave up to the lengths' size unused
         data.extend_from_slice(&ids);
+        if self.b.len() > 1 { ffi::recycle(ids); }
         (data, split, rows)
     }
 }
@@ -837,12 +845,11 @@ impl Reader {
 
     /// Next row: (length, label id). Steps to the next block when this one
     /// ends. Under --aln a zero length means "ask the reference".
+    // inline, its rare branches cold: a call a row cost the Rust decode
+    // more than the C's, whose loop has them in line
+    #[inline]
     fn step(&mut self, c: &mut Cursor, st: u64, last: bool) -> (u64, u64) {
-        if c.left == 0 {
-            let b = if c.blk == usize::MAX { 0 } else { c.blk + 1 };
-            let (data, split, rows) = self.load(b);
-            *c = Cursor { blk: b, data, lp: 0, ip: split, left: rows };
-        }
+        if c.left == 0 { self.next_block(c); }
         let (v, l2) = vget(&c.data, c.lp);
         c.lp = l2;
         let len = if last && self.taildec {
@@ -851,15 +858,8 @@ impl Reader {
             t - st
         } else if v != 0 {
             v
-        } else if self.raw {
-            0
         } else {
-            let lendec = self.lenfile && self.blk_nos.get(c.blk).copied().unwrap_or(0) != 1;
-            if !lendec { crate::bail("corrupt track: a zero length outside a sentinel block"); }
-            let q = self.alnq.unwrap_or_else(|| crate::bail("a length sentinel has no reference answer: wrong PAF or --ref"));
-            let (e, _) = self.aln.as_ref().unwrap().end(q, st);
-            if e <= st { crate::bail("a length sentinel has no reference answer: wrong PAF or --ref"); }
-            e - st
+            self.zero_len(c, st)
         };
         let (f, i2) = vget(&c.data, c.ip);
         c.ip = i2;
@@ -867,20 +867,45 @@ impl Reader {
         (len, f)
     }
 
+    #[cold]
+    fn next_block(&mut self, c: &mut Cursor) {
+        let b = if c.blk == usize::MAX { 0 } else { c.blk + 1 };
+        c.data = std::sync::Arc::new(Vec::new());   // let go of the old block, so load can reuse it
+        let (data, split, rows) = self.load(b);
+        *c = Cursor { blk: b, data, lp: 0, ip: split, left: rows };
+    }
+
+    /// A zero length: --raw keeps it, a sentinel block asks the reference.
+    #[cold]
+    fn zero_len(&self, c: &Cursor, st: u64) -> u64 {
+        if self.raw { return 0; }
+        let lendec = self.lenfile && self.blk_nos.get(c.blk).copied().unwrap_or(0) != 1;
+        if !lendec { crate::bail("corrupt track: a zero length outside a sentinel block"); }
+        let q = self.alnq.unwrap_or_else(|| crate::bail("a length sentinel has no reference answer: wrong PAF or --ref"));
+        let (e, _) = self.aln.as_ref().unwrap().end(q, st);
+        if e <= st { crate::bail("a length sentinel has no reference answer: wrong PAF or --ref"); }
+        e - st
+    }
+
     /// The label bytes, or None when the table is empty and the id is the label.
+    #[inline]
     fn label_at2(&self, f: u64, st: u64, len: u64) -> Option<&[u8]> {
         let l: &[u8] = match self.lab.get(f as usize) {
             Some(l) => l,
             None if self.lab.is_empty() => return None,
             None => crate::bail("corrupt block: a label id past the table"),
         };
-        if let (b"=", Some(a)) = (l, self.aln.as_ref()) {
-            let q = self.alnq.unwrap_or_else(|| crate::bail("a delta row has no reference answer: wrong PAF or reference track"));
-            let rl = a.row(q, st, len);
-            if rl == u32::MAX { crate::bail("a delta row has no reference answer: wrong PAF or reference track"); }
-            return Some(&self.lab[rl as usize]);
-        }
+        if self.aln.is_some() && l == b"=" { return Some(self.ref_label(st, len)); }
         Some(l)
+    }
+
+    #[cold]
+    fn ref_label(&self, st: u64, len: u64) -> &[u8] {
+        let a = self.aln.as_ref().unwrap();
+        let q = self.alnq.unwrap_or_else(|| crate::bail("a delta row has no reference answer: wrong PAF or reference track"));
+        let rl = a.row(q, st, len);
+        if rl == u32::MAX { crate::bail("a delta row has no reference answer: wrong PAF or reference track"); }
+        &self.lab[rl as usize]
     }
 
     fn label(&self, f: u64, out: &mut Vec<u8>, st: u64, len: u64) {

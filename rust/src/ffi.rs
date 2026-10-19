@@ -97,13 +97,37 @@ pub fn bzip3_version() -> String {
     unsafe { std::ffi::CStr::from_ptr(bz3_version()).to_string_lossy().into_owned() }
 }
 
-/// zstd, at `level`. The bound and the call are zstd's own.
+thread_local! {
+    /// Spent buffers this thread may reuse, as the C decodes every block
+    /// into one blkbuf: a fresh vector a block was an mmap a block, and
+    /// three times the C's page faults on an -e low decode.
+    static SPARE: std::cell::RefCell<Vec<Vec<u8>>> = const { std::cell::RefCell::new(Vec::new()) };
+}
 /// An output buffer the callee fills: capacity only, no zero fill, so the
 /// pages past what it writes are never touched. The caller sets the length
 /// after the call. The codecs take `unsigned char *in` but never write it,
 /// which the C relies on too, so the input is not copied either.
-fn raw_buf(cap: usize) -> Vec<u8> { Vec::with_capacity(cap) }
+/// A buffer with room for cap bytes, length 0: a spare when one is big enough.
+pub fn raw_buf(cap: usize) -> Vec<u8> {
+    SPARE.with(|s| {
+        let mut s = s.borrow_mut();
+        match s.iter().position(|v| v.capacity() >= cap) {
+            Some(i) => { let mut v = s.swap_remove(i); v.clear(); v }
+            None => Vec::with_capacity(cap),
+        }
+    })
+}
+/// Hand back a buffer no one reads any more; four are kept, the largest.
+pub fn recycle(v: Vec<u8>) {
+    if v.capacity() < 1 << 17 { return; }   // below the mmap threshold: malloc reuses it already
+    SPARE.with(|s| {
+        let mut s = s.borrow_mut();
+        s.push(v);
+        if s.len() > 4 { let i = (0..s.len()).min_by_key(|&i| s[i].capacity()).unwrap(); s.swap_remove(i); }
+    })
+}
 
+/// zstd, at `level`. The bound and the call are zstd's own.
 pub fn zstd(src: &[u8], level: i32) -> Vec<u8> {
     // SAFETY: the bound is what zstd asks for, and both slices are live.
     unsafe {

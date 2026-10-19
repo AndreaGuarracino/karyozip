@@ -3481,6 +3481,7 @@ typedef struct {
     const uint8_t *lp0, *ip0;
     uint32_t *htab; uint64_t hmask;
     ZSTD_DCtx *d; uint8_t *blkbuf; size_t blkcap;
+    uint8_t *cbuf; size_t cbcap;  /* the compressed block, kept across blocks as the Rust's spare */
     uint64_t cached;
     uint64_t curblk, curoff;      /* sequential cursor in the cached block */
     uint8_t *nz_keep; size_t nzl_keep; int names_ready, names_tok, names_int, names_fld, dropped;
@@ -4230,7 +4231,13 @@ static void loadblk(R *r, uint64_t b) {
        reader's block is already decoded. */
     if (r->cached == b) { PAYEND = r->payend; LENDEC = r->lenfile && r->b[b].nos != 1; return; }
     r->curblk = UINT64_MAX;   /* a new block invalidates the cursor */
-    uint8_t *cb = xmalloc(r->b[b].size);
+    /* a buffer per block was an mmap per block: 12480 page faults on an
+       -e low assembly decode against the Rust's 2024; one block frees it */
+    uint8_t *cb;
+    if (r->nblk > 1) {
+        if (r->b[b].size > r->cbcap) { free(r->cbuf); r->cbcap = r->b[b].size; r->cbuf = xmalloc(r->cbcap); }
+        cb = r->cbuf;
+    } else cb = xmalloc(r->b[b].size);
     if (fseeko(r->f, (off_t)(r->data0 + r->b[b].off), SEEK_SET)) die("seek");
     if (fread(cb, 1, r->b[b].size, r->f) != r->b[b].size)
         die("file is truncated: a block is missing or short");
@@ -4253,7 +4260,7 @@ static void loadblk(R *r, uint64_t b) {
     else
     { h2 = ZSTD_decompressDCtx(r->d, r->blkbuf + g, r->blkcap - g, cb + la, lb);
       if (ZSTD_isError(h2)) die(ZSTD_getErrorName(h2)); }
-    free(cb);
+    if (cb != r->cbuf) free(cb);
     if (r->ilv) {
         if (h2) die("corrupt block: a stream decodes to a size the index does not claim");
         g = ilv_split(r, r->blkbuf, g, r->b[b].lraw, r->b[b].raw);
@@ -5050,6 +5057,7 @@ static void rclose(R *r) {
     if (!r->name_borrowed) { free(r->namebuf); free(r->natbufp); free(r->name); }
     if (r->lab) { free(r->lab[0]); free(r->lab); }
     if (!r->blk_borrowed) { free(r->blkbuf); free(r->rtab); }
+    free(r->cbuf);
     free(r->b);
     free(r->nz_keep); free(r->pz); free(r->ibuf); free(r->ichunk);
     free(r->coff); free(r->cpendv); free(r->htab);

@@ -41,8 +41,10 @@ pub struct Rcon { pub name: Vec<u8>, ri: u64, rows: std::sync::OnceLock<Rows>,
 pub struct Aln {
     pub rc: Vec<Rcon>,
     rcix: HashMap<Vec<u8>, u32>,
-    pub qs: Vec<(Vec<u8>, Vec<Seg>)>,
-    qsix: HashMap<Vec<u8>, usize>,
+    pub qs: Vec<(Box<[u8]>, Vec<Seg>)>,
+    /// open addressed by hash, as the C's qseg_get: index + 1 into qs, 0 empty;
+    /// a HashMap kept a second copy of every name, 135 B more a short read
+    qsix: Vec<u32>,
     pub labs: Vec<Vec<u8>>,
     labix: HashMap<Vec<u8>, u32>,
     labh: Vec<u64>,
@@ -61,6 +63,40 @@ pub struct Aln {
 }
 
 impl Aln {
+    fn qget(&self, nm: &[u8]) -> Option<usize> {
+        if self.qsix.is_empty() { return None; }
+        let m = self.qsix.len() - 1;
+        let mut j = crate::kst::fnv(crate::kst::FNV0, nm) as usize & m;
+        loop {
+            let k = self.qsix[j] as usize;
+            if k == 0 { return None; }
+            if *self.qs[k - 1].0 == *nm { return Some(k - 1); }
+            j = (j + 1) & m;
+        }
+    }
+
+    /// a new query, at the end of qs; the caller checked it is not there
+    fn qput(&mut self, nm: Vec<u8>, segs: Vec<Seg>) -> usize {
+        self.qs.push((nm.into_boxed_slice(), segs));
+        let n = self.qs.len();
+        if n * 2 > self.qsix.len() {   // grow by 4 and rehash, as the C
+            let mut t = vec![0u32; (self.qsix.len() * 4).max(1 << 20)];
+            let m = t.len() - 1;
+            for (k, (q, _)) in self.qs.iter().enumerate() {
+                let mut j = crate::kst::fnv(crate::kst::FNV0, q) as usize & m;
+                while t[j] != 0 { j = (j + 1) & m; }
+                t[j] = k as u32 + 1;
+            }
+            self.qsix = t;
+        } else {
+            let m = self.qsix.len() - 1;
+            let mut j = crate::kst::fnv(crate::kst::FNV0, &self.qs[n - 1].0) as usize & m;
+            while self.qsix[j] != 0 { j = (j + 1) & m; }
+            self.qsix[j] = n as u32;
+        }
+        n - 1
+    }
+
     fn lab(&mut self, s: &[u8]) -> u32 {
         if let Some(&i) = self.labix.get(s) { return i; }
         let i = self.labs.len() as u32;
@@ -218,6 +254,7 @@ impl Aln {
                 match op {
                     b'M' | b'=' | b'X' => {
                         if rev && qp < v { crate::bail("PAF CIGAR runs before the query start"); }
+                        if segs.len() == segs.capacity() { segs.reserve_exact(segs.len()); }   // doubling, as the C: Vec's own jumps 1 to 4
                         segs.push(Seg { q: if rev { qp - v } else { qp }, t: tix,
                                         n: v as u32, tp, rev });
                         qp = if rev { qp - v } else { qp + v };
@@ -242,12 +279,9 @@ impl Aln {
                 crate::bail("PAF CIGAR consumes a different target length than the record says");
             }
             if segs.is_empty() { continue; }
-            match self.qsix.get(fl[0]) {
-                Some(&k) => self.qs[k].1.extend_from_slice(&segs),
-                None => {
-                    self.qsix.insert(fl[0].to_vec(), self.qs.len());
-                    self.qs.push((fl[0].to_vec(), segs));
-                }
+            match self.qget(fl[0]) {
+                Some(k) => self.qs[k].1.extend_from_slice(&segs),
+                None => { self.qput(fl[0].to_vec(), segs); }
             }
         }
         for (_, s) in self.qs.iter_mut() {
@@ -336,11 +370,8 @@ impl Aln {
             at += k + 1;
             let (cn, j) = vget(cnt, ci); ci = j;
             if cn == 0 || cn as usize > len.len() - li { crate::bail("corrupt packed alignment: more blocks than lengths"); }
-            if self.qsix.contains_key(&name) { crate::bail("corrupt packed alignment: a query name repeats"); }
-            let qi = *self.qsix.entry(name.clone()).or_insert_with(|| {
-                self.qs.push((name, Vec::new()));
-                self.qs.len() - 1
-            });
+            if self.qget(&name).is_some() { crate::bail("corrupt packed alignment: a query name repeats"); }
+            let qi = self.qput(name, Vec::new());
             let segs = &mut self.qs[qi].1;
             segs.clear();
             segs.reserve(cn as usize);
@@ -390,9 +421,9 @@ impl Aln {
         if !self.ord.is_empty() && !nm.is_empty() && nm.iter().all(|c| c.is_ascii_digit()) {
             let i: usize = std::str::from_utf8(nm).unwrap().parse().ok()?;
             if i >= self.ord.len() { return None; }
-            return self.qsix.get(&self.ord[i]).copied();
+            return self.qget(&self.ord[i]);
         }
-        self.qsix.get(nm).copied()
+        self.qget(nm)
     }
 
     /// One name a line, in the order the annotator produced them.

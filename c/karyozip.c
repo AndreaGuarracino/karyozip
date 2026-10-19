@@ -1965,6 +1965,7 @@ static fent *ftab; static size_t fcap, fn;
 static char **fset;                     /* feature set names, in table order */
 static size_t nfset;
 static char ***fid2lab;                 /* featureID -> label per set */
+static uint32_t **fid2len;              /* their lengths: a strlen a row a set was 10% of a -d decode */
 static size_t nfid;
 
 static size_t fhash(const char *s) {
@@ -2093,13 +2094,16 @@ static void loadfeatures(const char *path) {
             size_t nn = (size_t)id + 1024;
             fid2lab = xrealloc(fid2lab, nn * sizeof *fid2lab);
             memset(fid2lab + nfid, 0, (nn - nfid) * sizeof *fid2lab);
+            fid2len = xrealloc(fid2len, nn * sizeof *fid2len);
+            memset(fid2len + nfid, 0, (nn - nfid) * sizeof *fid2len);
             nfid = nn;
         }
         if (fid2lab[id]) die("features.tsv defines a featureID twice");
         fid2lab[id] = xcalloc(nfset, sizeof **fid2lab);
+        fid2len[id] = xcalloc(nfset, sizeof **fid2len);
         char *p = tab; size_t k = 0;
         while (p && k < nfset) { char *q = strchr(++p, '\t'); if (q) *q = 0;
-                                 fid2lab[id][k++] = xstrdup(p); p = q; }
+                                 fid2len[id][k] = (uint32_t)strlen(p); fid2lab[id][k++] = xstrdup(p); p = q; }
         if (k < nfset) die("a features.tsv row has fewer labels than sets");
         if (p) die("a features.tsv row has more labels than sets");
     }
@@ -2177,6 +2181,12 @@ static size_t vocidx(size_t k, const char *w) {   /* the rank of a label in its 
     size_t lo = 0, hi = NVOC[k];
     while (lo < hi) { size_t m = (lo + hi) / 2; int c = strcmp(VOC[k][m], w); if (!c) return m; if (c < 0) lo = m + 1; else hi = m; }
     return SIZE_MAX;
+}
+static const char *flab(uint32_t id, size_t k);
+/* flab and its length, from the table where it has one */
+static const char *flabn(uint32_t id, size_t k, size_t *n) {
+    if (id && id < CARTBASE) { *n = fid2len[id][k]; return fid2lab[id][k]; }
+    const char *s = flab(id, k); *n = strlen(s); return s;
 }
 static const char *flab(uint32_t id, size_t k) {   /* the label of set k for a featureID */
     if (!id) return "novel";
@@ -5426,16 +5436,16 @@ static void decode_db(const char *path, const char *dir) {
             for (size_t j = 0; j < nout; j++) {
                 const char *Lb; size_t Lbn;
                 if (tostd) {                        /* the selected columns, one tuple */
-                    size_t need = 1; for (size_t t = 0; t < NSETK; t++) need += strlen(flab(id, SETK[t])) + 1;
+                    size_t need = 1, L2; for (size_t t = 0; t < NSETK; t++) { flabn(id, SETK[t], &L2); need += L2 + 1; }
                     if (need > jcap[jw]) { jcap[jw] = need * 2; jb[jw] = xrealloc(jb[jw], jcap[jw]); }
                     char *q = jb[jw];
                     for (size_t t = 0; t < NSETK; t++) {
-                        const char *L = flab(id, SETK[t]); size_t L2 = strlen(L);
+                        const char *L = flabn(id, SETK[t], &L2);
                         if (t) *q++ = '\t';
                         memcpy(q, L, L2); q += L2;
                     }
                     *q = 0; Lb = jb[jw]; Lbn = (size_t)(q - jb[jw]);
-                } else { Lb = flab(id, SETK[j]); Lbn = strlen(Lb); }
+                } else Lb = flabn(id, SETK[j], &Lbn);
                 if (cseq && c1[j] == s && cll[j] == Lbn && !memcmp(cl[j], Lb, Lbn)) {
                     c1[j] = s + len;                       /* extend the run */
                 } else {

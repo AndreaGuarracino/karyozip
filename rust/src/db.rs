@@ -351,7 +351,9 @@ pub fn decode(r: &mut crate::reader::Reader, feats: &Feats, dir: Option<&str>, c
     let pid = std::process::id();
     let sets: Vec<&[u8]> = cols.iter().map(|&k| feats.sets[k].as_slice()).collect();
     let mut tmps: Vec<std::path::PathBuf> = Vec::new();
-    let mut out: Vec<Box<dyn Write>> = Vec::new();
+    // each output its own 1 MB row buffer, written whole, as the C's ow:
+    // a row through a BufWriter was a third copy and a virtual call a row
+    let mut out: Vec<(Box<dyn Write>, Vec<u8>)> = Vec::new();
     if let Some(dir) = dir {
         std::fs::create_dir_all(dir).unwrap_or_else(|_| crate::bail("cannot create the output directory"));
         for s in &sets {
@@ -364,10 +366,10 @@ pub fn decode(r: &mut crate::reader::Reader, feats: &Feats, dir: Option<&str>, c
         // Write beside the old BEDs, then swap them in together.
         tmps = sets.iter().map(|s| setpath(dir, s, &format!(".bed.tmp.{pid}"))).collect();
         *TMP.lock().unwrap() = tmps.clone();
-        out = tmps.iter().map(|p| Box::new(std::io::BufWriter::new(std::fs::File::create(p)
-                .unwrap_or_else(|_| crate::bail("cannot write a derived BED")))) as Box<dyn Write>).collect();
+        out = tmps.iter().map(|p| (Box::new(std::fs::File::create(p)
+                .unwrap_or_else(|_| crate::bail("cannot write a derived BED"))) as Box<dyn Write>, Vec::with_capacity(OCAP))).collect();
     } else {
-        out.push(Box::new(std::io::BufWriter::new(std::io::stdout())));
+        out.push((Box::new(std::io::stdout()), Vec::with_capacity(OCAP)));
     }
     // One open run per output, extended while its label does not change.
     let n = out.len();
@@ -375,12 +377,12 @@ pub fn decode(r: &mut crate::reader::Reader, feats: &Feats, dir: Option<&str>, c
     // (open, start, end, label) per output; the label buffer is reused
     let mut cur: Vec<(bool, u64, u64, Vec<u8>)> = vec![(false, 0, 0, Vec::new()); n];
     let mut cseq: Vec<u8> = Vec::new();
-    let (mut rows, mut ob) = (0u64, Vec::with_capacity(4096));
+    let mut rows = 0u64;
     r.for_each_row(&mut |seq: &[u8], st: u64, en: u64, lab: &[u8]| {
         if seq != cseq {
             for j in 0..n {
                 let c = &mut cur[j];
-                if c.0 { wr(&mut out[j], &cseq, c.1, c.2, &c.3, &mut ob); c.0 = false; }
+                if c.0 { wr(&mut out[j], &cseq, c.1, c.2, &c.3); c.0 = false; }
             }
             cseq.clear(); cseq.extend_from_slice(seq);
         }
@@ -390,15 +392,16 @@ pub fn decode(r: &mut crate::reader::Reader, feats: &Feats, dir: Option<&str>, c
             let l: &[u8] = if dir.is_none() { &joined } else { feats.lab(id, cols[j]) };
             let c = &mut cur[j];
             if c.0 && c.2 == st && c.3 == l { c.2 = en; continue; }
-            if c.0 { wr(&mut out[j], &cseq, c.1, c.2, &c.3, &mut ob); }
+            if c.0 { wr(&mut out[j], &cseq, c.1, c.2, &c.3); }
             c.0 = true; c.1 = st; c.2 = en; c.3.clear(); c.3.extend_from_slice(l);
         }
         rows += 1;
     });
     for j in 0..n {
         let c = &mut cur[j];
-        if c.0 { wr(&mut out[j], &cseq, c.1, c.2, &c.3, &mut ob); }
-        out[j].flush().unwrap_or_else(|_| crate::bail("write failed"));
+        if c.0 { wr(&mut out[j], &cseq, c.1, c.2, &c.3); }
+        let (f, b) = &mut out[j];
+        f.write_all(b).and_then(|_| f.flush()).unwrap_or_else(|_| crate::bail("write failed"));
     }
     drop(out);
     match dir {
@@ -412,8 +415,14 @@ pub fn decode(r: &mut crate::reader::Reader, feats: &Feats, dir: Option<&str>, c
     }
 }
 
-fn wr(f: &mut impl Write, seq: &[u8], st: u64, en: u64, lab: &[u8], v: &mut Vec<u8>) {
-    v.clear();
+const OCAP: usize = 1 << 20;
+/// One row into its output's buffer; the buffer goes out when the row would not fit, as the C's owput.
+fn wr(o: &mut (Box<dyn Write>, Vec<u8>), seq: &[u8], st: u64, en: u64, lab: &[u8]) {
+    let (f, v) = o;
+    if v.len() + seq.len() + lab.len() + 48 > OCAP.max(v.capacity()) {
+        f.write_all(v).unwrap_or_else(|_| crate::bail("write failed"));
+        v.clear();
+    }
     v.extend_from_slice(seq);
     v.push(b'\t');
     crate::kst::putu64(v, st);
@@ -422,7 +431,6 @@ fn wr(f: &mut impl Write, seq: &[u8], st: u64, en: u64, lab: &[u8], v: &mut Vec<
     v.push(b'\t');
     v.extend_from_slice(lab);
     v.push(b'\n');
-    f.write_all(v).unwrap_or_else(|_| crate::bail("write failed"));
 }
 
 /// Move every staged BED into place, or put back what was there.

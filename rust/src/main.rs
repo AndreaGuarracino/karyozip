@@ -433,15 +433,18 @@ fn fill_rows(s: &[u8], from: usize, to: usize, out: &mut Vec<Row>) -> Result<(),
         if s[nl] == 0 { return Err("a NUL byte inside a row"); }
         let line = &s[p..nl];
         let t1 = ffi::find(b'\t', line);
-        let fast = t1.and_then(|t1| { let (t2, st) = dig_tab(line, t1 + 1)?; let (t3, en) = dig_tab(line, t2 + 1)?; Some((t1, t3, st, en)) });
-        let (t1, t3, st, en) = match fast { Some(f) => f, None => {
+        let fast = t1.and_then(|t1| { let (t2, st) = dig_tab(line, t1 + 1)?; let (t3, en) = dig_tab(line, t2 + 1)?; Some((t1, t2, t3, st, en)) });
+        let (t1, t2, t3, st, en) = match fast { Some(f) => f, None => {
             // the slow path names the fault
             let t1 = t1.ok_or("bad line")?;
             let t2 = ffi::find(b'\t', &line[t1 + 1..]).ok_or("bad line")? + t1 + 1;
             let t3 = ffi::find(b'\t', &line[t2 + 1..]).ok_or("bad line")? + t2 + 1;
             if t1 + 1 == t2 || t2 + 1 == t3 { return Err("empty start or end column"); }
-            (t1, t3, bedcoord_r(&line[t1 + 1..t2], "start is not a number")?, bedcoord_r(&line[t2 + 1..t3], "end is not a number")?)
+            (t1, t2, t3, bedcoord_r(&line[t1 + 1..t2], "start is not a number")?, bedcoord_r(&line[t2 + 1..t3], "end is not a number")?)
         } };
+        if (line[t1 + 1] == b'0' && t2 - t1 > 2) || (line[t2 + 1] == b'0' && t3 - t2 > 2) {
+            return Err("a coordinate has a leading zero: it would not decode to the same bytes");
+        }
         if en < st { return Err("end is before start"); }
         if en == st { return Err("end equals start: a run must cover at least one base"); }
         if t1 == 0 { return Err("empty sequence name"); }

@@ -1695,7 +1695,7 @@ static void alnpack(const char *inpaf, const char *out) {
             }
         }
         fprintf(stderr, "  aln %-9s raw %10zu  coded %10zu  codec 0x%x\n",
-                SNAME[k], st[k]->n, bn, (unsigned)bc);
+                SNAME[k], st[k]->n, bn, bc < 0 ? 0u : (unsigned)bc);   /* an empty stream: 0, as the Rust */
 
         bvar(&all, bc < 0 ? 0 : bc == ALNTOK ? 2 : bc == 0 ? 1 : (uint64_t)bc + 3);
         bvar(&all, st[k]->n); bvar(&all, bn);
@@ -2471,6 +2471,7 @@ static void *slabfill(void *a) {
                 st = bedcoord_e(t1 + 1, t2, "start is not a number", &e); if (e) break;
                 en = bedcoord_e(t2 + 1, t3, "end is not a number", &e); if (e) break;
             }
+            if ((t1[1] == '0' && t2 - t1 > 2) || (t2[1] == '0' && t3 - t2 > 2)) { e = "a coordinate has a leading zero: it would not decode to the same bytes"; break; }
             if (en < st) { e = "end is before start"; break; }
 
             if (en == st) { e = "end equals start: a run must cover at least one base"; break; }
@@ -3752,6 +3753,7 @@ static R *ropen(const char *path) {
         for (uint64_t c = 0; c < r->nichunk; c++) {
             uint64_t cl = vgetb(&q, qe);
             r->cpendv[c] = vgetb(&q, qe);
+            if (cl > h[2] - acc) die("corrupt file: an index chunk runs past the index");   /* lengths that wrap would pass the total */
             r->coff[c] = acc; acc += cl;
         }
         r->coff[r->nichunk] = acc;
@@ -3992,9 +3994,9 @@ static uint64_t namesrc(void) {
     struct stat st; if (stat(NAMEFILE, &st)) die("cannot stat the file given to --names");
     return stathash(&st);
 }
-static int kcmp(const void *a, const void *b) {
-    uint64_t x = ((const uint64_t *)a)[0], y = ((const uint64_t *)b)[0];
-    return x < y ? -1 : x > y ? 1 : 0;
+static int kcmp(const void *a, const void *b) {   /* key, then ordinal: a tie is ordered, as the Rust */
+    const uint64_t *x = a, *y = b;
+    return x[0] != y[0] ? (x[0] < y[0] ? -1 : 1) : x[1] < y[1] ? -1 : x[1] > y[1];
 }
 
 static void rclose(R *r);
@@ -4040,7 +4042,11 @@ static void buildindex(const char *path) {
         cnt[key[2 * i] >> 32]++;
         if (i && key[2 * i] == key[2 * i - 2]) dup++;
         uint64_t bit = i * (32 + (uint64_t)w), v = (uint32_t)key[2 * i] | (key[2 * i + 1] << 32);
-        for (int j = 0; j < 32 + w; j++) if (v >> j & 1) ent[(bit + j) >> 3] |= (uint8_t)(1 << ((bit + j) & 7));
+        for (unsigned left = 32 + (unsigned)w; left; ) {
+            unsigned sh = (unsigned)(bit & 7), take = 8 - sh < left ? 8 - sh : left;
+            ent[bit >> 3] |= (uint8_t)((v & ((1ULL << take) - 1)) << sh);
+            v >>= take; bit += take; left -= take;
+        }
     }
     for (uint64_t g = 0, sum = 0; g < ns; g++) {
         memcpy(t + nb + g * 8, &sum, 8);
@@ -4278,11 +4284,11 @@ static inline void spannext(R *r, span *sp, const uint8_t **lp, const uint8_t **
 
 typedef struct { uint64_t blk, off; const uint8_t *lp, *ip; } cur_t;
 
-static void seqptrs(R *r, uint64_t ri, cur_t *c, const uint8_t **lp,
+static rec seqptrs(R *r, uint64_t ri, cur_t *c, const uint8_t **lp,
                     const uint8_t **ip, span *sp) {
-    loadblk(r, getidx(r, ri).blk);
-    uint64_t skip;
     rec q = getidx(r, ri);
+    loadblk(r, q.blk);
+    uint64_t skip;
     if (c->blk == q.blk && c->off <= q.off) {
         *lp = c->lp; *ip = c->ip; skip = q.off - c->off;
     } else {
@@ -4290,11 +4296,12 @@ static void seqptrs(R *r, uint64_t ri, cur_t *c, const uint8_t **lp,
     }
     for (uint64_t k = 0; k < skip; k++) { vget(lp); vget(ip); }
     sp->blk = q.blk; sp->left = r->b[q.blk].rows - q.off;
+    return q;
 }
 
 static void seqdone(R *r, uint64_t ri, cur_t *c, const uint8_t *lp,
                     const uint8_t *ip, span *sp) {
-    getidx(r, ri);          /* advances the cursor; result unused */
+    (void)ri;
     c->blk = sp->blk; c->off = r->b[sp->blk].rows - sp->left;
     c->lp = lp; c->ip = ip;
 }
@@ -4394,11 +4401,11 @@ static void dump(const char *path) {
     for (uint64_t i = 0; i < r->nreads; i++) {
         const uint8_t *lp, *ip;
         span sp;
-        seqptrs(r, i, &c, &lp, &ip, &sp);
+        rec qi = seqptrs(r, i, &c, &lp, &ip, &sp);
         const char *nm = r->name[i];
         size_t nlen = strlen(nm);
         const qseg *Q = ALNPAF ? qlookup(nm) : NULL;
-        uint64_t st = 0, nr = getidx(r, i).nruns;
+        uint64_t st = 0, nr = qi.nruns;
         for (uint64_t k = 0; k < nr; k++) {
             spannext(r, &sp, &lp, &ip); sp.left--;
             uint64_t e = st + rlen(&lp, nm, st, k + 1 == nr && i >= TAILSKIP_R), f = vget(&ip);
@@ -4646,7 +4653,7 @@ typedef struct { uint8_t *was; size_t wascap; uint32_t *dis; size_t discap;
                  int64_t *rel; size_t relcap; uint32_t gen; } smscratch;
 static __thread smscratch SM;
 static void smooth_one(uint64_t *st, uint64_t *en, int *feat, uint64_t n) {
-    if (!n) return;
+    if (n < 3) return;   /* only runs strictly inside a window change */
     smscratch *S = &SM;
     if (n > S->wascap) { S->wascap = n; S->was = xrealloc(S->was, n); }
     if ((size_t)NNODE > S->discap) {
@@ -4745,11 +4752,11 @@ static int *labnodes(R *r, const char *fs) {   /* label id to hierarchy node */
 
 static uint64_t loadseq(R *r, int64_t ri, uint64_t **st, uint64_t **en, int **feat,
                         uint8_t **novel, int *labmap) {
-    loadblk(r, getidx(r, ri).blk);
+    rec q = getidx(r, ri);
+    loadblk(r, q.blk);
     const uint8_t *lp, *ip;
     uint64_t skip;
 
-    rec q = getidx(r, ri);
     if (r->curblk == q.blk && r->curoff <= q.off) {
         lp = r->curlp; ip = r->curip; skip = q.off - r->curoff;
     } else {
@@ -5186,6 +5193,7 @@ static void bnext(brd *b) {
     if (!sl) die("empty sequence name");
     b->st = bedcoord(t1 + 1, t2, "start is not a number");
     b->en = bedcoord(t2 + 1, t3, "end is not a number");
+    if ((t1[1] == '0' && t2 - t1 > 2) || (t2[1] == '0' && t3 - t2 > 2)) die("a coordinate has a leading zero: it would not decode to the same bytes");
     if (b->en < b->st) die("end is before start");
     if (b->en == b->st) die("end equals start: a run must cover at least one base");
     if (b->plab && b->st == b->pen && !strcmp(b->seq, b->pseq) && !strcmp(b->lab, b->plab))
@@ -5377,7 +5385,7 @@ static void decode_db(const char *path, const char *dir) {
     for (uint64_t i = 0; i < r->nreads; i++) {
         const uint8_t *lp, *ip;
         span sp;
-        seqptrs(r, i, &c, &lp, &ip, &sp);
+        rec qi = seqptrs(r, i, &c, &lp, &ip, &sp);
         const char *nm = r->name[i];
         const qseg *Q = ALNPAF ? qlookup(nm) : NULL;
 
@@ -5385,7 +5393,7 @@ static void decode_db(const char *path, const char *dir) {
             for (size_t j = 0; j < nout; j++)
                 owput(&o[j], cseq, cseqn, c0[j], c1[j], cl[j], cll[j]);
         cseq = NULL;
-        uint64_t s = 0, nr = getidx(r, i).nruns;
+        uint64_t s = 0, nr = qi.nruns;
         size_t nml = strlen(nm);
         for (uint64_t k = 0; k < nr; k++) {
             spannext(r, &sp, &lp, &ip); sp.left--;

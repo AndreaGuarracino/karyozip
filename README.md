@@ -115,7 +115,7 @@ Names are ranked the same way among zstd, integer deltas, field deltas and the C
 Encode prints what it chose on stderr, on its `layout:` and `names:` lines.
 `-e low` also writes 262144-row blocks and a block index, which a query decodes one at a time, and so drops the codecs slow to decode, bzip3, arith and LZMA, on a track of more than one block.
 
-**Name index.** `karyozip index` appends a 32-bit fingerprint and a bit-packed ordinal per name, 2,044,644 B for 300,000 reads; a fingerprint match is confirmed against the decoded name.
+**Name index.** `karyozip index` appends a 32-bit fingerprint and a bit-packed ordinal per name, 2,044,644 B for 300,000 reads; one fingerprint match is answered without decoding the names, so a name absent from the track passes for a present one about 4 times in 2^32 lookups; two or more matches are confirmed against the decoded names.
 
 **Benchmark.** `tests/bench.sbatch` runs `tests/bench.sh` on the cluster at three sizes over the same rows, `small`, `wide` and `big`, checking every row's round trip, C against Rust bytes and smoothing against KaryoScope's, and recording the layout, codecs and phase times each encode chose.
 

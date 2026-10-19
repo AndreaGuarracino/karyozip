@@ -217,13 +217,10 @@ impl Brd {
     }
 
     fn next(&mut self) {
-        loop {
-            let Some(l) = self.lines.next_line() else { self.eof = true; return; };
-            if l.is_empty() { continue; }
-            self.line.clear(); self.line.extend_from_slice(l);
-            if !self.lines.nl { crate::bail("input does not end with a newline"); }
-            break;
-        }
+        let Some(l) = self.lines.next_line() else { self.eof = true; return; };
+        if l.is_empty() { crate::bail("bad line"); }   // as the C: a blank row is not skipped
+        self.line.clear(); self.line.extend_from_slice(l);
+        if !self.lines.nl { crate::bail("input does not end with a newline"); }
         let line = std::mem::take(&mut self.line);
         if line.contains(&0) { crate::bail("a NUL byte inside a row"); }
         let mut it = line.splitn(4, |&x| x == b'\t');
@@ -239,6 +236,9 @@ impl Brd {
         self.seq.clear(); self.seq.extend_from_slice(c[0]);
         self.st = crate::bedcoord(c[1], "start is not a number");
         self.en = crate::bedcoord(c[2], "end is not a number");
+        if c[1..3].iter().any(|v| v.len() > 1 && v[0] == b'0') {
+            crate::bail("a coordinate has a leading zero: it would not decode to the same bytes");
+        }
         if self.en < self.st { crate::bail("end is before start"); }
         if self.en == self.st {
             crate::bail("end equals start: a run must cover at least one base");

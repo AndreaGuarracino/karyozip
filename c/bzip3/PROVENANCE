@@ -1,12 +1,17 @@
 kspalaiologos/bzip3, release 1.5.4, plus one local change.
 Upstream: https://github.com/kspalaiologos/bzip3
 
-libbz3.h, common.h and libsais.h are byte-identical to 1.5.4.
+libbz3.h and common.h are byte-identical to 1.5.4.
 libbz3.c is 1.5.4 with one change, inside bz3_compress and
 bz3_decompress, the only bzip3 entry points karyozip calls: the
 independent blocks are encoded and decoded side by side under OpenMP,
 each with its own state, and written in order, so the bytes are the
 same. Diffed against 1.5.4 on 2026-10-19: no other line differs.
+libsais.h is 1.5.4 with one change at its 48 flag shifts:
+  ((sa_sint_t)(x) << (SAINT_BIT - 1))  became
+  (sa_sint_t)((sa_uint_t)(x) << (SAINT_BIT - 1)).
+A signed 1 << 31 is undefined behaviour; UBSan reported 21 of them on
+every encode of tests/db.*.bed. The unsigned shift gives the same bit.
 
 1.5.4 took the two fixes this tree carried against 1.5.3, with the same
 lines: the last block's size in bz3_compress (#175; 1.5.3 lost half the

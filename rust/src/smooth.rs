@@ -97,7 +97,7 @@ pub struct Scratch { was: Vec<u8>, dis: Vec<u32>, rel: Vec<usize>, mark: u32 }
 fn smooth_one(h: &Hier, st: &[u64], en: &[u64], feat: &mut [i32], maxgap: u64,
               sc: &mut Scratch) {
     let n = feat.len();
-    if n == 0 { return; }
+    if n < 3 { return; }   // only runs strictly inside a window change
     let nn = h.node.len();
     // every index below is proven once here: st, en, was are n long, every
     // feature id is a node, dis and par are nn long, anc and lca nn*nn;

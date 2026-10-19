@@ -354,6 +354,7 @@ impl Reader {
             let (cl, n1) = vget(&tbuf, q);
             let (sp, n2) = vget(&tbuf, n1);
             q = n2;
+            if cl > h[2] - acc2 { crate::bail("corrupt file: an index chunk runs past the index"); }   // lengths that wrap would pass the total
             acc2 += cl;
             coff.push(acc2);
             cpend.push(sp);
@@ -362,6 +363,10 @@ impl Reader {
         if acc2 != h[2] { crate::bail("index chunk table does not match the index"); }
         if !runhead && h[10] != h[0].div_ceil(ICHUNK) {
             crate::bail("corrupt file: index chunks do not match the sequence count");
+        }
+        // as the C: a start out of order, or a first start past 0, shifts every row
+        if cpend.windows(2).any(|w| w[0] > w[1]) || (h[10] > 0 && cpend[0] != 0) {
+            crate::bail("corrupt file: index chunk starts are not in order");
         }
 
         // A permutation track with no stored blob keeps its names outside,
@@ -429,7 +434,8 @@ impl Reader {
 
     /// Every sequence, in order. One forward pass over the blocks.
     pub fn decode(&mut self, out: &mut impl std::io::Write) {
-        let mut buf: Vec<u8> = Vec::with_capacity(1 << 22);
+        let mut ocap = 1usize << 22;
+        let mut buf: Vec<u8> = Vec::with_capacity(ocap);
         let mut c = Cursor { blk: usize::MAX, data: std::sync::Arc::new(Vec::new()), lp: 0, ip: 0, left: 0 };
         let (mut emitted, mut restored) = (0u64, 0u64);
         let tskip = self.tailskip;
@@ -449,7 +455,15 @@ impl Reader {
                 nl += kst::putu64_at(&mut nb[nl..], en);
                 nb[nl] = b'\t'; nl += 1;
                 if self.aln.is_some() && self.lab.get(f as usize).is_some_and(|l| l == b"=") { restored += 1; }
-                match self.label_at2(f, st, len) {
+                let lab = self.label_at2(f, st, len);
+                // the C's flush point, before a row that would not fit: a
+                // damaged file then stops at the same byte in both
+                let need = name.len() + lab.map_or(20, |l| l.len()) + 48;
+                if buf.len() + need > ocap {
+                    if !buf.is_empty() { rd(out.write_all(&buf), "write failed"); buf.clear(); }
+                    ocap = ocap.max(need);
+                }
+                match lab {
                     // one reserve for the whole row, then one pointer
                     // through it, as the C writes it
                     Some(l) => unsafe {
@@ -468,10 +482,6 @@ impl Reader {
                         buf.extend_from_slice(&nb[..nl]);
                         kst::putu64(&mut buf, f); buf.push(b'\n');
                     }
-                }
-                if buf.len() > (1 << 22) - 4096 {
-                    rd(out.write_all(&buf), "write failed");
-                    buf.clear();
                 }
                 st = en;
                 emitted += 1;
@@ -890,7 +900,8 @@ impl Reader {
         if names.last() == Some(&b'\n') { names.pop(); }
         let mut noff: Vec<u64> = vec![0];
         if !names.is_empty() {
-            for (i, &c) in names.iter().enumerate() { if c == b'\n' { noff.push(i as u64 + 1); } }
+            let mut at = 0usize;
+            while let Some(k) = crate::ffi::find(b'\n', &names[at..]) { at += k + 1; noff.push(at as u64); }
             noff.push(names.len() as u64 + 1);
         }
         if noff.len() as u64 - 1 != n {
@@ -1154,8 +1165,14 @@ impl Reader {
         let eo = (nb + ns * 8) as usize;
         for (i, &(kk, o)) in key.iter().enumerate() {
             t[(kk >> 32) as usize] += 1;
-            let (bit, v) = (i as u64 * (32 + w), (kk & 0xffff_ffff) | (o << 32));
-            for j in 0..32 + w { if v >> j & 1 == 1 { t[eo + ((bit + j) >> 3) as usize] |= 1 << ((bit + j) & 7); } }
+            let (mut bit, mut v) = (i as u64 * (32 + w), (kk & 0xffff_ffff) | (o << 32));
+            let mut left = 32 + w;
+            while left != 0 {
+                let sh = bit & 7;
+                let take = left.min(8 - sh);
+                t[eo + (bit >> 3) as usize] |= ((v & ((1u64 << take) - 1)) << sh) as u8;
+                v >>= take; bit += take; left -= take;
+            }
         }
         let mut sum = 0u64;
         for g in 0..ns {
@@ -1166,8 +1183,12 @@ impl Reader {
         use std::io::Write;
         let mut f = rd(std::fs::OpenOptions::new().append(true).open(path),
                        "cannot append the index to the track");
-        rd(f.write_all(&t), "index write failed");
-        rd(f.flush(), "index write failed");
+        let off0 = rd(f.metadata(), "cannot append the index to the track").len();
+        // as the C: a failed append is cut back, not left half written
+        if f.write_all(&t).and_then(|_| f.flush()).is_err() {
+            let _ = f.set_len(off0);
+            crate::bail("index write failed");
+        }
         eprintln!("index: {n} sequences, {} B appended, {dup} fingerprint collisions", pay + 40);
     }
 }

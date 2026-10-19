@@ -64,6 +64,9 @@ pub struct Writer {
     blkbp0: u64,
     pend: u64,
     nblk: u64,
+    /// the block and row the current sequence starts at, for the 32-bit check
+    curblk: u64,
+    curoff: u64,
     rows: u64,
     plen: u64,
     pval: u64,
@@ -131,7 +134,7 @@ impl Writer {
             perm_on, early: None, alnname: None, held: 0, spill: Vec::new(), natn: 0,
             opt, lens: Vec::new(), ids: Vec::new(), names: Vec::new(), ibx: Vec::new(),
             nidx: 0, ordok: true, labtab: Vec::new(), labmap: HashMap::default(), lastid: None, lcache: [u32::MAX; 512],
-            cur: Vec::new(), currun: 0, curbp: 0, blkbp0: 0, pend: 0, nblk: 0, rows: 0,
+            cur: Vec::new(), currun: 0, curbp: 0, blkbp0: 0, pend: 0, nblk: 0, curblk: 0, curoff: 0, rows: 0,
             plen: 0, pval: 0, phas: false, tailsamp: Vec::new(), tailpred: 0, tailon: None,
             srec: Vec::new(), sortbp: 0, natbuf: Vec::new(), natord: true, feathash: None, cart: false, rowhash: kst::FNV0, labh: Vec::new(), curnh: 0,
             aln: None, alnq: None, alnhit: 0,
@@ -212,14 +215,18 @@ impl Writer {
         self.phas = false;
     }
 
-    fn pushread(&mut self) {
-        if self.cur.is_empty() { return; }
+    fn pushread(&mut self) -> Result<(), String> {
+        if self.cur.is_empty() { return Ok(()); }
+        // as the C: the reader keeps these in 32 bits
+        if self.curblk > u32::MAX as u64 || self.curoff > u32::MAX as u64 || self.currun > u32::MAX as u64 {
+            return Err("sequence index does not fit 32 bits".into());
+        }
         kst::put(&mut self.ibx, self.currun);
         if self.ordok {
             let want = self.nidx.to_string();
             if self.cur == want.as_bytes() {
                 self.nidx += 1;
-                return;
+                return Ok(());
             }
             // Not 0,1,2,... after all: write out the ordinals so far.
             for j in 0..self.nidx {
@@ -249,6 +256,7 @@ impl Writer {
                 (pool.install(|| best_names(&mut copy, q, sn, None, level, slow)), q)
             }));
         }
+        Ok(())
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
@@ -447,7 +455,7 @@ impl Writer {
             if start != 0 { return Err("a sequence does not start at 0".into()); }
             if name.len() >= 512 { return Err("name too long".into()); }
             self.tail();
-            self.pushread();
+            self.pushread()?;
             self.cur.clear();
             self.cur.extend_from_slice(name);
             self.curnh = kst::fnv(kst::FNV0, name);
@@ -457,6 +465,7 @@ impl Writer {
             self.currun = 0;
             self.curbp = 0;
             if self.pend > 0 && self.pend >= self.opt.block { self.flush().map_err(io)?; }
+            self.curblk = self.nblk; self.curoff = self.pend;
         }
         if start != self.curbp {
             return Err("gap or overlap: start is not the previous end".into());
@@ -497,7 +506,7 @@ impl Writer {
     pub fn close(mut self, out: &mut impl Write) -> Result<Stats, String> {
         if self.opt.sort && !self.srec.is_empty() { self.sortflush()?; }
         self.tail();
-        self.pushread();
+        self.pushread()?;
         self.flush().map_err(io)?;
         let level = self.opt.level;
         let mut early = self.early.take();   // joined by the names job

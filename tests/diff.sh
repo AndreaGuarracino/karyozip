@@ -168,11 +168,13 @@ for pair in "s.bed p.paf ref.bed" "ls.bed lp.paf lref.bed"; do
   if cmp -s "$W/c.ref.kst" "$W/r.ref.kst" && cmp -s "$W/c.kst" "$W/a.kst" && cmp -s "$W/r.kst" "$W/a.kst" && [ $c1 = 0 ] && [ $c2 = 0 ] && [ $c3 = 0 ] && cmp -s "$W/r.out" "$D/$1"; then aok=$((aok+1))
   else abad=$((abad+1)); echo "  .kst reference differs: $1"; fi
 done
-for pair in "p.paf ref.bed" "lp.paf lref.bed" "db.self.paf db.rall.bed"; do
-  set -- $pair
-  "$C" aln-pack -a "$D/$1" --ref "$D/$2" -o "$W/c.pk" >/dev/null 2>&1; c1=$?
-  "$R" aln-pack -a "$D/$1" --ref "$D/$2" -o "$W/r.pk" >/dev/null 2>&1; c2=$?
-  if cmp -s "$W/c.pk" "$W/r.pk" && [ $c1 = $c2 ]; then aok=$((aok+1))
+# one block a query leaves the deltas stream empty: its codec line printed 0xffffffff in the C
+printf 's\t0\t1\tA\n' > "$W/one.ref.bed"; printf 'q\t1\t0\t1\t+\ts\t1\t0\t1\t1\t1\t60\tcg:Z:1M\n' > "$W/one.paf"
+for pair in "p.paf ref.bed" "lp.paf lref.bed" "db.self.paf db.rall.bed" "$W/one.paf $W/one.ref.bed"; do
+  set -- $pair; a=$1; b=$2; [ -e "$a" ] || a=$D/$1; [ -e "$b" ] || b=$D/$2
+  "$C" aln-pack -a "$a" --ref "$b" -o "$W/c.pk" >/dev/null 2>"$W/c.pe"; c1=$?
+  "$R" aln-pack -a "$a" --ref "$b" -o "$W/r.pk" >/dev/null 2>"$W/r.pe"; c2=$?
+  if cmp -s "$W/c.pk" "$W/r.pk" && cmp -s "$W/c.pe" "$W/r.pe" && [ $c1 = $c2 ]; then aok=$((aok+1))
   else abad=$((abad+1)); echo "  aln-pack differs: $1"; fi
 done
 [ $abad = 0 ] && echo "--aln and aln-pack: $aok forms identical" \
@@ -180,16 +182,18 @@ done
 
 # 11. the same refusals, with the same words.
 EXPECT=fail
-for bad_in in 'r1\t0\t10' 'r1\t5\t10\tA' 'r1\t0\t0\tA' '\t0\t10\tA' 'r1\tx\t10\tA'; do
+for bad_in in 'r1\t0\t10' 'r1\t5\t10\tA' 'r1\t0\t0\tA' '\t0\t10\tA' 'r1\tx\t10\tA' 'r1\t00\t10\tA' 'r1\t0\t010\tA'; do
   printf "$bad_in\n" | "$C" encode 2> "$W/ce" >/dev/null; c1=$?; cm=$(tail -1 "$W/ce")
   printf "$bad_in\n" | "$R" encode 2> "$W/re" >/dev/null; r1=$?; rm2=$(tail -1 "$W/re")
   [ "$cm" = "$rm2" ] && [ "$c1" = 1 ] && [ "$r1" = 1 ] || { echo "  refusal differs on [$bad_in]: c=[$cm] rc $c1, rust=[$rm2] rc $r1"; fail=1; }
 done
 # the same refusals on companions: a blank --aln-names line, a cut .gz reference, a packed alignment with a byte over
 printf 'q1\n\nq2\n' > "$W/blank"; gzip -c "$D/ref.bed" | head -c 40 > "$W/cut.gz"
+printf '\ns\t0\t10\t1\n' > "$W/dbblank.bed"; printf 's\t00\t10\t1\n' > "$W/dbzero.bed"
 "$C" aln-pack -a "$D/p.paf" --ref "$D/ref.bed" -o "$W/over.pk" >/dev/null 2>&1; printf '\0' >> "$W/over.pk"
 "$C" encode --aln "$D/p.paf" --ref "$D/ref.bed" < "$D/s.bed" > "$W/a.kst" 2>/dev/null
-for form in "encode --aln $D/p.paf --ref $D/ref.bed --aln-names $W/blank" "encode --aln $D/p.paf --ref $W/cut.gz" "decode --aln $W/over.pk --ref $D/ref.bed -i $W/a.kst"; do
+for form in "encode --aln $D/p.paf --ref $D/ref.bed --aln-names $W/blank" "encode --aln $D/p.paf --ref $W/cut.gz" "decode --aln $W/over.pk --ref $D/ref.bed -i $W/a.kst" \
+            "--db $D/db.features.tsv encode -i $W/dbblank.bed" "--db $D/db.features.tsv encode -i $W/dbzero.bed"; do
   "$C" $form < "$D/s.bed" 2> "$W/ce" >/dev/null; c1=$?; cm=$(tail -1 "$W/ce")
   "$R" $form < "$D/s.bed" 2> "$W/re" >/dev/null; r1=$?; rm2=$(tail -1 "$W/re")
   [ "$cm" = "$rm2" ] && [ "$c1" = 1 ] && [ "$r1" = 1 ] || { echo "  refusal differs on [$form]: c=[$cm] rc $c1, rust=[$rm2] rc $r1"; fail=1; }
@@ -288,6 +292,69 @@ cli --block=4 encode; cli -b4 encode; cli -t4 encode; cli --effort=low encode; c
 cli decode -i f --max-gap -1; cli decode -i f -r -x; cli encode -- -x; cli decode --sort=1Z; cli -o -i encode
 [ $cbad = 0 ] && echo "cli: $cok forms give the same words and code" \
   || { echo "cli: $cbad of $((cok+cbad)) DIFFER"; fail=1; }
+
+# 13. the tail predictor: on only past TAILSKIP (64) sequences, so no
+# fixture above reaches it. Equal lengths, two lengths, a short last run.
+python3 - "$W" <<'PY'
+import sys, random
+random.seed(5); w = sys.argv[1]
+for name, lens in (("tail1", [100]), ("tail2", [100, 150])):
+    with open(f"{w}/{name}.bed", "w") as f:
+        for r in range(200):
+            tot = random.choice(lens); cuts = sorted(random.sample(range(1, tot), random.randint(0, 3)))
+            p = 0
+            for k, e in enumerate(cuts + [tot]): f.write(f"q{r}\t{p}\t{e}\t{'ABCD'[(r + k) % 4]}\n"); p = e
+PY
+tok=0; tbad=0
+for f in tail1 tail2; do for flags in "" "-e low" "-e high" "--block 7" "--sort"; do
+  "$C" $flags encode -i "$W/$f.bed" > "$W/c.kst" 2>/dev/null; "$R" $flags encode -i "$W/$f.bed" > "$W/r.kst" 2>/dev/null
+  if cmp -s "$W/c.kst" "$W/r.kst" && "$R" decode -i "$W/c.kst" 2>/dev/null | sort | cmp -s - <(sort "$W/$f.bed"); then tok=$((tok+1)); else tbad=$((tbad+1)); echo "  tail differs: $f $flags"; fi
+done; done
+[ $tbad = 0 ] && echo "tail predictor: $tok forms identical" || { echo "tail predictor: $tbad DIFFER"; fail=1; }
+
+# 14. a damaged file of many blocks: the same rows reach stdout before the
+# refusal, since both flush before a row that would not fit 4 MB
+python3 -c "
+import random; random.seed(9)
+with open('$W/many.bed','w') as f:
+    for r in range(400000): f.write(f'read{r:07d}\t0\t{random.randint(50,150)}\t{random.choice(\"ABCD\")}\n')"
+"$C" -e low --block 4096 encode -i "$W/many.bed" > "$W/many.kst" 2>/dev/null
+dok=0; dbad=0
+for pct in 75 90; do   # a flipped byte: the block check refuses it after the rows before
+  python3 -c "import sys; d=bytearray(open(sys.argv[1],'rb').read()); d[len(d)*$pct//100]^=0xff; open(sys.argv[2],'wb').write(d)" "$W/many.kst" "$W/cut.kst"
+  "$C" decode -i "$W/cut.kst" > "$W/c.out" 2>"$W/c.err"; c1=$?; "$R" decode -i "$W/cut.kst" > "$W/r.out" 2>"$W/r.err"; r1=$?
+  if cmp -s "$W/c.out" "$W/r.out" && cmp -s "$W/c.err" "$W/r.err" && [ $c1 = $r1 ] && [ $c1 != 0 ] && [ -s "$W/c.out" ]; then dok=$((dok+1)); else dbad=$((dbad+1)); echo "  damaged decode differs at $pct%: $(wc -c < "$W/c.out") vs $(wc -c < "$W/r.out") B, rc $c1/$r1"; fi
+done
+[ $dbad = 0 ] && echo "damaged decode: $dok flips stop at the same byte" || { echo "damaged decode: $dbad DIFFER"; fail=1; }
+
+# 15. a forged index chunk table, re-signed: lengths whose sum wraps, and
+# starts shifted by one. The Rust panicked on the first and read a wrong row on the second.
+python3 -c "
+with open('$W/ck.bed','w') as f:
+    for i in range(65537): f.write(f'r{i}\t0\t1\t{\"B\" if i & 1 else \"A\"}\n')"
+"$C" -e low --block 1000 encode -i "$W/ck.bed" > "$W/ck.kst" 2>/dev/null
+python3 - "$W" "$D" <<'PY'
+import sys
+sys.path.insert(0, sys.argv[2])
+import kt
+w = sys.argv[1]
+src, h = kt.load(f"{w}/ck.kst")
+off = 136 + h[6] + (h[1] & ~kt.FLAGS) + h[2] + h[3]
+tab = kt.unzst(src[off:off + h[11]]); pairs = []; p = 0
+while p < len(tab):
+    cl, p = kt.vget(tab, p); sp, p = kt.vget(tab, p); pairs.append([cl, sp])
+for mode in ("wrap", "shift"):
+    q = [x[:] for x in pairs]
+    if mode == "wrap": q[0][0], q[1][0] = (1 << 64) - 1, h[2] + 1
+    else: q[0][1], q[1][1] = 1, 65537
+    z = kt.zst(w, b"".join(kt.vput(a) + kt.vput(b) for a, b in q))
+    out = bytearray(src); out[off:off + h[11]] = z; hh = h[:]; hh[11] = len(z); kt.sign(out, hh)
+    open(f"{w}/{mode}.kst", "wb").write(out)
+PY
+EXPECT=fail
+for m in wrap shift; do both "forged chunk table $m" decode -i "$W/$m.kst" -r r0; done
+EXPECT=ok
+tally "forged chunk tables"
 
 [ $fail = 0 ] && echo "DIFF_PASS" || echo "DIFF_FAIL"
 exit $fail

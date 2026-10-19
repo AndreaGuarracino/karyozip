@@ -22,6 +22,7 @@ run() {   # description, then the command; a refusal is a failure unless the des
   printf '  %-46s ' "$what"
   "$@" >/dev/null 2>"$W/err"; local rc=$?
   if grep -qE "LeakSanitizer|definitely lost: [1-9]" "$W/err" || [ $rc = 99 ]; then echo "LEAKED"; fail=1
+  elif grep -q "runtime error" "$W/err"; then echo "UNDEFINED BEHAVIOUR"; fail=1   # UBSan does not exit
   elif [ $rc = 0 ] && [[ "$what" != *"(refused)"* ]]; then echo clean
   elif [ $rc = 1 ] && [[ "$what" == *"(refused)"* ]]; then echo "clean (refused)"
   else echo "WRONG EXIT $rc"; fail=1; fi

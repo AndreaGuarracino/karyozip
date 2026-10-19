@@ -545,8 +545,10 @@ impl Reader {
 
     /// The run count heads every read on disk. Lift them into rtab and close
     /// the gap, so every walk below sees the layout it always saw.
-    fn rmheads(&mut self, lens: Vec<u8>) -> Vec<u8> {
-        let (mut out, mut i, mut seen) = (Vec::with_capacity(lens.len()), 0usize, 0u64);
+    /// In place, as the C's memmove: a second copy of the lengths was the
+    /// largest buffer of an assembly decode.
+    fn rmheads(&mut self, mut lens: Vec<u8>) -> Vec<u8> {
+        let (mut w, mut i, mut seen) = (0usize, 0usize, 0u64);
         let mut tab: Vec<u64> = Vec::with_capacity(self.nreads as usize + 1);
         tab.push(0);
         while i < lens.len() {
@@ -554,12 +556,16 @@ impl Reader {
             let (k, n) = vget(&lens, i); i = n;
             if k == 0 || k > self.rows - seen { crate::bail("corrupt block: a run count is out of range"); }
             seen += k; tab.push(seen);
+            let s0 = i;   // the read's lengths sit together: one move a read
             for _ in 0..k {
                 if i >= lens.len() { crate::bail("corrupt block: a read runs past its lengths"); }
-                let n2 = skip(&lens, i);
-                out.extend_from_slice(&lens[i..n2]); i = n2;
+                i = skip(&lens, i);
+                if i > lens.len() { crate::bail("corrupt block: a length runs past the lengths"); }
             }
+            lens.copy_within(s0..i, w); w += i - s0;
         }
+        lens.truncate(w);
+        let out = lens;
         if tab.len() as u64 != self.nreads + 1 || seen != self.rows {
             crate::bail("corrupt block: the run counts do not add up to the row count");
         }
@@ -570,27 +576,40 @@ impl Reader {
     /// Undo grp_pack: the labels, still in their own order, say which group
     /// each length came from. Runs after rmheads, so rtab holds the counts.
     fn grp_unpack(&self, lens: &[u8], ids: &[u8]) -> Vec<u8> {
-        let mut out = Vec::with_capacity(lens.len());
+        let mut out = Vec::with_capacity(lens.len() + ids.len());   // the ids join it next: no regrowth
         let (mut p, mut q) = (0usize, 0usize);
-        let mut kv: Vec<u64> = Vec::new();
-        let mut gv: Vec<(usize, usize)> = Vec::new();
-        let mut lv: Vec<(usize, usize)> = Vec::new();
+        // 8 B a run in each, as the C's: positions as pairs were 16 B in two
+        let (mut kv, mut gv, mut lv, mut cnt): (Vec<u64>, Vec<u64>, Vec<u64>, Vec<u64>) = Default::default();
         for w in self.rtab.windows(2) {
             let k = w[1] - w[0];
+            let mut top = 0u64;
             kv.clear(); gv.clear();
             for j in 0..k {
                 if p >= lens.len() || q >= ids.len() { crate::bail("corrupt block: a grouped read runs past its frames"); }
-                let n2 = skip(lens, p); gv.push((p, n2)); p = n2;
+                let (v, n2) = vget(lens, p); gv.push(v); p = n2;
                 let (id, n3) = vget(ids, q); q = n3;
+                if p > lens.len() || q > ids.len() { crate::bail("corrupt block: a grouped value runs past its frame"); }
                 if id >> 32 != 0 { crate::bail("corrupt block: a grouped label is out of range"); }
-                kv.push((id << 32) | j);
+                kv.push((id << 32) | j); top = top.max(id);
             }
-            kv.sort_unstable();
-            lv.clear(); lv.resize(k as usize, (0, 0));
-            for (j, key) in kv.iter().enumerate() { lv[(key & 0xffff_ffff) as usize] = gv[j]; }
-            for (a, b) in lv.iter() { out.extend_from_slice(&lens[*a..*b]); }
+            lv.clear(); lv.resize(k as usize, 0);
+            // label order, stable in j, as the C's: a few runs sort, many count
+            if k <= 32 || top > 4 * k + 1024 {
+                kv.sort_unstable();
+                for (j, key) in kv.iter().enumerate() { lv[(key & 0xffff_ffff) as usize] = gv[j]; }
+            } else {
+                cnt.clear(); cnt.resize(top as usize + 2, 0);
+                for key in &kv { cnt[(key >> 32) as usize + 1] += 1; }
+                for c in 1..=top as usize { cnt[c] += cnt[c - 1]; }
+                for (j, key) in kv.iter().enumerate() {
+                    let g = &mut cnt[(key >> 32) as usize];
+                    lv[j] = gv[*g as usize]; *g += 1;   // j's length is the next of its label
+                }
+            }
+            for &v in lv.iter() { kst::put(&mut out, v); }
         }
         if p != lens.len() || q != ids.len() { crate::bail("corrupt block: the grouped frames do not line up"); }
+        if out.len() != lens.len() { crate::bail("corrupt block: the grouped lengths change size"); }   // as the C: re-spelled, not copied
         out
     }
 
@@ -607,6 +626,7 @@ impl Reader {
         let want = if self.ilv { (m.lraw + m.raw) as usize } else { m.lraw as usize };
         let lens = frame(&cb[..la], self.lencodec, want);
         let ids = if self.ilv { Vec::new() } else { frame(&cb[la..la + lb], self.idcodec, m.raw as usize) };
+        drop(cb);   // as the C frees it: the compressed block is not needed past its frames
         let lens = if self.ilv { self.ilv_split(lens, m.lraw as usize, m.raw as usize) } else { lens };
         let (lens, ids) = if self.ilv {
             let mut l = lens; let t = l.split_off(m.lraw as usize); (l, t)
@@ -616,6 +636,7 @@ impl Reader {
         let split = lens.len();
         let rows = m.rows;
         let mut data = lens;
+        data.reserve_exact(ids.len());   // doubling would leave up to the lengths' size unused
         data.extend_from_slice(&ids);
         (data, split, rows)
     }

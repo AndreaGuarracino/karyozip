@@ -4187,10 +4187,10 @@ static size_t ilv_split(R *r, uint8_t *b, size_t n, size_t nl, size_t ni) {
 static void grp_unpack(R *r, uint8_t *lens, size_t nl, const uint8_t *ids, size_t ni) {
     uint8_t *out = xmalloc(nl + VGUARD), *w = out;
     const uint8_t *p = lens, *e = lens + nl, *q = ids, *qe = ids + ni;
-    size_t cap = 64;
-    uint64_t *gv = xmalloc(mul(cap, 8)), *kv = xmalloc(mul(cap, 8)), *lv = xmalloc(mul(cap, 8));
+    size_t cap = 64, ccap = 0;
+    uint64_t *gv = xmalloc(mul(cap, 8)), *kv = xmalloc(mul(cap, 8)), *lv = xmalloc(mul(cap, 8)), *cnt = NULL;
     for (uint64_t i = 0; i < r->nreads; i++) {
-        uint64_t k = r->rtab[i];
+        uint64_t k = r->rtab[i], top = 0;
         if (k > cap) { cap = (size_t)k; gv = xrealloc(gv, mul(cap, 8));
                        kv = xrealloc(kv, mul(cap, 8)); lv = xrealloc(lv, mul(cap, 8)); }
         for (uint64_t j = 0; j < k; j++) {
@@ -4199,13 +4199,24 @@ static void grp_unpack(R *r, uint8_t *lens, size_t nl, const uint8_t *ids, size_
             uint64_t id = vget(&q);
             if (p > e || q > qe) die("corrupt block: a grouped value runs past its frame");
             if (id >> 32) die("corrupt block: a grouped label is out of range");
-            kv[j] = (id << 32) | j;
+            kv[j] = (id << 32) | j; if (id > top) top = id;
         }
-        qsort(kv, (size_t)k, 8, gcmp);
-        for (uint64_t j = 0; j < k; j++) lv[kv[j] & 0xffffffffu] = gv[j];
+        /* label order, stable in j: a few runs by insertion, many by
+           counting; qsort here was 43% of an assembly decode */
+        if (k <= 32 || top > 4 * k + 1024) {   /* the second: ids a forged file made sparse */
+            if (k <= 32) for (uint64_t a = 1; a < k; a++) { uint64_t v = kv[a], b = a; while (b && kv[b - 1] > v) { kv[b] = kv[b - 1]; b--; } kv[b] = v; }
+            else qsort(kv, (size_t)k, 8, gcmp);
+            for (uint64_t j = 0; j < k; j++) lv[kv[j] & 0xffffffffu] = gv[j];
+        } else {
+            if (top + 2 > ccap) { ccap = (size_t)top + 2; cnt = xrealloc(cnt, mul(ccap, 8)); }
+            memset(cnt, 0, (size_t)(top + 2) * 8);
+            for (uint64_t j = 0; j < k; j++) cnt[(kv[j] >> 32) + 1]++;
+            for (uint64_t c = 1; c <= top; c++) cnt[c] += cnt[c - 1];
+            for (uint64_t j = 0; j < k; j++) lv[j] = gv[cnt[kv[j] >> 32]++];   /* j's length is the next of its label */
+        }
         for (uint64_t j = 0; j < k; j++) vput(&w, lv[j]);
     }
-    free(gv); free(kv); free(lv);
+    free(gv); free(kv); free(lv); free(cnt);
     if (p != e || q != qe) die("corrupt block: the grouped frames do not line up");
     if ((size_t)(w - out) != nl) die("corrupt block: the grouped lengths change size");
     memcpy(lens, out, nl); free(out);

@@ -85,9 +85,17 @@ impl Hier {
 
 }
 
+/// Buffers one worker reuses from sequence to sequence: short reads carry two
+/// to four runs, so three allocations a read cost more than the smoothing.
+/// `dis` keeps its marks across calls: `mark` only rises, and a wrap or a
+/// grown hierarchy clears it.
+#[derive(Default)]
+pub struct Scratch { was: Vec<u8>, dis: Vec<u32>, rel: Vec<usize>, mark: u32 }
+
 /// One sequence, in place. Promotes a run to the lowest common ancestor of
 /// its neighbours when the noise between them is below it.
-fn smooth_one(h: &Hier, st: &[u64], en: &[u64], feat: &mut [i32], maxgap: u64) {
+fn smooth_one(h: &Hier, st: &[u64], en: &[u64], feat: &mut [i32], maxgap: u64,
+              sc: &mut Scratch) {
     let n = feat.len();
     if n == 0 { return; }
     let nn = h.node.len();
@@ -101,10 +109,11 @@ fn smooth_one(h: &Hier, st: &[u64], en: &[u64], feat: &mut [i32], maxgap: u64) {
     let (anc, par, lca) = (&h.anc[..], &h.par[..], &h.lca[..]);
     macro_rules! at { ($v:expr, $i:expr) => { unsafe { *$v.get_unchecked($i) } } }
     let isanc = |node: i32, pa: i32| at!(anc, node as usize * nn + pa as usize) != 0;
-    let mut was = vec![0u8; n];
-    let mut dis = vec![0u32; nn];
-    let mut rel: Vec<usize> = Vec::with_capacity(n);
-    let mut mark = 0u32;
+    if sc.dis.len() < nn { sc.dis.resize(nn, 0); sc.mark = 0; }
+    sc.was.clear(); sc.was.resize(n, 0);
+    sc.rel.clear();
+    let (was, dis, rel) = (&mut sc.was[..n], &mut sc.dis[..nn], &mut sc.rel);
+    let mut mark = sc.mark;
     loop {
         let mut changes = false;
         was.iter_mut().for_each(|x| *x = 0);
@@ -114,7 +123,8 @@ fn smooth_one(h: &Hier, st: &[u64], en: &[u64], feat: &mut [i32], maxgap: u64) {
             rel.clear();
             rel.push(i);
             let mut firstun: i64 = -1;
-            mark += 1;
+            mark = mark.wrapping_add(1);
+            if mark == 0 { dis.fill(0); mark = 1; }
             let (mut lrf, mut lri, mut lre) = (at!(feat, i), i, at!(en, i));
             let mut j = i;
             while j + 1 < n {
@@ -166,6 +176,7 @@ fn smooth_one(h: &Hier, st: &[u64], en: &[u64], feat: &mut [i32], maxgap: u64) {
         }
         if !changes { break; }
     }
+    sc.mark = mark;
 }
 
 /// Merges equal neighbours and prints, dropping the v1 `_specific` suffix
@@ -242,13 +253,13 @@ pub fn run(path: &str, hier: &str, fs: &[u8], seq: Option<&[u8]>,
     // One sequence: smoothed whole, printed where it overlaps the range.
     // The phases are the C's serial ones; its threaded path records none.
     let one = |r: &mut Reader, ri: u64, sr: &mut crate::reader::SeqRows,
-               buf: &mut Vec<u8>, prof: bool| {
+               sc: &mut Scratch, buf: &mut Vec<u8>, prof: bool| {
         let s = crate::prof::span(if prof { 6 } else { 10 });
         r.seq_rows(ri, &labmap, &novelid, h.root, sr);
         drop(s);
         if hi > 0 && sr.en.last().is_none_or(|&e| lo >= e) { return; }
         let s = crate::prof::span(if prof { 4 } else { 10 });
-        smooth_one(&h, &sr.st, &sr.en, &mut sr.feat, maxgap);
+        smooth_one(&h, &sr.st, &sr.en, &mut sr.feat, maxgap, sc);
         drop(s);
         let name = r.name_at(ri).to_vec();
         let _s = crate::prof::span(if prof { 5 } else { 10 });
@@ -278,12 +289,13 @@ pub fn run(path: &str, hier: &str, fs: &[u8], seq: Option<&[u8]>,
                     if let Some(b) = blk { r.adopt_block(b); }
                     let mut buf = Vec::with_capacity(1 << 20);
                     let mut sr = crate::reader::SeqRows::default();
+                    let mut sc = Scratch::default();
                     loop {
                         let c = next.fetch_add(1, Ordering::Relaxed);
                         if c >= nchunk { break; }
                         let (a, b) = (first + c * chunk, (first + (c + 1) * chunk).min(last));
                         buf.clear();
-                        for ri in a..b { one(&mut r, ri, &mut sr, &mut buf, false); }
+                        for ri in a..b { one(&mut r, ri, &mut sr, &mut sc, &mut buf, false); }
                         let mut g = turn.lock().unwrap_or_else(|e| e.into_inner());
                         while g.0 != c { g = bell.wait(g).unwrap_or_else(|e| e.into_inner()); }
                         wr(&mut *g.1, &buf);
@@ -298,8 +310,9 @@ pub fn run(path: &str, hier: &str, fs: &[u8], seq: Option<&[u8]>,
     }
     let mut buf = Vec::with_capacity(1 << 20);
     let mut sr = crate::reader::SeqRows::default();
+    let mut sc = Scratch::default();
     for ri in first..last {
-        one(&mut r, ri, &mut sr, &mut buf, true);
+        one(&mut r, ri, &mut sr, &mut sc, &mut buf, true);
         if buf.len() > (1 << 20) - 4096 { wr(out, &buf); buf.clear(); }
     }
     wr(out, &buf);

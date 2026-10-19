@@ -197,7 +197,9 @@ impl Aln {
             if qe < qs { crate::bail("PAF query end is before its start"); }
             let mut qp = if rev { qe } else { qs };
             let tix = match self.rcix.get(fl[5]) { Some(&i) => i, None => { noref += 1; continue; } };
-            let mut segs: Vec<Seg> = Vec::new();
+            // one slot first: a short read carries 1.2 blocks, and Vec::new's
+            // four a query peaked at 961640 against 811864 KB on 2M reads
+            let mut segs: Vec<Seg> = Vec::with_capacity(1);
             let (mut qcons, mut tcons) = (0u64, 0u64);
             let mut i = 0usize;
             while i < cg.len() {

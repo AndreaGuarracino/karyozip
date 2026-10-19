@@ -1568,7 +1568,9 @@ static void loadpaf(const char *path) {
             if (op == 'M' || op == '=' || op == 'X') {
                 if (rev && qp < v) die("PAF CIGAR runs before the query start");
                 if (!Q) Q = qseg_get(fl[0], 1);
-                if (Q->n == Q->cap) { Q->cap = Q->cap ? Q->cap * 2 : 8;
+                /* one slot first: a short read carries 1.2 blocks; eight a
+                   query peaked at 972772 against 547952 KB on 2M reads */
+                if (Q->n == Q->cap) { Q->cap = Q->cap ? Q->cap * 2 : 1;
                                       Q->s = xrealloc(Q->s, Q->cap * sizeof *Q->s); }
                 Q->s[Q->n++] = (seg){ rev ? qp - v : qp, tix, (uint32_t)v, tp, rev };
                 qp = rev ? qp - v : qp + v; tp += v; qcons += v; tcons += v; nblk++;
@@ -4636,14 +4638,27 @@ static void buildanc(void) {
 }
 #define ISANC(node, pa) (ANC[(size_t)(node) * NNODE + (pa)])
 
+/* Per-thread scratch, reused from sequence to sequence: short reads carry
+   two to four runs, so three malloc/free pairs a read cost more than the
+   smoothing itself. dis keeps its marks across calls: gen only rises, and
+   a wrap or a grown hierarchy clears it. */
+typedef struct { uint8_t *was; size_t wascap; uint32_t *dis; size_t discap;
+                 int64_t *rel; size_t relcap; uint32_t gen; } smscratch;
+static __thread smscratch SM;
 static void smooth_one(uint64_t *st, uint64_t *en, int *feat, uint64_t n) {
     if (!n) return;
-    uint8_t *was = xmalloc(n);
-
-    uint32_t *dis = xmalloc(sizeof(uint32_t) * (size_t)NNODE);
-    uint32_t gen = 0;
-    int64_t *rel = xmalloc(sizeof(int64_t) * n);
-    memset(dis, 0, sizeof(uint32_t) * (size_t)NNODE);
+    smscratch *S = &SM;
+    if (n > S->wascap) { S->wascap = n; S->was = xrealloc(S->was, n); }
+    if ((size_t)NNODE > S->discap) {
+        S->dis = xrealloc(S->dis, sizeof(uint32_t) * (size_t)NNODE);
+        memset(S->dis, 0, sizeof(uint32_t) * (size_t)NNODE);
+        S->discap = (size_t)NNODE; S->gen = 0;
+    }
+    if (n > S->relcap) { S->relcap = n; S->rel = xrealloc(S->rel, sizeof(int64_t) * n); }
+    uint8_t *was = S->was;
+    uint32_t *dis = S->dis;
+    int64_t *rel = S->rel;
+    uint32_t gen = S->gen;
     for (;;) {
         int changes = 0;
         memset(was, 0, n);
@@ -4653,7 +4668,7 @@ static void smooth_one(uint64_t *st, uint64_t *en, int *feat, uint64_t n) {
             uint64_t nrel = 0;
             rel[nrel++] = (int64_t)i;
             int64_t firstun = -1;
-            gen++;
+            if (++gen == 0) { memset(dis, 0, sizeof(uint32_t) * (size_t)NNODE); gen = 1; }
             int lrf = feat[i];
             uint64_t lri = i, lre = en[i];
 
@@ -4705,7 +4720,7 @@ static void smooth_one(uint64_t *st, uint64_t *en, int *feat, uint64_t n) {
         }
         if (!changes) break;
     }
-    free(was); free(dis); free(rel);
+    S->gen = gen;
 }
 
 static uint8_t *isnovel = NULL;

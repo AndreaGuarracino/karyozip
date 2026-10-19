@@ -244,7 +244,9 @@ impl Writer {
             let (copy, level, slow, t) = (self.names[..q].to_vec(), self.opt.level, self.opt.slow, rayon::current_num_threads());
             self.early = Some(std::thread::spawn(move || {
                 let pool = rayon::ThreadPoolBuilder::new().num_threads(t).build().unwrap_or_else(|_| crate::bail("cannot start the names threads"));
-                (pool.install(|| best_names(&copy, sn, None, level, slow)), copy.len())
+                let mut copy = copy;
+                let q = copy.len();
+                (pool.install(|| best_names(&mut copy, q, sn, None, level, slow)), q)
             }));
         }
     }
@@ -505,11 +507,11 @@ impl Writer {
         // behind the layout search's.
         let bg = (!self.perm_on && !(self.ordok && self.nidx > 0) && !self.opt.drop_names
                   && !self.names.is_empty() && self.names.len() <= 64 << 20).then(|| {
-            let (nm, n, whole, slow, e) = (std::mem::take(&mut self.names), self.nidx, self.opt.whole, self.opt.slow, early.take());
+            let (mut nm, n, whole, slow, e) = (std::mem::take(&mut self.names), self.nidx, self.opt.whole, self.opt.slow, early.take());
             let t = rayon::current_num_threads();
             std::thread::spawn(move || {
                 let pool = rayon::ThreadPoolBuilder::new().num_threads(t).build().unwrap_or_else(|_| crate::bail("cannot start the names threads"));
-                let r = pool.install(|| names_pick(&nm, n, level, whole, slow, e));
+                let r = pool.install(|| names_pick(&mut nm, n, level, whole, slow, e));
                 (nm, r)
             })
         });
@@ -760,7 +762,7 @@ impl Writer {
             (Vec::new(), false, false, false)
         } else {
             // the names are unchanged when ranked early
-            let (b, q) = pre.take().unwrap_or_else(|| names_pick(&self.names, self.nidx, level, self.opt.whole, self.opt.slow, early.take()));
+            let (b, q) = pre.take().unwrap_or_else(|| names_pick(&mut self.names, self.nidx, level, self.opt.whole, self.opt.slow, early.take()));
             let r = if !b.bytes.is_empty() { (b.bytes, b.kind == 2, b.kind == 1, b.kind == 3) }
                     else { (ffi::zstd(&self.names, level), false, false, false) };   // refused
             let k = if r.2 { "integers" } else if r.1 { "tokeniser" } else if r.3 { "fields" } else { "zstd" };
@@ -790,9 +792,10 @@ impl Writer {
                 srt.extend_from_slice(nt[v as usize]);
                 srt.push(b'\n');
             }
-            let b = best_names(&srt, self.nidx, None, level, self.opt.slow);
+            let q = srt.len();
+            let b = best_names(&mut srt, q, self.nidx, None, level, self.opt.slow);
             let p1 = ffi::zstd(&self.natbuf, level);
-            let p2 = tok_best(&self.natbuf, self.opt.slow).map(|t| t.0);
+            let p2 = tok_best(&mut self.natbuf, self.opt.slow).map(|t| t.0);
             let (pbest, ptok) = match p2 {
                 Some(t) if t.len() < p1.len() => (t, true),
                 _ => (p1, false),
@@ -1406,7 +1409,7 @@ pub fn int_names(names: &[u8], n: u64) -> Option<Vec<u8>> {
 /// only the ends of the list, which is what the default encode does.
 pub const TCAND: [usize; 4] = [250_000, 1_000_000, 3_000_000, 9_000_000];
 /// The smallest tokeniser blob and its chunk.
-pub fn tok_best(names: &[u8], slow: bool) -> Option<(Vec<u8>, usize)> {
+pub fn tok_best(names: &mut [u8], slow: bool) -> Option<(Vec<u8>, usize)> {
     let mut best: Option<(Vec<u8>, usize)> = None;
     for (i, &chunk) in TCAND.iter().enumerate() {
         if !slow && i > 0 { continue; }   // -e low: the smallest chunk only
@@ -1419,7 +1422,7 @@ pub fn tok_best(names: &[u8], slow: bool) -> Option<(Vec<u8>, usize)> {
 }
 
 /// One tokeniser blob: a chunk table, then each chunk's output.
-fn tok_chunked(names: &[u8], chunk: usize) -> Option<Vec<u8>> {
+fn tok_chunked(names: &mut [u8], chunk: usize) -> Option<Vec<u8>> {
     if names.is_empty() { return None; }
     let mut offs = vec![0usize];
     let mut p = 0usize;
@@ -1436,9 +1439,19 @@ fn tok_chunked(names: &[u8], chunk: usize) -> Option<Vec<u8>> {
     let nchunk = offs.len() - 1;
     // One chunk per thread: 9.4M ONT read names is 38 chunks, and doing them
     // in turn was the whole of the Rust's names phase. The C threads it too.
-    let blobs: Vec<Vec<u8>> = (0..nchunk).into_par_iter()
-        .map(|i| ffi::tok_encode(&names[offs[i]..offs[i + 1]]))
-        .collect::<Option<Vec<_>>>()?;
+    // On one thread they stay on the caller's, as the C's: a pool worker
+    // would hold a second htscodecs scratch (+25.7 MB on 2M names, aln-pack).
+    let mut parts: Vec<&mut [u8]> = Vec::with_capacity(nchunk);
+    let mut rest = &mut names[..];
+    for i in 0..nchunk {
+        let (a, b) = std::mem::take(&mut rest).split_at_mut(offs[i + 1] - offs[i]);
+        parts.push(a); rest = b;
+    }
+    let blobs: Vec<Vec<u8>> = if rayon::current_num_threads() == 1 {
+        parts.into_iter().map(ffi::tok_encode).collect::<Option<Vec<_>>>()?
+    } else {
+        parts.into_par_iter().map(ffi::tok_encode).collect::<Option<Vec<_>>>()?
+    };
     // chunk size, chunk count, then the raw length of each chunk and the
     // coded length of each, then the blobs. c/karyozip.c tokc().
     let mut out = Vec::new();
@@ -1575,7 +1588,7 @@ fn fld_names1(names: &[u8], n: u64, sep: u8) -> Option<Vec<u8>> {
 
 /// Ranked on whole names up to 4 MB -e low, DEFSAMPLE MB the default, all
 /// -e high; the winner run on all. Empty bytes: zstd, by the caller.
-fn names_pick(names: &[u8], n: u64, level: i32, whole: bool, slow: bool,
+fn names_pick(names: &mut [u8], n: u64, level: i32, whole: bool, slow: bool,
               early: Option<std::thread::JoinHandle<(BestNames, usize)>>) -> (BestNames, usize) {
     if let Some(h) = early {   // ranked during the parse, on the sample
         let (mut b, sn) = h.join().unwrap_or_else(|_| crate::bail("the names thread failed"));
@@ -1591,27 +1604,32 @@ fn names_pick(names: &[u8], n: u64, level: i32, whole: bool, slow: bool,
         }
     }
     // the sample was all of it: the winner is done
-    let full = (q < names.len()).then_some((names, n));
-    (best_names(&names[..q], smpn, full, level, slow), q)
+    let full = (q < names.len()).then_some(n);
+    (best_names(names, q, smpn, full, level, slow), q)
 }
 
-pub fn best_names(names: &[u8], n: u64, full: Option<(&[u8], u64)>, level: i32, slow: bool) -> BestNames {
+/// Ranked on the first q bytes of w; with full (w's name count), the winner
+/// then runs on all of w.
+pub fn best_names(w: &mut [u8], q: usize, n: u64, full: Option<u64>, level: i32, slow: bool) -> BestNames {
     let t0 = std::time::Instant::now();
     // zstd, the slow one, ranks beside the rest, and the best known
-    // meanwhile runs on the whole buffer, as the C's
+    // meanwhile runs on the whole buffer, as the C's. The tokeniser works
+    // in place, so the two beside it read a copy of the sample, as the C's.
+    let zb = w[..q].to_vec();
     let ((z, i), (t, f, spec)) = rayon::join(
-        || (ffi::zstd(names, level), int_names(names, n).map(|v| ffi::zstd(&v, level))),
+        || (ffi::zstd(&zb, level), int_names(&zb, n).map(|v| ffi::zstd(&v, level))),
         || {
-            let t = tok_best(names, slow);
-            let f = fld_names(names, n);
+            let t = tok_best(&mut w[..q], slow);
+            let f = fld_names(&w[..q], n);
             let (tl, fl) = (t.as_ref().map_or(0, |x| x.0.len()), f.as_ref().map_or(0, |x| x.len()));
             let sk = if fl > 0 && (tl == 0 || fl < tl) { 3 } else if tl > 0 { 2 } else { 0 };
-            let spec = full.and_then(|(w, wn)| match sk {
+            let spec = full.and_then(|wn| match sk {
                 2 => tok_chunked(w, t.as_ref().unwrap().1), 3 => fld_names(w, wn), _ => None,
             }).map(|v| (sk, v));
             (t, f, spec)
         },
     );
+    drop(zb);
     let mut out = BestNames { bytes: z, kind: 0, chunk: TCAND[0] };
     if let Some(v) = i {
         if !v.is_empty() && v.len() < out.bytes.len() { out = BestNames { bytes: v, kind: 1, chunk: TCAND[0] }; }
@@ -1623,10 +1641,10 @@ pub fn best_names(names: &[u8], n: u64, full: Option<(&[u8], u64)>, level: i32, 
         if !v.is_empty() && v.len() < out.bytes.len() { out = BestNames { bytes: v, kind: 3, chunk: TCAND[0] }; }
     }
     if crate::prof::ON.load(std::sync::atomic::Ordering::Relaxed) {
-        eprintln!("  names {} B: candidates {:.3} s", names.len(), t0.elapsed().as_secs_f64());
+        eprintln!("  names {} B: candidates {:.3} s", q, t0.elapsed().as_secs_f64());
     }
     // with full, the winner on all of it; empty: zstd, by the caller
-    if let Some((w, wn)) = full {
+    if let Some(wn) = full {
         out.bytes = match spec {
             Some((k, v)) if k == out.kind => v,
             _ => names_run(out.kind, out.chunk, w, wn, level),
@@ -1636,7 +1654,7 @@ pub fn best_names(names: &[u8], n: u64, full: Option<(&[u8], u64)>, level: i32, 
 }
 
 /// The ranked winner on all the names; empty: zstd, by the caller.
-fn names_run(kind: u8, chunk: usize, w: &[u8], wn: u64, level: i32) -> Vec<u8> {
+fn names_run(kind: u8, chunk: usize, w: &mut [u8], wn: u64, level: i32) -> Vec<u8> {
     match kind {
         1 => int_names(w, wn).map(|v| ffi::zstd(&v, level)),
         2 => tok_chunked(w, chunk),

@@ -630,9 +630,9 @@ pub fn pack(a: &Aln, out: &str, refhash: u64) {
     }
     const SNAME: [&str; 10] = ["names", "counts", "deltas", "lengths", "targets", "qstarts", "tpos0", "tpos1", "tpos2", "tpos3"];
     let [p0, p1, p2, p3] = pl;
-    let st = [names, cnt, pos, len, seg_, fq, p0, p1, p2, p3];
+    let mut st = [names, cnt, pos, len, seg_, fq, p0, p1, p2, p3];
     let mut all = Vec::new();
-    for (k, raw) in st.iter().enumerate() {
+    for (k, raw) in st.iter_mut().enumerate() {
         let (mut best, mut bc): (Vec<u8>, i64) = (Vec::new(), -1);
         if !raw.is_empty() {
             if k == 0 {

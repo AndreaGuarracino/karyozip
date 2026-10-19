@@ -472,7 +472,7 @@ fn probe(path: &str) {
             None => writeln!(out, "codec:0x{c:x}\trefused").unwrap(),
         }
     }
-    match ffi::tok_encode(&src) {
+    match ffi::tok_encode(&mut src) {
         Some(v) => writeln!(out, "tok\t{}\t{:016x}\troundtrip={}", v.len(),
                             kst::fnv(kst::FNV0, &v),
                             ffi::tok_decode(&v).as_deref() == Some(&src[..])).unwrap(),

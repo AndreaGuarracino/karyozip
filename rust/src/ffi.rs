@@ -246,15 +246,17 @@ pub fn paydecomp(src: &[u8], codec: i32, raw: usize) -> Option<Vec<u8>> {
 /// The CRAM name tokeniser over one chunk. It overwrites every separator
 /// with NUL and does not put it back, so it gets a copy, never the caller's
 /// buffer: that trap has bitten this project before.
-pub fn tok_encode(names: &[u8]) -> Option<Vec<u8>> {
+/// In place, as the C's tokc: tok3 overwrites every separator with NUL, and
+/// they are put back here, so no copy of the names is made.
+pub fn tok_encode(names: &mut [u8]) -> Option<Vec<u8>> {
     if names.is_empty() || names.len() > c_int::MAX as usize { return None; }
-    let mut copy = names.to_vec();
     // SAFETY: out_len is written by the callee; the returned buffer is malloc'd
     // by C and freed here after copying.
     unsafe {
         let mut ol: c_int = 0;
-        let p = tok3_encode_names(copy.as_mut_ptr() as *mut c_char, copy.len() as c_int,
+        let p = tok3_encode_names(names.as_mut_ptr() as *mut c_char, names.len() as c_int,
                                   9, 0, &mut ol, std::ptr::null_mut());
+        for c in names.iter_mut() { if *c == 0 { *c = b'\n'; } }
         if p.is_null() || ol <= 0 { return None; }
         let v = std::slice::from_raw_parts(p, ol as usize).to_vec();
         free(p as *mut c_void);

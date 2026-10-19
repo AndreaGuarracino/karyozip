@@ -1,0 +1,3 @@
+layout: headed, lengths bzip3-8MB, labels arith-o1+rle, decided on 4427653 of 4427653 B of lengths
+names: tokeniser chunk 1000000, decided on 16777245 of 60700130 B
+encoded rows=4333480 reads=2000000 blocks=1 names=3361B (tokenised) index=0B offs=39B lens=2486275B labs=2063106B raw=8761133B

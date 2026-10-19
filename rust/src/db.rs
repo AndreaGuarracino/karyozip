@@ -281,7 +281,7 @@ pub fn encode(files: &[String], feats: &Feats, w: &mut crate::writer::Writer) ->
         }
         if !haveseq || lastseq != b[0].seq {
             haveseq = true;
-            lastseq = b[0].seq.clone();
+            lastseq.clone_from(&b[0].seq);   // reuses the buffer, one a sequence
             prevfid = u32::MAX;                      // a new sequence starts fresh
         }
         for (k, x) in b.iter_mut().enumerate() { if x.labid == u32::MAX - 1 { x.labid = feats.labid(k, &x.lab); } }

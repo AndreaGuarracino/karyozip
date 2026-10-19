@@ -360,6 +360,7 @@ impl Writer {
     /// The k-way merge over the spilled runs, in the same order.
     fn spillmerge(&mut self) -> Result<(), String> {
         let mut files = std::mem::take(&mut self.spill);
+        let lt = self.labtab.clone();
         let mut head: Vec<Option<SRec>> = Vec::with_capacity(files.len());
         for f in files.iter_mut() {
             f.seek(SeekFrom::Start(0)).map_err(io)?;
@@ -376,7 +377,7 @@ impl Writer {
             }
             if best == usize::MAX { break; }
             let r = head[best].take().unwrap();
-            self.sort_emit(&r)?;
+            self.sort_emit(&r, &lt)?;
             out += 1;
             head[best] = srd_next(&mut files[best])?;
         }
@@ -385,14 +386,14 @@ impl Writer {
     }
 
     /// One sorted record to the writer, under its rank when names are permuted.
-    fn sort_emit(&mut self, r: &SRec) -> Result<(), String> {
-        let rank = r.idx.to_string();
+    /// `lt` is the label table, copied once a flush, not once a row.
+    fn sort_emit(&mut self, r: &SRec, lt: &[Vec<u8>]) -> Result<(), String> {
+        let rank = if self.perm_on { r.idx.to_string() } else { String::new() };
         let name: &[u8] = if self.perm_on { rank.as_bytes() } else { &r.nm };
-        self.alnname = Some(r.nm.clone());
+        if self.aln.is_some() { self.alnname = Some(r.nm.clone()); }   // the PAF wants the real name
         let mut pos = 0u64;
         for &(len, id) in &r.runs {
-            let l = self.labtab[id as usize].clone();
-            self.row_inner(name, len as u64, &l, pos, false)?;
+            self.row_inner(name, len as u64, &lt[id as usize], pos, false)?;
             pos += len as u64;
         }
         Ok(())
@@ -407,7 +408,8 @@ impl Writer {
         let mut recs = std::mem::take(&mut self.srec);
         recs.sort_by(srec_cmp);
         let n = recs.len();
-        for r in &recs { self.sort_emit(r)?; }
+        let lt = self.labtab.clone();
+        for r in &recs { self.sort_emit(r, &lt)?; }
         eprintln!("sorted {n} records by label tuple then lengths");
         Ok(())
     }

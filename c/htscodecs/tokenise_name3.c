@@ -157,6 +157,13 @@ typedef struct {
     trie_t *t_head;
     pool_alloc_t *pool;
 
+    // Decoder only: each name's token array, carved from 1MB chunks
+    // that are freed together rather than one malloc per name.
+    char **chunk;
+    int nchunk;
+    char *chunk_p;
+    size_t chunk_left;
+
     // token blocks
     descriptor desc[MAX_TBLOCKS];
 
@@ -196,6 +203,10 @@ static name_context *create_context(int max_names) {
 
     ctx->lc = (last_context *)(((char *)ctx) + sizeof(*ctx));
     ctx->pool = NULL;
+    ctx->chunk = NULL;
+    ctx->nchunk = 0;
+    ctx->chunk_p = NULL;
+    ctx->chunk_left = 0;
 
      memset(&ctx->desc[0], 0, 2*16 * sizeof(ctx->desc[0]));
      memset(&ctx->token_dcount[0], 0, sizeof(int));
@@ -206,6 +217,25 @@ static name_context *create_context(int max_names) {
      ctx->lc[0].last_ntok = 0;
 
     return ctx;
+}
+
+// Returns n bytes from the decoder's chunks, or NULL on failure.
+static void *last_alloc(name_context *ctx, size_t n) {
+    if (n > ctx->chunk_left) {
+        size_t c = n > (1 << 20) ? n : (1 << 20);
+        char **v = realloc(ctx->chunk, (ctx->nchunk + 1) * sizeof(*v));
+        if (!v)
+            return NULL;
+        ctx->chunk = v;
+        if (!(ctx->chunk_p = malloc(c)))
+            return NULL;
+        ctx->chunk[ctx->nchunk++] = ctx->chunk_p;
+        ctx->chunk_left = c;
+    }
+    void *p = ctx->chunk_p;
+    ctx->chunk_p += n;
+    ctx->chunk_left -= n;
+    return p;
 }
 
 static void free_context(name_context *ctx) {
@@ -221,8 +251,14 @@ static void free_context(name_context *ctx) {
     for (i = 0; i < ctx->max_tok*16; i++)
         free(ctx->desc[i].buf);
 
-    for (i = 0; i < ctx->max_names; i++)
-        free(ctx->lc[i].last);
+    if (ctx->nchunk) {
+        for (i = 0; i < ctx->nchunk; i++)
+            free(ctx->chunk[i]);
+        free(ctx->chunk);
+    } else {
+        for (i = 0; i < ctx->max_names; i++)
+            free(ctx->lc[i].last);
+    }
 
     htscodecs_tls_free(ctx);
 }
@@ -1046,7 +1082,7 @@ static int decode_name(name_context *ctx, char *name, int name_len) {
         ctx->lc[cnum].last_ntok = ctx->lc[pnum].last_ntok;
 
         int nc = ctx->lc[cnum].last_ntok ? ctx->lc[cnum].last_ntok : MAX_TOKENS;
-        ctx->lc[cnum].last = malloc(nc * sizeof(*ctx->lc[cnum].last));
+        ctx->lc[cnum].last = last_alloc(ctx, nc * sizeof(*ctx->lc[cnum].last));
         if (!ctx->lc[cnum].last)
             return -1;
         memcpy(ctx->lc[cnum].last, ctx->lc[pnum].last,
@@ -1057,7 +1093,7 @@ static int decode_name(name_context *ctx, char *name, int name_len) {
 
     *name = 0;
     int ntok, len = 0, len2;
-    ctx->lc[cnum].last = malloc(MAX_TOKENS * sizeof(*ctx->lc[cnum].last));
+    ctx->lc[cnum].last = last_alloc(ctx, MAX_TOKENS * sizeof(*ctx->lc[cnum].last));
     if (!ctx->lc[cnum].last)
         return -1;
 
@@ -1190,11 +1226,11 @@ static int decode_name(name_context *ctx, char *name, int name_len) {
             ctx->lc[cnum].last_name = name;
             ctx->lc[cnum].last_ntok = ntok;
 
-            last_context_tok *shrunk
-                = realloc(ctx->lc[cnum].last,
-                          (ntok+1) * sizeof(*ctx->lc[cnum].last));
-            if (shrunk)
-                ctx->lc[cnum].last = shrunk;
+            // The most recent chunk allocation: hand back the unused tokens.
+            size_t unused = (MAX_TOKENS - (ntok+1))
+                * sizeof(*ctx->lc[cnum].last);
+            ctx->chunk_p -= unused;
+            ctx->chunk_left += unused;
 
             if (!ctx->lc[cnum].last)
                 return -1;

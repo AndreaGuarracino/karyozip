@@ -326,10 +326,7 @@ impl Aln {
     /// reference's contig-order hash. Returns false when it is not one.
     fn load_packed(&mut self, path: &str) -> bool {
         let Ok(d) = std::fs::read(path) else { return false };
-        if d.len() < 6 || &d[..6] != b"KSTAL3" {
-            if d.len() >= 6 && &d[..5] == b"KSTAL" { crate::bail("this packed alignment is an older format: pack it again with this version"); }
-            return false;
-        }
+        if d.len() < 6 || &d[..6] != b"KSTAL1" { return false; }
         if d.len() < 14 { crate::bail("truncated packed alignment"); }
         let rh = u64::from_le_bytes(d[6..14].try_into().unwrap());
         if rh != refhash(self) {
@@ -658,7 +655,7 @@ pub fn pack(a: &Aln, out: &str, refhash: u64) {
         all.extend_from_slice(&best);
     }
     let mut f = Vec::with_capacity(all.len() + 16);
-    f.extend_from_slice(b"KSTAL3");
+    f.extend_from_slice(b"KSTAL1");
     f.extend_from_slice(&refhash.to_le_bytes());
     f.extend_from_slice(&all);
     std::fs::write(out, &f).unwrap_or_else(|_| crate::bail("cannot write the packed alignment"));

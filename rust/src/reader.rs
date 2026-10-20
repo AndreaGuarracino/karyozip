@@ -141,15 +141,8 @@ impl Reader {
         if &m != crate::writer::MAGIC {
             let sh: String = m.iter()
                 .map(|&c| if (32..127).contains(&c) { c as char } else { '.' }).collect();
-            if m[..3] == crate::writer::MAGIC[..3] {
-                let mut e = b"karyozip: this is KST version ".to_vec();   // raw bytes, as the C prints them
-                e.extend_from_slice(&m[3..]); e.extend_from_slice(b", this build writes ");
-                e.extend_from_slice(&crate::writer::MAGIC[3..]); e.push(b'\n');
-                let _ = std::io::Write::write_all(&mut std::io::stderr(), &e);
-            } else {
-                eprintln!("karyozip: file starts with \"{sh}\", not \"KST00001\"");
-            }
-            crate::bail("not a KST file this build can read");
+            eprintln!("karyozip: file starts with \"{sh}\", not \"KST00001\"");
+            crate::bail("not a KST file");
         }
         let mut hb = [0u8; 128];
         rd(f.read_exact(&mut hb), "short header");

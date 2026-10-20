@@ -1604,7 +1604,7 @@ static void loadpaf(const char *path) {
 }
 
 /* --------------------------------------------------- packed alignment Only what --aln reads: */
-#define ALNMAGIC "KSTAL3\n"   /* carries the reference contig-order hash */
+#define ALNMAGIC "KSTAL1\n"   /* carries the reference contig-order hash */
 #define ALNMAGLEN 6
 #define ALNTOK 0x7fff0000   /* the name stream went through the tokeniser */
 
@@ -1719,7 +1719,6 @@ static int alnload(const char *path) {
     if (!f) return 0;
     char mg[ALNMAGLEN];
     if (fread(mg, 1, ALNMAGLEN, f) != ALNMAGLEN || memcmp(mg, ALNMAGIC, ALNMAGLEN)) {
-        if (!memcmp(mg, "KSTAL", 5)) die("this packed alignment is an older format: pack it again with this version");
         fclose(f); return 0;                       /* not packed: it is a PAF */
     }
     uint64_t rh;
@@ -3578,13 +3577,11 @@ static R *ropen(const char *path) {
     r->f = fopen(path, "rb"); if (!r->f) die("open");
     char m[8];
     if (fread(m, 1, 8, r->f) != 8) die("not a KST file: shorter than the magic");
-    if (memcmp(m, MAGIC, 8)) {                 /* name what was found, and the version */
+    if (memcmp(m, MAGIC, 8)) {                 /* name what was found */
         char sh[9]; for (int i = 0; i < 8; i++) sh[i] = (m[i] >= 32 && m[i] < 127) ? m[i] : '.';
         sh[8] = 0;
-        if (!memcmp(m, MAGIC, 3))
-            fprintf(stderr, "karyozip: this is KST version %.5s, this build writes %.5s\n", m + 3, MAGIC + 3);
-        else fprintf(stderr, "karyozip: file starts with \"%s\", not \"%.8s\"\n", sh, MAGIC);
-        die("not a KST file this build can read");
+        fprintf(stderr, "karyozip: file starts with \"%s\", not \"%.8s\"\n", sh, MAGIC);
+        die("not a KST file");
     }
     uint64_t h[16]; if (fread(h, 8, 16, r->f) != 16) die("short header");
     uint64_t h1_raw = h[1];             /* flags included, for the hash */

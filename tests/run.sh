@@ -534,7 +534,7 @@ $KT encode --aln "$W/p.kta" --ref "$W/ref2.bed" < "$D/s.bed" > "$W/pk.kt" 2>/dev
   && ok "packed alignment: round-trip" || no "packed alignment: WRONG"
 must_fail "packed alignment with a reordered reference" $KT decode --aln "$W/p.kta" --ref "$W/ref.rev" -i "$W/pk.kt"
 { printf 'KSTAL2'; tail -c +7 "$W/p.kta"; } > "$W/old.kta"
-$KT decode --aln "$W/old.kta" --ref "$W/ref2.bed" -i "$W/pk.kt" 2>&1 >/dev/null | grep -q "older format" && ok "a KSTAL2 packed alignment: named as older" || no "a KSTAL2 packed alignment: WRONG"
+must_fail "a packed alignment with another magic" $KT decode --aln "$W/old.kta" --ref "$W/ref2.bed" -i "$W/pk.kt"
 
 # a label count with no label table skipped the count check, and smooth then
 # wrote a map sized by a wrapped multiply
@@ -836,12 +836,9 @@ $KT encode --sort < "$D/s.bed" > "$W/so.kt" 2>/dev/null
 $KT decode -i "$W/so.kt" 2>/dev/null | cmp -s - "$D/s.bed" && { echo "sorted decode: CLAIMS INPUT ORDER"; fail=1; } || echo "sorted decode: sorted order, as documented"
 $KT decode -i "$W/so.kt" 2>/dev/null | sort | cmp -s - <(sort "$D/s.bed") && ok "sorted decode: same rows" || no "sorted decode: ROWS DIFFER"
 
-# A file that is not KST is named as such, and a future version is told apart
-# from a foreign file.
+# A file that is not KST is named as such.
 printf 'KTRACK02rest' > "$W/old.kst"
 $KT decode -i "$W/old.kst" 2>&1 | grep -q 'not "KST00001"' && ok "a foreign magic: named" || no "a foreign magic: WRONG MESSAGE"
-printf 'KST00099rest' > "$W/v99.kst"
-$KT decode -i "$W/v99.kst" 2>&1 | grep -q "KST version 00099" && ok "a future KST version: named" || no "a future KST version: WRONG MESSAGE"
 
 must_fail "unknown flag" $KT --bogus encode
 $KT --help > "$W/help.txt" 2>/dev/null && [ -s "$W/help.txt" ] && ok "--help: on stdout, exit 0" || no "--help: WRONG"

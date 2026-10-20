@@ -1,14 +1,16 @@
-AndreaGuarracino/htscodecs, tag v1.6.7-kz2: samtools/htscodecs release
-v1.6.7 (see version.h) plus two commits on branch karyozip.
+AndreaGuarracino/htscodecs, tag v1.6.7-kz3: samtools/htscodecs release
+v1.6.7 (see version.h) plus three commits on branch karyozip.
 Fork:     https://github.com/AndreaGuarracino/htscodecs
 Upstream: https://github.com/samtools/htscodecs
 
-The two commits:
+The three commits:
   23abfe3 tok3 decoder: each name's token array comes from 1 MB chunks
           freed together, not a malloc and a realloc a name (short-read
           smooth and decode, 2M names: C instructions -10.5% and -11.6%).
   09631c6 rANS_static4x16pr.c includes <asm/hwcap.h> in the aarch64
           branch, so HWCAP_* is defined on older glibc. Dead on x86.
+  2d05c60 the tok3 encoder takes its token arrays from the same chunks
+          (short-read encode, 1.2M rows: C instructions -1.7%).
 
 Only the files karyozip's Makefile compiles, and the headers they reach,
 are kept. Deleted from the tree: fqzcomp_qual, rANS_static, rANS_byte.h,

@@ -157,8 +157,8 @@ typedef struct {
     trie_t *t_head;
     pool_alloc_t *pool;
 
-    // Decoder only: each name's token array, carved from 1MB chunks
-    // that are freed together rather than one malloc per name.
+    // Each name's token array, carved from 1MB chunks that are freed
+    // together rather than one malloc and one realloc per name.
     char **chunk;
     int nchunk;
     char *chunk_p;
@@ -219,7 +219,7 @@ static name_context *create_context(int max_names) {
     return ctx;
 }
 
-// Returns n bytes from the decoder's chunks, or NULL on failure.
+// Returns n bytes from the context's chunks, or NULL on failure.
 static void *last_alloc(name_context *ctx, size_t n) {
     if (n > ctx->chunk_left) {
         size_t c = n > (1 << 20) ? n : (1 << 20);
@@ -251,14 +251,9 @@ static void free_context(name_context *ctx) {
     for (i = 0; i < ctx->max_tok*16; i++)
         free(ctx->desc[i].buf);
 
-    if (ctx->nchunk) {
-        for (i = 0; i < ctx->nchunk; i++)
-            free(ctx->chunk[i]);
-        free(ctx->chunk);
-    } else {
-        for (i = 0; i < ctx->max_names; i++)
-            free(ctx->lc[i].last);
-    }
+    for (i = 0; i < ctx->nchunk; i++)
+        free(ctx->chunk[i]);
+    free(ctx->chunk);
 
     htscodecs_tls_free(ctx);
 }
@@ -749,7 +744,7 @@ static int encode_name(name_context *ctx, char *name, int len, int mode) {
         ctx->lc[cnum].last_name = name;
         ctx->lc[cnum].last_ntok = ctx->lc[pnum].last_ntok;
         int nc = ctx->lc[cnum].last_ntok ? ctx->lc[cnum].last_ntok : MAX_TOKENS;
-        ctx->lc[cnum].last = malloc(nc * sizeof(*ctx->lc[cnum].last));
+        ctx->lc[cnum].last = last_alloc(ctx, nc * sizeof(*ctx->lc[cnum].last));
         if (!ctx->lc[cnum].last)
             return -1;
         memcpy(ctx->lc[cnum].last, ctx->lc[pnum].last,
@@ -757,7 +752,7 @@ static int encode_name(name_context *ctx, char *name, int len, int mode) {
         return 0;
     }
 
-    ctx->lc[cnum].last = malloc(MAX_TOKENS * sizeof(*ctx->lc[cnum].last));
+    ctx->lc[cnum].last = last_alloc(ctx, MAX_TOKENS * sizeof(*ctx->lc[cnum].last));
     if (!ctx->lc[cnum].last)
         return -1;
     encode_token_diff(ctx, cnum-pnum);
@@ -1040,13 +1035,10 @@ static int encode_name(name_context *ctx, char *name, int len, int mode) {
     
     ctx->lc[cnum].last_name = name;
     ctx->lc[cnum].last_ntok = ntok;
-    last_context_tok *shrunk = realloc(ctx->lc[cnum].last,
-                                       (ntok+1) * sizeof(*ctx->lc[cnum].last));
-    if (shrunk)
-        ctx->lc[cnum].last = shrunk;
-
-    if (!ctx->lc[cnum].last)
-        return -1;
+    // The most recent chunk allocation: hand back the unused tokens.
+    size_t unused = (MAX_TOKENS - (ntok+1)) * sizeof(*ctx->lc[cnum].last);
+    ctx->chunk_p -= unused;
+    ctx->chunk_left += unused;
 
     return 0;
 }

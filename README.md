@@ -96,8 +96,8 @@ The readers are decode and smooth.
 | `--aln-names F` | encode, readers | with `-a`: read N is line N+1 of `F` |
 | `--out-dir DIR`, `--raw` | decode without `-r` | one BED per set under `-d`; `--raw` prints what is stored, for debugging |
 | `--max-gap N`, `--v1` | smooth | KaryoScope's smoothing options |
-| `-t`, `--threads N` | all | default `OMP_NUM_THREADS`, else the cores, up to 8 |
-| `--tmp-dir DIR` | all | where temporary files go, default `TMPDIR`, else /tmp |
+| `-t`, `--threads N` | all | default the cores, up to 8 |
+| `--tmp-dir DIR` | all | where temporary files go, default /tmp |
 | `--profile`, `-h`, `--help`, `--version` | all | time per phase; usage; library versions |
 
 Flags work on either side of the command name.

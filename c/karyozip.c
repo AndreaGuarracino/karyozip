@@ -52,20 +52,19 @@ static inline double nowsec(void) {
     if (_n - PHLAST > 0.01) { PHRSS[i] = rss_now(); PHLAST = _n; } } } while (0)
 static size_t PHRSS[10]; static double PHLAST;
 static double WALL0 = 0;
-/* --threads, else OMP_NUM_THREADS, else one per core capped at 8. The cap is
+/* --threads, else one per core capped at 8. The cap is
    measured, not guessed: encode is about half serial, so past 8 threads the
    extra ones only spin at barriers. On a 40M-row track, 16 cores:
      -t 4   5.09 s wall  13.7 s cpu
      -t 8   4.41 s wall  19.5 s cpu   <- the knee
      -t 16  4.69 s wall  35.3 s cpu
-   An explicit --threads or OMP_NUM_THREADS overrides it. */
+   No environment variable changes it. */
 #define THRCAP 8
 static int nthreads(void) {
     if (NTHREADS > 0) return NTHREADS;
 #ifdef _OPENMP
-    int m = omp_get_max_threads();
-    if (m > THRCAP && !getenv("OMP_NUM_THREADS")) m = THRCAP;
-    return m < 1024 ? m : 1024;   /* libgomp keeps team state on the stack */
+    int m = omp_get_num_procs();
+    return m < THRCAP ? m : THRCAP;
 #else
     return 1;
 #endif
@@ -848,7 +847,7 @@ static char *fldnamesd(const uint8_t *b, size_t n, uint64_t cnt, size_t *outn) {
 #define TOKDEC 4
 
 static int V1 = 0;
-static const char *TMPD = NULL;         /* --tmp-dir, else TMPDIR, else /tmp */
+static const char *TMPD = "/tmp";       /* --tmp-dir */
 
 #include "htscodecs/tokenise_name3.h"
 #include "htscodecs/version.h"
@@ -1337,17 +1336,17 @@ static void ktw_close(ktw *w);
 static ktw *ktw_open(FILE *out) {
     ktw *w = xcalloc(1, sizeof(ktw));
     w->ordok = 1; ROWHASH = FNV0;
-    const char *td = TMPD; if (!td || !*td) td = getenv("TMPDIR"); if (!td || !*td) td = "/tmp";
+    const char *td = *TMPD ? TMPD : "/tmp";
     char *tp; if (asprintf(&tp, "%s/karyozip.XXXXXX", td) < 0) die("oom");
     int tfd = mkstemp(tp);
-    if (tfd < 0) { fprintf(stderr, "karyozip: cannot create a temp file under %s (set TMPDIR)\n", td); exit(1); }
+    if (tfd < 0) { fprintf(stderr, "karyozip: cannot create a temp file under %s (see --tmp-dir)\n", td); exit(1); }
     unlink(tp); free(tp);
     w->out = out;
     w->tmp = fdopen(tfd, "w+b");
     if (!w->tmp) die("tmpfile");
     if (asprintf(&tp, "%s/karyozip.raw.XXXXXX", td) < 0) die("oom");
     w->rawfd = mkstemp(tp);
-    if (w->rawfd < 0) { fprintf(stderr, "karyozip: cannot create a temp file under %s (set TMPDIR)\n", td); exit(1); }
+    if (w->rawfd < 0) { fprintf(stderr, "karyozip: cannot create a temp file under %s (see --tmp-dir)\n", td); exit(1); }
     unlink(tp); free(tp);
     return w;
 }
@@ -2284,7 +2283,7 @@ static void spillwrite(void) {
         cspill = cspill ? cspill * 2 : 16;
         SPILL = xrealloc(SPILL, cspill * sizeof *SPILL);
     }
-    const char *sd = TMPD; if (!sd || !*sd) sd = getenv("TMPDIR"); if (!sd || !*sd) sd = "/tmp";
+    const char *sd = *TMPD ? TMPD : "/tmp";
     char *tp; if (asprintf(&tp, "%s/karyozip.sort.XXXXXX", sd) < 0) die("oom");
     int fd = mkstemp(tp);
     if (fd < 0) die("cannot create a sort temp file: check --tmp-dir");
@@ -5563,10 +5562,7 @@ int main(int argc, char **argv) {
             "  with -a:     --aln-names FILE, on encode and decode, when the track names rows by ordinal\n"
             "  smooth:      --max-gap N  --v1\n"
             "  long forms:  -i --input  -o --output  -r --region  -f --feature-set  -b --block\n"
-            "               -e --effort  -n --names  -d --db  -a --aln\n"
-            "  Two variables are read, and neither changes the stored bytes:\n"
-            "    TMPDIR         where temp files go, when --tmp-dir is not given\n"
-            "    OMP_NUM_THREADS  the thread count, when --threads is not given";
+            "               -e --effort  -n --names  -d --db  -a --aln";
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) { puts(USAGE); return 0; }
         /* The codec versions decide the stored bytes, so print them. */

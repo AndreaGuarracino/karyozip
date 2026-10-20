@@ -19,23 +19,17 @@ fn main() {
     ffi::ignore_sigxfsz();
     if !ffi::STDFDS_OPEN.load(std::sync::atomic::Ordering::Relaxed) { die("stdin, stdout or stderr is closed"); }
     let c = Cli::get();
-    // --threads, else OMP_NUM_THREADS, else one per core capped at 8, which
-    // is what the C does. The pool is always explicit, so RAYON_NUM_THREADS
-    // cannot reach it and the two binaries read the one same variable.
+    // --threads, else one per core capped at 8, as the C. The pool is
+    // explicit, so no environment variable reaches it.
     const THRCAP: usize = 8;
     let n = match cnt(&c.threads, 1, 1024, "--threads is a number of 1 to 1024") {
         Some(t) => t as usize,
-        None => match std::env::var("OMP_NUM_THREADS").ok().and_then(|s| s.parse().ok()) {
-            Some(m @ 1..) => usize::min(m, 1024),
-            _ => std::thread::available_parallelism().map_or(1, |p| p.get()).min(THRCAP),
-        },
+        None => std::thread::available_parallelism().map_or(1, |p| p.get()).min(THRCAP),
     };
     ffi::pin_mmap_threshold();
     ffi::omp_threads(n);
     rayon::ThreadPoolBuilder::new().num_threads(n).build_global().ok();
-    let tmpdir = c.tmp_dir.clone()
-        .or_else(|| std::env::var("TMPDIR").ok())
-        .unwrap_or_else(|| "/tmp".into());
+    let tmpdir = c.tmp_dir.clone().filter(|d| !d.is_empty()).unwrap_or_else(|| "/tmp".into());
 
     let mut opt = writer::Options::default();
     if let Some(b) = &c.block {
@@ -272,7 +266,7 @@ fn load_aln(paf: &Option<String>, refbed: &Option<String>,
 /// The staging file goes under tmpdir; the C's words if it cannot.
 fn new_writer(opt: writer::Options, tmpdir: &std::path::Path) -> writer::Writer {
     writer::Writer::new(opt, tmpdir).unwrap_or_else(|_| die(&format!(
-        "cannot create a temp file under {} (set TMPDIR)", tmpdir.display())))
+        "cannot create a temp file under {} (see --tmp-dir)", tmpdir.display())))
 }
 
 fn encode(opt: writer::Options, tmpdir: &std::path::Path, a: Option<aln::Aln>) {

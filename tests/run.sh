@@ -676,14 +676,14 @@ must_fail "--tmp-dir that does not exist" $KT --tmp-dir /nonexistent/dir encode 
 $KT --tmp-dir "$W" encode < "$D/s.bed" 2>/dev/null | cmp -s - "$W/p.kt" && ok "--tmp-dir honoured: same bytes" || no "--tmp-dir honoured: WRONG"
 
 # round 25 findings, one case each
-OMP_NUM_THREADS=100000 $KT encode < "$D/s.bed" 2>/dev/null | cmp -s - "$W/p.kt" && ok "OMP_NUM_THREADS 100000: capped" || no "OMP_NUM_THREADS 100000: WRONG"
-# OMP_NUM_THREADS never moves a stored byte
+# environment variables are ignored
 ok=1
-for e in 1 3 16; do
+for e in 1 3 16 100000; do
   OMP_NUM_THREADS=$e $KT encode < "$D/db.rall.bed" 2>/dev/null | cmp -s - "$W/omp.ref" || ok=0
   OMP_NUM_THREADS=$e $KT --threads 2 encode < "$D/db.rall.bed" 2>/dev/null | cmp -s - "$W/omp.ref" || ok=0
 done
-[ $ok = 1 ] && ok "OMP_NUM_THREADS: no effect on the stored bytes" || no "OMP_NUM_THREADS: MOVED THE STORED BYTES"
+TMPDIR=/nonexistent $KT encode < "$D/s.bed" 2>/dev/null | cmp -s - "$W/p.kt" || ok=0
+[ $ok = 1 ] && ok "OMP_NUM_THREADS, TMPDIR: ignored" || no "OMP_NUM_THREADS or TMPDIR: READ"
 must_fail "--block 4abc" $KT encode --block 4abc < "$D/s.bed"
 must_fail "-t 4x" $KT -t 4x encode < "$D/s.bed"
 must_fail "--sort=nan" $KT encode --tmp-dir "$W" --sort=nan < "$D/s.bed"

@@ -2,7 +2,7 @@
 //! The alignment is read for one thing only, the collinear M/=/X segments.
 
 use crate::kst::{self, unzz, vget, FNV0};
-use std::collections::HashMap;
+use crate::kst::FnvMap as HashMap;   // FNV, as the C's intern: SipHash was a tenth of aln-pack
 
 /// How a .kst reference is read: whole at load, per contig on demand, or one
 /// block at a time when a single sequence is asked for.
@@ -45,9 +45,7 @@ pub struct Aln {
     /// open addressed by hash, as the C's qseg_get: index + 1 into qs, 0 empty;
     /// a HashMap kept a second copy of every name, 135 B more a short read
     qsix: Vec<u32>,
-    pub labs: Vec<Vec<u8>>,
-    labix: HashMap<Vec<u8>, u32>,
-    labh: Vec<u64>,
+    pub lt: kst::Intern,
     /// --aln-names: ordinal N is line N+1, for tracks named by ordinal.
     pub ord: Vec<Vec<u8>>,
     pub hash: u64,
@@ -98,12 +96,7 @@ impl Aln {
     }
 
     fn lab(&mut self, s: &[u8]) -> u32 {
-        if let Some(&i) = self.labix.get(s) { return i; }
-        let i = self.labs.len() as u32;
-        self.labs.push(s.to_vec());
-        self.labh.push(kst::fnv(FNV0, s));
-        self.labix.insert(s.to_vec(), i);
-        i
+        self.lt.get(s)
     }
 
     /// The reference track: one contig's rows together, sorted, gapless.
@@ -125,8 +118,11 @@ impl Aln {
         while let Some(raw) = lines.next_line() {
             let mut line = raw;
             if line.last() == Some(&b'\r') { line = &line[..line.len() - 1]; }
-            let c: Vec<&[u8]> = line.splitn(4, |&x| x == b'\t').collect();
-            if c.len() < 4 { if !line.is_empty() { badln += 1; } continue; }
+            let mut it = line.splitn(4, |&x| x == b'\t');   // no Vec a line
+            let c: [&[u8]; 4] = match (it.next(), it.next(), it.next(), it.next()) {
+                (Some(a), Some(b), Some(d), Some(e)) => [a, b, d, e],
+                _ => { if !line.is_empty() { badln += 1; } continue; }
+            };
             if c[0].is_empty() { crate::bail("reference track: empty contig name"); }
             if cur == usize::MAX || self.rc[cur].name != c[0] {
                 if self.rcix.contains_key(c[0]) {
@@ -146,7 +142,7 @@ impl Aln {
             if s != want { crate::bail("reference track: rows are not sorted and gapless from 0"); }
             if en <= s { crate::bail("reference track: a run of no length"); }
             let l = self.lab(c[3]);
-            rh = kst::rowmix(rh, nh, s, en, self.labh[l as usize]);
+            rh = kst::rowmix(rh, nh, s, en, self.lt.h[l as usize]);
             st.push(s);
             lab.push(l);
             end = en;

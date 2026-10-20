@@ -7,7 +7,6 @@ use crate::ffi;
 use crate::kst::{self, FNV0, TOKFLAG, INTFLAG, FLDFLAG, DROPPED, ALNFLAG, DBFLAG, SIDEFLAG, LENFLAG,
                  TAILFLAG, RUNFLAG, ILVFLAG, GRPFLAG, PERMFLAG, PERMTOK, CARTFLAG, ICHUNK};
 use rayon::prelude::*;
-use std::collections::HashMap;
 use std::collections::HashSet;
 use std::io::{Read, Seek, SeekFrom, Write};
 
@@ -51,13 +50,9 @@ pub struct Writer {
     ibx: Vec<u8>,
     nidx: u64,
     ordok: bool,
-    labtab: Vec<Vec<u8>>,
-    labmap: HashMap<Vec<u8>, u32, kst::Fnv>,
-    lastid: Option<u32>,
-    lcache: [u32; 512],   // label cache, u32::MAX empty
+    lt: kst::Intern,
     cur: Vec<u8>,
     /// fnv of each label and of cur, for the row hash
-    labh: Vec<u64>,
     curnh: u64,
     currun: u64,
     curbp: u64,
@@ -123,7 +118,7 @@ impl Writer {
     /// The reference's labels share the track's table: loadref interns them
     /// first, so the ids the reference answers with are the track's ids.
     pub fn set_aln(&mut self, a: crate::aln::Aln) {
-        for l in a.labs.clone() { self.intern(&l); }
+        for l in a.lt.tab.clone() { self.intern(&l); }
         self.aln = Some(a);
     }
     pub fn aln_hash(&self) -> u64 { self.aln.as_ref().map_or(0, |a| a.hash) }
@@ -133,10 +128,10 @@ impl Writer {
         Ok(Writer {
             perm_on, early: None, alnname: None, held: 0, spill: Vec::new(), natn: 0,
             opt, lens: Vec::new(), ids: Vec::new(), names: Vec::new(), ibx: Vec::new(),
-            nidx: 0, ordok: true, labtab: Vec::new(), labmap: HashMap::default(), lastid: None, lcache: [u32::MAX; 512],
+            nidx: 0, ordok: true, lt: kst::Intern::default(),
             cur: Vec::new(), currun: 0, curbp: 0, blkbp0: 0, pend: 0, nblk: 0, curblk: 0, curoff: 0, rows: 0,
             plen: 0, pval: 0, phas: false, tailsamp: Vec::new(), tailpred: 0, tailon: None,
-            srec: Vec::new(), sortbp: 0, natbuf: Vec::new(), natord: true, feathash: None, cart: false, rowhash: kst::FNV0, labh: Vec::new(), curnh: 0,
+            srec: Vec::new(), sortbp: 0, natbuf: Vec::new(), natord: true, feathash: None, cart: false, rowhash: kst::FNV0, curnh: 0,
             aln: None, alnq: None, alnhit: 0,
             lalt: [Vec::new(), Vec::new()], rawalt: [Vec::new(), Vec::new()],
             prev_rev: false,
@@ -145,31 +140,7 @@ impl Writer {
     }
 
     #[inline(always)]
-    fn intern(&mut self, label: &[u8]) -> u32 {
-        if let Some(id) = self.lastid {
-            if self.labtab[id as usize] == label { return id; }
-        }
-        // As the C's: labels cycle, so a direct-mapped cache on the length
-        // and three bytes answers most rows without hashing the label.
-        let n = label.len();
-        let mut ck = (n as u32).wrapping_mul(2654435761);
-        if n > 0 { ck ^= (label[0] as u32) << 7 ^ (label[n - 1] as u32) << 15 ^ (label[n >> 1] as u32) << 23; }
-        let ck = ((ck ^ (ck >> 13)) & 511) as usize;
-        let cid = self.lcache[ck];
-        if cid != u32::MAX && self.labtab[cid as usize] == label { self.lastid = Some(cid); return cid; }
-        if let Some(&id) = self.labmap.get(label) {
-            self.lastid = Some(id);
-            self.lcache[ck] = id;
-            return id;
-        }
-        let id = self.labtab.len() as u32;
-        self.labtab.push(label.to_vec());
-        self.labh.push(kst::fnv(kst::FNV0, label));
-        self.labmap.insert(label.to_vec(), id);
-        self.lastid = Some(id);
-        self.lcache[ck] = id;
-        id
-    }
+    fn intern(&mut self, label: &[u8]) -> u32 { self.lt.get(label) }
 
     /// The lengths frame, plus the two alternate spellings --aln keeps.
     #[inline(always)]
@@ -360,7 +331,7 @@ impl Writer {
     /// The k-way merge over the spilled runs, in the same order.
     fn spillmerge(&mut self) -> Result<(), String> {
         let mut files = std::mem::take(&mut self.spill);
-        let lt = self.labtab.clone();
+        let lt = self.lt.tab.clone();
         let mut head: Vec<Option<SRec>> = Vec::with_capacity(files.len());
         for f in files.iter_mut() {
             f.seek(SeekFrom::Start(0)).map_err(io)?;
@@ -408,7 +379,7 @@ impl Writer {
         let mut recs = std::mem::take(&mut self.srec);
         recs.sort_by(srec_cmp);
         let n = recs.len();
-        let lt = self.labtab.clone();
+        let lt = self.lt.tab.clone();
         for r in &recs { self.sort_emit(r, &lt)?; }
         eprintln!("sorted {n} records by label tuple then lengths");
         Ok(())
@@ -475,7 +446,7 @@ impl Writer {
         // The C interns first and then decides, so the label joins the table
         // even when the reference answers for it.
         let mut id = self.intern(label);
-        self.rowhash = kst::rowmix(self.rowhash, self.curnh, start, start + run_len, self.labh[id as usize]);
+        self.rowhash = kst::rowmix(self.rowhash, self.curnh, start, start + run_len, self.lt.h[id as usize]);
         if self.aln.is_some() {
             if label == b"=" { return Err("a label \"=\" is reserved under --aln".into()); }
             // borrowed, not taken: taking moved the whole Aln out and back per row
@@ -729,7 +700,7 @@ impl Writer {
         drop(_s);
         let _s = crate::prof::span(2);
         let mut labs = Vec::new();
-        for l in &self.labtab { labs.extend_from_slice(l); labs.push(b'\n'); }
+        for l in &self.lt.tab { labs.extend_from_slice(l); labs.push(b'\n'); }
 
         // The C's decision, step for step: which of the names are stored,
         // as text, as ordinals, in a sidecar, or as ranks plus a blob.
@@ -879,7 +850,7 @@ impl Writer {
         h[4] = self.rows;
         h[5] = lencodec as u32 as u64 | self.feathash.map_or(0, |f| (f & 0xffff_ffff) << 32);
         h[6] = lz.len() as u64;
-        h[7] = self.labtab.len() as u64;
+        h[7] = self.lt.tab.len() as u64;
         h[8] = self.opt.block;
         h[9] = idc as u32 as u64 | self.feathash.map_or(0, |f| (f >> 32) << 32);
         h[10] = nichunk;

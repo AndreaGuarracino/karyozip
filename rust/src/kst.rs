@@ -156,3 +156,40 @@ impl std::hash::Hasher for FnvHasher {
 }
 
 pub type FnvMap<K, V> = std::collections::HashMap<K, V, Fnv>;
+
+/// A label table: ids in first-seen order and each label's FNV. As the C's
+/// intern: the last id, then a direct-mapped cache on the length and three
+/// bytes, since labels cycle, and only then the hash map.
+pub struct Intern { pub tab: Vec<Vec<u8>>, pub h: Vec<u64>, map: FnvMap<Vec<u8>, u32>, last: Option<u32>, cache: [u32; 512] }
+
+impl Default for Intern {
+    fn default() -> Self { Intern { tab: Vec::new(), h: Vec::new(), map: FnvMap::default(), last: None, cache: [u32::MAX; 512] } }
+}
+
+impl Intern {
+    #[inline(always)]
+    pub fn get(&mut self, label: &[u8]) -> u32 {
+        if let Some(id) = self.last {
+            if self.tab[id as usize] == label { return id; }
+        }
+        let n = label.len();
+        let mut ck = (n as u32).wrapping_mul(2654435761);
+        if n > 0 { ck ^= (label[0] as u32) << 7 ^ (label[n - 1] as u32) << 15 ^ (label[n >> 1] as u32) << 23; }
+        let ck = ((ck ^ (ck >> 13)) & 511) as usize;
+        let cid = self.cache[ck];
+        if cid != u32::MAX && self.tab[cid as usize] == label { self.last = Some(cid); return cid; }
+        let id = match self.map.get(label) {
+            Some(&id) => id,
+            None => {
+                let id = self.tab.len() as u32;
+                self.tab.push(label.to_vec());
+                self.h.push(fnv(FNV0, label));
+                self.map.insert(label.to_vec(), id);
+                id
+            }
+        };
+        self.last = Some(id);
+        self.cache[ck] = id;
+        id
+    }
+}

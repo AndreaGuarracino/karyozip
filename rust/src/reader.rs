@@ -451,26 +451,7 @@ impl Reader {
                     ocap = ocap.max(need);
                 }
                 match lab {
-                    // one reserve for the whole row, then one pointer
-                    // through it, as the C writes it
-                    // the numbers straight into the buffer, as the C's
-                    // putu64: a scratch copy was a third memmove a row
-                    Some(l) => unsafe {
-                        buf.reserve(name.len() + 44 + l.len() + 1);
-                        let n0 = buf.len();
-                        let p = buf.as_mut_ptr().add(n0);
-                        std::ptr::copy_nonoverlapping(name.as_ptr(), p, name.len());
-                        let row = std::slice::from_raw_parts_mut(p.add(name.len()), 44);
-                        row[0] = b'\t';
-                        let mut nl = 1 + kst::putu64_at(&mut row[1..], st);
-                        row[nl] = b'\t'; nl += 1;
-                        nl += kst::putu64_at(&mut row[nl..], en);
-                        row[nl] = b'\t'; nl += 1;
-                        let q = p.add(name.len() + nl);
-                        std::ptr::copy_nonoverlapping(l.as_ptr(), q, l.len());
-                        *q.add(l.len()) = b'\n';
-                        buf.set_len(n0 + name.len() + nl + l.len() + 1);
-                    },
+                    Some(l) => kst::put_row(&mut buf, &name, st, en, l),
                     None => {
                         buf.extend_from_slice(&name);
                         buf.push(b'\t'); kst::putu64(&mut buf, st);

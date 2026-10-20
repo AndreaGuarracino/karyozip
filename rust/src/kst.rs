@@ -74,6 +74,31 @@ pub fn fnv(mut h: u64, b: &[u8]) -> u64 {
 
 /// Decimal digits straight into the buffer. `to_string()` allocates a String
 /// per number, which is a quarter of decode's time on a 40M-row track.
+/// One BED row onto `buf`: one reserve, the numbers straight into it as
+/// the C's putu64, one copy for each string; a scratch for the numbers was
+/// two more memmove a row.
+#[inline]
+pub fn put_row(buf: &mut Vec<u8>, name: &[u8], st: u64, en: u64, lab: &[u8]) {
+    buf.reserve(name.len() + 44 + lab.len() + 1);
+    // SAFETY: reserved above: the name, 44 bytes for three tabs and two
+    // numbers of at most 20 digits, the label and the newline.
+    unsafe {
+        let n0 = buf.len();
+        let p = buf.as_mut_ptr().add(n0);
+        std::ptr::copy_nonoverlapping(name.as_ptr(), p, name.len());
+        let row = std::slice::from_raw_parts_mut(p.add(name.len()), 44);
+        row[0] = b'\t';
+        let mut nl = 1 + putu64_at(&mut row[1..], st);
+        row[nl] = b'\t'; nl += 1;
+        nl += putu64_at(&mut row[nl..], en);
+        row[nl] = b'\t'; nl += 1;
+        let q = p.add(name.len() + nl);
+        std::ptr::copy_nonoverlapping(lab.as_ptr(), q, lab.len());
+        *q.add(lab.len()) = b'\n';
+        buf.set_len(n0 + name.len() + nl + lab.len() + 1);
+    }
+}
+
 pub fn putu64(out: &mut Vec<u8>, v: u64) {
     let mut b = [0u8; 20];
     let n = putu64_at(&mut b, v);

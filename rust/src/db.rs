@@ -374,32 +374,36 @@ pub fn decode(r: &mut crate::reader::Reader, feats: &Feats, dir: Option<&str>, c
     // One open run per output, extended while its label does not change.
     let n = out.len();
     let mut joined = Vec::new();
-    // (open, start, end, label) per output; the label buffer is reused
-    let mut cur: Vec<(bool, u64, u64, Vec<u8>)> = vec![(false, 0, 0, Vec::new()); n];
+    // (open, start, end, label) per output: the label is the table's own
+    // bytes, as the C's pointer, so a run start copies nothing; on stdout
+    // the joined label of the open run is kept in cj
+    let mut cur: Vec<(bool, u64, u64, &[u8])> = vec![(false, 0, 0, &[][..]); n];
+    let mut cj: Vec<u8> = Vec::new();
     let mut cseq: Vec<u8> = Vec::new();
     let mut rows = 0u64;
     r.for_each_row(&mut |seq: &[u8], st: u64, en: u64, lab: &[u8]| {
         if seq != cseq {
             for j in 0..n {
                 let c = &mut cur[j];
-                if c.0 { wr(&mut out[j], &cseq, c.1, c.2, &c.3); c.0 = false; }
+                if c.0 { wr(&mut out[j], &cseq, c.1, c.2, if dir.is_none() { &cj } else { c.3 }); c.0 = false; }
             }
             cseq.clear(); cseq.extend_from_slice(seq);
         }
         let id = feats.featid(lab);
         if dir.is_none() { feats.joined(id, cols, &mut joined); }
         for j in 0..n {
-            let l: &[u8] = if dir.is_none() { &joined } else { feats.lab(id, cols[j]) };
+            let l: &[u8] = if dir.is_none() { &[] } else { feats.lab(id, cols[j]) };
             let c = &mut cur[j];
-            if c.0 && c.2 == st && c.3 == l { c.2 = en; continue; }
-            if c.0 { wr(&mut out[j], &cseq, c.1, c.2, &c.3); }
-            c.0 = true; c.1 = st; c.2 = en; c.3.clear(); c.3.extend_from_slice(l);
+            if c.0 && c.2 == st && if dir.is_none() { cj == joined } else { c.3 == l } { c.2 = en; continue; }
+            if c.0 { wr(&mut out[j], &cseq, c.1, c.2, if dir.is_none() { &cj } else { c.3 }); }
+            *c = (true, st, en, l);
+            if dir.is_none() { cj.clear(); cj.extend_from_slice(&joined); }
         }
         rows += 1;
     });
     for j in 0..n {
         let c = &mut cur[j];
-        if c.0 { wr(&mut out[j], &cseq, c.1, c.2, &c.3); }
+        if c.0 { wr(&mut out[j], &cseq, c.1, c.2, if dir.is_none() { &cj } else { c.3 }); }
         let (f, b) = &mut out[j];
         f.write_all(b).and_then(|_| f.flush()).unwrap_or_else(|_| crate::bail("write failed"));
     }
@@ -423,14 +427,7 @@ fn wr(o: &mut (Box<dyn Write>, Vec<u8>), seq: &[u8], st: u64, en: u64, lab: &[u8
         f.write_all(v).unwrap_or_else(|_| crate::bail("write failed"));
         v.clear();
     }
-    v.extend_from_slice(seq);
-    v.push(b'\t');
-    crate::kst::putu64(v, st);
-    v.push(b'\t');
-    crate::kst::putu64(v, en);
-    v.push(b'\t');
-    v.extend_from_slice(lab);
-    v.push(b'\n');
+    crate::kst::put_row(v, seq, st, en, lab);
 }
 
 /// Move every staged BED into place, or put back what was there.

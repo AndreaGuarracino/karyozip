@@ -5413,6 +5413,9 @@ static void decode_db(const char *path, const char *dir) {
         }
     }
     char *jb[2] = { NULL, NULL }; size_t jcap[2] = { 0, 0 }; int jw = 0;   /* joined labels, pending and current */
+    /* a label's featureID, parsed the first time its table entry is seen */
+    uint32_t *fidof = r->lab ? xmalloc(r->nlab * sizeof *fidof) : NULL;
+    for (size_t f = 0; fidof && f < r->nlab; f++) fidof[f] = UINT32_MAX;
     cur_t c = { UINT64_MAX, 0, NULL, NULL };
     uint64_t rows = 0;
     for (uint64_t i = 0; i < r->nreads; i++) {
@@ -5434,9 +5437,11 @@ static void decode_db(const char *path, const char *dir) {
             if (r->lab && f >= r->nlab) die("corrupt block: a label id past the table");
             const char *idtxt = (r->lab && f < r->nlab) ? r->lab[f] : NULL;
 
-            if (ALNPAF && idtxt && idtxt[0] == '=' && !idtxt[1]) idtxt = labtab[eqrow(Q, NULL, s, len, (uint64_t)nlabtab)];
+            uint32_t id;
+            if (ALNPAF && idtxt && idtxt[0] == '=' && !idtxt[1]) id = featid(labtab[eqrow(Q, NULL, s, len, (uint64_t)nlabtab)]);
             /* the label text IS the featureID: parse it as strictly as encode did */
-            uint32_t id = idtxt ? featid(idtxt) : (uint32_t)f;
+            else if (idtxt) { if (fidof[f] == UINT32_MAX) fidof[f] = featid(idtxt); id = fidof[f]; }
+            else id = (uint32_t)f;
             for (size_t j = 0; j < nout; j++) {
                 const char *Lb; size_t Lbn;
                 if (tostd) {                        /* the selected columns, one tuple */
@@ -5450,7 +5455,7 @@ static void decode_db(const char *path, const char *dir) {
                     }
                     *q = 0; Lb = jb[jw]; Lbn = (size_t)(q - jb[jw]);
                 } else Lb = flabn(id, SETK[j], &Lbn);
-                if (cseq && c1[j] == s && cll[j] == Lbn && !memcmp(cl[j], Lb, Lbn)) {
+                if (cseq && c1[j] == s && cll[j] == Lbn && (cl[j] == Lb || !memcmp(cl[j], Lb, Lbn))) {
                     c1[j] = s + len;                       /* extend the run */
                 } else {
                     if (cseq) owput(&o[j], cseq, cseqn, c0[j], c1[j], cl[j], cll[j]);
@@ -5470,7 +5475,7 @@ static void decode_db(const char *path, const char *dir) {
         if ((o[j].n && fwrite(o[j].b, 1, o[j].n, o[j].f) != o[j].n) || (tostd ? fflush(o[j].f) : fclose(o[j].f))) die("write failed");
         free(o[j].b);
     }
-    free(jb[0]); free(jb[1]);
+    free(jb[0]); free(jb[1]); free(fidof);
     if (tostd) fprintf(stderr, "db: %llu rows, %zu sets on stdout\n", (unsigned long long)rows, NSETK);
     else {
         char **old = xcalloc(NSETK, sizeof *old); size_t nmv = 0; int bad = 0;

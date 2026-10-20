@@ -381,7 +381,9 @@ pub fn decode(r: &mut crate::reader::Reader, feats: &Feats, dir: Option<&str>, c
     let mut cj: Vec<u8> = Vec::new();
     let mut cseq: Vec<u8> = Vec::new();
     let mut rows = 0u64;
-    r.for_each_row(&mut |seq: &[u8], st: u64, en: u64, lab: &[u8]| {
+    // a label's featureID, parsed the first time its table entry is seen, as the C's fidof
+    let mut fidof: Vec<u32> = Vec::new();
+    r.for_each_row(&mut |seq: &[u8], st: u64, en: u64, lab: &[u8], tix: Option<usize>| {
         if seq != cseq {
             for j in 0..n {
                 let c = &mut cur[j];
@@ -389,7 +391,14 @@ pub fn decode(r: &mut crate::reader::Reader, feats: &Feats, dir: Option<&str>, c
             }
             cseq.clear(); cseq.extend_from_slice(seq);
         }
-        let id = feats.featid(lab);
+        let id = match tix {
+            Some(t) => {
+                if t >= fidof.len() { fidof.resize(t + 1, u32::MAX); }
+                if fidof[t] == u32::MAX { fidof[t] = feats.featid(lab); }
+                fidof[t]
+            }
+            None => feats.featid(lab),
+        };
         if dir.is_none() { feats.joined(id, cols, &mut joined); }
         for j in 0..n {
             let l: &[u8] = if dir.is_none() { &[] } else { feats.lab(id, cols[j]) };

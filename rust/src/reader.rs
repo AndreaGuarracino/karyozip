@@ -56,7 +56,8 @@ fn read_name_file(path: &str, nreads: u64) -> Vec<u8> {
 struct Blk { off: u64, size: u64, l: u64, raw: u64, lraw: u64, rows: u64, bp: u64, hash: u64 }
 
 /// seq, start, end, label, as decode hands each row out.
-pub type RowFn<'a> = dyn FnMut(&[u8], u64, u64, &[u8]) + 'a;
+/// name, start, end, label, and the label's table index when the label is that entry's own text
+pub type RowFn<'a> = dyn FnMut(&[u8], u64, u64, &[u8], Option<usize>) + 'a;
 
 #[derive(Default)]
 pub struct ReadOpts {
@@ -414,7 +415,8 @@ impl Reader {
                 let (len, id) = self.step(&mut c, st, k + 1 == nruns && i >= tskip);
                 lab.clear();
                 self.label(id, &mut lab, st, len);
-                f(&name, st, st + len, &lab);
+                let own = self.lab.get(id as usize).is_some_and(|l| self.aln.is_none() || l != b"=");
+                f(&name, st, st + len, &lab, own.then_some(id as usize));
                 st += len;
                 emitted += 1;
             }

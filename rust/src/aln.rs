@@ -162,7 +162,7 @@ impl Aln {
         if !r.plainref {
             crate::bail("the reference .kst must be a plain track: not --aln, not --db, and its names in the file, neither dropped nor in a sidecar");
         }
-        if r.rowhash == 0 { crate::bail("the reference .kst carries no row hash: encode it again with this version"); }
+        if r.rowhash == 0 { crate::bail("the reference .kst carries no row hash"); }
         let taildec = r.taildec();
         self.reflab = r.labels().to_vec().iter().map(|l| self.lab(l)).collect();
         let mut tot = 0u64;

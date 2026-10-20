@@ -4844,7 +4844,7 @@ static void loadref_kst(const char *path) {
     if (hh[1] & (ALNFLAG | DBFLAG | SIDEFLAG | DROPPED | PERMFLAG))
         die("the reference .kst must be a plain track: not --aln, not --db, and its names in the file, neither dropped nor in a sidecar");
     R *r = refopen(path);
-    if (!r->rowhash) die("the reference .kst carries no row hash: encode it again with this version");
+    if (!r->rowhash) die("the reference .kst carries no row hash");
     ensurenames(r);
     REFPERBLK = REFLAZY && ONESEQ && !r->taildec;
     REFLAB = xmalloc(mul(r->nlab ? r->nlab : 1, 4));

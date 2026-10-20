@@ -517,7 +517,7 @@ impl Reader {
     /// Split it back into the two regions the walks expect; the counts stay
     /// in front of the lengths for rmheads to lift out.
     fn ilv_split(&self, v: Vec<u8>, nl: usize, ni: usize) -> Vec<u8> {
-        let (mut lens, mut ids) = (Vec::with_capacity(nl), Vec::with_capacity(ni));
+        let (mut lens, mut ids) = (Vec::with_capacity(nl + ni), Vec::with_capacity(ni));   // the ids join lens: no regrowth
         let (mut i, mut seen) = (0usize, 0u64);
         while i < v.len() {
             let h0 = i;
@@ -544,7 +544,7 @@ impl Reader {
     /// the gap, so every walk below sees the layout it always saw.
     /// In place, as the C's memmove: a second copy of the lengths was the
     /// largest buffer of an assembly decode.
-    fn rmheads(&mut self, mut lens: Vec<u8>) -> Vec<u8> {
+    fn rmheads(&mut self, lens: &mut [u8]) -> usize {
         let (mut w, mut i, mut seen) = (0usize, 0usize, 0u64);
         let mut tab: Vec<u64> = Vec::with_capacity(self.nreads as usize + 1);
         tab.push(0);
@@ -561,13 +561,11 @@ impl Reader {
             }
             lens.copy_within(s0..i, w); w += i - s0;
         }
-        lens.truncate(w);
-        let out = lens;
         if tab.len() as u64 != self.nreads + 1 || seen != self.rows {
             crate::bail("corrupt block: the run counts do not add up to the row count");
         }
         self.rtab = std::sync::Arc::new(tab);
-        out
+        w
     }
 
     /// Undo grp_pack: the labels, still in their own order, say which group
@@ -621,34 +619,32 @@ impl Reader {
             crate::bail("corrupt block: its bytes do not match the stored hash");
         }
         let (la, lb) = (m.l as usize, (m.size - m.l) as usize);
-        let want = if self.ilv { (m.lraw + m.raw) as usize } else { m.lraw as usize };
-        let lens = frame(&cb[..la], self.lencodec, want);
-        let ids = if self.ilv { Vec::new() } else { frame(&cb[la..la + lb], self.idcodec, m.raw as usize) };
+        let (lraw, raw) = (m.lraw as usize, m.raw as usize);
+        // both frames into one buffer, the labels behind the lengths, as the C's blkbuf
+        let mut data = ffi::raw_buf(crate::ckalloc(lraw + raw));
+        frame(&cb[..la], self.lencodec, &mut data, if self.ilv { lraw + raw } else { lraw });
+        if !self.ilv { frame(&cb[la..la + lb], self.idcodec, &mut data, raw); }
         // as the C frees it: not needed past its frames; kept for the next
         // block only when there is one, or a one-block decode holds it to the end
         if self.b.len() > 1 { ffi::recycle(cb); } else { drop(cb); }
-        let lens = if self.ilv { self.ilv_split(lens, m.lraw as usize, m.raw as usize) } else { lens };
-        let (lens, ids) = if self.ilv {
-            let mut l = lens; let t = l.split_off(m.lraw as usize); (l, t)
-        } else { (lens, ids) };
-        let lens = if self.runhead { self.rmheads(lens) } else { lens };
-        let lens = if self.grp { self.grp_unpack(&lens, &ids) } else { lens };
-        let split = lens.len();
-        let rows = m.rows;
-        let mut data = lens;
-        data.reserve_exact(ids.len());   // doubling would leave up to the lengths' size unused
-        data.extend_from_slice(&ids);
-        if self.b.len() > 1 { ffi::recycle(ids); }
-        (data, split, rows)
+        let mut data = if self.ilv { self.ilv_split(data, lraw, raw) } else { data };
+        let mut split = lraw;
+        if self.runhead {   // close the gap the run counts leave, as the C's memmove
+            split = self.rmheads(&mut data[..lraw]);
+            data.copy_within(lraw.., split);
+            data.truncate(split + raw); data.shrink_to_fit();   // the heads' touched tail goes back
+        }
+        if self.grp {
+            let out = self.grp_unpack(&data[..split], &data[split..]);
+            data[..split].copy_from_slice(&out);
+        }
+        (data, split, m.rows)
     }
 }
 
-fn frame(src: &[u8], codec: i32, raw: usize) -> Vec<u8> {
-    if codec != 0 {
-        ffi::paydecomp(src, codec, raw).unwrap_or_else(|| crate::bail("frame decode failed"))
-    } else {
-        ffi::zstd_decompress(src, raw).unwrap_or_else(|| crate::bail("frame decode failed"))
-    }
+fn frame(src: &[u8], codec: i32, out: &mut Vec<u8>, raw: usize) {
+    let ok = if codec != 0 { ffi::paydecomp_into(src, codec, out, raw) } else { ffi::zstd_decompress_into(src, out, raw) };
+    if !ok { crate::bail("frame decode failed"); }
 }
 
 fn zdec(src: &[u8], what: &str) -> Vec<u8> {

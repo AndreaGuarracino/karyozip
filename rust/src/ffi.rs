@@ -151,14 +151,22 @@ pub fn zstd_frame_size(src: &[u8]) -> Option<usize> {
 }
 
 pub fn zstd_decompress(src: &[u8], raw: usize) -> Option<Vec<u8>> {
-    // SAFETY: out is sized to the caller's expected length.
+    let mut out = raw_buf(crate::ckalloc(raw));
+    zstd_decompress_into(src, &mut out, raw).then_some(out)
+}
+
+/// zstd onto the end of `out`, as paydecomp_into.
+pub fn zstd_decompress_into(src: &[u8], out: &mut Vec<u8>, raw: usize) -> bool {
+    crate::ckalloc(raw);
+    out.reserve(raw);
+    let n0 = out.len();
+    // SAFETY: out has room for raw bytes past n0, and zstd is told so.
     unsafe {
-        let mut out = raw_buf(crate::ckalloc(raw));
-        let n = zstd_sys::ZSTD_decompress(out.as_mut_ptr() as *mut c_void, raw,
+        let n = zstd_sys::ZSTD_decompress(out.as_mut_ptr().add(n0) as *mut c_void, raw,
                                           src.as_ptr() as *const c_void, src.len());
-        if zstd_sys::ZSTD_isError(n) != 0 || n != raw { return None; }
-        out.set_len(raw);
-        Some(out)
+        if zstd_sys::ZSTD_isError(n) != 0 || n != raw { return false; }
+        out.set_len(n0 + raw);
+        true
     }
 }
 
@@ -230,40 +238,37 @@ pub fn paycomp(src: &[u8], codec: i32) -> Option<Vec<u8>> {
 
 /// The matching decompressor. `raw` is the decoded length the file claims.
 pub fn paydecomp(src: &[u8], codec: i32, raw: usize) -> Option<Vec<u8>> {
+    let mut out = raw_buf(crate::ckalloc(raw));
+    paydecomp_into(src, codec, &mut out, raw).then_some(out)
+}
+
+/// paydecomp onto the end of `out`, as the C decodes both frames into one
+/// blkbuf: false when the frame does not come back to `raw` bytes.
+pub fn paydecomp_into(src: &[u8], codec: i32, out: &mut Vec<u8>, raw: usize) -> bool {
     crate::ckalloc(raw);
-    if codec & CODEC_LZMA != 0 {
-        // SAFETY: out is the claimed length; the decoder checks it came back whole.
-        unsafe {
-            let mut out = raw_buf(raw);
-            if kz_lzma_decode(src.as_ptr(), src.len(), out.as_mut_ptr(), raw) == 0 { return None; }
-            out.set_len(raw);
-            return Some(out);
-        }
-    }
-    if codec & CODEC_BZIP3 != 0 {
-        // SAFETY: out is the claimed decoded length; got is checked against it.
-        unsafe {
-            let mut out = raw_buf(raw);
-            let mut got = raw;
-            if bz3_decompress(src.as_ptr(), out.as_mut_ptr(), src.len(), &mut got) != 0
-                || got != raw { return None; }
-            out.set_len(raw);
-            return Some(out);
-        }
-    }
-    if raw > u32::MAX as usize { return None; }
-    // SAFETY: out is the claimed length and ul is checked against it.
+    out.reserve(raw);
+    let n0 = out.len();
+    // SAFETY: out has room for raw bytes past n0; each decoder is told so and
+    // checked to have written all of them before the length moves.
     unsafe {
-        let mut out = raw_buf(raw);
-        let mut ul = raw as c_uint;
-        let q = if codec & CODEC_ARITH != 0 {
-            arith_uncompress_to(src.as_ptr() as *mut u8, src.len() as c_uint, out.as_mut_ptr(), &mut ul)
+        let dst = out.as_mut_ptr().add(n0);
+        let ok = if codec & CODEC_LZMA != 0 {
+            kz_lzma_decode(src.as_ptr(), src.len(), dst, raw) != 0
+        } else if codec & CODEC_BZIP3 != 0 {
+            let mut got = raw;
+            bz3_decompress(src.as_ptr(), dst, src.len(), &mut got) == 0 && got == raw
         } else {
-            rans_uncompress_to_4x16(src.as_ptr() as *mut u8, src.len() as c_uint, out.as_mut_ptr(), &mut ul)
+            if raw > u32::MAX as usize { return false; }
+            let mut ul = raw as c_uint;
+            let q = if codec & CODEC_ARITH != 0 {
+                arith_uncompress_to(src.as_ptr() as *mut u8, src.len() as c_uint, dst, &mut ul)
+            } else {
+                rans_uncompress_to_4x16(src.as_ptr() as *mut u8, src.len() as c_uint, dst, &mut ul)
+            };
+            !q.is_null() && ul as usize == raw
         };
-        if q.is_null() || ul as usize != raw { return None; }
-        out.set_len(raw);
-        Some(out)
+        if ok { out.set_len(n0 + raw); }
+        ok
     }
 }
 

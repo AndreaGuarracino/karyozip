@@ -9,7 +9,7 @@ pub struct Hier {
     par: Vec<i32>,
     anc: Vec<u8>,
     lca: Vec<i16>,
-    nlen1: Vec<usize>,   /* the --v1 name length, no compare a row */
+    nlen: Vec<usize>,   /* printed length: KaryoScope 1.x drops "_specific" */
     pub root: i32,
 }
 
@@ -26,7 +26,7 @@ impl Hier {
     pub fn load(path: &str, fs: &[u8]) -> Hier {
         let data = crate::slurp(path, "cannot open the hierarchy file");
         let mut h = Hier { node: Vec::new(), par: Vec::new(), anc: Vec::new(),
-                           lca: Vec::new(), nlen1: Vec::new(), root: -1 };
+                           lca: Vec::new(), nlen: Vec::new(), root: -1 };
         for raw in data.split(|&c| c == b'\n') {
             let mut line = raw;
             if line.last() == Some(&b'\r') { line = &line[..line.len() - 1]; }
@@ -60,7 +60,7 @@ impl Hier {
     /// own labels are added as nodes.
     pub fn build(&mut self) {
         let n = self.node.len();
-        self.nlen1 = (0..n).map(|a| {
+        self.nlen = (0..n).map(|a| {
             let (l, nm) = (self.node[a].len(), &self.node[a]);
             if a as i32 != self.root && l > 9 && &nm[l - 9..] == b"_specific" { l - 9 } else { l }
         }).collect();
@@ -179,11 +179,10 @@ fn smooth_one(h: &Hier, st: &[u64], en: &[u64], feat: &mut [i32], maxgap: u64,
     sc.mark = mark;
 }
 
-/// Merges equal neighbours and prints, dropping the v1 `_specific` suffix
-/// when asked.
+/// Merges equal neighbours and prints, dropping the `_specific` suffix.
 #[allow(clippy::too_many_arguments)]
 fn emit(h: &Hier, out: &mut Vec<u8>, seq: &[u8], st: &[u64], en: &[u64],
-        feat: &[i32], novel: &[u8], lo: u64, hi: u64, v1: bool) {
+        feat: &[i32], novel: &[u8], lo: u64, hi: u64) {
     let n = feat.len();
     if n == 0 { return; }
     let (mut cs, mut ce, mut cf, mut cn) = (st[0], en[0], feat[0], novel[0]);
@@ -194,7 +193,7 @@ fn emit(h: &Hier, out: &mut Vec<u8>, seq: &[u8], st: &[u64], en: &[u64],
         if (hi == 0 && lo == 0) || (ce > lo && (hi == 0 || cs < hi)) {
             let nm: &[u8] = if cf == h.root && cn != 0 { b"novel" } else { &h.node[cf as usize] };
             let ml = if cf == h.root && cn != 0 { 5 }
-                     else if v1 { h.nlen1[cf as usize] } else { nm.len() };
+                     else { h.nlen[cf as usize] };
             let mut b = [0u8; 44];      // \tSTART\tEND\t in one piece
             b[0] = b'\t';
             let mut i = 1 + crate::kst::putu64_at(&mut b[1..], cs);
@@ -221,7 +220,7 @@ fn emit(h: &Hier, out: &mut Vec<u8>, seq: &[u8], st: &[u64], en: &[u64],
 
 #[allow(clippy::too_many_arguments)]
 pub fn run(path: &str, hier: &str, fs: &[u8], seq: Option<&[u8]>,
-           lo: u64, hi: u64, v1: bool, maxgap: u64,
+           lo: u64, hi: u64, maxgap: u64,
            ro: &crate::reader::ReadOpts, feats: Option<&crate::db::Feats>,
            out: &mut (impl Write + Send)) {
     let mut h = Hier::load(hier, fs);
@@ -263,7 +262,7 @@ pub fn run(path: &str, hier: &str, fs: &[u8], seq: Option<&[u8]>,
         drop(s);
         let name = r.name_at(ri).to_vec();
         let _s = crate::prof::span(if prof { 5 } else { 10 });
-        emit(&h, buf, &name, &sr.st, &sr.en, &sr.feat, &sr.nov, lo, hi, v1);
+        emit(&h, buf, &name, &sr.st, &sr.en, &sr.feat, &sr.nov, lo, hi);
     };
     let wr = |out: &mut dyn Write, b: &[u8]| out.write_all(b).unwrap_or_else(|_| crate::bail("write failed"));
     let (nthr, chunk) = (rayon::current_num_threads() as u64, 4096u64);

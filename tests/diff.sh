@@ -105,7 +105,7 @@ tally "reader flags"
 printf 'feature_set\tchild\tparent\nfs\tA\tcategorized\nfs\tB\tcategorized\nfs\tC\tcategorized\nfs\tD\tcategorized\n' > "$W/h.tsv"
 for f in ls.bed s.bed db.rall.bed; do
   "$C" encode < "$D/$f" > "$W/t.kst" 2>/dev/null
-  for q in "" "--v1" "--max-gap 5" "--max-gap 100000"; do both "smooth $f [$q]" $q smooth -i "$W/t.kst" --hier "$W/h.tsv" -f fs; done
+  for q in "" "--max-gap 5" "--max-gap 100000"; do both "smooth $f [$q]" $q smooth -i "$W/t.kst" --hier "$W/h.tsv" -f fs; done
   for seq in $(awk -F'\t' '{print $1}' "$D/$f" | uniq | head -2); do
     for q in "-r $seq" "-r $seq:0-100"; do both "smooth $f [$q]" smooth -i "$W/t.kst" --hier "$W/h.tsv" -f fs $q; done
   done

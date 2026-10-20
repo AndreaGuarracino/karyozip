@@ -846,7 +846,6 @@ static char *fldnamesd(const uint8_t *b, size_t n, uint64_t cnt, size_t *outn) {
 #define TOKMAX 9000000u
 #define TOKDEC 4
 
-static int V1 = 0;
 static const char *TMPD = "/tmp";       /* --tmp-dir */
 
 #include "htscodecs/tokenise_name3.h"
@@ -4613,7 +4612,7 @@ static void region(const char *path, const char *seq, uint64_t lo, uint64_t hi,
 static char *NODE[MAXNODE];
 static int NPAR[MAXNODE];
 static int NNODE = 0;
-static size_t NLEN[MAXNODE], NLEN1[MAXNODE];   /* name and --v1 name lengths */
+static size_t NLEN[MAXNODE];   /* printed length: KaryoScope 1.x drops "_specific" */
 static uint8_t *ANC = NULL;
 static int16_t *LCA = NULL;
 static int ROOTID = -1;
@@ -4659,8 +4658,7 @@ static void loadhier(const char *path, const char *fs) {
 static void buildanc(void) {
     for (int a = 0; a < NNODE; a++) {   /* emit needs no strlen a row */
         size_t l = strlen(NODE[a]);
-        NLEN[a] = l;
-        NLEN1[a] = a != ROOTID && l > 9 && !strcmp(NODE[a] + l - 9, "_specific") ? l - 9 : l;
+        NLEN[a] = a != ROOTID && l > 9 && !strcmp(NODE[a] + l - 9, "_specific") ? l - 9 : l;
     }
     ANC = xcalloc((size_t)NNODE * NNODE, 1);
     LCA = xmalloc(sizeof(int16_t) * (size_t)NNODE * NNODE);
@@ -5009,7 +5007,7 @@ static void emitflush(void) {   /* runs from atexit: die would recurse */
    way, which is why they used to be written out twice. */
 static void emit_to(char **ob, size_t *cap, size_t *len, FILE *f,
                     const char *seq, uint64_t *st, uint64_t *en, int *feat,
-                    uint8_t *novel, uint64_t n, uint64_t lo, uint64_t hi, int v1) {
+                    uint8_t *novel, uint64_t n, uint64_t lo, uint64_t hi) {
     if (!n) return;
     size_t sl = strlen(seq);
     uint64_t cs = st[0], ce = en[0];
@@ -5021,7 +5019,7 @@ static void emit_to(char **ob, size_t *cap, size_t *len, FILE *f,
         if ((hi == 0 && lo == 0) || (ce > lo && (hi == 0 || cs < hi))) {
             int root = cf == ROOTID && cn;
             const char *nm = root ? "novel" : NODE[cf];
-            size_t ml = root ? 5 : (v1 ? NLEN1[cf] : NLEN[cf]);
+            size_t ml = root ? 5 : NLEN[cf];
             size_t need = sl + ml + 48;
             if (*len + need > *cap) {
                 if (f) {
@@ -5052,15 +5050,15 @@ static void emit_to(char **ob, size_t *cap, size_t *len, FILE *f,
 }
 
 static void emit(const char *seq, uint64_t *st, uint64_t *en, int *feat,
-                 uint8_t *novel, uint64_t n, uint64_t lo, uint64_t hi, int v1) {
+                 uint8_t *novel, uint64_t n, uint64_t lo, uint64_t hi) {
     char *o = out; size_t cap = sizeof out;      /* f is set, so never grown */
-    emit_to(&o, &cap, &eo, stdout, seq, st, en, feat, novel, n, lo, hi, v1);
+    emit_to(&o, &cap, &eo, stdout, seq, st, en, feat, novel, n, lo, hi);
 }
 
 static void emit_buf(char **ob, size_t *cap, size_t *len, const char *seq,
                      uint64_t *st, uint64_t *en, int *feat, uint8_t *novel,
-                     uint64_t n, uint64_t lo, uint64_t hi, int v1) {
-    emit_to(ob, cap, len, NULL, seq, st, en, feat, novel, n, lo, hi, v1);
+                     uint64_t n, uint64_t lo, uint64_t hi) {
+    emit_to(ob, cap, len, NULL, seq, st, en, feat, novel, n, lo, hi);
 }
 
 static void rclose(R *r) {
@@ -5079,7 +5077,7 @@ static void rclose(R *r) {
 }
 
 static void smooth_mt(const char *path, R *r0, int64_t first, int64_t last,
-                      int *labmap, uint64_t lo, uint64_t hi, int v1, int nthr) {
+                      int *labmap, uint64_t lo, uint64_t hi, int nthr) {
 
     const int64_t CHUNK = 4096;
     int64_t nchunk = (last - first + CHUNK - 1) / CHUNK;
@@ -5110,7 +5108,7 @@ static void smooth_mt(const char *path, R *r0, int64_t first, int64_t last,
                 uint64_t n = loadseq(rr, ri, &st, &en, &feat, &novel, labmap);
                 if (hi && (!n || lo >= en[n - 1])) continue;   /* the range misses it */
                 smooth_one(st, en, feat, n);   /* the whole sequence: a range only cuts the output */
-                emit_buf(&ob, &cap, &len, rr->name[ri], st, en, feat, novel, n, lo, hi, v1);
+                emit_buf(&ob, &cap, &len, rr->name[ri], st, en, feat, novel, n, lo, hi);
             }
 #ifdef _OPENMP
 #pragma omp ordered
@@ -5127,7 +5125,7 @@ static void smooth_mt(const char *path, R *r0, int64_t first, int64_t last,
 
 /* smooth TRACK HIER FS [SEQ [START END]] */
 static void smoothcmd(const char *path, const char *hier, const char *fs,
-                      const char *seq, uint64_t lo, uint64_t hi, int v1) {
+                      const char *seq, uint64_t lo, uint64_t hi) {
     loadhier(hier, fs);
     R *r = ropen_informed(path);
     if (r->nblk == 1) loadblk(r, 0);   /* the block before the names, as dump */
@@ -5146,7 +5144,7 @@ static void smoothcmd(const char *path, const char *hier, const char *fs,
 #endif
     if (last - first < 64) nthr = 1;      /* not worth a team */
     if (nthr > 1) {
-        smooth_mt(path, r, first, last, labmap, lo, hi, v1, nthr);
+        smooth_mt(path, r, first, last, labmap, lo, hi, nthr);
         rclose(r);            /* the threaded path returned without this */
         free(labmap);
         return;
@@ -5162,7 +5160,7 @@ static void smoothcmd(const char *path, const char *hier, const char *fs,
         smooth_one(st, en, feat, n);
         PH_ADD(4, _t);
         _t = nowsec();
-        emit(r->name[ri], st, en, feat, novel, n, lo, hi, v1);
+        emit(r->name[ri], st, en, feat, novel, n, lo, hi);
         PH_ADD(5, _t);
     }
     free(labmap); rclose(r);
@@ -5560,7 +5558,7 @@ int main(int argc, char **argv) {
             "               --out-dir decode prints them as columns, merged where they all agree\n"
             "               --raw shows what is stored, reversing no transform\n"
             "  with -a:     --aln-names FILE, on encode and decode, when the track names rows by ordinal\n"
-            "  smooth:      --max-gap N  --v1\n"
+            "  smooth:      --max-gap N\n"
             "  long forms:  -i --input  -o --output  -r --region  -f --feature-set  -b --block\n"
             "               -e --effort  -n --names  -d --db  -a --aln";
     for (int i = 1; i < argc; i++) {
@@ -5582,7 +5580,7 @@ int main(int argc, char **argv) {
     char *REGA = NULL;
     static const struct { const char *f; int nv; } FLAGS[] = {
         {"--version",0},{"--threads",1},{"-t",1},{"--profile",0},{"--tmp-dir",1},{"--names",1},
-        {"--max-gap",1},{"--v1",0},{"--aln-names",1},{"--sort",0},
+        {"--max-gap",1},{"--aln-names",1},{"--sort",0},
         {"--effort",1},
         {"--block",1},{"--db",1},{"--aln",1},
         {"--ref",1},{"--out-dir",1},{"--set",1},{"--raw",0},{"--hier",1},
@@ -5635,7 +5633,6 @@ int main(int argc, char **argv) {
             else { ok = rd; NAMESARG = v; }   /* the blob drop:FILE wrote, or a FASTA, FASTQ or list */
             take = 2; }
         else if (!strcmp(a, "--max-gap")) { ok = sm; MAXGAP = num_arg(v, UINT64_MAX, "--max-gap needs a number"); take = 2; }
-        else if (!strcmp(a, "--v1")) { ok = sm; V1 = 1; take = 1; }
         else if (!strcmp(a, "--aln-names")) {   /* the alignment's own table: ordinal N is line N+1 */
             ok = inf; ALNNAMES = v; take = 2; }
         else if (!strcmp(a, "--sort")) { ok = enc; SORT = 1; take = 1; }
@@ -5735,7 +5732,7 @@ int main(int argc, char **argv) {
         if (!HIERA || !FSA) die("smooth needs --hier HIER and -f FEATURE_SET");
         uint64_t slo = 0, shi = 0; const char *nm = REGA ? regparse(REGA, &slo, &shi) : NULL;
         loadinformed("smooth ");
-        smoothcmd(INS[0], HIERA, FSA, nm, slo, shi, V1);
+        smoothcmd(INS[0], HIERA, FSA, nm, slo, shi);
     }
     else die("bad command or missing arguments");
     return 0;

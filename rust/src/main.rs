@@ -146,7 +146,7 @@ fn main() {
             // workers, and they are serialized by turn anyway
             let mut o = BufWriter::new(std::io::stdout());
             smooth::run(track, hier, fs.as_bytes(), c.region.as_ref().map(|_| seq.as_bytes()),
-                        lo, hi, c.v1, maxgap, &ro, feats.as_ref(), &mut o);
+                        lo, hi, maxgap, &ro, feats.as_ref(), &mut o);
             o.flush().unwrap_or_else(|e| die(&e.to_string()));
         }
         Cmd::Index => {
@@ -471,7 +471,6 @@ pub struct Cli {
     pub aln_names: Option<String>,
     pub raw: bool,
     pub max_gap: Option<String>,
-    pub v1: bool,
     pub threads: Option<String>,
     pub tmp_dir: Option<String>,
     pub profile: bool,
@@ -480,7 +479,7 @@ pub struct Cli {
 /// Every flag and whether it takes a value, as the C's FLAGS.
 const FLAGS: &[(&str, bool)] = &[
     ("--version", false), ("--threads", true), ("-t", true), ("--profile", false), ("--tmp-dir", true),
-    ("--names", true), ("--max-gap", true), ("--v1", false), ("--aln-names", true), ("--sort", false),
+    ("--names", true), ("--max-gap", true), ("--aln-names", true), ("--sort", false),
     ("--effort", true), ("--block", true), ("--db", true), ("--aln", true), ("--ref", true),
     ("--out-dir", true), ("--set", true), ("--raw", false), ("--hier", true), ("--input", true),
     ("--output", true), ("--region", true), ("--halo", true), ("--feature-set", true),
@@ -547,7 +546,6 @@ impl Cli {
                     o.names.push(n); ok
                 }
                 "--max-gap" => { crate::num(&v, 0, u64::MAX, "--max-gap needs a number"); o.max_gap = Some(val()); sm }
-                "--v1" => { o.v1 = true; sm }
                 "--aln-names" => { o.aln_names = Some(val()); inf }
                 "--sort" => { o.sort = Some(String::new()); enc }
                 s if s.starts_with("--sort=") => {
@@ -580,7 +578,7 @@ impl Cli {
                 if cmd.is_empty() { die(USAGE); }
                 die(&format!("{a} does not apply to {cmd}"));
             }
-            av.drain(i..i + if matches!(a.as_str(), "--profile" | "--v1" | "--raw") || a.starts_with("--sort") { 1 } else { 2 });
+            av.drain(i..i + if matches!(a.as_str(), "--profile" | "--raw") || a.starts_with("--sort") { 1 } else { 2 });
         }
         if cmd.is_empty() { die(USAGE); }
         o.cmd = Some(match c {

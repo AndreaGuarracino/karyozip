@@ -50,7 +50,7 @@ A name may contain `:`; only a final `:START-END` of digits is read as a range.
 
 A KaryoScope run writes one BED per feature set, presmoothed and smoothed.
 
-- **Smoothed tracks need not be stored.** `karyozip smooth` rebuilds a smoothed track from the presmoothed one, row for row as KaryoScope writes it. Tracks written by KaryoScope 1.x, whose smoothed labels carry no `_specific` suffix, need `--v1`.
+- **Smoothed tracks need not be stored.** `karyozip smooth` rebuilds a smoothed track from the presmoothed one, row for row as KaryoScope writes it. A label ending in `_specific` is printed without it, as KaryoScope 1.x writes it; only the KaryoScope 1.x hierarchy has such labels.
 - **All feature sets in one file.** `-d features.tsv` merges one sample's per-set BEDs into a single, smaller track. Smoothed sets merged this way also need `--hier hierarchy.tsv`, on encode and on every read.
 
 ```
@@ -95,7 +95,7 @@ The readers are decode and smooth.
 | `-a`, `--aln P.paf`, `--ref R` | encode, readers, aln-pack | see Feature sets |
 | `--aln-names F` | encode, readers | with `-a`: read N is line N+1 of `F` |
 | `--out-dir DIR`, `--raw` | decode without `-r` | one BED per set under `-d`; `--raw` prints what is stored, for debugging |
-| `--max-gap N`, `--v1` | smooth | KaryoScope's smoothing options |
+| `--max-gap N` | smooth | KaryoScope's smoothing option |
 | `-t`, `--threads N` | all | default the cores, up to 8 |
 | `--tmp-dir DIR` | all | where temporary files go, default /tmp |
 | `--profile`, `-h`, `--help`, `--version` | all | time per phase; usage; library versions |

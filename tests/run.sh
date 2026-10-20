@@ -635,7 +635,7 @@ $KT decode -i "$W/halo1.kt" -r s:45-46 --halo 18446744073709551614 2>/dev/null |
 L309=$(head -c 300 /dev/zero | tr '\0' L)_specific
 printf 's\t0\t10\t%s\n' "$L309" > "$W/l309.bed"; $KT encode < "$W/l309.bed" > "$W/l309.kt" 2>/dev/null
 printf 'feature_set\tchild\tparent\nfs\t%s\tcategorized\n' "$L309" > "$W/l309.tsv"
-[ "$($KT --v1 smooth -i "$W/l309.kt" --hier "$W/l309.tsv" -f fs 2>/dev/null | cut -f4 | wc -c)" = 301 ] && ok "V1 strip on a 309-byte label: stripped" || no "V1 strip on a 309-byte label: WRONG"
+[ "$($KT smooth -i "$W/l309.kt" --hier "$W/l309.tsv" -f fs 2>/dev/null | cut -f4 | wc -c)" = 301 ] && ok "_specific strip on a 309-byte label: stripped" || no "_specific strip on a 309-byte label: WRONG"
 
 # round 22 findings, one case each
 mkdir -p "$W/keepdir"; printf 'PRECIOUS\n' > "$W/keepdir/acrocentric.bed"

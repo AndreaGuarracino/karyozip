@@ -3108,15 +3108,22 @@ static void ktw_close(ktw *w) {
         if (r5[4]) sz[3] = r5[4];                             /* interleaved: no ids frame */
         int L = 0;
         for (int k = 1; k < 4; k++) if (sz[k] && (!sz[L] || sz[k] < sz[L])) L = k;
-        for (int k = 1; k < 4; k++) free(lay[k]);
+        /* the sample is the whole block: its winner is built, keep it */
+        int whole = pl == nl0 && pi == ni0 && pb == w->ibx.n;
+        for (int k = 1; k < 4; k++) if (!whole || k != L) { free(lay[k]); lay[k] = NULL; }
         IDCODEC = c5[0]; LEVEL_I = l5[0];
         LENCODEC = c5[L + 1]; LEVEL_L = l5[L + 1];
-        size_t hn = 0; uint8_t *hb = NULL;
-        if (L) hn = splice_heads(rb0, nl0, w->ibx.d, w->ibx.n, &hb);
-        if (L == 1) { altbuf = hb; altlen = alt_lens = hn; hb = NULL; }
-        if (L == 2) { altlen = alt_lens = grp_pack(rb0, nl0, rb0 + nl0, ni0, w->ibx.d, w->ibx.n, &altbuf); GRP = 1; }
-        if (L == 3) { altlen = ilv_pack(rb0, nl0, rb0 + nl0, ni0, w->ibx.d, w->ibx.n, &altbuf); alt_lens = hn; ILV = 1; }
-        free(hb);
+        if (whole && L) { altbuf = lay[L]; altlen = n4[L]; alt_lens = L == 3 ? n4[1] : n4[L]; }
+        else {
+            size_t hn = 0; uint8_t *hb = NULL;
+            if (L) hn = splice_heads(rb0, nl0, w->ibx.d, w->ibx.n, &hb);
+            if (L == 1) { altbuf = hb; altlen = alt_lens = hn; hb = NULL; }
+            if (L == 2) altlen = alt_lens = grp_pack(rb0, nl0, rb0 + nl0, ni0, w->ibx.d, w->ibx.n, &altbuf);
+            if (L == 3) { altlen = ilv_pack(rb0, nl0, rb0 + nl0, ni0, w->ibx.d, w->ibx.n, &altbuf); alt_lens = hn; }
+            free(hb);
+        }
+        if (L == 2) GRP = 1;
+        if (L == 3) ILV = 1;
         RUNHEAD = L > 0;
         if (L && !(lkn = lensok(mc, altbuf, altlen, &lk))) LENCODEC = 0;  /* it does not come back: zstd does */
         static const char *LN[4] = {"plain", "headed", "grouped", "interleaved"};

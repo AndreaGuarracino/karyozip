@@ -574,7 +574,7 @@ impl Writer {
             }
             let (ls, is, bs) = (&lens0[..pl], &ids0[..pi], &self.ibx[..pb]);
             let idx = idxsize(bs, if level < 19 { level } else { 19 });
-            let lay = [None, splice_heads(ls, bs), if slow { grp_pack(ls, is, bs) } else { None }, ilv_pack(ls, is, bs)];
+            let mut lay = [None, splice_heads(ls, bs), if slow { grp_pack(ls, is, bs) } else { None }, ilv_pack(ls, is, bs)];
             // the labels and the four length spellings, ranked in one pool; a
             // spelling's whole size is its sample's scaled by the lengths'
             let e: Vec<u8> = Vec::new();
@@ -592,11 +592,16 @@ impl Writer {
             for k in 1..4 { if sz[k] > 0 && (sz[l] == 0 || sz[k] < sz[l]) { l = k; } }
             (idc, lvl_id) = (r[0].0, if r[0].1 < 0 { level } else { r[0].1 });
             (ilvcodec, lvl_len) = (r[l + 1].0, if r[l + 1].1 < 0 { level } else { r[l + 1].1 });
+            // the sample is the whole block: its winner is built, keep it; the
+            // rest go now, as the C frees them, not after the winner's frame
+            let whole = pl == lens0.len() && pi == ids0.len() && pb == self.ibx.len();
+            let hlen = lay[1].as_ref().map_or(0, |h| h.len());
+            for (k, v) in lay.iter_mut().enumerate() { if !whole || k != l { *v = None; } }
             match l {   // the winner built whole; only the headed one keeps its buffer
-                1 => { altbuf = splice_heads(&lens0, &self.ibx).unwrap_or_default(); alt_lens = altbuf.len(); }
-                2 => { altbuf = grp_pack(&lens0, &ids0, &self.ibx).unwrap_or_default(); alt_lens = altbuf.len(); grp = true; }
-                3 => { alt_lens = splice_heads(&lens0, &self.ibx).map_or(0, |h| h.len());
-                       altbuf = ilv_pack(&lens0, &ids0, &self.ibx).unwrap_or_default(); ilv = true; }
+                1 => { altbuf = if whole { lay[1].take() } else { splice_heads(&lens0, &self.ibx) }.unwrap_or_default(); alt_lens = altbuf.len(); }
+                2 => { altbuf = if whole { lay[2].take() } else { grp_pack(&lens0, &ids0, &self.ibx) }.unwrap_or_default(); alt_lens = altbuf.len(); grp = true; }
+                3 => { alt_lens = if whole { hlen } else { splice_heads(&lens0, &self.ibx).map_or(0, |h| h.len()) };
+                       altbuf = if whole { lay[3].take() } else { ilv_pack(&lens0, &ids0, &self.ibx) }.unwrap_or_default(); ilv = true; }
                 _ => {}
             }
             runhead = l > 0;

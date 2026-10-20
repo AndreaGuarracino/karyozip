@@ -1,22 +1,20 @@
 #!/bin/bash
-# Every case is computed by hand in aln.expected, not by agreeing with another
-# implementation: the previous python and C both had the same reverse-strand
-# off-by-one, so matching each other proved nothing.
-#
+# aln.expected cases, all computed by hand:
 #   q1  forward, exact
-#   q2  MINUS strand: position 0 is the LAST target base, tp+n-1-pos
+#   q2  minus strand, maps to tp+n-1-pos
 #   q3  50M20D50M, the deletion shifts the target
-#   q4  50M20I50M, the insertion leaves query bases with no target
+#   q4  50M20I50M, insertion bases have no target
 #   q5  no alignment at all
+#   run.sh BINARY LIBTEST [SANITIZER_BINARY]
+# LIBTEST: C library test, compared to BINARY
 set -eu
-KT=${KT:-$(dirname "$0")/../c/build/karyozip}
-export KARYOZIP_SAN=${KARYOZIP_SAN:-$(dirname "$KT")/karyozip-san}   # the C twin; fuzz.sh tests the Rust as itself
+KT=$(realpath -m "$1"); LT=$(realpath -m "$2"); SAN=$(realpath -m "${3:-$1}")
 D=$(dirname "$0")
 W=$(mktemp -d); trap 'rm -rf "$W"' EXIT
 fail=0
 ok() { echo "$1"; }
-no() { echo "$1"; fail=1; }   # a check that failed
-must_fail() {  # description, then the command: exit 1 with a message
+no() { echo "$1"; fail=1; }
+must_fail() {  # DESC CMD...: expect exit 1, message
   local what=$1 rc=0; shift
   "$@" >/dev/null 2>"$W/mf.err" || rc=$?
   if [ $rc = 1 ] && grep -q '^karyozip: ' "$W/mf.err"; then echo "$what: refused ($(grep -m1 '^karyozip: ' "$W/mf.err" | cut -c11-90))"
@@ -30,22 +28,18 @@ cmp -s "$W/got" "$W/want" && echo "aln delta: correct" || { echo "aln delta: WRO
 
 $KT decode --aln "$D/p.paf" --ref "$D/ref.bed" -i "$W/d.kt" 2>/dev/null > "$W/rt"
 cmp -s "$W/rt" "$D/s.bed" && ok "aln restore: byte-identical" || no "aln restore: WRONG"
-# the reference as a track: the same bytes written, the same rows read
+# a .kst reference: same bytes, same rows
 $KT encode < "$D/ref.bed" > "$W/ref.kst" 2>/dev/null
 $KT encode --aln "$D/p.paf" --ref "$W/ref.kst" < "$D/s.bed" 2>/dev/null | cmp -s - "$W/d.kt" && ok "aln with a .kst reference: same bytes" || no "aln with a .kst reference: WRONG"
 $KT decode --aln "$D/p.paf" --ref "$W/ref.kst" -i "$W/d.kt" 2>/dev/null | cmp -s - "$D/s.bed" && ok "aln restore from a .kst reference: byte-identical" || no "aln restore from a .kst reference: WRONG"
-# Two readers interleave under --ref R.kst, and the payload bound and the
-# length mode are thread-globals: a reference contig taken from a block the
-# reference reader already held left the track's bound in place and decode
-# died with "a run reads past the payload". Many contigs, many blocks.
+# .kst reference across many contigs and blocks
 $KT encode --block 4 < "$D/db.rall.bed" > "$W/rall.kst" 2>/dev/null
 $KT encode --block 4 --aln "$D/db.self.paf" --ref "$D/db.rall.bed" < "$D/db.rall.bed" > "$W/rall.aln.kst" 2>/dev/null
 $KT decode --aln "$D/db.self.paf" --ref "$D/db.rall.bed" -i "$W/rall.aln.kst" > "$W/rall.want" 2>/dev/null
 $KT decode --aln "$D/db.self.paf" --ref "$W/rall.kst" -i "$W/rall.aln.kst" 2>/dev/null | cmp -s - "$W/rall.want" \
   && ok "a .kst reference read across contigs: same rows" || no "a .kst reference read across contigs: WRONG"
 must_fail "an --aln track as reference" $KT decode --aln "$D/p.paf" --ref "$W/d.kt" -i "$W/d.kt"
-# Eight readers on one track at once, plain and with a .kst reference whose
-# contigs are filled lazily: nothing a reader mutates may be shared.
+# eight readers at once share no state
 $KT decode -i "$W/rall.kst" > "$W/conc.want" 2>/dev/null
 seq=$(head -1 "$D/db.rall.bed" | cut -f1)
 $KT decode -i "$W/rall.kst" -r "$seq" > "$W/conc.rwant" 2>/dev/null
@@ -62,10 +56,7 @@ for i in 1 2 3 4 5 6 7 8; do
   cmp -s "$W/c.a.$i" "$W/rall.want" || bad=1
 done
 [ $bad = 0 ] && ok "eight readers at once: same bytes" || no "eight readers at once: WRONG"
-# The review round of 2026-09-07, one case each: a label longer than any
-# stack or output buffer, more labels than a fixed hash, a decimal name past 2^50, a
-# blank --aln-names line, a cut .gz companion, a packed alignment with a
-# byte over, and a second library writer in one process.
+# review cases of 2026-09-07, one each
 python3 - "$W" <<'PY'
 import sys; W = sys.argv[1]; L = "L" * 2100000
 open(W + "/rv.tsv", "w").write("featureID\tA\tB\n1\tx\ty\n2\t%s\tz\n" % L)
@@ -89,8 +80,7 @@ for f in --sort "--sort --names drop" "--block 262144" "--block 4"; do
   ofl=""
   $KT encode $f < "$D/s.bed" > "$W/f.kt" 2>/dev/null || { echo "$f: ENCODE FAILED"; fail=1; continue; }
   case "$f" in
-    # a dropped-names track refuses a plain decode: the stored ordinals are
-    # not names, so asking for them is explicit
+    # dropped names need --names ordinal
     *"--names drop"*|*--sort*)
       case "$f" in *"--names drop"*) ofl="--names ordinal" ;; esac
       $KT decode ${ofl:-} -i "$W/f.kt" 2>/dev/null | sort -k2 > "$W/a"
@@ -100,9 +90,7 @@ for f in --sort "--sort --names drop" "--block 262144" "--block 4"; do
     *) $KT decode -i "$W/f.kt" 2>/dev/null | cmp -s - "$D/s.bed" && ok "$f: byte-identical" || no "$f: WRONG" ;;
   esac
 done
-# --db: 6 BEDs in, one featureID track, 6 BEDs out, each byte compared. Two
-# featureIDs can carry the same label in one set, so the merge on decode must
-# compare the label TEXT; comparing pointers silently stopped merging.
+# --db: 6 BEDs in, 6 out, byte-compared
 sets="acrocentric chromosome gene region repeat subtelomeric"
 in=""; for f in $sets; do in="$in -i $D/db.$f.bed"; done
 $KT encode --db "$D/db.features.tsv" $in > "$W/f.kt" 2>/dev/null
@@ -111,18 +99,14 @@ $KT decode --db "$D/db.features.tsv" --out-dir "$W/o" -i "$W/f.kt" 2>/dev/null
 n=0; for f in $sets; do cmp -s "$W/o/$f.bed" "$D/db.$f.bed" && n=$((n+1)); done
 [ "$n" = 6 ] && ok "db: 6/6 identical" || no "db: only $n/6 identical"
 
-# give byte-identical output to the in-memory sort: that is
-# the whole point of an external sort.
+# external sort: same bytes as in-memory
 $KT encode --sort --names drop < "$D/s.bed" > "$W/mem.kt" 2>/dev/null
 mkdir -p "$W/tmp"
 $KT encode --tmp-dir "$W/tmp" --sort=1M --names drop < "$D/s.bed" > "$W/ext.kt" 2>/dev/null
 cmp -s "$W/mem.kt" "$W/ext.kt" && ok "external sort: identical to in-memory" || no "external sort: DIFFERS from in-memory"
 [ -z "$(ls -A "$W/tmp")" ] && ok "external sort: temp files cleaned up" || no "external sort: temp files LEFT BEHIND"
 
-# --db with sequence names of DIFFERENT LENGTHS. encode_db cached the name
-# length behind a pointer compare against a fixed buffer, so it froze on the
-# first sequence and every later name was truncated or overran. The original
-# db fixture used one name length and never caught it.
+# --db with mixed sequence name lengths
 in2=""; for f in $sets; do in2="$in2 -i $D/db2.$f.bed"; done
 $KT encode --db "$D/db2.features.tsv" $in2 > "$W/f2.kt" 2>/dev/null
 mkdir -p "$W/o2"
@@ -130,9 +114,7 @@ $KT decode --db "$D/db2.features.tsv" --out-dir "$W/o2" -i "$W/f2.kt" 2>/dev/nul
 n=0; for f in $sets; do cmp -s "$W/o2/$f.bed" "$D/db2.$f.bed" && n=$((n+1)); done
 [ "$n" = 6 ] && ok "db mixed name lengths: 6/6 identical" || no "db mixed name lengths: only $n/6"
 
-# A track written with a transform must not decode without it. Every one of
-# these used to exit 0 and emit "=" rows, bare featureIDs, or fabricated
-# ordinals: valid-looking output that was silently wrong.
+# a transform track refuses decode without it
 must_fail "decode --aln track without --aln" $KT decode -i "$W/d.kt"
 must_fail "decode plain track with --aln" $KT decode --aln "$D/p.paf" --ref "$D/ref.bed" -i "$W/p.kt"
 must_fail "decode --db track without --db" $KT decode -i "$W/f.kt"
@@ -141,29 +123,25 @@ must_fail "--aln-names without --aln" $KT encode --aln-names "$D/ord.names.txt" 
 must_fail "a name file given to encode as --names" $KT encode --names "$D/ord.names.txt" < "$D/s.bed"
 must_fail "--sort= with no size" $KT encode --sort=
 
-# the sidecar --names drop:writes must be the one --names reads
+# drop:FILE writes what --names FILE reads
 $KT encode --names drop:"$W/side.bin" < "$D/s.bed" > "$W/sc.kt" 2>/dev/null
 $KT decode --names "$W/side.bin" -i "$W/sc.kt" 2>/dev/null | cmp -s - "$D/s.bed" && ok "sidecar: round-trips byte-identical" || no "sidecar: WRONG"
 must_fail "decode a sidecar track without --names" $KT decode -i "$W/sc.kt"
-# the delta is computed from the names, so a nameless aln track cannot be read
+# --aln needs names to compute deltas
 must_fail "encode --aln with --names drop and no name list" \
   $KT encode --aln "$D/p.paf" --ref "$D/ref.bed" --names drop
-# sorting reorders records, so an ordinal name map names the wrong ones
+# --sort breaks an ordinal name map
 must_fail "encode --aln --sort --names drop even with a name list" \
   $KT encode --aln "$D/p.paf" --ref "$D/ref.bed" --aln-names "$D/ord.names.txt" --sort --names drop
 
-# --db with --aln. Two touching runs can both become "=" while the featureIDs
-# behind them differ, and a guard that compared the LABEL rejected every such
-# encode. The check belongs on the id, before the delta.
+# --db with --aln: check ids, not labels
 $KT encode --db "$D/db.features.tsv" --aln "$D/db.self.paf" --ref "$D/db.rall.bed" $in \
   > "$W/da.kt" 2>/dev/null
 mkdir -p "$W/dao"
 $KT decode --db "$D/db.features.tsv" --aln "$D/db.self.paf" --ref "$D/db.rall.bed" --out-dir "$W/dao" -i "$W/da.kt" 2>/dev/null
 n=0; for f in $sets; do cmp -s "$W/dao/$f.bed" "$D/db.$f.bed" && n=$((n+1)); done
 [ "$n" = 6 ] && ok "db+aln: 6/6 identical" || no "db+aln: only $n/6"
-# smooth and region read every informed form, given what encode was given,
-# and give the same rows as the plain track. Under --db region prints the
-# whole label tuple, one column per set.
+# smooth and region on every informed form
 { printf 'feature_set\tchild\tparent\n'; for l in $(cut -f4 "$D/db.acrocentric.bed" "$D/s.bed" | sort -u); do printf 'acrocentric\t%s\tcategorized\n' "$l"; done; } > "$W/inf.tsv"
 $KT encode < "$D/db.acrocentric.bed" > "$W/pa.kt" 2>/dev/null
 $KT smooth -i "$W/pa.kt" --hier "$W/inf.tsv" -f acrocentric > "$W/inf.want" 2>/dev/null
@@ -178,7 +156,7 @@ $KT --db "$D/db.features.tsv" decode -i "$W/f.kt" -r "$sq":0-100000 2>/dev/null 
 awk -F'\t' 'NR>1 && $1==p && $2==e && $4==l {e=$3; next} NR>1 {print p"\t"s"\t"e"\t"l} {p=$1; s=$2; e=$3; l=$4} END{print p"\t"s"\t"e"\t"l}' <(cut -f1-4 "$W/inf.got") | cmp -s - "$W/inf.want" && ok "decode --db: acrocentric column, merged, same as plain" || no "decode --db: DIFFERS"
 $KT --db "$D/db.features.tsv" --aln "$D/db.self.paf" --ref "$D/db.rall.bed" decode -i "$W/da.kt" -r "$sq":0-100000 2>/dev/null | cmp -s - "$W/inf.got" && ok "decode --db --aln: same as --db" || no "decode --db --aln: DIFFERS"
 $KT --aln "$D/p.paf" --ref "$D/ref.bed" decode -i "$W/d.kt" -r q1 2>/dev/null | cmp -s <($KT decode -i "$W/p.kt" -r q1 2>/dev/null) && ok "decode --aln: same as plain" || no "decode --aln: DIFFERS"
-# --set: one set of a --db track, on stdout, equal to the set's own track
+# --set: one set equals its own track
 n=0; for f in $sets; do $KT --db "$D/db.features.tsv" --set $f decode -i "$W/f.kt" 2>/dev/null | cmp -s - "$D/db.$f.bed" && n=$((n+1)); done
 [ "$n" = 6 ] && ok "decode --set: 6/6 equal to the set's track" || no "decode --set: only $n/6"
 $KT --db "$D/db.features.tsv" --aln "$D/db.self.paf" --ref "$D/db.rall.bed" --set gene decode -i "$W/da.kt" 2>/dev/null | cmp -s - "$D/db.gene.bed" && ok "decode --set on db+aln: same" || no "decode --set on db+aln: DIFFERS"
@@ -187,9 +165,7 @@ n=0; for r in "-r $sq" "-r $sq:100-101" "-r $sq:0-100000" "-r $sq:50-400 --halo 
 $KT --db "$D/db.features.tsv" --set gene,acrocentric decode -i "$W/f.kt" 2>/dev/null > "$W/ga.bed"
 [ "$(awk -F'\t' '{print NF}' "$W/ga.bed" | sort -u)" = 5 ] && awk -F'\t' 'NR>1 && $1==p && $2==e && $5==l {e=$3; next} NR>1 {print p"\t"s"\t"e"\t"l} {p=$1; s=$2; e=$3; l=$5} END{print p"\t"s"\t"e"\t"l}' "$W/ga.bed" | cmp -s - "$D/db.acrocentric.bed" && ok "decode --set gene,acrocentric: two columns, merged jointly" || no "decode --set gene,acrocentric: WRONG"
 $KT --db "$D/db.features.tsv" decode -i "$W/f.kt" 2>/dev/null | cmp -s - <($KT --db "$D/db.features.tsv" --set all decode -i "$W/f.kt" 2>/dev/null) && ok "decode --db on stdout: all sets, same as --set all" || no "decode --db on stdout: DIFFERS from --set all"
-# --hier: a tuple outside features.tsv (a smoothed track's ancestor label)
-# gets 2^26 + its rank in the sorted vocabulary, the same in every file.
-# Without --hier it stays refused; with it a presmoothed track is unchanged.
+# --hier: outside tuples get 2^26 + rank
 { printf 'feature_set\tchild\tparent\n'; for f in $sets; do for l in $(cut -f4 "$D/db.$f.bed" | sort -u | grep -v '^novel$'); do printf '%s\t%s\tcategorized\n' "$f" "$l"; done; done; printf 'repeat\tLINE\trepeat\nrepeat\trepeat\tcategorized\n'; } | awk -F'\t' '!s[$1 FS $2]++' > "$W/hv.tsv"
 mkdir -p "$W/hv"; for f in $sets; do cp "$D/db.$f.bed" "$W/hv/$f.bed"; done
 awk -F'\t' 'NR==5{$4="repeat"} {print}' OFS='\t' "$D/db.repeat.bed" > "$W/hv/repeat.bed"
@@ -197,8 +173,7 @@ hin=$(for f in $sets; do echo "-i $W/hv/$f.bed"; done)
 must_fail "a tuple outside features.tsv without --hier" $KT encode --db "$D/db.features.tsv" $hin
 $KT encode --db "$D/db.features.tsv" --hier "$W/hv.tsv" $hin > "$W/hv.kt" 2>/dev/null
 $KT --raw decode -i "$W/hv.kt" 2>/dev/null | awk -F'\t' '$4>=67108864' | grep -q . && ok "--hier: a vocabulary featureID stored" || no "--hier: NO vocabulary featureID"
-# A featureID one below 2^26 must round trip, and 2^26 must be refused: above
-# it the ids are vocabulary ranks and a wrap would name another tuple.
+# featureID 2^26-1 round trips, 2^26 refused
 printf 'featureID\tacrocentric\tchromosome\n67108863\tacro\tchr1\n' > "$W/big.tsv"
 printf 'a\t0\t10\t67108863\n' > "$W/big.bed"
 $KT encode --db "$W/big.tsv" -i "$W/big.bed" > "$W/big.kt" 2>/dev/null && $KT decode --db "$W/big.tsv" --set acrocentric -i "$W/big.kt" 2>/dev/null | grep -q acro \
@@ -217,7 +192,7 @@ $KT encode < "$W/hv/repeat.bed" > "$W/hvp.kt" 2>/dev/null
 $KT --db "$D/db.features.tsv" smooth -i "$W/hv.kt" --hier "$W/hv.tsv" -f repeat 2>/dev/null | cmp -s - <($KT smooth -i "$W/hvp.kt" --hier "$W/hv.tsv" -f repeat 2>/dev/null) && ok "--hier: smooth --db same as the plain track" || no "--hier: smooth --db DIFFERS"
 $KT --db "$D/db.features.tsv" --hier "$W/hv.tsv" --set repeat decode -i "$W/hv.kt" 2>/dev/null | cmp -s - "$W/hv/repeat.bed" && ok "--hier: --set repeat gives the input" || no "--hier: --set repeat DIFFERS"
 mkdir -p "$W/so"; $KT --db "$D/db.features.tsv" --set repeat,gene --out-dir "$W/so/new" decode -i "$W/f.kt" 2>/dev/null; [ "$(ls "$W/so/new" | tr '\n' ' ')" = "gene.bed repeat.bed " ] && cmp -s "$W/so/new/gene.bed" "$D/db.gene.bed" && ok "decode --set --out: only the picked sets, directory created" || no "decode --set --out: WRONG"
-# index reads names only: an --aln or --db track is indexed without its companions
+# index needs no --aln or --db companions
 cp "$W/d.kt" "$W/di.kt"; cp "$W/f.kt" "$W/fi.kt"
 $KT index -i "$W/di.kt" >/dev/null 2>&1 && $KT index -i "$W/fi.kt" >/dev/null 2>&1 && $KT --aln "$D/p.paf" --ref "$D/ref.bed" decode -i "$W/di.kt" -r q1 2>/dev/null | cmp -s - <($KT --aln "$D/p.paf" --ref "$D/ref.bed" decode -i "$W/d.kt" -r q1 2>/dev/null) && ok "index on --aln and --db tracks: built, same answers" || no "index on --aln and --db tracks: FAILED"
 must_fail "--set without --db" $KT --set gene decode -i "$W/pa.kt"
@@ -231,29 +206,23 @@ must_fail "decode --db on a plain track" $KT --db "$D/db.features.tsv" decode -i
 must_fail "smooth --aln without --ref" $KT --aln "$D/p.paf" smooth -i "$W/d.kt" --hier "$W/inf.tsv" -f acrocentric
 must_fail "index --aln" $KT --aln "$D/p.paf" --ref "$D/ref.bed" index -i "$W/d.kt"
 
-# HKS tracks name sequences by ordinal, so --aln reaches the PAF only through
-# --names FILE. Dropping the names is legal here and must still round-trip.
+# ordinal names reach the PAF via --aln-names
 $KT encode --aln "$D/p.paf" --ref "$D/ref.bed" --aln-names "$D/ord.names.txt" --names drop < "$D/ord.bed" > "$W/ord.kt" 2>/dev/null
 $KT decode --aln "$D/p.paf" --ref "$D/ref.bed" --aln-names "$D/ord.names.txt" -i "$W/ord.kt" 2>/dev/null > "$W/ord.out"
 cmp -s "$D/ord.bed" "$W/ord.out" && ok "aln --names drop with an ordinal map: round-trips" || no "aln --names drop with an ordinal map: DIFFERS"
 
-# A read that hit no k-mer leaves no rows, so the ordinals in the track have
-# gaps and the rank no longer equals the ordinal. Dropping the names then
-# pointed --aln at the wrong read and decode failed on real ONT data.
+# gaps in the ordinals, names dropped
 $KT encode --aln "$D/p.paf" --ref "$D/ref.bed" --aln-names "$D/ord2.names.txt" --names drop < "$D/ord2.bed" > "$W/ord2.kt" 2>/dev/null
 $KT decode --aln "$D/p.paf" --ref "$D/ref.bed" --aln-names "$D/ord2.names.txt" -i "$W/ord2.kt" 2>/dev/null > "$W/ord2.out"
 cmp -s "$D/ord2.bed" "$W/ord2.out" && ok "aln --names drop with gaps in the ordinals: round-trips" || no "aln --names drop with gaps in the ordinals: DIFFERS"
 
-# A run that ends where the reference run ends stores no length at all. This
-# fixture is built so 6 of its 8 rows do, which the s.bed fixture never did.
+# runs ending on reference run ends
 $KT encode --aln "$D/lp.paf" --ref "$D/lref.bed" < "$D/ls.bed" \
   > "$W/ls.kt" 2>/dev/null
 $KT decode --aln "$D/lp.paf" --ref "$D/lref.bed" -i "$W/ls.kt" 2>/dev/null > "$W/ls.out"
 cmp -s "$D/ls.bed" "$W/ls.out" && ok "lengths the reference implies: round-trip" || no "lengths the reference implies: DIFFERS"
 must_fail "decode a length-delta track without --aln" $KT decode -i "$W/ls.kt"
-# Each block keeps the sentinel only where it shrinks the stream, so an 8-row
-# file may store plain lengths. This one cannot: 3000 runs of random length
-# that all end on a reference run end, so the sentinel column is all zeros.
+# 3000 runs, all on reference run ends
 awk 'BEGIN{srand(5);p=0;for(i=0;i<3000;i++){c=p+int(rand()*900)+1;printf "chrA\t%d\t%d\tL%d\n",p,c,i%4;p=c}print p > "'"$W"'/len"}' > "$W/big.ref"
 L=$(cat "$W/len"); sed 's/^chrA/q/' "$W/big.ref" > "$W/big.q"
 printf "q\t$L\t0\t$L\t+\tchrA\t$L\t0\t$L\t$L\t$L\t60\tcg:Z:${L}M\n" > "$W/big.paf"
@@ -261,13 +230,12 @@ $KT encode --aln "$W/big.paf" --ref "$W/big.ref" < "$W/big.q" > "$W/big.kt" 2>/d
 n=$($KT decode --raw -i "$W/big.kt" 2>/dev/null | awk -F'\t' '$2==$3' | wc -l)
 [ "$n" = 3000 ] && ok "lengths left out: 3000 of 3000 rows" || no "lengths left out: $n of 3000, expected 3000"
 $KT decode --aln "$W/big.paf" --ref "$W/big.ref" -i "$W/big.kt" 2>/dev/null | cmp -s - "$W/big.q" && ok "sentinel block: round-trip" || no "sentinel block: DIFFERS"
-# and a block where plain lengths win keeps them, flagged in the sizes table
+# a block where plain lengths win
 awk 'BEGIN{srand(6);p=0;for(i=0;i<3000;i++){c=p+int(rand()*900)+1;printf "q\t%d\t%d\tL%d\n",p,c,i%4;p=c}}' > "$W/off.q"
 $KT encode --aln "$W/big.paf" --ref "$W/big.ref" < "$W/off.q" > "$W/off.kt" 2>/dev/null
 $KT decode --aln "$W/big.paf" --ref "$W/big.ref" -i "$W/off.kt" 2>/dev/null | cmp -s - "$W/off.q" && ok "plain-length block under --aln: round-trip" || no "plain-length block under --aln: DIFFERS"
 
-# Reads are all one length, so the last run of each is the total minus the
-# rest. Storing that total as a delta costs nothing where a length would.
+# one-length reads: last run from the total
 python3 - > "$W/tail.bed" <<'PY'
 import random
 random.seed(5)
@@ -279,13 +247,12 @@ PY
 $KT encode --block 4096 < "$W/tail.bed" > "$W/tail.kt" 2>/dev/null
 $KT decode -i "$W/tail.kt" 2>/dev/null > "$W/tail.out"
 cmp -s "$W/tail.bed" "$W/tail.out" && ok "constant-length reads: round-trip" || no "constant-length reads: DIFFERS"
-# random access must still land on the right rows
+# random access lands on the right rows
 $KT decode -i "$W/tail.kt" -r r2000 2>/dev/null > "$W/tq.out"
 grep "^r2000	" "$W/tail.bed" > "$W/tq.exp"
 cmp -s "$W/tq.out" "$W/tq.exp" && ok "constant-length reads: query exact" || no "constant-length reads: query WRONG"
 
-# Trimmed reads vary in length, and then storing the total LOSES: measured
-# -9.4% before the gate looked at the totals instead of the run count.
+# mixed-length reads: storing the total loses
 python3 - > "$W/vlen.bed" <<'PY'
 import random
 random.seed(5)
@@ -298,8 +265,7 @@ PY
 $KT encode --block 4096 < "$W/vlen.bed" > "$W/vlen.kt" 2>/dev/null
 $KT decode -i "$W/vlen.kt" 2>/dev/null | cmp -s - "$W/vlen.bed" && ok "reads of mixed length: round-trip" || no "reads of mixed length: DIFFERS"
 
-# Every real short-read track is one length at 100.0% but still carries a few
-# stray reads. A min/max gate threw the whole win away over one of them.
+# one-length reads with 1 in 51 strays
 python3 - > "$W/out.bed" <<'PY'
 import random
 random.seed(11)
@@ -312,15 +278,12 @@ PY
 $KT encode --block 4096 < "$W/out.bed" > "$W/out.kt" 2>/dev/null
 $KT decode -i "$W/out.kt" 2>/dev/null | cmp -s - "$W/out.bed" && ok "uniform reads with stray lengths: round-trip" || no "uniform reads with stray lengths: DIFFERS"
 
-# A row belongs to the record above it only if it carries the same name. The
-# sort path keyed on start == 0 alone and filed this row under the wrong
-# sequence, while the plain path rejected it.
+# interleaved records refused, plain and --sort
 printf 'a\t0\t10\tA\nb\t0\t10\tB\na\t10\t20\tC\n' > "$W/il.bed"
 must_fail "interleaved records, plain" $KT encode --block 4 < "$W/il.bed"
 must_fail "interleaved records, --sort" $KT encode --block 4 --tmp-dir "$W" --sort=1G < "$W/il.bed"
 
-# The rows tile each sequence gaplessly and that is what lets start go
-# unstored. --sort took a gap and an overlap and moved the run instead.
+# gaps and overlaps refused, plain and --sort
 printf 'a\t0\t10\tA\na\t20\t30\tB\n' > "$W/gap.bed"
 printf 'a\t0\t10\tA\na\t9\t20\tB\n'  > "$W/ovl.bed"
 for f in gap ovl; do
@@ -335,23 +298,18 @@ printf '0\t0\t10\tA\n1\t0\t10\tB\n2\t0\t10\tC\n' > "$W/ord2.bed"
 $KT encode --block 4 < "$W/ord2.bed" > "$W/ord2.kt" 2>/dev/null
 $KT decode -i "$W/ord2.kt" 2>/dev/null | cmp -s - "$W/ord2.bed" && ok "ordinal names: round-trip" || no "ordinal names: DIFFERS"
 
-# a single line with no trailing newline was thrown away and still exited 0
+# a last line with no newline: refused
 printf 'a\t0\t10\tA' > "$W/nonl.bed"
 must_fail "input without a trailing newline" $KT encode --block 4 < "$W/nonl.bed"
 
 
-# The --db parser used strtoull and took "x" as 0, an overflow as UINT64_MAX
-# and a reverse interval as valid, while the plain parser rejected all three.
+# --db parser refuses what plain parser refuses
 for bad in 'a\tx\t10\t1' '\t0\t10\t1' 'a\t0\t18446744073709551616\t1' 'a\t0\t20\t1\na\t20\t10\t2'; do
   printf "$bad\n" > "$W/dbbad.bed"
   must_fail "--db malformed input" $KT encode --db "$D/db.features.tsv" -i "$W/dbbad.bed"
 done
 
-# smooth crashed with a double free on every real cell: the threaded path gives
-# each worker the primary reader's name table and each one freed it. The
-# harness reported it as a bare word no monitor counted.
-# 10,000 sequences: the threaded path only splits work above 4,096, so 200
-# never exercised it and a shared decode boundary between workers went unseen.
+# threaded smooth equals serial on 10,000 sequences
 python3 - > "$W/sm.bed" <<'PY'
 for i in range(10000):
     print("r%d\t0\t50\tacro" % i); print("r%d\t50\t100\tnovel" % i)
@@ -365,9 +323,7 @@ for t in 2 4 8; do
   cmp -s "$W/sm.1" "$W/sm.$t" && ok "smooth, $t threads: identical to serial" || no "smooth, $t threads: DIFFERS from serial"
 done
 
-# A CIGAR was trusted: "M" read as 0M, an overflow wrapped, "Q" was ignored,
-# and consumed length was never checked against the record. Each one placed
-# a delta somewhere else without a word.
+# malformed CIGARs refused, a good one accepted
 T1=$(cut -f1 "$D/ref.bed" | head -1); printf 'a\t0\t10\tA\n' > "$W/cg.bed"
 for cg in "cg:Z:M" "cg:Z:999999999999999999999999M" "cg:Z:5M5Q5M" "cg:Z:5M" "cg:Z:0M10M"; do
   printf "a\t10\t0\t10\t+\t$T1\t100\t0\t10\t10\t10\t60\t$cg\n" > "$W/cg.paf"
@@ -376,10 +332,7 @@ done
 printf "a\t10\t0\t10\t+\t$T1\t100\t0\t10\t10\t10\t60\tcg:Z:10M\n" > "$W/cg.paf"
 $KT encode --aln "$W/cg.paf" --ref "$D/ref.bed" < "$W/cg.bed" > /dev/null 2>&1 && ok "good CIGAR: accepted" || no "good CIGAR: REFUSED"
 
-# An audit found these. A rows-per-byte header check refused a repetitive
-# track; a features.tsv defining id 0 decoded as novel; a FASTQ read longer
-# than 65535 bp desynchronised the name file; a stray <track>.names renamed an
-# ordinal track; a label longer than 255 bytes overflowed the emit buffer.
+# first audit: one case per finding
 awk 'BEGIN{for(i=0;i<20000;i++)printf "s\t%d\t%d\tA\n",i*10,i*10+10}' > "$W/rep.bed"
 $KT encode < "$W/rep.bed" > "$W/rep.kt" 2>/dev/null
 $KT decode -i "$W/rep.kt" 2>/dev/null | cmp -s - "$W/rep.bed" && ok "repetitive track: byte-identical" || no "repetitive track: WRONG"
@@ -399,10 +352,7 @@ printf 's\t0\t10\t%s\n' "$LL" > "$W/ll.bed"
 $KT encode < "$W/ll.bed" > "$W/ll.kt" 2>/dev/null
 $KT decode -i "$W/ll.kt" > /dev/null 2>&1 && ok "long label v1: ok" || no "long label v1: CRASHED"
 
-# A second audit. --sort --aln looked up the PAF by rank, not name; a short
-# features.tsv row left NULL labels that decode dereferenced; a wrong sidecar
-# renamed every row; a plain name list lost everything after a space; and
-# `encode FILE` truncated FILE as a sidecar before reading a byte.
+# second audit: one case per finding
 printf 'chr1\t0\t100\tA\nchr1\t100\t200\tB\nchr1\t200\t300\tC\nchr1\t300\t400\tD\nchr1\t400\t500\tE\nchr1\t500\t600\tF\n' > "$W/sa.ref"
 printf '1\t500\t0\t500\t+\tchr1\t600\t0\t550\t500\t550\t60\tcg:Z:100M50D400M\n0\t500\t0\t500\t+\tchr1\t600\t0\t500\t500\t500\t60\tcg:Z:500M\n' > "$W/sa.paf"
 printf '1\t0\t100\tA\n1\t100\t200\tB\n1\t200\t300\tC\n1\t300\t400\tD\n1\t400\t500\tE\n0\t0\t100\tA\n0\t100\t200\tB\n0\t200\t300\tC\n0\t300\t400\tD\n0\t400\t500\tE\n' > "$W/sa.bed"
@@ -421,12 +371,7 @@ $KT --names "$W/sp.names.txt" decode -i "$W/sp.kt" 2>/dev/null | cmp -s - "$W/sp
 cp "$D/s.bed" "$W/keep.bed"; $KT encode "$W/keep.bed" < /dev/null > /dev/null 2>&1 && { echo "encode FILE: ACCEPTED"; fail=1; }
 cmp -s "$W/keep.bed" "$D/s.bed" && ok "encode FILE: refused, input intact" || no "encode FILE: INPUT DESTROYED"
 
-# A third audit. region lost halo runs in an earlier block; a stale index
-# answered for another sequence; an input label "=" under --aln decoded as
-# the reference label; a sequence total past 2^63 broke the tail predictor;
-# a cyclic hierarchy hung smooth; a full disk exited 0; a NUL in a row was
-# cut; spill files outlived a failed encode; a different features.tsv at
-# decode wrote wrong BEDs.
+# third audit: one case per finding
 awk 'BEGIN{for(i=0;i<12;i++)printf "s\t%d\t%d\tL%d\n",i*10,i*10+10,i}' > "$W/halo.bed"
 $KT encode --block 4 < "$W/halo.bed" > "$W/halo4.kt" 2>/dev/null; $KT encode < "$W/halo.bed" > "$W/halo1.kt" 2>/dev/null
 $KT decode -i "$W/halo4.kt" -r s:45-46 --halo 3 2>/dev/null | cmp -s - <($KT decode -i "$W/halo1.kt" -r s:45-46 --halo 3 2>/dev/null) \
@@ -459,9 +404,7 @@ grep -qi spill "$W/sp.err" || no "late overlap: NEVER SPILLED"
 sed '2s/acro/ACRO/' "$D/db.features.tsv" > "$W/other.tsv"
 mkdir -p "$W/o2"; must_fail "decode --db with another features.tsv" $KT decode --db "$W/other.tsv" --out-dir "$W/o2" -i "$W/f.kt"
 
-# A block that keeps plain lengths compressed its ids from the wrong offset:
-# every label in the block landed on another row, exit 0. These inputs make
-# some blocks pick plain lengths and some the sentinel.
+# blocks mixing plain lengths and the sentinel
 for seed in 1 3; do
 python3 - "$W" "$seed" <<'PY'
 import random, sys
@@ -484,8 +427,7 @@ $KT encode --aln "$W/mx.paf" --ref "$W/mx.ref" --block 3000 < "$W/mx.bed" > "$W/
 $KT decode --aln "$W/mx.paf" --ref "$W/mx.ref" -i "$W/mx.kt" 2>/dev/null | cmp -s - "$W/mx.bed" \
   && ok "mixed sentinel blocks, seed $seed: byte-identical" || no "mixed sentinel blocks, seed $seed: WRONG"
 done
-# On the minus strand a run end maps to a reference run start; the sentinel
-# never fired there before.
+# minus-strand sentinel on reference run starts
 printf 'chrB\t0\t100\tA\nchrB\t100\t250\tB\nchrB\t250\t400\tC\n' > "$W/mn.ref"
 printf 'm\t400\t0\t400\t-\tchrB\t400\t0\t400\t400\t400\t60\tcg:Z:400M\n' > "$W/mn.paf"
 printf 'm\t0\t150\tX\nm\t150\t300\tY\nm\t300\t400\tZ\n' > "$W/mn.bed"
@@ -494,12 +436,9 @@ n=$($KT decode --raw -i "$W/mn.kt" 2>/dev/null | awk -F'\t' '$2==$3' | wc -l)
 $KT decode --aln "$W/mn.paf" --ref "$W/mn.ref" -i "$W/mn.kt" 2>/dev/null | cmp -s - "$W/mn.bed" && [ "$n" = 3 ] \
   && ok "minus-strand sentinel: 3 of 3 rows, round-trip" || no "minus-strand sentinel: $n of 3, WRONG"
 
-# A NOSZ codec carries no size, so a forged index could not be caught: refused
-# from the environment and in a header.
+# NOSZ codecs carry no size: refused
 
-# Round 32: flags with no command dereferenced argv[1] past the end of a
-# compacted argv and segfaulted (exit 139). The argc<2 guard ran before the
-# compaction, so it never saw these.
+# flags with no command: usage, no crash
 must_fail "--threads with no command" $KT --threads 4
 must_fail "--tmp-dir with no command" $KT --tmp-dir /tmp
 must_fail "--effort low with no command" $KT --effort low
@@ -507,9 +446,7 @@ $KT --profile 2>&1 | grep -q '^karyozip: usage:' && ok "flags with no command: u
 python3 "$D/kt.py" "$W/p.kt" "$W/nosz.kt" lo9 0x10
 must_fail "a header naming a NOSZ codec" $KT decode -i "$W/nosz.kt"
 
-#  ranked the plain length spelling in a scratch buffer sized for the
-# sentinel one, which is up to 5 bytes a row shorter: with every run ending on
-# a reference boundary and lengths near 2^31, the proxy ran out of room.
+# plain lengths near 2^31 under --aln
 python3 - "$W" <<'PY'
 import random, sys
 W = sys.argv[1]; random.seed(9); p = 0; ref = []
@@ -517,17 +454,16 @@ for i in range(3000):
     c = p + random.randint(1 << 28, (1 << 31) - 1); ref.append((p, c)); p = c
 open(W + "/huge.ref", "w").write("".join("chrH\t%d\t%d\tL%d\n" % (a, b, i % 3) for i, (a, b) in enumerate(ref)))
 open(W + "/huge.q", "w").write("".join("h\t%d\t%d\tL%d\n" % (a, b, i % 3) for i, (a, b) in enumerate(ref)))
-cg = "".join("%dM" % (b - a) for a, b in ref)   # one op per run: an op stays under 4 GB
+cg = "".join("%dM" % (b - a) for a, b in ref)   # one op per run, each under 2^32
 open(W + "/huge.paf", "w").write("h\t%d\t0\t%d\t+\tchrH\t%d\t0\t%d\t%d\t%d\t60\tcg:Z:%s\n" % ((p,) * 6 + (cg,)))
 PY
 $KT encode --aln "$W/huge.paf" --ref "$W/huge.ref" < "$W/huge.q" > "$W/huge.kt" 2>/dev/null && $KT decode --aln "$W/huge.paf" --ref "$W/huge.ref" -i "$W/huge.kt" 2>/dev/null | cmp -s - "$W/huge.q" \
   && ok "fast with long plain lengths: byte-identical" || no "fast with long plain lengths: FAILED"
-# a codec id with bit 31 set slipped past the NOSZ gate as a negative int
+# codec id with bit 31 set: refused
 python3 "$D/kt.py" "$W/p.kt" "$W/neg.kt" lo9 0x80010010
 must_fail "a codec id with bit 31 set" $KT decode -i "$W/neg.kt"
 
-# a packed alignment indexes the reference by row order: another order or
-# another reference is refused rather than mislabelling every row
+# a packed alignment needs the same reference
 { cat "$D/ref.bed"; printf 'chr2\t0\t50\tB\n'; } > "$W/ref2.bed"; { printf 'chr2\t0\t50\tB\n'; cat "$D/ref.bed"; } > "$W/ref.rev"
 $KT aln-pack -a "$D/p.paf" --ref "$W/ref2.bed" -o "$W/p.kta" >/dev/null 2>&1
 $KT encode --aln "$W/p.kta" --ref "$W/ref2.bed" < "$D/s.bed" > "$W/pk.kt" 2>/dev/null && $KT decode --aln "$W/p.kta" --ref "$W/ref2.bed" -i "$W/pk.kt" 2>/dev/null | cmp -s - "$D/s.bed" \
@@ -536,15 +472,12 @@ must_fail "packed alignment with a reordered reference" $KT decode --aln "$W/p.k
 { printf 'KSTAL2'; tail -c +7 "$W/p.kta"; } > "$W/old.kta"
 must_fail "a packed alignment with another magic" $KT decode --aln "$W/old.kta" --ref "$W/ref2.bed" -i "$W/pk.kt"
 
-# a label count with no label table skipped the count check, and smooth then
-# wrote a map sized by a wrapped multiply
+# label count with no label table: refused
 $KT encode < /dev/null > "$W/mt.kt" 2>/dev/null
 python3 "$D/kt.py" "$W/mt.kt" "$W/mt2.kt" 7 0x4000000000000000
 must_fail "a label count with no label table" $KT smooth -i "$W/mt2.kt" --hier "$W/sm.tsv" -f acrocentric
 
-# Input-side findings: a featureID or set named twice, a name list whose names
-# start with '>', a sort temp dir past 511 bytes, a closed stdout, a read error
-# on stdin, a name that repeats later in the file, a 512-byte name under --sort.
+# input-side findings, one case each
 printf 'featureID\tacrocentric\tchromosome\n1\tA\tX\n1\tB\tY\n' > "$W/dupid.tsv"
 printf 's\t0\t10\tA\n' > "$W/d1.bed"; printf 's\t0\t10\tX\n' > "$W/d2.bed"
 must_fail "features.tsv with a featureID twice" $KT encode --db "$W/dupid.tsv" -i "$W/d1.bed" -i "$W/d2.bed"
@@ -567,9 +500,7 @@ must_fail "a sequence name that repeats later, sorted" $KT encode --sort < "$W/d
 N512=$(head -c 512 /dev/zero | tr '\0' n); printf '%s\t0\t10\tA\n' "$N512" > "$W/n512.bed"
 must_fail "a 512-byte name under --sort" $KT encode --sort < "$W/n512.bed"
 
-# Round 14: two names with one FNV hash, a repeat of the second was missed;
-# a spill left behind when the disk filled; CRLF and one-line name lists; a
-# features.tsv whose first line is not the header.
+# round 14 findings, one case each
 printf 'FQ6SH1h576F\t0\t10\tL\nOyHUvXChfZK\t0\t10\tL\nzz\t0\t10\tL\nOyHUvXChfZK\t0\t10\tL\n' > "$W/coll.bed"
 must_fail "a repeat behind a hash collision" $KT encode < "$W/coll.bed"
 must_fail "a repeat behind a hash collision, sorted" $KT encode --sort < "$W/coll.bed"
@@ -589,8 +520,7 @@ must_fail "a name file with a repeat, on query" $KT --names "$W/dupn2.txt" decod
 printf 'featureID acrocentric chromosome\n1\tA\tX\n' > "$W/notab.tsv"; printf 's\t0\t10\t1\n' > "$W/ids1.bed"
 must_fail "features.tsv whose first line has no tab" $KT encode --db "$W/notab.tsv" -i "$W/ids1.bed"
 
-# Round 15: an index answered an absent name whose 64-bit hash matched a
-# stored one, and one built under a name file answered under another.
+# round 15 findings, one case each
 printf 'aaa\t0\t10\tA\nYo5P2GphlrB\t0\t10\tB\nYo5P2GphlrB\t10\t30\tC\nzzz\t0\t10\tD\n' > "$W/hc.bed"
 $KT encode < "$W/hc.bed" > "$W/hc.kt" 2>/dev/null; $KT index -i "$W/hc.kt" >/dev/null 2>&1
 must_fail "indexed query of a colliding absent name" $KT decode -i "$W/hc.kt" -r TQyOn5lCDT5
@@ -601,16 +531,12 @@ printf 'r0\nr1\nr2\nr3\n' > "$W/A.txt"; printf 'r3\nr2\nr1\nr0\n' > "$W/B.txt"
 $KT --names "$W/A.txt" index -i "$W/nx.kt" >/dev/null 2>&1
 [ "$($KT --names "$W/B.txt" decode -i "$W/nx.kt" -r r0 2>/dev/null | cut -f4)" = D ] && ok "index under another name file: ignored" || no "index under another name file: WRONG"
 
-# Round 16: a name file rewritten in place, an index entry with its ordinal
-# edited, a 5 MB label through smooth, query and decode, and --names ordinal
-# on query.
+# round 16 findings, one case each
 cp "$W/B.txt" "$W/A.txt"
 [ "$($KT --names "$W/A.txt" decode -i "$W/nx.kt" -r r0 2>/dev/null | cut -f4)" = D ] && ok "index after the name file changed: ignored" || no "index after the name file changed: WRONG"
 python3 - "$W" <<'PY'
 import struct, sys
-# the index is a trailer inside the track: n, bucket bits, bind, payload,
-# magic in the last five words; the payload ends in entries of a 32-bit
-# fingerprint and a w-bit ordinal, bit-packed. Swap the first and last ordinal.
+# swap the index's first and last ordinal
 W = sys.argv[1]; d = bytearray(open(W + "/hc.kt", "rb").read())
 n, k, _, pay = struct.unpack_from("<4Q", d, len(d) - 40)
 nb = 1 << k; base = len(d) - 40 - pay + nb + (nb + 1023) // 1024 * 8
@@ -630,8 +556,7 @@ $KT encode --names drop < "$D/s.bed" > "$W/nn.kt" 2>/dev/null
 $KT decode --names ordinal -i "$W/nn.kt" -r 0 2>/dev/null | cut -f2,3,4 | cmp -s - <(grep -P '^q1\t' "$D/s.bed" | cut -f2,3,4) \
   && ok "query --names ordinal: correct" || no "query --names ordinal: WRONG"
 
-# Round 17: a 5 MB label with a long name overflowed decode's buffer, and a
-# features.tsv label past 1 MB overflowed the per-set writer.
+# round 17 findings, one case each
 N300=$(head -c 300 /dev/zero | tr '\0' n); python3 -c "open('$W/fivename.bed', 'w').write('$N300\t0\t10\t%s\n' % ('z' * (5 << 20)))"
 $KT encode < "$W/fivename.bed" > "$W/fivename.kt" 2>/dev/null
 $KT decode -i "$W/fivename.kt" 2>/dev/null | cmp -s - "$W/fivename.bed" && ok "5 MB label, long name: decode" || no "5 MB label, long name: WRONG"
@@ -641,8 +566,7 @@ $KT encode --db "$W/biglab.tsv" -i "$W/bigids.bed" > "$W/biglab.kt" 2>/dev/null;
 $KT decode --db "$W/biglab.tsv" --out-dir "$W/bl" -i "$W/biglab.kt" 2>/dev/null && [ "$(wc -l < "$W/bl/acrocentric.bed")" = 3 ] \
   && ok "2 MB features label: decode --db" || no "2 MB features label: WRONG"
 
-# Round 18: decode sized its buffer without the name; a name file can bring
-# a 5 MB name, which is refused, or a 1000-byte one, which is refused too.
+# round 18 findings, one case each
 python3 -c "open('$W/L.bed', 'w').write('0\t0\t10\t' + 'z' * (42 << 17) + '\n')"
 $KT encode --names drop < "$W/L.bed" > "$W/L.kt" 2>/dev/null
 printf '%s\n' "$(head -c 500 /dev/zero | tr '\0' n)" > "$W/n500.names"
@@ -651,8 +575,7 @@ $KT --names "$W/n500.names" decode -i "$W/L.kt" 2>/dev/null | cut -f1 | cmp -s -
 printf '%s\n' "$(head -c 1000 /dev/zero | tr '\0' n)" > "$W/n1000.names"
 must_fail "a name file name past 511 bytes" $KT --names "$W/n1000.names" decode -i "$W/L.kt"
 
-# On-the-fly: the encoder must take rows as a producer writes them, from a
-# pipe and from a slow writer, and give the same bytes as a file encode.
+# pipe or slow producer equals file encode
 cat "$D/s.bed" | $KT encode > "$W/pipe.kt" 2>/dev/null
 (while IFS= read -r l; do printf '%s\n' "$l"; sleep 0.02; done < "$D/s.bed") | $KT encode > "$W/slow.kt" 2>/dev/null
 cmp -s "$W/p.kt" "$W/pipe.kt" && cmp -s "$W/p.kt" "$W/slow.kt" && ok "encode from a pipe and a slow producer: byte-identical" || no "encode from a pipe: WRONG"
@@ -664,9 +587,7 @@ $KT decode --raw -i "$W/f.kt" 2>/dev/null | $KT encode --db "$D/db.features.tsv"
 $KT decode --raw -i "$W/f.kt" 2>/dev/null > "$W/merged.bed"; $KT encode --db "$D/db.features.tsv" -i "$W/merged.bed" > "$W/filedb.kt" 2>/dev/null
 cmp -s "$W/pipedb.kt" "$W/filedb.kt" && ok "db encode from a pipe: byte-identical" || no "db encode from a pipe: WRONG"
 
-# Round 19: an all-gap PAF record desynchronised the packed alignment; an
-# unsorted reference made encoder and decoder disagree; nothing bound a track
-# to its PAF, reference and name map; a strand other than + or -.
+# round 19 findings, one case each
 printf 'chrA\t0\t100\tA\nchrA\t100\t200\tB\nchrB\t0\t100\tC\nchrB\t100\t200\tD\n' > "$W/r19.ref"
 printf 'q0\t0\t0\t0\t+\tchrA\t200\t0\t100\t0\t100\t60\tcg:Z:100D\nq1\t200\t0\t200\t-\tchrB\t200\t0\t200\t200\t200\t60\tcg:Z:200M\n' > "$W/r19.paf"
 printf 'q1\t0\t100\tD\nq1\t100\t200\tC\n' > "$W/r19.bed"
@@ -684,9 +605,7 @@ must_fail "decode with another PAF" $KT decode --aln "$W/other.paf" --ref "$W/r1
 sed 's/\t-\t/\t*\t/' "$W/r19.paf" > "$W/star.paf"
 must_fail "a PAF strand of *" $KT encode --aln "$W/star.paf" --ref "$W/r19.ref" < "$W/r19.bed"
 
-# Round 20: an empty reference contig name crashed; a 300-byte contig name
-# was refused; a PAF in another record order was refused at decode; aln-pack
-# took a flag as its output name.
+# round 20 findings, one case each
 printf '\t0\t100\tA\n' > "$W/empty.ref"
 must_fail "reference with an empty contig name" $KT encode --aln "$D/p.paf" --ref "$W/empty.ref" < "$D/s.bed"
 N300=$(head -c 300 /dev/zero | tr '\0' N)
@@ -700,9 +619,7 @@ tac "$D/p.paf" > "$W/rev.paf"
 $KT decode --aln "$W/rev.paf" --ref "$D/ref.bed" -i "$W/d.kt" 2>/dev/null | cmp -s - "$D/s.bed" && ok "PAF in another record order: accepted" || no "PAF in another record order: WRONG"
 must_fail "--names on aln-pack" $KT aln-pack --names "$W/x.kta" -a "$D/p.paf" --ref "$D/ref.bed"
 
-# Round 21: a CRLF hierarchy, a four-column row, a child listed twice, a
-# root other than categorized, smooth region arguments, a halo that wraps,
-# and the V1 suffix on a long label.
+# round 21 findings, one case each
 printf 'feature_set\tchild\tparent\r\nacrocentric\tacro\tcategorized\r\nacrocentric\tnovel\tcategorized\r\n' > "$W/crlf.tsv"
 $KT smooth -i "$W/sm.kt" --hier "$W/crlf.tsv" -f acrocentric 2>/dev/null | cmp -s - "$W/sm.1" && ok "CRLF hierarchy: same rows" || no "CRLF hierarchy: WRONG"
 printf 'feature_set\tchild\tparent\nacrocentric\tacro\tcategorized\tx\n' > "$W/four.tsv"
@@ -720,10 +637,7 @@ printf 's\t0\t10\t%s\n' "$L309" > "$W/l309.bed"; $KT encode < "$W/l309.bed" > "$
 printf 'feature_set\tchild\tparent\nfs\t%s\tcategorized\n' "$L309" > "$W/l309.tsv"
 [ "$($KT --v1 smooth -i "$W/l309.kt" --hier "$W/l309.tsv" -f fs 2>/dev/null | cut -f4 | wc -c)" = 301 ] && ok "V1 strip on a 309-byte label: stripped" || no "V1 strip on a 309-byte label: WRONG"
 
-# Round 22: a refused decode --db truncated the old per-set BEDs; touching
-# same-label runs in one set were merged on decode; "+1" was a featureID;
-# 33 sets with long labels and a 300-byte label were refused; a last line
-# without a newline was taken.
+# round 22 findings, one case each
 mkdir -p "$W/keepdir"; printf 'PRECIOUS\n' > "$W/keepdir/acrocentric.bed"
 $KT decode --db "$D/db.features.tsv" --out-dir "$W/keepdir" -i "$W/p.kt" >/dev/null 2>&1 && { echo "decode --db of a plain track: EXIT 0"; fail=1; }
 [ "$(cat "$W/keepdir/acrocentric.bed")" = PRECIOUS ] && ok "refused decode --db: old BEDs intact" || no "refused decode --db: OLD BEDS DESTROYED"
@@ -743,9 +657,7 @@ $KT encode --db "$W/l300.tsv" -i "$W/l300.s1.bed" -i "$W/l300.s2.bed" > "$W/l300
 head -c -1 "$D/db.gene.bed" > "$W/nonl.gene.bed"
 must_fail "a set BED without a final newline" $KT encode --db "$D/db.features.tsv" -i "$D/db.acrocentric.bed" -i "$D/db.chromosome.bed" -i "$W/nonl.gene.bed" -i "$D/db.region.bed" -i "$D/db.repeat.bed" -i "$D/db.subtelomeric.bed"
 
-# Round 23: a first sequence named \x01 matched the "no sequence yet"
-# sentinel of --db; a long --out path was truncated silently; MAXGAP near 2^64
-# wrapped; region with END before START printed nothing.
+# round 23 findings, one case each
 printf '\001\t0\t10\t1\n\001\t10\t20\t2\nb\t0\t10\t1\n' > "$W/c3.bed"
 $KT encode --db "$W/two.tsv" -i "$W/c3.bed" > "$W/c3.kt" 2>/dev/null && $KT decode --raw -i "$W/c3.kt" 2>/dev/null | cmp -s - "$W/c3.bed" \
   && ok "first sequence named 0x01 under --db: round-trip" || no "first sequence named 0x01 under --db: WRONG"
@@ -755,8 +667,7 @@ must_fail "decode --db --out-dir with a 4070-byte path" $KT decode --db "$D/db.f
 $KT --max-gap 18446744073709551615 smooth -i "$W/sm.kt" --hier "$W/sm.tsv" -f acrocentric 2>/dev/null | cmp -s - "$W/sm.1" && ok "MAXGAP of 2^64-1: same as default" || no "MAXGAP of 2^64-1: WRONG"
 must_fail "region with END before START" $KT decode -i "$W/p.kt" -r q1:150-20
 
-# Round 24: 100,000 threads crashed in libgomp; a file-size limit killed
-# encode by signal; the block temp file ignored TMPDIR.
+# round 24 findings, one case each
 rc=0; (ulimit -f 1; $KT encode < "$W/pbig.bed" > "$W/lim.kt" 2> "$W/lim.err") || rc=$?
 [ $rc = 1 ] && ok "file-size limit: exit 1, not a signal" || no "file-size limit: rc=$rc"
 sz=""; for e in high medium low; do sz="$sz $($KT -e $e encode < "$D/ls.bed" 2>/dev/null | wc -c)"; done
@@ -764,13 +675,9 @@ sz=""; for e in high medium low; do sz="$sz $($KT -e $e encode < "$D/ls.bed" 2>/
 must_fail "--tmp-dir that does not exist" $KT --tmp-dir /nonexistent/dir encode < "$D/s.bed"
 $KT --tmp-dir "$W" encode < "$D/s.bed" 2>/dev/null | cmp -s - "$W/p.kt" && ok "--tmp-dir honoured: same bytes" || no "--tmp-dir honoured: WRONG"
 
-# Round 25: OMP_NUM_THREADS bypassed the thread cap; a stream of exactly
-# 2^31-1 bytes under rANS wrote an unreadable file; arith X_EXT double-freed;
-# numeric options took junk suffixes.
+# round 25 findings, one case each
 OMP_NUM_THREADS=100000 $KT encode < "$D/s.bed" 2>/dev/null | cmp -s - "$W/p.kt" && ok "OMP_NUM_THREADS 100000: capped" || no "OMP_NUM_THREADS 100000: WRONG"
-# OMP_NUM_THREADS is documented to steer the thread count and nothing else:
-# a SLURM allocation sets it, and honouring it is right. It must never move
-# a stored byte, at any value, with or without --threads.
+# OMP_NUM_THREADS never moves a stored byte
 ok=1
 for e in 1 3 16; do
   OMP_NUM_THREADS=$e $KT encode < "$D/db.rall.bed" 2>/dev/null | cmp -s - "$W/omp.ref" || ok=0
@@ -780,16 +687,12 @@ done
 must_fail "--block 4abc" $KT encode --block 4abc < "$D/s.bed"
 must_fail "-t 4x" $KT -t 4x encode < "$D/s.bed"
 must_fail "--sort=nan" $KT encode --tmp-dir "$W" --sort=nan < "$D/s.bed"
-# Round 32: mem_arg used strtod, so a sign, an exponent, a fraction and a
-# leading space all got through, though the README says a number on the
-# command line refuses +1 and 1e2. Digits and an optional unit now.
+# --sort= takes digits and a unit only
 for v in "1e9" "+1M" "1.5M" " 1M" "0" "-1M" "1Z" "99999999999999999999T"; do
   must_fail "--sort=$v" $KT encode --sort="$v" < "$D/s.bed"
 done
 
-# Round 26: an index built while its name file was replaced answered from the
-# new file; a failed decode --db destroyed the previous output; a signal left
-# spill files; junk after the unit.
+# round 26 findings, one case each
 cp "$W/A.txt" "$W/A2.txt"; $KT --names "$W/A2.txt" index -i "$W/nx.kt" >/dev/null 2>&1; cp "$W/B.txt" "$W/A2.tmp"; mv -f "$W/A2.tmp" "$W/A2.txt"
 [ "$($KT --names "$W/A2.txt" decode -i "$W/nx.kt" -r r0 2>/dev/null | cut -f4)" = D ] && ok "index built before a name file swap: ignored" || no "index built before a name file swap: WRONG"
 mkdir -p "$W/good"; $KT decode --db "$D/db.features.tsv" --out-dir "$W/good" -i "$W/f.kt" >/dev/null 2>&1; m1=$(cat "$W/good"/*.bed | md5sum)
@@ -800,9 +703,7 @@ mkdir -p "$W/sigspill"; ( (awk '{print; if (NR % 2000 == 0) system("sleep 0.05")
 [ "$(ls "$W/sigspill" | wc -l)" = 0 ] && ok "SIGINT during a spilling sort: no files left" || no "SIGINT during a spilling sort: FILES LEFT"
 must_fail "--sort=1M2" $KT encode --tmp-dir "$W" --sort=1M2 < "$D/s.bed"
 
-# Round 27: a name file on a pipe lost its first lines to a failed rewind; a
-# failed rename left the db output half-updated; a signal left db temporaries;
-# its cast.
+# round 27 findings, one case each
 printf 'r0\nr1\nr2\nr3\n' > "$W/pn.txt"
 $KT decode --names ordinal -i "$W/nx.kt" 2>/dev/null | cut -f2,3,4 > "$W/pn.want"
 $KT --names <(cat "$W/pn.txt") decode -i "$W/nx.kt" 2>/dev/null | cmp -s - "$W/nx.bed" && ok "name file from a pipe: restored" || no "name file from a pipe: WRONG"
@@ -815,28 +716,26 @@ must_fail "decode --db over a directory in --out" $KT decode --db "$D/db.feature
   && ok "refused db decode: all old files kept, no leftovers" || no "refused db decode: HALF UPDATED"
 must_fail "--sort=1e18T" $KT encode --tmp-dir "$W" --sort=1e18T < "$D/s.bed"
 
-# The README says these pairs are exclusive and these ranges are the limits.
+# exclusive flag pairs and range limits
 must_fail "--block junk" $KT encode --block xyz < "$D/s.bed"
 must_fail "--threads 1025" $KT -t 1025 encode < "$D/s.bed"
 $KT -t 1024 encode < "$D/s.bed" > /dev/null 2>&1 && ok "the documented limits: accepted" || no "the documented limits: REFUSED"
 
-# Every flag is parsed once, before the command, so it works on either side of
-# it and a flag on the wrong command is refused instead of read as an argument.
+# flags work before or after the command
 $KT --effort low encode < "$D/s.bed" > "$W/side1.kt" 2>/dev/null
 $KT encode --effort low < "$D/s.bed" > "$W/side2.kt" 2>/dev/null
 cmp -s "$W/side1.kt" "$W/side2.kt" && ok "a flag before the command: same bytes" || no "a flag before the command: DIFFERENT"
-# A names file that is not the one drop:FILE wrote is refused by name, not as
-# a corrupt track.
+# a foreign names file: refused by name
 $KT encode --names "drop:$W/side.names" < "$D/s.bed" > "$W/side.kt" 2>/dev/null
 awk '{print $1}' "$D/s.bed" | uniq | sed 's/^/>/' > "$W/side.fa"
 $KT decode --names "$W/side.fa" -i "$W/side.kt" 2>&1 | grep -q "does not belong to this track" && ok "a foreign names file: named as such" || no "a foreign names file: WRONG MESSAGE"
 
-# A sorted track decodes in sorted order, never the input order.
+# a sorted track decodes in sorted order
 $KT encode --sort < "$D/s.bed" > "$W/so.kt" 2>/dev/null
 $KT decode -i "$W/so.kt" 2>/dev/null | cmp -s - "$D/s.bed" && { echo "sorted decode: CLAIMS INPUT ORDER"; fail=1; } || echo "sorted decode: sorted order, as documented"
 $KT decode -i "$W/so.kt" 2>/dev/null | sort | cmp -s - <(sort "$D/s.bed") && ok "sorted decode: same rows" || no "sorted decode: ROWS DIFFER"
 
-# A file that is not KST is named as such.
+# a non-KST file: named as such
 printf 'KTRACK02rest' > "$W/old.kst"
 $KT decode -i "$W/old.kst" 2>&1 | grep -q 'not "KST00001"' && ok "a foreign magic: named" || no "a foreign magic: WRONG MESSAGE"
 
@@ -847,16 +746,10 @@ must_fail "encode --names ordinal" $KT encode --names ordinal < "$D/s.bed"
 must_fail "decode --sort" $KT decode --sort -i "$W/side1.kt"
 must_fail "decode two tracks" $KT decode -i "$W/side1.kt" -i "$W/side2.kt"
 
-# htscodecs wrote "compiled without libbz2" for 32 candidates that were never
-# meant to reach arith: nothing from htscodecs may reach stderr.
+# nothing from htscodecs reaches stderr
 $KT encode < "$D/s.bed" 2>&1 >/dev/null | grep -qi "htscodecs" && { echo "encode stderr: HTSCODECS COMPLAINED"; fail=1; } || echo "encode stderr: clean"
 
-# Generative stage. The checks above are one fixed case per bug already found;
-# this one searches input space instead of remembering it.
-# The library and the CLI must produce the same file: an annotator that
-# calls kt_row instead of writing a BED gets byte-identical output, or the
-# whole point of the API is lost.
-LT=${LT:-"$(dirname "$KT")/libtest"}
+# library API: same bytes as the CLI
 if [ -x "$LT" ]; then
   lok=1
   for f in s.bed ls.bed db.rall.bed db.chromosome.bed ord.bed; do
@@ -873,10 +766,7 @@ if [ -x "$LT" ]; then
     && ok "library API: a second writer starts clean" || no "library API: a second writer keeps the first's state"
   cmp -s "$W/lc.kt" "$W/ll.kt" || { lok=0; echo "  library differs on --block 4"; }
   [ $lok = 1 ] && ok "library API: same bytes as the CLI" || no "library API: DIFFERS from the CLI"
-  # Round 32: the header promises the library refuses what the CLI refuses.
-  # It did not. A newline in a label produced a track that would not decode,
-  # "the label table has more lines than its count", which breaks the one
-  # contract the tool has. These are the twelve ways in.
+  # library refuses all 12 contract violations
   aok=1
   for c in 1 2 3 4 5 6 7 8 9 10 11 12; do
     rc=0; $LT -abuse $c >/dev/null 2>"$W/ab.err" || rc=$?
@@ -887,11 +777,7 @@ else
   echo "library API: FAILED, $LT not built"; fail=1
 fi
 
-# Round 32, the phase 2 and 3 surfaces. The label cache is keyed on four
-# bytes, so labels sharing length and their first, middle and last byte
-# collide; the parse threads decide "same name as the row before", so names
-# that are prefixes of each other and sequences split across chunk
-# boundaries are the cases that would break it.
+# label cache collisions, prefix names, chunk boundaries
 printf 'r1\t0\t10\tabcXYZ\nr1\t10\t20\tabqXYZ\nr1\t20\t30\tabcXYZ\n' > "$W/coll.bed"
 $KT encode < "$W/coll.bed" > "$W/coll.kt" 2>/dev/null
 $KT decode -i "$W/coll.kt" 2>/dev/null | cmp -s - "$W/coll.bed" && ok "label cache: colliding keys round-trip" || no "label cache: COLLIDING KEYS WRONG"
@@ -912,18 +798,15 @@ for s in range(200000): f.write('seq%06d\t0\t10\tA\n' % s)
 "
 $KT -t 8 encode < "$W/chunk.bed" > "$W/chunk.kt" 2>/dev/null
 $KT decode -i "$W/chunk.kt" 2>/dev/null | cmp -s - "$W/chunk.bed" && ok "200000 one-row sequences at 8 threads: round-trip" || no "200000 one-row sequences: WRONG"
-# The staging file is new: a full temp filesystem must be fatal, not silent.
+# a full temp filesystem must be fatal
 mkdir -p "$W/tinytmp"
 awk 'BEGIN{p=0; for(k=0;k<400000;k++){printf "r1\t%d\t%d\tchr%d\n", p, p+20, k%22; p+=20}}' > "$W/stage.bed"
-# 256 KB: the staging payload for this input is about 780 KB
+# 256 KB cap, below the staging payload
 ( ulimit -f 512; trap "" XFSZ; $KT --tmp-dir "$W/tinytmp" encode < "$W/stage.bed" >/dev/null 2>&1 ) && { echo "a full staging filesystem: ACCEPTED"; fail=1; } \
   || echo "a full staging filesystem: refused"
 [ -z "$(ls -A "$W/tinytmp" 2>/dev/null)" ] && ok "a full staging filesystem: no temp files left" || no "a full staging filesystem: TEMP FILES LEFT"
 
-# The stored bytes are a function of the codec versions, and zstd does not
-# promise identical output across its own releases. Pin them here: a bump
-# has to be a deliberate act that re-records this line, never a silent one
-# that invalidates every ratio already measured.
+# pin the stored bytes to codec versions
 want=55b6e9eadfe851a4374e094e045ee8ecb4ffac9a2fdd83de126ff076724e700b
 got=$($KT --block 4 encode < "$D/db.rall.bed" 2>/dev/null | sha256sum | cut -d' ' -f1)
 if [ "$got" = "$want" ]; then echo "codec versions: stored bytes unchanged"
@@ -932,7 +815,6 @@ else
   echo "  want $want"; echo "  got  $got"; $KT --version | sed 's/^/  /'
 fi
 
-if KT="$KT" bash "$D/leaks.sh"; then :; else echo "leaks: FOUND SOMETHING"; fail=1; fi
-if bash "$D/fuzz.sh" "$KT"; then echo "fuzz: clean"; else echo "fuzz: FOUND SOMETHING"; fail=1; fi
+if bash "$D/fuzz.sh" "$KT" "$SAN"; then echo "fuzz: clean"; else echo "fuzz: FOUND SOMETHING"; fail=1; fi
 
 exit $fail

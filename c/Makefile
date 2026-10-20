@@ -63,7 +63,7 @@ build/libkaryozip.a: $(OBJ) $(XZ_OBJ)
 build/libtest: build/libkaryozip.a ../tests/libtest.c
 	$(CC) $(CFLAGS) $(ZSTD_CFLAGS) -o $@ ../tests/libtest.c build/libkaryozip.a $(LDFLAGS) $(ZSTD_LIBS) -lm -lpthread -lz
 
-# the memory-checked twin leaks.sh and fuzz.sh run: one build, kept until a
+# the memory-checked twin fuzz.sh runs: one build, kept until a
 # source changes, where each script used to compile its own every run
 build/karyozip-san: $(SRC) $(HDR) $(XZ_SAN)
 	mkdir -p build
@@ -71,7 +71,7 @@ build/karyozip-san: $(SRC) $(HDR) $(XZ_SAN)
 	  $(ZSTD_CFLAGS) -o $@ $(SRC) $(XZ_SAN) $(LDFLAGS) $(ZSTD_LIBS) -lm -lpthread -lz
 
 test: build/karyozip build/libtest build/karyozip-san
-	KT=$(CURDIR)/build/karyozip KARYOZIP_SAN=$(CURDIR)/build/karyozip-san bash ../tests/run.sh
+	bash ../tests/run.sh build/karyozip build/libtest build/karyozip-san
 
 clean:
 	rm -rf build

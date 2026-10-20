@@ -1,13 +1,13 @@
 """Forging helpers for the suite: parse a track, patch it, re-sign its hashes."""
 import struct, subprocess, sys, random, os
 FNV0 = 0xcbf29ce484222325; P = 0x100000001b3; M = (1 << 64) - 1
-FLAGS = M ^ ((1 << 49) - 1)   # bits 49 to 63 are flags, below them the names length
+FLAGS = M ^ ((1 << 49) - 1)   # bits 49-63: flags; below: names length
 def fnv(h, b):
     for x in b: h = ((h ^ x) * P) & M
     return h
 def load(path):
     d = bytearray(open(path, "rb").read()); return d, list(struct.unpack_from("<16Q", d, 8))
-def sign(d, h):   # header with h[15] = 0, then lz, nz, iz, sz, itz, np
+def sign(d, h):   # hash header (h[15]=0), then lz..np sections
     hz = list(h); hz[15] = 0; mh = fnv(FNV0, struct.pack("<16Q", *hz)); off = 136
     for n in (h[6], h[1] & ~FLAGS, h[2], h[3], h[11], h[14]): mh = fnv(mh, d[off:off + n]); off += n
     h[15] = mh; struct.pack_into("<16Q", d, 8, *h)
@@ -20,7 +20,7 @@ def vput(v):
     o = bytearray()
     while v >= 0x80: o.append(v & 0x7f | 0x80); v >>= 7
     o.append(v); return bytes(o)
-def zst(W, body):   # from a file, so the frame carries its content size
+def zst(W, body):   # via a file: frame keeps content size
     open(W + "/c", "wb").write(body)
     subprocess.run(["zstd", "-q", "-f", "-19", "--no-check", W + "/c", "-o", W + "/c.zst"], check=True)
     return open(W + "/c.zst", "rb").read()
@@ -29,7 +29,7 @@ def unzst(z):
     if r.returncode:
         raise RuntimeError("zstd -d failed: " + r.stderr.decode("utf-8", "replace").strip())
     return r.stdout
-def gen(W, N):   # valid input of every awkward shape: fuzz.sh 1b and diff.sh 12 read the same files
+def gen(W, N):   # awkward valid BEDs for fuzz.sh, diff.sh
     random.seed(13)
     byt = [c for c in range(1, 256) if c not in (9, 10)]
     def nm(i):
@@ -52,7 +52,7 @@ def gen(W, N):   # valid input of every awkward shape: fuzz.sh 1b and diff.sh 12
                 rows.append(n + b"\t%d\t%d\t" % (p, p + L) + lab + b"\n"); p += L
         open(os.path.join(W, "ok%d.bed" % f), "wb").write(b"".join(rows))
 
-def bgzf(src, dst):   # BGZF as bgzip writes it: 65280-byte blocks, each a gzip member with a BC field, then the empty block
+def bgzf(src, dst):   # bgzip-style BGZF: 65280-byte blocks, empty EOF
     import zlib
     d = open(src, "rb").read(); o = bytearray()
     for i in list(range(0, len(d), 65280)) + [len(d)]:

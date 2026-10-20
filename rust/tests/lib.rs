@@ -1,6 +1,6 @@
 //! The library must write the same bytes as the CLI, and refuse the same
 //! contract violations. This is the Rust half of tests/libtest.c.
-use karyozip::writer::{Options, Writer};
+use karyozip::{ffi, writer::{self, Options, Writer}};
 use std::io::Write;
 
 /// One BED through `Writer::row`, which is what an annotator would call
@@ -81,5 +81,24 @@ fn refuses_what_the_header_promises() {
     for (i, f) in bad.iter().enumerate() {
         let mut w = Writer::new(Options::default(), &dir).expect("temp file");
         assert!(f(&mut w).is_err(), "case {i} was accepted");
+    }
+}
+
+/// Every codec candidate, and the name tokeniser, round-trips its input.
+#[test]
+fn every_codec_round_trips() {
+    for f in ["db.rall.bed", "db.chromosome.bed", "ls.bed"] {
+        let mut src = std::fs::read(format!("{}/../tests/{f}", env!("CARGO_MANIFEST_DIR"))).unwrap();
+        let mut n = 0;
+        for c in writer::candlist(true) {
+            if let Some(v) = ffi::paycomp(&src, c) {
+                n += 1;
+                assert_eq!(ffi::paydecomp(&v, c, src.len()).as_deref(), Some(&src[..]), "codec 0x{c:x} on {f}");
+            }
+        }
+        assert!(n > 0, "no codec took {f}");
+        if let Some(v) = ffi::tok_encode(&mut src) {
+            assert_eq!(ffi::tok_decode(&v).as_deref(), Some(&src[..]), "tokeniser on {f}");
+        }
     }
 }

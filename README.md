@@ -107,6 +107,8 @@ Flags work on either side of the command name.
 **Two implementations.** `c/` and `rust/` write the same bytes, print the same `--help` and refuse the same inputs with the same words; `rust/build.rs` takes the usage text from `c/karyozip.c`.
 `make test` (111 s) runs the shared suite in `tests/`, sanitizers and fuzzing on both and compares them encode by encode.
 The C finds zstd, zlib and libgomp at the path in its rpath; the Rust bundles zstd. Both compile the same liblzma from `c/xz`.
+The Rust compiles the C codecs too, through `rust/src/ffi.rs`: there is no Rust htscodecs, and the `bzip3` crate lacks the two fixes in `c/bzip3/PROVENANCE`. `zstd-sys` is pinned to `=2.0.16`, the zstd 1.5.7 the C links, because zstd does not promise the same bytes across releases.
+Outside `ffi.rs`, four hot loops write unchecked, each behind an assertion: the digit writer in `kst.rs`, the row writers in `reader.rs` and `smooth.rs`, and `smooth_one`.
 
 **How encode chooses.** The three efforts are one rule with two settings: `low` tries 8 of the 51 codecs plus zstd at 17 on 4 MB, `medium` all 51 plus zstd at 17 and 22 on 16 MB, `high` the same on the whole file.
 The smallest wins, with no margin, and must read back what it was ranked on.
@@ -117,7 +119,7 @@ Encode prints what it chose on stderr, on its `layout:` and `names:` lines.
 
 **Name index.** `karyozip index` appends a 32-bit fingerprint and a bit-packed ordinal per name, 2,044,644 B for 300,000 reads; one fingerprint match is answered without decoding the names, so a name absent from the track passes for a present one about 4 times in 2^32 lookups; two or more matches are confirmed against the decoded names.
 
-**Benchmark.** `tests/bench.sbatch` runs `tests/bench.sh` on the cluster at three sizes over the same rows, `small`, `wide` and `big`, checking every row's round trip, C against Rust bytes and smoothing against KaryoScope's, and recording the layout, codecs and phase times each encode chose.
+**Real tracks.** `tests/cmp.sbatch` runs C and Rust on real tracks on the cluster, one Slurm task a track, and checks every operation's bytes, round trip, time and memory.
 
 **Library.** `make` also builds `c/build/libkaryozip.a`, six calls in `c/karyozip.h` (`kt_open`, `kt_block`, `kt_level`, `kt_row`, `kt_close`, `kt_version`), for an annotator that writes `.kst` directly.
 Rows must arrive grouped by sequence, each sequence once, starting at 0, gapless; anything else is refused with the CLI's message.

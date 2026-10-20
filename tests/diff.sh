@@ -1,5 +1,5 @@
 #!/bin/bash
-# The equivalence gate: c/ and rust/ must produce the same bytes.
+# C and Rust: same bytes, same words
 set -u
 C=${1:-$(dirname "$0")/../c/build/karyozip}
 R=${2:-$(dirname "$0")/../rust/target/release/karyozip}
@@ -14,10 +14,9 @@ rv=$("$R" --version | awk '/zstd|libbz3|liblzma/{print $1"="$2}' | tr '\n' ' ')
 if [ "$cv" = "$rv" ]; then echo "codec versions: $cv"
 else echo "codec versions DIFFER: c=[$cv] rust=[$rv]"; fail=1; fi
 
-# Run both on the same input and arguments: stdout, stderr and exit code
-# must match. IN names the stdin file. Every section below tallies with these.
+# both: same stdout, stderr, exit code
 ok=0; bad=0; EXPECT=ok
-both() {  # both LABEL args...  a shared refusal passes only where EXPECT=fail
+both() {  # a shared refusal passes if EXPECT=fail
   local l=$1; shift
   "$C" "$@" < "${IN:-/dev/null}" > "$W/c.out" 2>"$W/c.err"; local a=$?
   "$R" "$@" < "${IN:-/dev/null}" > "$W/r.out" 2>"$W/r.err"; local b=$?
@@ -26,14 +25,7 @@ both() {  # both LABEL args...  a shared refusal passes only where EXPECT=fail
 }
 tally() { [ $bad = 0 ] && echo "$1: $ok forms identical" || { echo "$1: $bad of $((ok+bad)) DIFFER"; fail=1; }; ok=0; bad=0; }
 
-# 1. every codec round-trips in the Rust; section 2 compares the bytes.
-for f in db.rall.bed db.chromosome.bed ls.bed; do
-  o=$("$R" codecs "$D/$f" 2>&1) && ! grep -q 'roundtrip=false' <<<"$o" && grep -q 'roundtrip=true' <<<"$o" \
-    || { echo "codecs: a round trip failed on $f"; fail=1; }
-done
-echo "codecs: every candidate round-trips"
-
-# 2. encode must be byte-identical, over every fixture and flag.
+# 2. encode, every fixture and flag
 for f in "$D"/*.bed; do
   for fl in "" "--block 4" "--block 262144" \
             "--effort low" "--effort low --block 4" "--names drop" "--effort high" \
@@ -44,7 +36,7 @@ for f in "$D"/*.bed; do
 done
 tally encode
 
-# 3. decode: the Rust must give back exactly what was encoded.
+# 3. Rust decodes what C encoded
 dok=0; dbad=0
 for f in "$D"/*.bed; do
   for fl in "" "--block 4" "--block 262144"; do
@@ -56,7 +48,7 @@ done
 [ $dbad = 0 ] && echo "decode: $dok forms give the input back" \
   || { echo "decode: $dbad of $((dok+dbad)) DIFFER"; fail=1; }
 
-# 4. the C must read what the Rust wrote.
+# 4. C decodes what Rust encoded
 for f in "$D"/ls.bed "$D"/db.rall.bed; do
   "$R" encode < "$f" > "$W/r.kst" 2>/dev/null
   "$C" decode -i "$W/r.kst" 2>/dev/null | cmp -s - "$f" \
@@ -64,7 +56,7 @@ for f in "$D"/ls.bed "$D"/db.rall.bed; do
 done
 echo "cross-decode: the C reads the Rust's files"
 
-# 5. region: the same rows for every shape of query.
+# 5. region: same rows, every query shape
 for f in ls.bed s.bed db.rall.bed ord.bed; do
   for bl in "" "--block 4"; do
     "$C" $bl encode < "$D/$f" > "$W/t.kst" 2>/dev/null
@@ -77,7 +69,7 @@ for f in ls.bed s.bed db.rall.bed ord.bed; do
 done
 tally region
 
-# 6. index: the same trailer, and each reads the other's.
+# 6. index: same trailer, cross-read
 "$C" encode < "$D/db.rall.bed" > "$W/ci.kst" 2>/dev/null
 cp "$W/ci.kst" "$W/ri.kst"
 "$C" index -i "$W/ci.kst" >/dev/null 2>&1; irc=$?
@@ -86,7 +78,7 @@ if [ $irc = 0 ] && [ $irr = 0 ] && cmp -s "$W/ci.kst" "$W/ri.kst"; then echo "in
 else echo "index: TRAILERS DIFFER (rc $irc/$irr)"; fail=1; fi
 both "index cross-read" decode -i "$W/ci.kst" -r seq0005; tally "index cross-read"
 
-# 6b. a sorted track: the Rust must resolve the ranks the same way.
+# 6b. sorted tracks: same ranks resolved
 for f in ls.bed s.bed db.rall.bed ord.bed; do
   for fl in "--sort"; do
     "$C" $fl encode < "$D/$f" > "$W/t.kst" 2>/dev/null
@@ -97,11 +89,11 @@ for f in ls.bed s.bed db.rall.bed ord.bed; do
 done
 tally "sorted decode"
 
-# 7. the reader's flags: dropped names, a sidecar, --raw.
+# 7. reader flags: dropped names, sidecar, --raw
 for f in ls.bed s.bed db.rall.bed ord.bed; do
   "$C" encode --names drop < "$D/$f" > "$W/d.kst" 2>/dev/null
   for dfl in "--names ordinal" "--raw"; do both "decode $dfl on $f" $dfl decode -i "$W/d.kst"; done
-  # an ordinal-named input has no names to put beside the track: refused by design
+  # ordinal names have no sidecar: refused
   if "$C" encode --names "drop:$W/side" < "$D/$f" > "$W/s.kst" 2>/dev/null; then both "sidecar $f" --names "$W/side" decode -i "$W/s.kst"
   else EXPECT=fail both "sidecar $f refused" encode --names "drop:$W/side2" < "$D/$f"; EXPECT=ok; fi
   "$C" encode < "$D/$f" > "$W/p.kst" 2>/dev/null
@@ -109,7 +101,7 @@ for f in ls.bed s.bed db.rall.bed ord.bed; do
 done
 tally "reader flags"
 
-# 8. smooth: the same rows, over a real hierarchy shape.
+# 8. smooth over a real hierarchy shape
 printf 'feature_set\tchild\tparent\nfs\tA\tcategorized\nfs\tB\tcategorized\nfs\tC\tcategorized\nfs\tD\tcategorized\n' > "$W/h.tsv"
 for f in ls.bed s.bed db.rall.bed; do
   "$C" encode < "$D/$f" > "$W/t.kst" 2>/dev/null
@@ -131,7 +123,7 @@ rm -rf "$W/co" "$W/ro"; mkdir -p "$W/co" "$W/ro"
 "$R" decode --db "$D/db.features.tsv" --out-dir "$W/ro" -i "$W/cdb.kst" >/dev/null 2>&1
 if diff -r "$W/co" "$W/ro" >/dev/null 2>&1; then echo "--db decode: identical"
 else echo "--db decode: DIFFERS"; fail=1; fi
-# a tuple outside features.tsv, given the hierarchy: 2^26 + its rank, on both
+# outside tuple with --hier: 2^26 + rank
 { printf 'feature_set\tchild\tparent\nrepeat\trepeat\tcategorized\nrepeat\tLINE\trepeat\n'; } > "$W/hv.tsv"
 awk -F'\t' 'NR==5{$4="repeat"} {print}' OFS='\t' "$D/db.repeat.bed" > "$W/hv.repeat.bed"
 HV=${DB/$D\/db.repeat.bed/$W\/hv.repeat.bed}
@@ -160,7 +152,7 @@ for pair in "s.bed p.paf ref.bed" "ls.bed lp.paf lref.bed"; do
   "$R" decode --aln "$D/$2" --ref "$D/$3" -i "$W/a.kst" > "$W/r.out" 2>/dev/null; c2=$?
   if cmp -s "$W/c.out" "$W/r.out" && [ $c1 = $c2 ] && cmp -s "$W/r.out" "$D/$1"; then aok=$((aok+1))
   else abad=$((abad+1)); echo "  --aln decode differs: $1"; fi
-  # the reference as a track, from either binary: the same bytes and rows as the text gives
+  # a .kst reference: same bytes and rows
   "$C" encode < "$D/$3" > "$W/c.ref.kst" 2>/dev/null; "$R" encode < "$D/$3" > "$W/r.ref.kst" 2>/dev/null
   "$C" encode --aln "$D/$2" --ref "$W/r.ref.kst" < "$D/$1" > "$W/c.kst" 2>/dev/null; c1=$?
   "$R" encode --aln "$D/$2" --ref "$W/c.ref.kst" < "$D/$1" > "$W/r.kst" 2>/dev/null; c2=$?
@@ -168,7 +160,7 @@ for pair in "s.bed p.paf ref.bed" "ls.bed lp.paf lref.bed"; do
   if cmp -s "$W/c.ref.kst" "$W/r.ref.kst" && cmp -s "$W/c.kst" "$W/a.kst" && cmp -s "$W/r.kst" "$W/a.kst" && [ $c1 = 0 ] && [ $c2 = 0 ] && [ $c3 = 0 ] && cmp -s "$W/r.out" "$D/$1"; then aok=$((aok+1))
   else abad=$((abad+1)); echo "  .kst reference differs: $1"; fi
 done
-# one block a query leaves the deltas stream empty: its codec line printed 0xffffffff in the C
+# one-block query: empty deltas stream
 printf 's\t0\t1\tA\n' > "$W/one.ref.bed"; printf 'q\t1\t0\t1\t+\ts\t1\t0\t1\t1\t1\t60\tcg:Z:1M\n' > "$W/one.paf"
 for pair in "p.paf ref.bed" "lp.paf lref.bed" "db.self.paf db.rall.bed" "$W/one.paf $W/one.ref.bed"; do
   set -- $pair; a=$1; b=$2; [ -e "$a" ] || a=$D/$1; [ -e "$b" ] || b=$D/$2
@@ -180,14 +172,14 @@ done
 [ $abad = 0 ] && echo "--aln and aln-pack: $aok forms identical" \
   || { echo "--aln: $abad DIFFER"; fail=1; }
 
-# 11. the same refusals, with the same words.
+# 11. same refusals, same words
 EXPECT=fail
 for bad_in in 'r1\t0\t10' 'r1\t5\t10\tA' 'r1\t0\t0\tA' '\t0\t10\tA' 'r1\tx\t10\tA' 'r1\t00\t10\tA' 'r1\t0\t010\tA'; do
   printf "$bad_in\n" | "$C" encode 2> "$W/ce" >/dev/null; c1=$?; cm=$(tail -1 "$W/ce")
   printf "$bad_in\n" | "$R" encode 2> "$W/re" >/dev/null; r1=$?; rm2=$(tail -1 "$W/re")
   [ "$cm" = "$rm2" ] && [ "$c1" = 1 ] && [ "$r1" = 1 ] || { echo "  refusal differs on [$bad_in]: c=[$cm] rc $c1, rust=[$rm2] rc $r1"; fail=1; }
 done
-# the same refusals on companions: a blank --aln-names line, a cut .gz reference, a packed alignment with a byte over
+# refusals on companion files
 printf 'q1\n\nq2\n' > "$W/blank"; gzip -c "$D/ref.bed" | head -c 40 > "$W/cut.gz"
 printf '\ns\t0\t10\t1\n' > "$W/dbblank.bed"; printf 's\t00\t10\t1\n' > "$W/dbzero.bed"
 "$C" aln-pack -a "$D/p.paf" --ref "$D/ref.bed" -o "$W/over.pk" >/dev/null 2>&1; printf '\0' >> "$W/over.pk"
@@ -200,8 +192,7 @@ for form in "encode --aln $D/p.paf --ref $D/ref.bed --aln-names $W/blank" "encod
 done
 echo "refusals: same message from both"
 
-# 12. valid input of every awkward shape, the fuzz's generator: both must
-# write the same bytes under every flag form.
+# 12. awkward valid input: same bytes
 python3 "$D/kt.py" gen "$W" 20
 gok=0; gbad=0
 for f in "$W"/ok*.bed; do
@@ -215,9 +206,7 @@ done
 [ $gbad = 0 ] && echo "awkward input: $gok forms identical" || { echo "awkward input: $gbad DIFFER"; fail=1; }
 
 EXPECT=ok
-# 11b. gzipped input, which is how the real tracks are stored. zlib and
-# zlib-rs must inflate to the same bytes, so the track must be identical to
-# the one built from the plain file.
+# 11b. gzip input: same track as plain
 gok=0; gbad=0
 for f in "$D"/s.bed "$D"/ls.bed "$D"/db.rall.bed "$D"/ord.bed; do
   gzip -c "$f" > "$W/in.gz"
@@ -236,7 +225,7 @@ for b in "$C" "$R"; do
   if cmp -s "$W/a.plain" "$W/a.gz.kst"; then gok=$((gok+1))
   else gbad=$((gbad+1)); echo "  gz --aln differs: $b"; fi
 done
-# BGZF, inflated block by block in parallel: many blocks, from a file and a pipe
+# many BGZF blocks, file and pipe
 awk 'BEGIN{for(i=0;i<60000;i++){p=0;for(j=0;j<5;j++){printf "read%d\t%d\t%d\tL%d\n",i,p,p+j+7,j%3;p+=j+7}}}' > "$W/bz.bed"
 python3 "$D/kt.py" bgzf "$W/bz.bed" "$W/bz.bgz"
 "$C" encode < "$W/bz.bed" > "$W/bz.plain" 2>/dev/null
@@ -246,7 +235,7 @@ for b in "$C" "$R"; do
     if cmp -s "$W/bz.plain" "$W/bz.kst"; then gok=$((gok+1)); else gbad=$((gbad+1)); echo "  bgzf differs: $b $how"; fi
   done
 done
-sz=$(stat -c%s "$W/bz.bgz"); head -c $((sz / 2)) "$W/bz.bgz" > "$W/bzcut.bgz"   # cut, and a bit flipped inside a block
+sz=$(stat -c%s "$W/bz.bgz"); head -c $((sz / 2)) "$W/bz.bgz" > "$W/bzcut.bgz"   # cut and byte-flipped BGZF
 cp "$W/bz.bgz" "$W/bzflip.bgz"; printf 'U' | dd of="$W/bzflip.bgz" bs=1 seek=$((sz / 3)) conv=notrunc status=none
 for f in bzcut bzflip; do
   "$C" encode -i "$W/$f.bgz" 2> "$W/ce" >/dev/null; c1=$?; cm=$(tail -1 "$W/ce")
@@ -256,11 +245,10 @@ done
 [ $gbad = 0 ] && echo "gzip input: $gok forms match the plain track" \
   || { echo "gzip input: $gbad DIFFER"; fail=1; }
 
-# 12. the command line itself: the same words and the same exit code for
-# every malformed form, including --help and --version.
+# 12. CLI: same words, same exit code
 cok=0; cbad=0
 cli() {
-  (cd "$W" && "$C" "$@" </dev/null > cliout.c 2>&1); local cr=$?   # in $W: a form may write a file
+  (cd "$W" && "$C" "$@" </dev/null > cliout.c 2>&1); local cr=$?   # in $W, since forms may write files
   (cd "$W" && "$R" "$@" </dev/null > cliout.r 2>&1); local rr=$?
   if cmp -s "$W/cliout.c" "$W/cliout.r" && [ "$cr" = "$rr" ]; then cok=$((cok+1)); return; fi
   cbad=$((cbad+1)); echo "  cli differs: [$*] rc $cr/$rr"; echo "    c=[$(head -c 200 "$W/cliout.c" | tr -d '\0' | head -1)]"
@@ -293,8 +281,7 @@ cli decode -i f --max-gap -1; cli decode -i f -r -x; cli encode -- -x; cli decod
 [ $cbad = 0 ] && echo "cli: $cok forms give the same words and code" \
   || { echo "cli: $cbad of $((cok+cbad)) DIFFER"; fail=1; }
 
-# 13. the tail predictor: on only past TAILSKIP (64) sequences, so no
-# fixture above reaches it. Equal lengths, two lengths, a short last run.
+# 13. tail predictor, past TAILSKIP=64 sequences
 python3 - "$W" <<'PY'
 import sys, random
 random.seed(5); w = sys.argv[1]
@@ -312,23 +299,21 @@ for f in tail1 tail2; do for flags in "" "-e low" "-e high" "--block 7" "--sort"
 done; done
 [ $tbad = 0 ] && echo "tail predictor: $tok forms identical" || { echo "tail predictor: $tbad DIFFER"; fail=1; }
 
-# 14. a damaged file of many blocks: the same rows reach stdout before the
-# refusal, since both flush before a row that would not fit 4 MB
+# 14. damaged file: same rows before refusal
 python3 -c "
 import random; random.seed(9)
 with open('$W/many.bed','w') as f:
     for r in range(400000): f.write(f'read{r:07d}\t0\t{random.randint(50,150)}\t{random.choice(\"ABCD\")}\n')"
 "$C" -e low --block 4096 encode -i "$W/many.bed" > "$W/many.kst" 2>/dev/null
 dok=0; dbad=0
-for pct in 75 90; do   # a flipped byte: the block check refuses it after the rows before
+for pct in 75 90; do
   python3 -c "import sys; d=bytearray(open(sys.argv[1],'rb').read()); d[len(d)*$pct//100]^=0xff; open(sys.argv[2],'wb').write(d)" "$W/many.kst" "$W/cut.kst"
   "$C" decode -i "$W/cut.kst" > "$W/c.out" 2>"$W/c.err"; c1=$?; "$R" decode -i "$W/cut.kst" > "$W/r.out" 2>"$W/r.err"; r1=$?
   if cmp -s "$W/c.out" "$W/r.out" && cmp -s "$W/c.err" "$W/r.err" && [ $c1 = $r1 ] && [ $c1 != 0 ] && [ -s "$W/c.out" ]; then dok=$((dok+1)); else dbad=$((dbad+1)); echo "  damaged decode differs at $pct%: $(wc -c < "$W/c.out") vs $(wc -c < "$W/r.out") B, rc $c1/$r1"; fi
 done
 [ $dbad = 0 ] && echo "damaged decode: $dok flips stop at the same byte" || { echo "damaged decode: $dbad DIFFER"; fail=1; }
 
-# 15. a forged index chunk table, re-signed: lengths whose sum wraps, and
-# starts shifted by one. The Rust panicked on the first and read a wrong row on the second.
+# 15. forged chunk tables, re-signed
 python3 -c "
 with open('$W/ck.bed','w') as f:
     for i in range(65537): f.write(f'r{i}\t0\t1\t{\"B\" if i & 1 else \"A\"}\n')"

@@ -1,10 +1,6 @@
-mod cli;
+use karyozip::{aln, bail as die, bedcoord_r, db, ffi, prof, reader, smooth, writer};
 
-use karyozip::{aln, bail as die, bedcoord_r, db, ffi, kst, prof, reader, smooth, writer};
-
-use cli::{Cli, Cmd};
 use std::io::{BufWriter, Read, Write};
-
 
 /// The C's wording for a number that is not one.
 /// A count: digits only, at most 18 of them, in range, as the C's int_arg.
@@ -18,11 +14,6 @@ fn num(v: &Option<String>, lo: u64, hi: u64, what: &'static str) -> Option<u64> 
     v.as_ref().map(|s| { let n = karyozip::bedcoord(s.as_bytes(), what); if n < lo || n > hi { die(what); } n })
 }
 fn cnt(v: &Option<String>, lo: u64, hi: u64, what: &'static str) -> Option<u64> { v.as_ref().map(|s| count(s, lo, hi, what)) }
-
-/// A positional the command cannot run without.
-fn need(v: &Option<String>) -> &str {
-    v.as_deref().unwrap_or_else(|| die("bad command or missing arguments"))
-}
 
 fn main() {
     ffi::ignore_sigxfsz();
@@ -62,7 +53,7 @@ fn main() {
         if !m.is_empty() { opt.sortmem = mem_arg(m); }
     }
 
-    let Some(cmd) = c.cmd.as_ref() else { die(cli::USAGE) };
+    let Some(cmd) = c.cmd.as_ref() else { die(USAGE) };
     prof::start(c.profile, n);
     let mut ro = reader::ReadOpts { raw: c.raw, db: c.db.is_some(), ..Default::default() };
     // The C keeps a mode and a file separately, so a repeat of one does not
@@ -169,7 +160,6 @@ fn main() {
             ro.index = true;
             reader::Reader::open_with(track, &ro).build_index(track)
         }
-        Cmd::Codecs { file } => probe(need(file)),
         Cmd::AlnPack => {
             let (Some(paf), Some(rbed), Some(dest)) = (&c.aln, &c.refbed, &c.output)
                 else { die("usage: karyozip aln-pack -a P.paf --ref REF.bed|REF.kst -o OUT") };
@@ -243,7 +233,7 @@ fn regparse(r: &str) -> (&str, u64, u64) {
 /// --aln needs --ref, and the two are read once, before any row.
 /// --db and --aln companions for a reader, in the C's order: features first.
 /// smooth's positional hierarchy stands in for --hier under --db.
-fn informed(c: &cli::Cli, ro: &mut reader::ReadOpts, who: &str, hier: Option<&str>,
+fn informed(c: &Cli, ro: &mut reader::ReadOpts, who: &str, hier: Option<&str>,
             lazy: aln::Lazy) -> Option<db::Feats> {
     if c.set.is_some() && c.db.is_none() { die("--set needs --db"); }
     if c.hier.is_some() && c.db.is_none() && hier.is_none() { die("--hier does nothing without --db"); }
@@ -457,28 +447,164 @@ fn fill_rows(s: &[u8], from: usize, to: usize, out: &mut Vec<Row>) -> Result<(),
     Ok(())
 }
 
-fn probe(path: &str) {
-    let mut src = Vec::new();
-    std::fs::File::open(path).and_then(|mut f| f.read_to_end(&mut src)).unwrap_or_else(|e| die(&format!("{path}: {e}")));
-    let mut out = std::io::stdout().lock();
-    for lvl in [1, 3, 17, 19, 22] {
-        let z = ffi::zstd(&src, lvl);
-        writeln!(out, "zstd:{lvl}\t{}\t{:016x}", z.len(), kst::fnv(kst::FNV0, &z)).unwrap();
-    }
-    for c in writer::candlist(true) {
-        match ffi::paycomp(&src, c) {
-            Some(v) => {
-                let ok = ffi::paydecomp(&v, c, src.len()).as_deref() == Some(&src[..]);
-                writeln!(out, "codec:0x{c:x}\t{}\t{:016x}\troundtrip={}",
-                         v.len(), kst::fnv(kst::FNV0, &v), ok).unwrap();
+// The command line, parsed as the C parses it: the same flag table, flags
+// on either side of the command, short forms rewritten to long ones, and
+// the C's own refusal for each mistake, in the same order.
+
+/// The C's own usage text, lifted from karyozip.c by build.rs.
+pub const USAGE: &str = include_str!(concat!(env!("OUT_DIR"), "/usage.txt"));
+
+pub enum Cmd { Encode, Decode, Smooth, Index, AlnPack }
+
+#[derive(Default)]
+pub struct Cli {
+    pub cmd: Option<Cmd>,
+    pub input: Vec<String>,
+    pub output: Option<String>,
+    pub region: Option<String>,
+    pub halo: Option<String>,
+    pub feature_set: Option<String>,
+    pub block: Option<String>,
+    pub effort: Option<String>,
+    pub sort: Option<String>,        // "" for a bare --sort
+    pub names: Vec<String>,
+    pub db: Option<String>,
+    pub hier: Option<String>,
+    pub out: Option<String>,
+    pub set: Option<String>,
+    pub aln: Option<String>,
+    pub refbed: Option<String>,
+    pub aln_names: Option<String>,
+    pub raw: bool,
+    pub max_gap: Option<String>,
+    pub v1: bool,
+    pub threads: Option<String>,
+    pub tmp_dir: Option<String>,
+    pub profile: bool,
+}
+
+/// Every flag and whether it takes a value, as the C's FLAGS.
+const FLAGS: &[(&str, bool)] = &[
+    ("--version", false), ("--threads", true), ("-t", true), ("--profile", false), ("--tmp-dir", true),
+    ("--names", true), ("--max-gap", true), ("--v1", false), ("--aln-names", true), ("--sort", false),
+    ("--effort", true), ("--block", true), ("--db", true), ("--aln", true), ("--ref", true),
+    ("--out-dir", true), ("--set", true), ("--raw", false), ("--hier", true), ("--input", true),
+    ("--output", true), ("--region", true), ("--halo", true), ("--feature-set", true),
+];
+const SHORT: &[(&str, &str)] = &[
+    ("-i", "--input"), ("-o", "--output"), ("-r", "--region"), ("-f", "--feature-set"),
+    ("-b", "--block"), ("-e", "--effort"), ("-n", "--names"), ("-d", "--db"), ("-a", "--aln"),
+];
+
+fn long(a: String) -> String {
+    SHORT.iter().find(|(s, _)| *s == a).map_or(a, |(_, l)| l.to_string())
+}
+
+impl Cli {
+    pub fn get() -> Cli {
+        let mut av: Vec<String> = std::env::args().skip(1).collect();
+        for a in &av {
+            if a == "--help" || a == "-h" { println!("{USAGE}"); std::process::exit(0); }
+            if a == "--version" {
+                println!("karyozip {}, format KST00001\n  zstd       {}\n  libbz3     {}\n  htscodecs  {}\n  libdeflate {}\n  liblzma    {}",
+                         env!("CARGO_PKG_VERSION"), karyozip::ffi::zstd_version(),
+                         karyozip::ffi::bzip3_version(), karyozip::ffi::HTSCODECS_VERSION, karyozip::ffi::LIBDEFLATE_VERSION,
+                         karyozip::ffi::lzma_version());
+                std::process::exit(0);
             }
-            None => writeln!(out, "codec:0x{c:x}\trefused").unwrap(),
         }
+        if av.is_empty() { die(USAGE); }
+        // the command: the first word that is not a flag or its value
+        let mut cmd = String::new();
+        let mut i = 0;
+        while i < av.len() {
+            let a = long(av[i].clone());
+            if !a.starts_with('-') || a.len() == 1 { cmd = a; break; }
+            let nv = if a.starts_with("--sort=") { Some(false) }
+                     else { FLAGS.iter().find(|(f, _)| *f == a).map(|f| f.1) };
+            match nv { Some(v) => i += 1 + v as usize, None => die(&format!("unknown flag {a}")) }
+        }
+        av = av.into_iter().map(long).collect();
+        let c = cmd.as_str();
+        let (enc, dec, sm) = (c == "encode", c == "decode", c == "smooth");
+        let rd = sm || dec || c == "index";
+        let inf = enc || sm || dec;
+        let pack = c == "aln-pack";
+        let mut o = Cli::default();
+        let mut i = 0;
+        while i < av.len() {
+            let a = av[i].clone();
+            let v = av.get(i + 1).cloned();
+            if FLAGS.iter().any(|(f, nv)| *f == a && *nv) && v.is_none() { die(&format!("{a} needs a value")); }
+            let val = || v.clone().unwrap();
+            let ok = match a.as_str() {
+                "--threads" | "-t" => { crate::count(&val(), 1, 1024, "--threads is a number of 1 to 1024"); o.threads = Some(val()); true }
+                "--profile" => { o.profile = true; true }
+                "--tmp-dir" => { o.tmp_dir = Some(val()); true }
+                "--names" => {
+                    let n = val();
+                    let ok = if n == "drop" || n.starts_with("drop:") {
+                        if n == "drop:" { die("--names drop:FILE needs a file"); }
+                        enc
+                    } else if enc {
+                        die(if n == "ordinal" { "encode takes --names drop or drop:FILE" }
+                            else { "encode takes --names drop or drop:FILE; a name file is --aln-names" })
+                    } else { rd };
+                    o.names.push(n); ok
+                }
+                "--max-gap" => { crate::num(&v, 0, u64::MAX, "--max-gap needs a number"); o.max_gap = Some(val()); sm }
+                "--v1" => { o.v1 = true; sm }
+                "--aln-names" => { o.aln_names = Some(val()); inf }
+                "--sort" => { o.sort = Some(String::new()); enc }
+                s if s.starts_with("--sort=") => {
+                    crate::mem_arg(&s[7..]);
+                    o.sort = Some(s[7..].to_string()); enc
+                }
+                "--effort" => {
+                    if !["low", "medium", "high"].contains(&val().as_str()) { die("--effort is low, medium or high"); }
+                    o.effort = Some(val()); enc
+                }
+                "--block" => {
+                    if val() != "all" { crate::count(&val(), 1, i64::MAX as u64, "--block is a number of runs, 1 or more, or \"all\""); }
+                    o.block = Some(val()); enc
+                }
+                "--db" => { o.db = Some(val()); inf }
+                "--hier" => { o.hier = Some(val()); inf }
+                "--aln" => { o.aln = Some(val()); inf || pack }
+                "--ref" => { o.refbed = Some(val()); inf || pack }
+                "--out-dir" => { o.out = Some(val()); dec }
+                "--input" => { o.input.push(val()); !pack }
+                "--output" => { o.output = Some(val()); c != "index" }
+                "--region" => { o.region = Some(val()); sm || dec }
+                "--halo" => { o.halo = Some(val()); dec }
+                "--feature-set" => { o.feature_set = Some(val()); sm }
+                "--set" => { o.set = Some(val()); dec }
+                "--raw" => { o.raw = true; dec }
+                _ => { i += 1; continue; }
+            };
+            if !ok {
+                if cmd.is_empty() { die(USAGE); }
+                die(&format!("{a} does not apply to {cmd}"));
+            }
+            av.drain(i..i + if matches!(a.as_str(), "--profile" | "--v1" | "--raw") || a.starts_with("--sort") { 1 } else { 2 });
+        }
+        if cmd.is_empty() { die(USAGE); }
+        o.cmd = Some(match c {
+            "encode" => Cmd::Encode, "decode" => Cmd::Decode,
+            "smooth" => Cmd::Smooth, "index" => Cmd::Index, "aln-pack" => Cmd::AlnPack,
+            _ => die("bad command or missing arguments"),
+        });
+        if let Some(a) = av.get(1) {   // every argument is a flag now
+            die(&if a.starts_with('-') && a.len() > 1 { format!("unknown flag {a}") }
+                 else { format!("unexpected argument {a}") });
+        }
+        o
     }
-    match ffi::tok_encode(&mut src) {
-        Some(v) => writeln!(out, "tok\t{}\t{:016x}\troundtrip={}", v.len(),
-                            kst::fnv(kst::FNV0, &v),
-                            ffi::tok_decode(&v).as_deref() == Some(&src[..])).unwrap(),
-        None => writeln!(out, "tok\trefused").unwrap(),
+
+    pub fn name(&self) -> &'static str {
+        match self.cmd.as_ref().unwrap() {
+            Cmd::Encode => "encode", Cmd::Decode => "decode",
+            Cmd::Smooth => "smooth", Cmd::Index => "index", Cmd::AlnPack => "aln-pack",
+        }
     }
 }

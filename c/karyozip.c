@@ -5531,28 +5531,30 @@ int main(int argc, char **argv) {
             "  karyozip encode [-i IN.bed[.gz]] [-o OUT.kst] [-e low|medium|high]\n"
             "                  [-n drop|drop:FILE] [--sort[=MEM]]\n"
             "                  [-d features.tsv [--hier H] -i SET.bed ...] [-a P.paf --ref R.bed|R.kst [--aln-names F]]\n"
-            "  karyozip decode -i F [-o OUT.bed] [-r NAME[:START-END] [--halo N]] [-n FILE] [--raw]\n"
+            "  karyozip decode -i F [-o OUT.bed] [-r NAME[:START-END] [--halo N]] [-n FILE]\n"
             "                  [-d features.tsv [--hier H] [--set A,B] [--out-dir DIR]] [-a P.paf --ref R]\n"
             "  karyozip smooth -i F --hier H -f FEATURE_SET [-r NAME[:START-END]] [-o OUT]\n"
             "  karyozip index  -i F                  appends a name index to the track itself\n"
             "  karyozip aln-pack -a P.paf --ref REF.bed|REF.kst -o OUT   only what -a reads\n"
             "  encode reads stdin without -i; every command but index writes stdout without -o\n"
-            "  any command: -t N, --threads N  --profile  --tmp-dir DIR  -h, --help\n"
+            "  any command: -t N, --threads N  --tmp-dir DIR  -h, --help\n"
             "               --version prints the codec versions\n"
             "  encode:      -e, --effort: low is a quick encode with blocks and an index for fast\n"
             "               queries, medium the default, high the smallest file\n"
-            "               -b N|all sets the blocks by hand\n"
             "  -r NAME:START-END is BED, 0-based, END excluded; -r NAME alone is the whole sequence;\n"
             "               decode -r prints the runs overlapping it, --halo N more each side\n"
             "  readers:     -n, -d, --hier, -a, --ref as encode was given; -n FILE takes the names from\n"
             "               drop:FILE, a FASTA, FASTQ or list\n"
             "               --set A,B picks feature sets of a -d track, default all; without\n"
             "               --out-dir decode prints them as columns, merged where they all agree\n"
-            "               --raw shows what is stored, reversing no transform\n"
             "  with -a:     --aln-names FILE, on encode and decode, when the track names rows by ordinal\n"
             "  smooth:      --max-gap N  --v1\n"
-            "  long forms:  -i --input  -o --output  -r --region  -f --feature-set  -b --block\n"
-            "               -e --effort  -n --names  -d --db  -a --aln";
+            "  long forms:  -i --input  -o --output  -r --region  -f --feature-set\n"
+            "               -e --effort  -n --names  -d --db  -a --aln"
+            /* Debug and profiling flags, out of the help:
+                 -b, --block N|all   encode: rows per block by hand
+                 --raw               decode: what is stored, reversing no transform
+                 --profile           any command: time and memory per phase on stderr */;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) { puts(USAGE); return 0; }
         /* The codec versions decide the stored bytes, so print them. */

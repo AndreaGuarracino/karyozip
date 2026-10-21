@@ -80,9 +80,10 @@ for f in --sort "--sort --names drop" "--block 262144" "--block 4"; do
   ofl=""
   $KT encode $f < "$D/s.bed" > "$W/f.kt" 2>/dev/null || { echo "$f: ENCODE FAILED"; fail=1; continue; }
   case "$f" in
-    # dropped names need --names ordinal
+    # dropped names need --names FILE
     *"--names drop"*|*--sort*)
-      case "$f" in *"--names drop"*) ofl="--names ordinal" ;; esac
+      cut -f1 "$D/s.bed" | uniq > "$W/s.names"
+      case "$f" in *"--names drop"*) ofl="--names $W/s.names" ;; esac
       $KT decode ${ofl:-} -i "$W/f.kt" 2>/dev/null | sort -k2 > "$W/a"
                            sort -k2 "$D/s.bed" | cut -f2,3,4 > "$W/b"
                            cut -f2,3,4 "$W/a" > "$W/a2"
@@ -490,7 +491,7 @@ L="$W"; for i in 1 2 3 4 5; do L="$L/$(printf 'd%.0s' $(seq 1 120))"; done; mkdi
 echo keep > "${L:0:511}" 2>/dev/null || true
 awk 'BEGIN{for(i=0;i<80000;i++)printf "s%d\t0\t10\tA\n",i}' > "$W/long.bed"
 $KT encode --tmp-dir "$L" --sort=1M --names drop < "$W/long.bed" > "$W/long.kt" 2>/dev/null \
-  && $KT decode --names ordinal -i "$W/long.kt" 2>/dev/null | cut -f2,3,4 | cmp -s - <(cut -f2,3,4 "$W/long.bed") && [ "$(cat "${L:0:511}" 2>/dev/null)" = keep ] \
+  && $KT decode --names <(cut -f1 "$W/long.bed") -i "$W/long.kt" 2>/dev/null | cmp -s - "$W/long.bed" && [ "$(cat "${L:0:511}" 2>/dev/null)" = keep ] \
   && ok "long sort temp dir: round-trip, bystander intact" || no "long sort temp dir: WRONG"
 $KT encode < "$D/s.bed" >&- 2>/dev/null && { echo "encode with stdout closed: EXIT 0"; fail=1; } || echo "encode with stdout closed: refused"
 $KT encode < "$W" > "$W/dir.kt" 2>/dev/null && { echo "encode from a directory: EXIT 0"; fail=1; } || echo "encode from a directory: refused"
@@ -553,8 +554,11 @@ printf 'feature_set\tchild\tparent\nfs\t%s\tcategorized\n' "$(head -c $((5 << 20
 $KT smooth -i "$W/five.kt" --hier "$W/five.tsv" -f fs 2>/dev/null | cmp -s - "$W/five.bed" && $KT decode -i "$W/five.kt" 2>/dev/null | cmp -s - "$W/five.bed" \
   && $KT decode -i "$W/five.kt" -r s 2>/dev/null | cmp -s - "$W/five.bed" && ok "5 MB label: smooth, decode, query" || no "5 MB label: WRONG"
 $KT encode --names drop < "$D/s.bed" > "$W/nn.kt" 2>/dev/null
-$KT decode --names ordinal -i "$W/nn.kt" -r 0 2>/dev/null | cut -f2,3,4 | cmp -s - <(grep -P '^q1\t' "$D/s.bed" | cut -f2,3,4) \
-  && ok "query --names ordinal: correct" || no "query --names ordinal: WRONG"
+$KT decode --names <(cut -f1 "$D/s.bed" | uniq) -i "$W/nn.kt" -r q1 2>/dev/null | cmp -s - <(grep -P '^q1\t' "$D/s.bed") \
+  && ok "query --names FILE on dropped names: correct" || no "query --names FILE on dropped names: WRONG"
+must_fail "decode of dropped names without --names" $KT decode -i "$W/nn.kt"
+must_fail "query of dropped names without --names" $KT decode -i "$W/nn.kt" -r 0
+must_fail "decode --names ordinal (no such file)" $KT decode --names ordinal -i "$W/nn.kt"
 
 # round 17 findings, one case each
 N300=$(head -c 300 /dev/zero | tr '\0' n); python3 -c "open('$W/fivename.bed', 'w').write('$N300\t0\t10\t%s\n' % ('z' * (5 << 20)))"
@@ -705,7 +709,6 @@ must_fail "--sort=1M2" $KT encode --tmp-dir "$W" --sort=1M2 < "$D/s.bed"
 
 # round 27 findings, one case each
 printf 'r0\nr1\nr2\nr3\n' > "$W/pn.txt"
-$KT decode --names ordinal -i "$W/nx.kt" 2>/dev/null | cut -f2,3,4 > "$W/pn.want"
 $KT --names <(cat "$W/pn.txt") decode -i "$W/nx.kt" 2>/dev/null | cmp -s - "$W/nx.bed" && ok "name file from a pipe: restored" || no "name file from a pipe: WRONG"
 printf '@r0\nACGT\n+\nIIII\n@r1\nACGT\n+\nIIII\n@r2\nACGT\n+\nIIII\n@r3\nACGT\n+\nIIII\n' > "$W/pn.fq"
 $KT --names <(cat "$W/pn.fq") decode -i "$W/nx.kt" 2>/dev/null | cmp -s - "$W/nx.bed" && ok "FASTQ from a pipe: restored" || no "FASTQ from a pipe: WRONG"

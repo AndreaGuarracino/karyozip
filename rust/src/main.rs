@@ -59,7 +59,6 @@ fn main() {
                 if n.len() == 5 { die("--names drop:FILE needs a file"); }
                 opt.names_out = Some(n[5..].to_string());
             }
-            "ordinal" => ro.ordnames = true,
             _ => ro.names_file = Some(n.clone()),
         }
     }
@@ -541,8 +540,7 @@ impl Cli {
                         if n == "drop:" { die("--names drop:FILE needs a file"); }
                         enc
                     } else if enc {
-                        die(if n == "ordinal" { "encode takes --names drop or drop:FILE" }
-                            else { "encode takes --names drop or drop:FILE; a name file is --aln-names" })
+                        die("encode takes --names drop or drop:FILE; a name file is --aln-names")
                     } else { rd };
                     o.names.push(n); ok
                 }

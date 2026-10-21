@@ -85,14 +85,17 @@ for f in ls.bed s.bed db.rall.bed ord.bed; do
     both "sorted decode $f [$fl]" decode -i "$W/t.kst"
   done
   "$C" --sort --names drop encode < "$D/$f" > "$W/t.kst" 2>/dev/null
-  both "sorted+drop $f" --names ordinal decode -i "$W/t.kst"
+  cut -f1 "$D/$f" | uniq > "$W/nm"
+  both "sorted+drop $f" --names "$W/nm" decode -i "$W/t.kst"
 done
 tally "sorted decode"
 
 # 7. reader flags: dropped names, sidecar, --raw
 for f in ls.bed s.bed db.rall.bed ord.bed; do
   "$C" encode --names drop < "$D/$f" > "$W/d.kst" 2>/dev/null
-  for dfl in "--names ordinal" "--raw"; do both "decode $dfl on $f" $dfl decode -i "$W/d.kst"; done
+  cut -f1 "$D/$f" | uniq > "$W/nm"
+  for dfl in "--names $W/nm" "--raw"; do both "decode $dfl on $f" $dfl decode -i "$W/d.kst"; done
+  EXPECT=fail both "decode without names on $f" decode -i "$W/d.kst"; EXPECT=ok
   # ordinal names have no sidecar: refused
   if "$C" encode --names "drop:$W/side" < "$D/$f" > "$W/s.kst" 2>/dev/null; then both "sidecar $f" --names "$W/side" decode -i "$W/s.kst"
   else EXPECT=fail both "sidecar $f refused" encode --names "drop:$W/side2" < "$D/$f"; EXPECT=ok; fi

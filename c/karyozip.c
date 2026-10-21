@@ -565,7 +565,6 @@ static int RAW = 0;
 static const char *OUTDIR = NULL;   /* --out-dir DIR, for decode --db */
 static const char *SETNAME = NULL;  /* --set NAME: one set of a --db track */
 static int INDEXING = 0;            /* the index command: names only, no companions */
-static int ORDNAMES = 0;              /* --names ordinal: accept dropped names */
 static const char *ALNREF = NULL;     /* --ref reference track */
 static const char *ALNNAMES = NULL;   /* --names FILE: ordinal N is line N+1 */
 static char **ORD; static size_t nord;
@@ -3921,18 +3920,10 @@ static void ensurenames(R *r) {
             "them, so it is refused. Unset it to read the names in the file");
     if (NAMEFILE && !r->perm_ext) {                        /* rank N is the Nth record */
         names = readnamefile(r->nreads);
-    } else if (r->dropped) {
-
-        if (!RAW && !ORDNAMES)
-            die("the names of this track were dropped at encode time: give "
-                "them back with --names FILE, or pass --names ordinal to "
-                "accept the ordinals that are stored instead");
-        names = xmalloc(mul(r->nreads, 21) + 1);
-        size_t w = 0;
-        for (uint64_t i = 0; i < r->nreads; i++)
-            { w = (size_t)(putu64(names + w, i) - names); names[w++] = '\n'; }
-        names[w] = 0;
-    } else if (!r->nzl_keep) {             /* ordinal: the name is the row */
+    } else if (r->dropped && !RAW) {
+        die("the names of this track were dropped at encode time: give "
+            "them back with --names FILE");
+    } else if (r->dropped || !r->nzl_keep) {   /* ordinal: the name is the row */
         names = xmalloc(mul(r->nreads, 21) + 1);
         size_t w = 0;
         for (uint64_t i = 0; i < r->nreads; i++)
@@ -3963,10 +3954,9 @@ static void ensurenames(R *r) {
         char *nat;
         if (r->perm_ext) {
             if (!NAMEFILE) {
-                if (RAW || ORDNAMES) goto ranks_are_names;
+                if (RAW) goto ranks_are_names;
                 die("--sort --names drop keeps the rank of every record and no "
-                    "name text: give the original FASTA/FASTQ in "
-                    "--names FILE, or --names ordinal to see the ranks");
+                    "name text: give the original FASTA/FASTQ in --names FILE");
             }
             nat = readnamefile(r->nreads);
         }
@@ -5541,7 +5531,7 @@ int main(int argc, char **argv) {
             "  karyozip encode [-i IN.bed[.gz]] [-o OUT.kst] [-e low|medium|high]\n"
             "                  [-n drop|drop:FILE] [--sort[=MEM]]\n"
             "                  [-d features.tsv [--hier H] -i SET.bed ...] [-a P.paf --ref R.bed|R.kst [--aln-names F]]\n"
-            "  karyozip decode -i F [-o OUT.bed] [-r NAME[:START-END] [--halo N]] [-n FILE|ordinal] [--raw]\n"
+            "  karyozip decode -i F [-o OUT.bed] [-r NAME[:START-END] [--halo N]] [-n FILE] [--raw]\n"
             "                  [-d features.tsv [--hier H] [--set A,B] [--out-dir DIR]] [-a P.paf --ref R]\n"
             "  karyozip smooth -i F --hier H -f FEATURE_SET [-r NAME[:START-END]] [-o OUT]\n"
             "  karyozip index  -i F                  appends a name index to the track itself\n"
@@ -5555,7 +5545,7 @@ int main(int argc, char **argv) {
             "  -r NAME:START-END is BED, 0-based, END excluded; -r NAME alone is the whole sequence;\n"
             "               decode -r prints the runs overlapping it, --halo N more each side\n"
             "  readers:     -n, -d, --hier, -a, --ref as encode was given; -n FILE takes the names from\n"
-            "               drop:FILE, a FASTA, FASTQ or list; -n ordinal accepts dropped names\n"
+            "               drop:FILE, a FASTA, FASTQ or list\n"
             "               --set A,B picks feature sets of a -d track, default all; without\n"
             "               --out-dir decode prints them as columns, merged where they all agree\n"
             "               --raw shows what is stored, reversing no transform\n"
@@ -5628,9 +5618,6 @@ int main(int argc, char **argv) {
             if (!strcmp(v, "drop")) { ok = enc; NAMEMODE = 1; }
             else if (!strncmp(v, "drop:", 5)) { ok = enc; NAMES_OUT = v + 5;
                                                 if (!*NAMES_OUT) die("--names drop:FILE needs a file"); }
-            else if (!strcmp(v, "ordinal")) {
-                if (enc) die("encode takes --names drop or drop:FILE");
-                ok = rd; ORDNAMES = 1; }
             else if (enc) die("encode takes --names drop or drop:FILE; a name file is --aln-names");
             else { ok = rd; NAMESARG = v; }   /* the blob drop:FILE wrote, or a FASTA, FASTQ or list */
             take = 2; }

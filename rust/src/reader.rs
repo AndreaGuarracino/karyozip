@@ -66,7 +66,6 @@ pub struct ReadOpts {
     pub index: bool,
     pub db: bool,
     pub aln: Option<std::sync::Arc<crate::aln::Aln>>,
-    pub ordnames: bool,
     pub names_file: Option<String>,
 }
 
@@ -89,7 +88,6 @@ pub struct Reader {
     nz: Vec<u8>,
     pz: Vec<u8>,
     names_file: Option<String>,
-    ordnames: bool,
     /// side, perm_ext, dropped, int, tok, perm, perm_tok
     nf: u8,
     /// the appended index: offset of its key table, and its trailer's binding word
@@ -388,7 +386,7 @@ impl Reader {
             taildec, tailpred: h[12], tailskip: h[13] & 0xff, iz, coff, cpend, ibx: Vec::new(), cur_chunk: u64::MAX,
             runhead, ilv, grp, rtab: Default::default(),
             names: std::cell::OnceCell::new(), nz, pz, names_file: o.names_file.clone(),
-            ordnames: o.ordnames, nf, idx,
+            nf, idx,
             hasidx, mhash: h[15], cur_ri: 0, cur_q: 0, cur_pend: 0, cached: None, sc: None,
             rowhash: if h1_raw & ALNFLAG != 0 { 0 } else { h[13] >> 8 },
             plainref: h1_raw & (ALNFLAG | DBFLAG | SIDEFLAG | DROPPED | PERMFLAG) == 0,
@@ -900,8 +898,8 @@ impl Reader {
             }
             read_name_file(f, n)
         } else if dropped && nz.is_empty() {
-            if !self.raw && !self.ordnames {
-                crate::bail("the names of this track were dropped at encode time: give them back with --names FILE, or pass --names ordinal to accept the ordinals that are stored instead");
+            if !self.raw {
+                crate::bail("the names of this track were dropped at encode time: give them back with --names FILE");
             }
             ordinals(n)
         } else if nz.is_empty() {
@@ -931,8 +929,8 @@ impl Reader {
             let resolve = if perm_ext {
                 match &self.names_file {
                     Some(f) => Some(read_name_file(f, n)),
-                    None if self.raw || self.ordnames => None,
-                    None => crate::bail("--sort --names drop keeps the rank of every record and no name text: give the original FASTA/FASTQ in --names FILE, or --names ordinal to see the ranks"),
+                    None if self.raw => None,
+                    None => crate::bail("--sort --names drop keeps the rank of every record and no name text: give the original FASTA/FASTQ in --names FILE"),
                 }
             } else if perm_tok {
                 Some(tok_d(pz))

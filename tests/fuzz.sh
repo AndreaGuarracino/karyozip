@@ -96,7 +96,7 @@ for f in "$W"/ok*.bed; do
   for m in "" "--block 4" "--block 262144" "--sort" "--names drop" "--effort low --block 3"; do
     $KT encode $m < "$f" > "$W/v.kt" 2>"$W/err" || { echo "fuzz: valid BED REFUSED ($f $m): $(tail -1 "$W/err")"; fail=1; continue; }
     case "$m" in *sort*)  $KT decode -i "$W/v.kt" 2>/dev/null | sort | cmp -s - <(sort "$f") ;;
-                 *drop*)  $KT decode --names ordinal -i "$W/v.kt" 2>/dev/null | cut -f2- | cmp -s - <(cut -f2- "$f") ;;
+                 *drop*)  $KT decode --raw -i "$W/v.kt" 2>/dev/null | cut -f2- | cmp -s - <(cut -f2- "$f") ;;
                  *)       $KT decode -i "$W/v.kt" 2>/dev/null | cmp -s - "$f" ;; esac \
       || { echo "fuzz: valid BED did not come back ($f $m)"; fail=1; }
     v=$((v+1))
@@ -117,7 +117,7 @@ PY
 # decoded rows must match; sanitizer reports fail
 check() {
   local f=$1 what=$2 rc out
-  out=$(ASAN_OPTIONS=detect_leaks=0 timeout 30 $SAN decode --names ordinal $NIN -i "$f" 2>"$W/err"); rc=$?
+  out=$(ASAN_OPTIONS=detect_leaks=0 timeout 30 $SAN decode --raw $NIN -i "$f" 2>"$W/err"); rc=$?
   if [ $rc -gt 1 ]; then echo "fuzz: $what crashed rc=$rc"; fail=1; return; fi
   grep -qE "AddressSanitizer|runtime error" "$W/err" && { echo "fuzz: $what sanitizer report"; fail=1; return; }
   if [ $rc -eq 0 ] && [ -s "$W/want" ]; then
@@ -133,7 +133,7 @@ for m in "--block 32" "--block 262144" "--block 32 --effort low" "--block 32 --s
   case "$m" in *names-in*) cp "$W/side.kt" "$W/t.kt";; *) $KT encode $m < "$W/ok.bed" > "$W/t.kt" 2>/dev/null || { echo "fuzz: encode $m FAILED"; fail=1; continue; };; esac
   sz=$(stat -c%s "$W/t.kt")
   NIN=""; case "$m" in *names-in*) NIN="--names $W/side.names";; esac
-  $KT decode --names ordinal $NIN -i "$W/t.kt" 2>/dev/null | cut -f2,3,4 > "$W/want"
+  $KT decode --raw $NIN -i "$W/t.kt" 2>/dev/null | cut -f2,3,4 > "$W/want"
   for cut in 1 8 64 512; do
     [ "$cut" -ge "$sz" ] && continue
     head -c $((sz - cut)) "$W/t.kt" > "$W/m.kt"
@@ -212,7 +212,7 @@ PY
 printf 'feature_set\tchild\tparent\nfs\tL0\tcategorized\n' > "$W/hier.tsv"
 one_forged() {   # three commands on one file
   local m=$1 e="$1.err"
-  for c in "decode --names ordinal" "decode --names ordinal -r read1" smooth; do
+  for c in "decode --raw" "decode --raw -r read1" smooth; do
     case $c in smooth) args="-i $m --hier $W/hier.tsv -f fs";; *) args="-i $m";; esac
     ASAN_OPTIONS=detect_leaks=0 timeout 30 $SAN $c $args > /dev/null 2>"$e"; rc=$?
     [ $rc -gt 1 ] && { echo "fuzz: forged $(basename $m) $c crashed rc=$rc"; return 1; }
@@ -260,7 +260,7 @@ for bi in sorted(set([0, len(rows) // 2, len(rows) - 1])):
 PY
 one_fsz() {
   local m=$1 e="$1.err" out rc
-  out=$(ASAN_OPTIONS=detect_leaks=0 timeout 30 $SAN decode --names ordinal -i "$m" 2>"$e"); rc=$?
+  out=$(ASAN_OPTIONS=detect_leaks=0 timeout 30 $SAN decode --raw -i "$m" 2>"$e"); rc=$?
   [ $rc -gt 1 ] && { echo "fuzz: forged sizes $(basename $m) crashed rc=$rc"; return 1; }
   grep -qE "AddressSanitizer|runtime error" "$e" && { echo "fuzz: forged sizes $(basename $m) sanitizer report"; return 1; }
   [ $rc -eq 0 ] && { printf '%s\n' "$out" | cut -f2,3,4 | cmp -s - "$W/want4" || { echo "fuzz: forged sizes $(basename $m) decoded WRONG rows with exit 0"; return 1; }; }

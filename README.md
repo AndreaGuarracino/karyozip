@@ -67,10 +67,9 @@ Read names are stored in the file by default.
 
 | flag | effect |
 |---|---|
-| `-n drop` | store none; the file is smaller and a read is known by its number |
+| `-n drop` | store none; the file is smaller, and every read of it needs `-n F` |
 | `-n drop:F` | write the names to `F` beside the track |
 | `-n F` | on decode and smooth: take names from `F`, a `drop:F` file, a FASTA, a FASTQ or a list, one a line |
-| `-n ordinal` | on decode: accept a track stored with `-n drop` and print the numbers |
 
 `--sort` groups records by their labels, which pays on short reads stored with `-n drop`; a decode then returns the rows in that order.
 

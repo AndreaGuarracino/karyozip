@@ -90,7 +90,26 @@ impl Hier {
 /// `dis` keeps its marks across calls: `mark` only rises, and a wrap or a
 /// grown hierarchy clears it.
 #[derive(Default)]
-pub struct Scratch { was: Vec<u8>, dis: Vec<u32>, rel: Vec<usize>, mark: u32 }
+pub struct Scratch { was: Vec<u8>, dis: Vec<u32>, rel: Vec<usize>, mark: u32, tmp: Vec<i32> }
+
+/// As KaryoScope 6186079 (2025-12-10), as the C's smooth_seq: chunks of
+/// `chunk` runs overlapping by a quarter, each smoothed alone on a copy,
+/// its first three quarters kept; the rest smoothed whole. 0 is no chunks.
+fn smooth_seq(h: &Hier, st: &[u64], en: &[u64], feat: &mut [i32], maxgap: u64,
+              chunk: usize, sc: &mut Scratch) {
+    let (n, mut s) = (feat.len(), 0);
+    if chunk > 0 {
+        let keep = chunk - chunk / 4;
+        while n - s >= chunk + chunk / 4 {
+            let mut tmp = std::mem::take(&mut sc.tmp);
+            tmp.clear(); tmp.extend_from_slice(&feat[s..s + chunk]);
+            smooth_one(h, &st[s..s + chunk], &en[s..s + chunk], &mut tmp, maxgap, sc);
+            feat[s..s + keep].copy_from_slice(&tmp[..keep]);
+            sc.tmp = tmp; s += keep;
+        }
+    }
+    smooth_one(h, &st[s..], &en[s..], &mut feat[s..], maxgap, sc);
+}
 
 /// One sequence, in place. Promotes a run to the lowest common ancestor of
 /// its neighbours when the noise between them is below it.
@@ -221,7 +240,7 @@ fn emit(h: &Hier, out: &mut Vec<u8>, seq: &[u8], st: &[u64], en: &[u64],
 
 #[allow(clippy::too_many_arguments)]
 pub fn run(path: &str, hier: &str, fs: &[u8], seq: Option<&[u8]>,
-           lo: u64, hi: u64, v1: bool, maxgap: u64,
+           lo: u64, hi: u64, v1: bool, maxgap: u64, smchunk: usize,
            ro: &crate::reader::ReadOpts, feats: Option<&crate::db::Feats>,
            out: &mut (impl Write + Send)) {
     let mut h = Hier::load(hier, fs);
@@ -259,7 +278,7 @@ pub fn run(path: &str, hier: &str, fs: &[u8], seq: Option<&[u8]>,
         drop(s);
         if hi > 0 && sr.en.last().is_none_or(|&e| lo >= e) { return; }
         let s = crate::prof::span(if prof { 4 } else { 10 });
-        smooth_one(&h, &sr.st, &sr.en, &mut sr.feat, maxgap, sc);
+        smooth_seq(&h, &sr.st, &sr.en, &mut sr.feat, maxgap, smchunk, sc);
         drop(s);
         let name = r.name_at(ri).to_vec();
         let _s = crate::prof::span(if prof { 5 } else { 10 });

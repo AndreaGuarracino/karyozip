@@ -4608,6 +4608,7 @@ static uint8_t *ANC = NULL;
 static int16_t *LCA = NULL;
 static int ROOTID = -1;
 static uint64_t MAXGAP = 1000;
+static uint64_t SMCHUNK = 0;   /* --chunk: KaryoScope 6186079 smoothed runs in chunks */
 /* runs of context around a requested region */
 
 static int nodeid(const char *nm, size_t n) {
@@ -4749,6 +4750,24 @@ static void smooth_one(uint64_t *st, uint64_t *en, int *feat, uint64_t n) {
         if (!changes) break;
     }
     S->gen = gen;
+}
+
+/* As KaryoScope 6186079 (2025-12-10): chunks of SMCHUNK runs overlapping
+   by a quarter, each smoothed alone on a copy, its first three quarters
+   kept; the rest of the sequence smoothed whole. */
+static __thread int *SMTMP; static __thread uint64_t SMTCAP;
+static void smooth_seq(uint64_t *st, uint64_t *en, int *feat, uint64_t n) {
+    uint64_t s = 0;
+    if (SMCHUNK) {
+        uint64_t ov = SMCHUNK / 4, keep = SMCHUNK - ov;
+        if (SMCHUNK > SMTCAP) { SMTCAP = SMCHUNK; SMTMP = xrealloc(SMTMP, mul(SMCHUNK, sizeof(int))); }
+        for (; n - s >= SMCHUNK + ov; s += keep) {
+            memcpy(SMTMP, feat + s, SMCHUNK * sizeof(int));
+            smooth_one(st + s, en + s, SMTMP, SMCHUNK);
+            memcpy(feat + s, SMTMP, keep * sizeof(int));
+        }
+    }
+    smooth_one(st + s, en + s, feat + s, n - s);
 }
 
 static uint8_t *isnovel = NULL;
@@ -5099,7 +5118,7 @@ static void smooth_mt(const char *path, R *r0, int64_t first, int64_t last,
                 uint64_t *st, *en; int *feat; uint8_t *novel;
                 uint64_t n = loadseq(rr, ri, &st, &en, &feat, &novel, labmap);
                 if (hi && (!n || lo >= en[n - 1])) continue;   /* the range misses it */
-                smooth_one(st, en, feat, n);   /* the whole sequence: a range only cuts the output */
+                smooth_seq(st, en, feat, n);   /* the whole sequence: a range only cuts the output */
                 emit_buf(&ob, &cap, &len, rr->name[ri], st, en, feat, novel, n, lo, hi, v1);
             }
 #ifdef _OPENMP
@@ -5149,7 +5168,7 @@ static void smoothcmd(const char *path, const char *hier, const char *fs,
 
         if (hi && (!n || lo >= en[n - 1])) continue;
         _t = nowsec();
-        smooth_one(st, en, feat, n);
+        smooth_seq(st, en, feat, n);
         PH_ADD(4, _t);
         _t = nowsec();
         emit(r->name[ri], st, en, feat, novel, n, lo, hi, v1);
@@ -5548,7 +5567,7 @@ int main(int argc, char **argv) {
             "               --set A,B picks feature sets of a -d track, default all; without\n"
             "               --out-dir decode prints them as columns, merged where they all agree\n"
             "  with -a:     --aln-names FILE, on encode and decode, when the track names rows by ordinal\n"
-            "  smooth:      --max-gap N  --v1\n"
+            "  smooth:      --max-gap N  --v1  --chunk N (KaryoScope 1.x before 2026-01-08: 20000)\n"
             "  long forms:  -i --input  -o --output  -r --region  -f --feature-set\n"
             "               -e --effort  -n --names  -d --db  -a --aln"
             /* Debug and profiling flags, out of the help:
@@ -5574,7 +5593,7 @@ int main(int argc, char **argv) {
     char *REGA = NULL;
     static const struct { const char *f; int nv; } FLAGS[] = {
         {"--version",0},{"--threads",1},{"-t",1},{"--profile",0},{"--tmp-dir",1},{"--names",1},
-        {"--max-gap",1},{"--v1",0},{"--aln-names",1},{"--sort",0},
+        {"--max-gap",1},{"--v1",0},{"--chunk",1},{"--aln-names",1},{"--sort",0},
         {"--effort",1},
         {"--block",1},{"--db",1},{"--aln",1},
         {"--ref",1},{"--out-dir",1},{"--set",1},{"--raw",0},{"--hier",1},
@@ -5625,6 +5644,7 @@ int main(int argc, char **argv) {
             take = 2; }
         else if (!strcmp(a, "--max-gap")) { ok = sm; MAXGAP = num_arg(v, UINT64_MAX, "--max-gap needs a number"); take = 2; }
         else if (!strcmp(a, "--v1")) { ok = sm; V1 = 1; take = 1; }
+        else if (!strcmp(a, "--chunk")) { ok = sm; SMCHUNK = (uint64_t)int_arg(v, 1, 1000000000, "--chunk is a number of runs, 1 to 1000000000"); take = 2; }
         else if (!strcmp(a, "--aln-names")) {   /* the alignment's own table: ordinal N is line N+1 */
             ok = inf; ALNNAMES = v; take = 2; }
         else if (!strcmp(a, "--sort")) { ok = enc; SORT = 1; take = 1; }

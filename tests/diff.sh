@@ -113,6 +113,17 @@ for f in ls.bed s.bed db.rall.bed; do
     for q in "-r $seq" "-r $seq:0-100"; do both "smooth $f [$q]" smooth -i "$W/t.kst" --hier "$W/h.tsv" -f fs $q; done
   done
 done
+# --chunk on a two-level hierarchy, one long sequence
+python3 -c "
+import random; random.seed(5); p=0
+with open('$W/ch.bed','w') as f:
+    for i in range(6000):
+        l=random.randint(1,40); f.write('s1\t%d\t%d\t%s\n'%(p,p+l,random.choice('a b c d G1 G2 a a c novel'.split()))); p+=l
+"
+printf 'feature_set\tchild\tparent\nfs\tG1\tcategorized\nfs\tG2\tcategorized\nfs\ta\tG1\nfs\tb\tG1\nfs\tc\tG2\nfs\td\tG2\n' > "$W/ch.tsv"
+"$C" encode < "$W/ch.bed" > "$W/ch.kst" 2>/dev/null
+for q in "--chunk 1" "--chunk 7" "--chunk 64" "--chunk 64 --v1" "--chunk 100000"; do both "smooth --chunk [$q]" smooth -i "$W/ch.kst" --hier "$W/ch.tsv" -f fs $q; done
+both "smooth --chunk -r" smooth -i "$W/ch.kst" --hier "$W/ch.tsv" -f fs --chunk 64 -r s1:1000-2000
 tally smooth
 
 # 9. --db, both directions.

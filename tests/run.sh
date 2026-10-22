@@ -641,6 +641,21 @@ printf 's\t0\t10\t%s\n' "$L309" > "$W/l309.bed"; $KT encode < "$W/l309.bed" > "$
 printf 'feature_set\tchild\tparent\nfs\t%s\tcategorized\n' "$L309" > "$W/l309.tsv"
 [ "$($KT --v1 smooth -i "$W/l309.kt" --hier "$W/l309.tsv" -f fs 2>/dev/null | cut -f4 | wc -c)" = 301 ] && ok "V1 strip on a 309-byte label: stripped" || no "V1 strip on a 309-byte label: WRONG"
 
+# --chunk: KaryoScope 6186079 chunked smoothing
+python3 -c "
+import random; random.seed(5); p=0
+with open('$W/ch.bed','w') as f:
+    for i in range(6000):
+        l=random.randint(1,40); f.write('s1\t%d\t%d\t%s\n'%(p,p+l,random.choice('a b c d G1 G2 a a c novel'.split()))); p+=l
+"
+printf 'feature_set\tchild\tparent\nfs\tG1\tcategorized\nfs\tG2\tcategorized\nfs\ta\tG1\nfs\tb\tG1\nfs\tc\tG2\nfs\td\tG2\n' > "$W/ch.tsv"
+$KT encode < "$W/ch.bed" > "$W/ch.kst" 2>/dev/null
+$KT smooth -i "$W/ch.kst" --hier "$W/ch.tsv" -f fs > "$W/ch.whole" 2>/dev/null
+$KT smooth -i "$W/ch.kst" --hier "$W/ch.tsv" -f fs --chunk 64 2>/dev/null | cmp -s - "$W/ch.whole" && no "--chunk 64: SAME as whole" || ok "--chunk 64: chunks change the smoothing"
+$KT smooth -i "$W/ch.kst" --hier "$W/ch.tsv" -f fs --chunk 5000 2>/dev/null | cmp -s - "$W/ch.whole" && ok "--chunk 5000 on 6000 runs: under 6250, smoothed whole" || no "--chunk 5000: WRONG"
+must_fail "--chunk 0" $KT smooth -i "$W/ch.kst" --hier "$W/ch.tsv" -f fs --chunk 0
+must_fail "--chunk on decode" $KT decode -i "$W/ch.kst" --chunk 64
+
 # round 22 findings, one case each
 mkdir -p "$W/keepdir"; printf 'PRECIOUS\n' > "$W/keepdir/acrocentric.bed"
 $KT decode --db "$D/db.features.tsv" --out-dir "$W/keepdir" -i "$W/p.kt" >/dev/null 2>&1 && { echo "decode --db of a plain track: EXIT 0"; fail=1; }

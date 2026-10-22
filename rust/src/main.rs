@@ -139,13 +139,14 @@ fn main() {
             let (Some(hier), Some(fs)) = (c.hier.as_deref(), c.feature_set.as_deref())
                 else { die("smooth needs --hier HIER and -f FEATURE_SET") };
             let maxgap = num(&c.max_gap, 0, u64::MAX, "--max-gap needs a number").unwrap_or(1000);
+            let smchunk = cnt(&c.chunk, 1, 1000000000, "--chunk is a number of runs, 1 to 1000000000").unwrap_or(0) as usize;
             let (seq, lo, hi) = c.region.as_deref().map_or(("", 0, 0), regparse);
             let feats = informed(&c, &mut ro, "smooth ", Some(hier), aln::Lazy::Contig);
             // not stdout().lock(): a lock guard cannot cross to the smooth
             // workers, and they are serialized by turn anyway
             let mut o = BufWriter::new(std::io::stdout());
             smooth::run(track, hier, fs.as_bytes(), c.region.as_ref().map(|_| seq.as_bytes()),
-                        lo, hi, c.v1, maxgap, &ro, feats.as_ref(), &mut o);
+                        lo, hi, c.v1, maxgap, smchunk, &ro, feats.as_ref(), &mut o);
             o.flush().unwrap_or_else(|e| die(&e.to_string()));
         }
         Cmd::Index => {
@@ -470,6 +471,7 @@ pub struct Cli {
     pub aln_names: Option<String>,
     pub raw: bool,
     pub max_gap: Option<String>,
+    pub chunk: Option<String>,
     pub v1: bool,
     pub threads: Option<String>,
     pub tmp_dir: Option<String>,
@@ -479,7 +481,7 @@ pub struct Cli {
 /// Every flag and whether it takes a value, as the C's FLAGS.
 const FLAGS: &[(&str, bool)] = &[
     ("--version", false), ("--threads", true), ("-t", true), ("--profile", false), ("--tmp-dir", true),
-    ("--names", true), ("--max-gap", true), ("--v1", false), ("--aln-names", true), ("--sort", false),
+    ("--names", true), ("--max-gap", true), ("--v1", false), ("--chunk", true), ("--aln-names", true), ("--sort", false),
     ("--effort", true), ("--block", true), ("--db", true), ("--aln", true), ("--ref", true),
     ("--out-dir", true), ("--set", true), ("--raw", false), ("--hier", true), ("--input", true),
     ("--output", true), ("--region", true), ("--halo", true), ("--feature-set", true),
@@ -546,6 +548,7 @@ impl Cli {
                 }
                 "--max-gap" => { crate::num(&v, 0, u64::MAX, "--max-gap needs a number"); o.max_gap = Some(val()); sm }
                 "--v1" => { o.v1 = true; sm }
+                "--chunk" => { cnt(&v, 1, 1000000000, "--chunk is a number of runs, 1 to 1000000000"); o.chunk = Some(val()); sm }
                 "--aln-names" => { o.aln_names = Some(val()); inf }
                 "--sort" => { o.sort = Some(String::new()); enc }
                 s if s.starts_with("--sort=") => {

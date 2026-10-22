@@ -3998,9 +3998,27 @@ static uint64_t namesrc(void) {
     struct stat st; if (stat(NAMEFILE, &st)) die("cannot stat the file given to --names");
     return stathash(&st);
 }
-static int kcmp(const void *a, const void *b) {   /* key, then ordinal: a tie is ordered, as the Rust */
-    const uint64_t *x = a, *y = b;
-    return x[0] != y[0] ? (x[0] < y[0] ? -1 : 1) : x[1] < y[1] ? -1 : x[1] > y[1];
+/* (key, ordinal) pairs by key, then ordinal, as the Rust's sort_unstable:
+   inlined, where qsort's merge sort, its copies and a call a compare were
+   62% of index on short reads. Keys are hashes, so pivots are random. */
+#define KLT(a, b) ((a)[0] < (b)[0] || ((a)[0] == (b)[0] && (a)[1] < (b)[1]))
+static void ksort(uint64_t *a, uint64_t n) {
+    while (n > 16) {
+        uint64_t p[2], t, i = 0, j = n - 1, *m = a + 2 * (n / 2);
+        memcpy(p, m, 16);
+        for (;;) {
+            while (KLT(a + 2 * i, p)) i++;
+            while (KLT(p, a + 2 * j)) j--;
+            if (i >= j) break;
+            for (int c = 0; c < 2; c++) { t = a[2 * i + c]; a[2 * i + c] = a[2 * j + c]; a[2 * j + c] = t; }
+            i++; j--;
+        }
+        if (j + 1 < n - j - 1) { ksort(a, j + 1); a += 2 * (j + 1); n -= j + 1; }
+        else { ksort(a + 2 * (j + 1), n - j - 1); n = j + 1; }
+    }
+    for (uint64_t i = 1; i < n; i++)
+        for (uint64_t j = i; j && KLT(a + 2 * j, a + 2 * j - 2); j--)
+            for (int c = 0; c < 2; c++) { uint64_t t = a[2 * j + c]; a[2 * j + c] = a[2 * j - 2 + c]; a[2 * j - 2 + c] = t; }
 }
 
 static void rclose(R *r);
@@ -4034,7 +4052,7 @@ static void buildindex(const char *path) {
             uint64_t h = h64b(r->name[i]);
             key[2 * i] = (k ? (h >> (64 - k)) << 32 : 0) | IXFP(h, i); key[2 * i + 1] = i;
         }
-        qsort(key, n, 16, kcmp);
+        ksort(key, n);
         uint64_t run = 0, top = 0;
         for (uint64_t i = 0; i < n; i++) { run = i && key[2 * i] >> 32 == key[2 * i - 2] >> 32 ? run + 1 : 1; if (run > top) top = run; }
         if (top <= 255) break;

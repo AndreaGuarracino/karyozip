@@ -10,7 +10,7 @@ const IDXMAGIC: u64 = 0x3130_5844_4954_534b;   // "KSTIDX01"
 
 /// A decoded block: its number, bytes, where the labels start, rows.
 type Cached = (usize, std::sync::Arc<Vec<u8>>, usize, u64);
-pub type Shared = (Cached, std::sync::Arc<Vec<u64>>);
+pub type Shared = (Cached, std::sync::Arc<Vec<u32>>);
 
 fn ordinals(n: u64) -> Vec<u8> {
     let mut v = Vec::with_capacity(crate::ckalloc(n as usize * 8));
@@ -100,7 +100,7 @@ pub struct Reader {
     /// the sequence index: chunk frames, their offsets, the run count each
     /// starts at, and the one chunk decoded now, as the C's loadichunk
     iz: Vec<u8>, coff: Vec<u64>, cpend: Vec<u64>, ibx: Vec<u8>, cur_chunk: u64,
-    runhead: bool, ilv: bool, grp: bool, rtab: std::sync::Arc<Vec<u64>>,   // run-count prefix sums, lifted out of the lengths
+    runhead: bool, ilv: bool, grp: bool, rtab: std::sync::Arc<Vec<u32>>,   // run-count prefix sums, lifted out of the lengths; 32 bits, as the C's offsets
     hasidx: bool,
     mhash: u64,
     cur_ri: u64,
@@ -527,13 +527,15 @@ impl Reader {
     /// largest buffer of an assembly decode.
     fn rmheads(&mut self, lens: &mut [u8]) -> usize {
         let (mut w, mut i, mut seen) = (0usize, 0usize, 0u64);
-        let mut tab: Vec<u64> = Vec::with_capacity(self.nreads as usize + 1);
+        // 4 B a read, as the C's counts: 8 B was 295 MB more on 73.7M reads
+        if self.rows > u32::MAX as u64 { crate::bail("corrupt index: a sequence offset past 32 bits"); }
+        let mut tab: Vec<u32> = Vec::with_capacity(self.nreads as usize + 1);
         tab.push(0);
         while i < lens.len() {
             if tab.len() as u64 > self.nreads { crate::bail("corrupt block: more reads than the header claims"); }
             let (k, n) = vget(&lens, i); i = n;
             if k == 0 || k > self.rows - seen { crate::bail("corrupt block: a run count is out of range"); }
-            seen += k; tab.push(seen);
+            seen += k; tab.push(seen as u32);
             let s0 = i;   // the read's lengths sit together: one move a read
             for _ in 0..k {
                 if i >= lens.len() { crate::bail("corrupt block: a read runs past its lengths"); }
@@ -557,7 +559,7 @@ impl Reader {
         // 8 B a run in each, as the C's: positions as pairs were 16 B in two
         let (mut kv, mut gv, mut lv, mut cnt): (Vec<u64>, Vec<u64>, Vec<u64>, Vec<u64>) = Default::default();
         for w in self.rtab.windows(2) {
-            let k = w[1] - w[0];
+            let k = (w[1] - w[0]) as u64;
             let mut top = 0u64;
             kv.clear(); gv.clear();
             for j in 0..k {
@@ -783,8 +785,8 @@ impl Reader {
         if self.runhead {
             if ri >= self.nreads { crate::bail("corrupt index: a sequence past the end"); }
             if self.rtab.is_empty() { self.load(0); }
-            let start = self.rtab[ri as usize];
-            let n = self.rtab[ri as usize + 1] - start;
+            let start = self.rtab[ri as usize] as u64;
+            let n = self.rtab[ri as usize + 1] as u64 - start;
             if start + n > self.rows { crate::bail("corrupt index: a sequence points outside the block table"); }
             return (0, start, n);
         }

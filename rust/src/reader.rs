@@ -664,10 +664,7 @@ fn fld_names_d(b: &[u8], cnt: u64) -> Vec<u8> {
     }
     let nvar = var.iter().filter(|&&x| x == 1).count();
     let mut cur = vec![0i64; nvar];
-    // the C's bound a name, reserved once: growing past a guess copied the
-    // names (73.7M names of 39.5 B outgrew 32 B a name)
-    let per = cf.iter().map(|c| c.len()).sum::<usize>() + hw.iter().sum::<usize>() + nf as usize + nvar * 20;
-    let mut o = Vec::with_capacity(crate::ckalloc((cnt as usize).saturating_mul(per)));
+    let mut o = Vec::with_capacity(crate::ckalloc(cnt as usize * 32));
     for _ in 0..cnt {
         let mut k = 0usize;
         for i in 0..nf as usize {
@@ -694,7 +691,7 @@ fn fld_names_d(b: &[u8], cnt: u64) -> Vec<u8> {
 
 fn int_names_d(b: &[u8], cnt: u64) -> Vec<u8> {
     let v = zdec(b, "int names");
-    let mut o = Vec::with_capacity(crate::ckalloc(cnt as usize * 21));   // the C's bound: 2^50 is 16 digits
+    let mut o = Vec::with_capacity(crate::ckalloc(cnt as usize * 8));
     let (mut q, mut cur) = (0usize, 0u64);
     for _ in 0..cnt {
         let (u, n) = vget(&v, q);

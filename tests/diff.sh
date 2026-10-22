@@ -105,8 +105,8 @@ done
 tally "reader flags"
 
 # 8. smooth over a real hierarchy shape
-printf 'feature_set\tchild\tparent\nfs\tA\tcategorized\nfs\tB\tcategorized\nfs\tC\tcategorized\nfs\tD\tcategorized\n' > "$W/h.tsv"
 for f in ls.bed s.bed db.rall.bed; do
+  { printf 'feature_set\tchild\tparent\n'; cut -f4 "$D/$f" | sort -u | sed 's/^/fs\t/; s/$/\tcategorized/'; } > "$W/h.tsv"
   "$C" encode < "$D/$f" > "$W/t.kst" 2>/dev/null
   for q in "" "--v1" "--max-gap 5" "--max-gap 100000"; do both "smooth $f [$q]" $q smooth -i "$W/t.kst" --hier "$W/h.tsv" -f fs; done
   for seq in $(awk -F'\t' '{print $1}' "$D/$f" | uniq | head -2); do

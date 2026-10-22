@@ -143,7 +143,7 @@ $KT decode --db "$D/db.features.tsv" --aln "$D/db.self.paf" --ref "$D/db.rall.be
 n=0; for f in $sets; do cmp -s "$W/dao/$f.bed" "$D/db.$f.bed" && n=$((n+1)); done
 [ "$n" = 6 ] && ok "db+aln: 6/6 identical" || no "db+aln: only $n/6"
 # smooth and region on every informed form
-{ printf 'feature_set\tchild\tparent\n'; for l in $(cut -f4 "$D/db.acrocentric.bed" "$D/s.bed" | sort -u); do printf 'acrocentric\t%s\tcategorized\n' "$l"; done; } > "$W/inf.tsv"
+{ printf 'feature_set\tchild\tparent\n'; for l in $(cut -f4 "$D/db.acrocentric.bed" "$D/s.bed" "$D/ref.bed" | sort -u); do printf 'acrocentric\t%s\tcategorized\n' "$l"; done; } > "$W/inf.tsv"
 $KT encode < "$D/db.acrocentric.bed" > "$W/pa.kt" 2>/dev/null
 $KT smooth -i "$W/pa.kt" --hier "$W/inf.tsv" -f acrocentric > "$W/inf.want" 2>/dev/null
 $KT smooth -i "$W/p.kt" --hier "$W/inf.tsv" -f acrocentric > "$W/inf.wants" 2>/dev/null
@@ -337,7 +337,8 @@ $KT encode --aln "$W/cg.paf" --ref "$D/ref.bed" < "$W/cg.bed" > /dev/null 2>&1 &
 awk 'BEGIN{for(i=0;i<20000;i++)printf "s\t%d\t%d\tA\n",i*10,i*10+10}' > "$W/rep.bed"
 $KT encode < "$W/rep.bed" > "$W/rep.kt" 2>/dev/null
 $KT decode -i "$W/rep.kt" 2>/dev/null | cmp -s - "$W/rep.bed" && ok "repetitive track: byte-identical" || no "repetitive track: WRONG"
-$KT smooth -i "$W/rep.kt" --hier "$W/sm.tsv" -f acrocentric > /dev/null 2>&1 && ok "repetitive smooth: ok" || no "repetitive smooth: FAILED"
+printf 'feature_set\tchild\tparent\nacrocentric\tA\tcategorized\n' > "$W/rep.tsv"
+$KT smooth -i "$W/rep.kt" --hier "$W/rep.tsv" -f acrocentric > /dev/null 2>&1 && ok "repetitive smooth: ok" || no "repetitive smooth: FAILED"
 { head -1 "$D/db.features.tsv"; printf '0\tacro\tchr1\tintergenic\tarm\tLINE\tITS\n'; tail -n +2 "$D/db.features.tsv"; } > "$W/id0.tsv"
 must_fail "features.tsv defining id 0" $KT encode --db "$W/id0.tsv" $in
 LR=$(head -c 70000 /dev/zero | tr '\0' A)
@@ -641,6 +642,11 @@ printf 's\t0\t10\t%s\n' "$L309" > "$W/l309.bed"; $KT encode < "$W/l309.bed" > "$
 printf 'feature_set\tchild\tparent\nfs\t%s\tcategorized\n' "$L309" > "$W/l309.tsv"
 [ "$($KT --v1 smooth -i "$W/l309.kt" --hier "$W/l309.tsv" -f fs 2>/dev/null | cut -f4 | wc -c)" = 301 ] && ok "V1 strip on a 309-byte label: stripped" || no "V1 strip on a 309-byte label: WRONG"
 
+printf 'feature_set\tchild\tparent\nfs\ta\tcategorized\n' > "$W/miss.tsv"
+printf 's\t0\t10\ta\ns\t10\t20\tb\ns\t20\t30\tnovel\n' | $KT encode > "$W/miss.kt" 2>/dev/null
+must_fail "smooth: a track label missing from the hierarchy" $KT smooth -i "$W/miss.kt" --hier "$W/miss.tsv" -f fs
+printf 'fs\tb\tcategorized\n' >> "$W/miss.tsv"
+$KT smooth -i "$W/miss.kt" --hier "$W/miss.tsv" -f fs > /dev/null 2>&1 && ok "smooth: novel need not be in the hierarchy" || no "smooth: novel REFUSED"
 # --chunk: KaryoScope 6186079 chunked smoothing
 python3 -c "
 import random; random.seed(5); p=0

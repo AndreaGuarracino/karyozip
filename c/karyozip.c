@@ -4776,6 +4776,7 @@ static int *labnodes(R *r, const char *fs) {   /* label id to hierarchy node */
     if (DBFEATS) { while (k < nfset && strcmp(fset[k], fs)) k++;
                    if (k == nfset) die("smooth: the set is not in features.tsv"); }
     uint64_t n = r->nlab ? r->nlab : 1;
+    int known = NNODE;   /* a label past these is not in the hierarchy */
     isnovel = xmalloc(n); int *m = xmalloc(mul(n, sizeof(int)));
     for (uint64_t i = 0; i < r->nlab; i++) {
         const char *L = r->lab[i];
@@ -4786,6 +4787,8 @@ static int *labnodes(R *r, const char *fs) {   /* label id to hierarchy node */
             L = flab(featid(L), k); }
         isnovel[i] = (uint8_t)(strcmp(L, "novel") == 0);
         m[i] = nodeid(L, strlen(L));
+        if (m[i] >= known && !isnovel[i])
+            die("a track label is not in the hierarchy: is it the hierarchy of the track's database?");
     }
     return m;
 }

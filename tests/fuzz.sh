@@ -29,7 +29,7 @@ lk() {   # fails on refusal unless "(refused)" in DESC
   else echo "WRONG EXIT $rc"; fail=1; fi
 }
 L=$W/lk.d; mkdir -p "$L/out"
-printf 'feature_set\tchild\tparent\nfs\tA\tcategorized\nfs\tB\tcategorized\nfs\tC\tcategorized\nfs\tD\tcategorized\n' > "$L/h.tsv"
+printf 'feature_set\tchild\tparent\nfs\tA\tcategorized\nfs\tB\tcategorized\nfs\tC\tcategorized\nfs\tD\tcategorized\nfs\tX\tcategorized\nfs\tZ\tcategorized\n' > "$L/h.tsv"
 "$LK" encode < "$D/ls.bed" > "$L/p.kt" 2>/dev/null
 "$LK" encode --names drop:"$L/side" < "$D/ls.bed" > "$L/s.kt" 2>/dev/null
 "$LK" encode --aln "$D/lp.paf" --ref "$D/lref.bed" < "$D/ls.bed" > "$L/a.kt" 2>/dev/null
@@ -209,7 +209,7 @@ for i in range(15):
         except Exception: continue
         open("%s/forged%d.kt" % (W, k), "wb").write(d); k += 1
 PY
-printf 'feature_set\tchild\tparent\nfs\tL0\tcategorized\n' > "$W/hier.tsv"
+printf 'feature_set\tchild\tparent\nfs\tL0\tcategorized\nfs\tL1\tcategorized\nfs\tL2\tcategorized\nfs\tL3\tcategorized\nfs\tL4\tcategorized\nfs\tL5\tcategorized\n' > "$W/hier.tsv"
 one_forged() {   # three commands on one file
   local m=$1 e="$1.err"
   for c in "decode --raw" "decode --raw -r read1" smooth; do

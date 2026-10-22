@@ -250,7 +250,7 @@ pub fn run(path: &str, hier: &str, fs: &[u8], seq: Option<&[u8]>,
         .unwrap_or_else(|| crate::bail("smooth: the set is not in features.tsv")));
     // The track's own labels join the hierarchy, so the tables are rebuilt.
     // Under --aln "=" and under --db a non-featureID are resolved per row.
-    let (mut labmap, mut novelid) = (Vec::new(), Vec::new());
+    let (mut labmap, mut novelid, known) = (Vec::new(), Vec::new(), h.node.len());
     for i in 0..r.nlabels() {
         let mut l = r.label_at(i).to_vec();
         if r.has_aln() && l == b"=" { labmap.push(i32::MIN); novelid.push(0); continue; }
@@ -260,7 +260,11 @@ pub fn run(path: &str, hier: &str, fs: &[u8], seq: Option<&[u8]>,
             l = f.lab(id, setk.unwrap()).to_vec();
         }
         novelid.push(u8::from(l == b"novel"));
-        labmap.push(h.id(&l));
+        let id = h.id(&l);
+        if id as usize >= known && l != b"novel" {
+            crate::bail("a track label is not in the hierarchy: is it the hierarchy of the track's database?");
+        }
+        labmap.push(id);
     }
     h.build();   // after the labels: they add the unknown nodes
 

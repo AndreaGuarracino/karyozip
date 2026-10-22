@@ -269,7 +269,7 @@ pub fn run(path: &str, hier: &str, fs: &[u8], seq: Option<&[u8]>,
     h.build();   // after the labels: they add the unknown nodes
 
     let (first, last) = match seq {
-        Some(s) => { let i = r.find(s); if i < 0 { crate::bail("sequence not found"); }
+        Some(s) => { let i = r.find_seq(s); if i < 0 { crate::bail("sequence not found"); }
                      (i as u64, i as u64 + 1) }
         None => (0, r.nreads),
     };

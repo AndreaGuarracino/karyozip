@@ -996,6 +996,15 @@ impl Reader {
         hits.into_iter().find(|&o| self.name_at(o) == nm).map_or(-1, |o| o as i64)
     }
 
+    /// As find, but a one-block track decodes its block before the names, as
+    /// the C: the codec's working memory is gone when the names arrive.
+    pub fn find_seq(&mut self, seq: &[u8]) -> i64 {
+        let hit = self.idxlookup(seq);
+        if hit >= 0 { return hit; }
+        if self.b.len() == 1 { self.load(0); }
+        self.find(seq)
+    }
+
     pub fn find(&self, seq: &[u8]) -> i64 {
         let hit = self.idxlookup(seq);
         if hit >= 0 { return hit; }
@@ -1064,7 +1073,7 @@ impl Reader {
     #[allow(clippy::too_many_arguments)]
     pub fn region(&mut self, seq: &[u8], lo: u64, hi: u64, halo: u64,
                   feats: Option<&crate::db::Feats>, cols: &[usize], out: &mut impl std::io::Write) {
-        let ri = self.find(seq);
+        let ri = self.find_seq(seq);
         if ri < 0 { crate::bail("sequence not found"); }
         let ri = ri as u64;
         self.alnq = self.aln.as_ref().and_then(|a| a.find(seq));

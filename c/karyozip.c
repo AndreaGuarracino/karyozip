@@ -4536,7 +4536,8 @@ static void region(const char *path, const char *seq, uint64_t lo, uint64_t hi,
     R *r = ropen_informed(path);
 
     int64_t ri = idxlookup(r, path, seq);
-    if (ri < 0) ri = rfind(r, seq);
+    if (ri < 0) { if (r->nblk == 1) loadblk(r, 0);   /* the block before the names, as dump */
+                  ri = rfind(r, seq); }
     if (ri < 0) die("sequence not found");
     if (DBFEATS) { region_set(r, ri, seq, lo, hi, halo); return; }
     rec q = getidx(r, ri);

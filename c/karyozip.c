@@ -5200,8 +5200,8 @@ static void smoothcmd(const char *path, const char *hier, const char *fs,
 
 typedef struct { FILE *f; char *ln; size_t cap;
                  char seq[512]; uint64_t st, en; char *lab; size_t labcap; int eof;
-                 char *labc; size_t labccap; uint32_t labid; int set;
-                 char pseq[512]; uint64_t pen; char *plab; size_t plabcap;   /* the run before */
+                 size_t labn; uint32_t labid; int set;
+                 char pseq[512]; uint64_t pen;   /* the run before */
                  char *buf; size_t bp, bn, bcap; } brd;
 static void sset(char **d, size_t *cap, const char *s, size_t n) {   /* a string on the heap */
     if (n + 1 > *cap) { *cap = n + 64; *d = xrealloc(*d, *cap); }
@@ -5249,23 +5249,20 @@ static void bnext(brd *b) {
     char *t3 = memchr(t2 + 1, '\t', (size_t)(n - (t2 + 1 - b->ln))); if (!t3) die("bad line");
     size_t sl = (size_t)(t1 - b->ln), ll = (size_t)(n - (t3 + 1 - b->ln));
     if (sl >= sizeof b->seq) die("name too long");
-    if (b->lab) { memcpy(b->pseq, b->seq, strlen(b->seq) + 1); b->pen = b->en; sset(&b->plab, &b->plabcap, b->lab, strlen(b->lab)); }
+    /* the label before is compared, not copied, as the Rust's */
+    int had = b->lab != NULL, same = had && b->labn == ll && !memcmp(b->lab, t3 + 1, ll);
+    if (had) { memcpy(b->pseq, b->seq, strlen(b->seq) + 1); b->pen = b->en; }
     memcpy(b->seq, b->ln, sl); b->seq[sl] = 0;
-    sset(&b->lab, &b->labcap, t3 + 1, ll);
+    if (!same) { sset(&b->lab, &b->labcap, t3 + 1, ll); b->labn = ll; }
     if (!sl) die("empty sequence name");
     b->st = bedcoord(t1 + 1, t2, "start is not a number");
     b->en = bedcoord(t2 + 1, t3, "end is not a number");
     if ((t1[1] == '0' && t2 - t1 > 2) || (t2[1] == '0' && t3 - t2 > 2)) die("a coordinate has a leading zero: it would not decode to the same bytes");
     if (b->en < b->st) die("end is before start");
     if (b->en == b->st) die("end equals start: a run must cover at least one base");
-    if (b->plab && b->st == b->pen && !strcmp(b->seq, b->pseq) && !strcmp(b->lab, b->plab))
+    if (same && b->st == b->pen && !strcmp(b->seq, b->pseq))
         die("two touching runs carry the same label: merge them first");
-    if (DBFAST) {                       /* the same label spans several rows */
-        if (!b->labc || strcmp(b->labc, b->lab)) {
-            sset(&b->labc, &b->labccap, b->lab, ll);
-            b->labid = si_get(&SI[b->set], b->lab, 0);
-        }
-    }
+    if (DBFAST && !same) b->labid = si_get(&SI[b->set], b->lab, 0);   /* the same label spans several rows */
 }
 
 static void encode_db(int nfiles, char **files) {
@@ -5375,7 +5372,7 @@ static void encode_db(int nfiles, char **files) {
     ktw_close(w); free(keyb.d);
     for (int i = 0; i < nfiles; i++) {
         if (b[i].f && b[i].f != stdin) fclose(b[i].f);
-        free(b[i].buf); free(b[i].lab); free(b[i].labc); free(b[i].plab);   /* ln points into buf */
+        free(b[i].buf); free(b[i].lab);   /* ln points into buf */
     }
     free(b);
 }

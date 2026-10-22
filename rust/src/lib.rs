@@ -165,23 +165,33 @@ impl std::io::Read for Zr {
 
 /// A text input one line at a time, plain or gzipped, without holding the
 /// file: a reference track is a gigabyte of text for 24 million runs.
-pub struct Lines { r: std::io::BufReader<Box<dyn std::io::Read + Send>>, buf: Vec<u8>, pub nl: bool, pub err: &'static str }
+pub struct Lines { r: std::io::BufReader<Box<dyn std::io::Read + Send>>, buf: Vec<u8>, pend: usize, pub nl: bool, pub err: &'static str }
 impl Lines {
     pub fn open(path: &str, what: &'static str) -> Lines {
         let f = std::fs::File::open(path).unwrap_or_else(|_| bail(what));
         Lines::new(f)
     }
     pub fn new(r: impl std::io::Read + Send + 'static) -> Lines {
-        Lines { r: std::io::BufReader::with_capacity(1 << 20, unzip(r)), buf: Vec::new(), nl: true, err: "read error" }
+        Lines { r: std::io::BufReader::with_capacity(1 << 20, unzip(r)), buf: Vec::new(), pend: 0, nl: true, err: "read error" }
     }
     /// The next line without its newline, or None at the end; `nl` says
     /// whether the line had one.
-    pub fn next_line(&mut self) -> Option<&[u8]> {
+    pub fn next_line(&mut self) -> Option<&[u8]> { self.next_line_nl().map(|(l, _)| l) }
+    /// The line and whether a newline ended it, for a caller that keeps the line borrowed.
+    /// A line inside the reader's buffer is returned in place, consumed on
+    /// the next call; only one across the buffer's end is copied.
+    pub fn next_line_nl(&mut self) -> Option<(&[u8], bool)> {
         use std::io::BufRead;
+        self.r.consume(std::mem::take(&mut self.pend));
+        let hit = crate::ffi::find(b'\n', self.r.fill_buf().unwrap_or_else(|_| bail(self.err)));
+        if let Some(i) = hit {
+            self.pend = i + 1; self.nl = true;
+            return Some((&self.r.buffer()[..i], true));
+        }
         self.buf.clear();
         match self.r.read_until(b'\n', &mut self.buf) {
             Ok(0) => None,
-            Ok(_) => { self.nl = self.buf.last() == Some(&b'\n'); if self.nl { self.buf.pop(); } Some(&self.buf) }
+            Ok(_) => { self.nl = self.buf.last() == Some(&b'\n'); if self.nl { self.buf.pop(); } Some((&self.buf, self.nl)) }
             Err(_) => bail(self.err),
         }
     }

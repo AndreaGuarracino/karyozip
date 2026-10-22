@@ -15,7 +15,7 @@ pub struct Feats {
     tup: HashMap<Vec<u8>, u32>,
     /// the C's integer-tuple index: labels interned per set, tuples of ids
     intern: Vec<HashMap<Vec<u8>, u32>>,
-    tupint: HashMap<Vec<u32>, u32>,
+    tupint: HashMap<kst::Tup, u32>,
     pub hash: u64,
     /// --hier: per set, features.tsv column plus the hierarchy nodes plus
     /// "novel", sorted; a tuple outside features.tsv is 2^26 + its rank
@@ -75,8 +75,8 @@ impl Feats {
             f.labs.push(cols[1..].iter().map(|c| c.to_vec()).collect());
             f.nids += 1;
             if f.intern.is_empty() { f.intern = vec![HashMap::default(); f.sets.len()]; }
-            let key: Vec<u32> = cols[1..].iter().enumerate().map(|(k, c)| {
-                let n = f.intern[k].len() as u32; *f.intern[k].entry(c.to_vec()).or_insert(n) }).collect();
+            let key = kst::Tup(cols[1..].iter().enumerate().map(|(k, c)| {
+                let n = f.intern[k].len() as u32; *f.intern[k].entry(c.to_vec()).or_insert(n) }).collect());
             f.tupint.entry(key).or_insert(id);
         }
         if f.sets.is_empty() { crate::bail("features table has no header"); }
@@ -199,8 +199,8 @@ fn num(b: &[u8], max: u32, what: &str) -> u32 {
 }
 
 /// One input BED, streamed a row at a time.
-struct Brd { lines: crate::Lines, line: Vec<u8>, seq: Vec<u8>, st: u64, en: u64, lab: Vec<u8>, labid: u32,
-             pseq: Vec<u8>, pen: u64, plab: Vec<u8>, had: bool, eof: bool }
+struct Brd { lines: crate::Lines, seq: Vec<u8>, st: u64, en: u64, lab: Vec<u8>, labid: u32,
+             pseq: Vec<u8>, pen: u64, had: bool, eof: bool }
 
 impl Brd {
     fn open(path: &str) -> Brd {
@@ -209,20 +209,20 @@ impl Brd {
             crate::Lines::open(path, "cannot open an input BED")
         };
         let mut lines = lines; lines.err = "read error on an input BED";
-        let mut b = Brd { lines, line: Vec::new(), seq: Vec::new(), st: 0, en: 0, lab: Vec::new(), labid: u32::MAX,
-                          pseq: Vec::new(), pen: 0, plab: Vec::new(), had: false, eof: false };
+        let mut b = Brd { lines, seq: Vec::new(), st: 0, en: 0, lab: Vec::new(), labid: u32::MAX,
+                          pseq: Vec::new(), pen: 0, had: false, eof: false };
         b.next();
         if b.eof { crate::bail("an input BED is empty"); }
         b
     }
 
+    /// The row parsed straight from the reader's buffer, no copy of the line,
+    /// and the previous label compared, not copied: as the C's bnext.
     fn next(&mut self) {
-        let Some(l) = self.lines.next_line() else { self.eof = true; return; };
-        if l.is_empty() { crate::bail("bad line"); }   // as the C: a blank row is not skipped
-        self.line.clear(); self.line.extend_from_slice(l);
-        if !self.lines.nl { crate::bail("input does not end with a newline"); }
-        let line = std::mem::take(&mut self.line);
-        if line.contains(&0) { crate::bail("a NUL byte inside a row"); }
+        let Some((line, nl)) = self.lines.next_line_nl() else { self.eof = true; return; };
+        if line.is_empty() { crate::bail("bad line"); }   // as the C: a blank row is not skipped
+        if !nl { crate::bail("input does not end with a newline"); }
+        if crate::ffi::find(0, line).is_some() { crate::bail("a NUL byte inside a row"); }
         let mut it = line.splitn(4, |&x| x == b'\t');
         let mut c = [&line[..0]; 4];
         for (i, s) in c.iter_mut().enumerate() { *s = it.next().unwrap_or_else(|| { if i < 4 { crate::bail("bad line") } else { &[] } }); }
@@ -231,7 +231,6 @@ impl Brd {
         if self.had {
             std::mem::swap(&mut self.pseq, &mut self.seq);
             self.pen = self.en;
-            self.plab.clear(); self.plab.extend_from_slice(&self.lab);
         }
         self.seq.clear(); self.seq.extend_from_slice(c[0]);
         self.st = crate::bedcoord(c[1], "start is not a number");
@@ -243,12 +242,12 @@ impl Brd {
         if self.en == self.st {
             crate::bail("end equals start: a run must cover at least one base");
         }
-        if c[3] != self.lab.as_slice() { self.lab.clear(); self.lab.extend_from_slice(c[3]); self.labid = u32::MAX - 1; }
-        if self.had && self.st == self.pen && self.seq == self.pseq && self.lab == self.plab {
+        let samelab = c[3] == self.lab.as_slice();
+        if !samelab { self.lab.clear(); self.lab.extend_from_slice(c[3]); self.labid = u32::MAX - 1; }
+        if self.had && self.st == self.pen && self.seq == self.pseq && samelab {
             crate::bail("two touching runs carry the same label: merge them first");
         }
         self.had = true;
-        self.line = line;
     }
 }
 
@@ -265,7 +264,7 @@ pub fn encode(files: &[String], feats: &Feats, w: &mut crate::writer::Writer) ->
     let (mut prevfid, mut lastend) = (u32::MAX, 0u64);
     let mut lastseq: Vec<u8> = Vec::new();
     let mut haveseq = false;
-    let mut keyi: Vec<u32> = Vec::with_capacity(b.len());
+    let mut keyi = kst::Tup(Vec::with_capacity(b.len()));
     let mut lab = Vec::with_capacity(12);
     while !b[0].eof {
         for i in 1..b.len() {
@@ -297,7 +296,7 @@ pub fn encode(files: &[String], feats: &Feats, w: &mut crate::writer::Writer) ->
             if v >= CARTBASE { cart_used = true; }
             v
         } else {
-            keyi.clear(); keyi.extend(b.iter().map(|x| x.labid));
+            keyi.0.clear(); keyi.0.extend(b.iter().map(|x| x.labid));
             let hit = if b.iter().all(|x| x.labid != u32::MAX) { feats.tupint.get(&keyi).copied() } else { None };
             match hit.or_else(|| feats.tup.get(&b.iter().map(|x| x.lab.clone()).collect::<Vec<_>>().join(&b'\t')).copied()) {
                 Some(v) => v,

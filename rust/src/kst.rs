@@ -153,6 +153,15 @@ impl std::hash::BuildHasher for Fnv {
 impl std::hash::Hasher for FnvHasher {
     fn finish(&self) -> u64 { self.0 }
     fn write(&mut self, b: &[u8]) { self.0 = fnv(self.0, b); }
+    fn write_u32(&mut self, v: u32) { self.0 = (self.0 ^ v as u64).wrapping_mul(0x100_0000_01b3); }
+}
+
+/// A tuple of label ids hashed a word at a time, as the C's tuphash: a
+/// slice of u32 would hash byte by byte, four FNV rounds a word.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct Tup(pub Vec<u32>);
+impl std::hash::Hash for Tup {
+    fn hash<H: std::hash::Hasher>(&self, h: &mut H) { for &v in &self.0 { h.write_u32(v); } }
 }
 
 pub type FnvMap<K, V> = std::collections::HashMap<K, V, Fnv>;

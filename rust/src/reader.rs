@@ -980,17 +980,22 @@ impl Reader {
         let (nb, w) = (1u64 << k, ixw(n.max(1)));
         let ns = nb.div_ceil(1024);
         if bind != self.mhash ^ self.namesrc() || pay != nb + ns * 8 + (n * (32 + w)).div_ceil(8) + 8 { return -1; }
-        let mut t = vec![0u8; crate::ckalloc(pay as usize)];
-        rd(xf.read_exact_at(&mut t, base), "index read");
+        // only the name's bucket is read, as the C's mmap touches only it:
+        // reading the whole index was 481 MB a query on 64M short reads
         let h = h64b(nm);
         let b = if k > 0 { h >> (64 - k) } else { 0 };
-        let mut at = u64::from_le_bytes(t[(nb + (b >> 10) * 8) as usize..][..8].try_into().unwrap());
-        for j in (b & !1023)..b { at += t[j as usize] as u64; }
-        let ent = &t[(nb + ns * 8) as usize..];
-        let hits: Vec<u64> = (at..(at + t[b as usize] as u64).min(n)).filter_map(|e| {
-            let bit = e * (32 + w);
-            let o = ixget(ent, bit + 32, w);
-            (o < n && ixget(ent, bit, 32) == ixfp(h, o)).then_some(o)
+        let get = |off: u64, len: u64| { let mut v = vec![0u8; len as usize]; rd(xf.read_exact_at(&mut v, base + off), "index read"); v };
+        let b0 = b & !1023;
+        let cnt = get(b0, b - b0 + 1);
+        let mut at = u64::from_le_bytes(get(nb + (b >> 10) * 8, 8)[..8].try_into().unwrap());
+        for &c in &cnt[..cnt.len() - 1] { at += c as u64; }
+        let (e0, e1) = (at, (at + cnt[cnt.len() - 1] as u64).min(n));
+        let byte0 = (e0 * (32 + w)) >> 3;
+        let ent = if e1 > e0 { get(nb + ns * 8 + byte0, ((e1 - e0) * (32 + w) + 7) / 8 + 8) } else { Vec::new() };
+        let hits: Vec<u64> = (e0..e1).filter_map(|e| {
+            let bit = e * (32 + w) - byte0 * 8;
+            let o = ixget(&ent, bit + 32, w);
+            (o < n && ixget(&ent, bit, 32) == ixfp(h, o)).then_some(o)
         }).collect();
         if hits.len() == 1 && self.names.get().is_none() { return hits[0] as i64; }   // one fingerprint: no name to decode
         hits.into_iter().find(|&o| self.name_at(o) == nm).map_or(-1, |o| o as i64)

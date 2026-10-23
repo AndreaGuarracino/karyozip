@@ -65,7 +65,7 @@ fn main() {
 
     let name = c.name();
     let pack = name == "aln-pack";
-    if c.input.len() > 1 && !(name == "encode" && c.db.is_some()) { die("give one -i"); }
+    if c.input.len() > 1 && !(name == "compress" && c.db.is_some()) { die("give one -i"); }
     if let (Some(o), false) = (&c.output, pack) { ffi::redirect(o, 1); }
     let track = || c.input.first().map(|s| s.as_str())
         .unwrap_or_else(|| die(&format!("{name} needs -i TRACK")));
@@ -77,7 +77,7 @@ fn main() {
             if c.aln.is_some() && c.refbed.is_none() { die("--aln needs --ref"); }
             if c.aln.is_some() && opt.drop_names && c.aln_names.is_none() {
                 die("--aln with --names drop needs --aln-names: without the names \
-                     decode cannot reach the alignment");
+                     decompress cannot reach the alignment");
             }
             if c.aln.is_some() && opt.sort && opt.drop_names {
                 die("--aln with --sort and --names drop cannot be decoded: sorting \
@@ -104,8 +104,8 @@ fn main() {
         }
         Cmd::Decode if c.region.is_none() => {
             let track = track();
-            if c.halo.is_some() { die("--halo needs -r NAME:START-END"); }
-            let feats = informed(&c, &mut ro, "decode ", None, aln::Lazy::Contig);
+            if c.query { die("query needs -r NAME[:START-END]"); }
+            let feats = informed(&c, &mut ro, "decompress ", None, aln::Lazy::Contig);
             let mut r = reader::Reader::open_with(track, &ro);
             if let Some(f) = &feats { f.check_hash(&r); }
             match &feats {
@@ -125,7 +125,7 @@ fn main() {
             let (seq, lo, hi) = regparse(c.region.as_deref().unwrap());
             if c.halo.is_some() && hi == 0 { die("--halo needs -r NAME:START-END"); }
             let hlo = c.halo.as_ref().map_or(0, |h| karyozip::bedcoord(h.as_bytes(), "--halo is not a number"));
-            let feats = informed(&c, &mut ro, "decode ", None, aln::Lazy::OneSeq);
+            let feats = informed(&c, &mut ro, "query ", None, aln::Lazy::OneSeq);
             let mut r = reader::Reader::open_with(track, &ro);
             if let Some(f) = &feats { f.check_hash(&r); }
             let cols = feats.as_ref().map_or(Vec::new(), |f| f.setcols(c.set.as_deref()));
@@ -137,11 +137,11 @@ fn main() {
         Cmd::Smooth => {
             let track = track();
             let (Some(hier), Some(fs)) = (c.hier.as_deref(), c.feature_set.as_deref())
-                else { die("smooth needs --hier HIER and -f FEATURE_SET") };
+                else { die("--smooth needs --hier HIER") };
             let maxgap = num(&c.max_gap, 0, u64::MAX, "--max-gap needs a number").unwrap_or(1000);
             let smchunk = cnt(&c.chunk, 1, 1000000000, "--chunk is a number of runs, 1 to 1000000000").unwrap_or(0) as usize;
             let (seq, lo, hi) = c.region.as_deref().map_or(("", 0, 0), regparse);
-            let feats = informed(&c, &mut ro, "smooth ", Some(hier), aln::Lazy::Contig);
+            let feats = informed(&c, &mut ro, if c.query { "query " } else { "decompress " }, Some(hier), aln::Lazy::Contig);
             // not stdout().lock(): a lock guard cannot cross to the smooth
             // workers, and they are serialized by turn anyway
             let mut o = BufWriter::new(std::io::stdout());
@@ -458,6 +458,7 @@ pub struct Cli {
     pub region: Option<String>,
     pub halo: Option<String>,
     pub feature_set: Option<String>,
+    pub query: bool,
     pub block: Option<String>,
     pub effort: Option<String>,
     pub sort: Option<String>,        // "" for a bare --sort
@@ -484,10 +485,10 @@ const FLAGS: &[(&str, bool)] = &[
     ("--names", true), ("--max-gap", true), ("--v1", false), ("--chunk", true), ("--aln-names", true), ("--sort", false),
     ("--effort", true), ("--block", true), ("--db", true), ("--aln", true), ("--ref", true),
     ("--out-dir", true), ("--set", true), ("--raw", false), ("--hier", true), ("--input", true),
-    ("--output", true), ("--region", true), ("--halo", true), ("--feature-set", true),
+    ("--output", true), ("--region", true), ("--halo", true), ("--smooth", true),
 ];
 const SHORT: &[(&str, &str)] = &[
-    ("-i", "--input"), ("-o", "--output"), ("-r", "--region"), ("-f", "--feature-set"),
+    ("-i", "--input"), ("-o", "--output"), ("-r", "--region"),
     ("-b", "--block"), ("-e", "--effort"), ("-n", "--names"), ("-d", "--db"), ("-a", "--aln"),
 ];
 
@@ -521,9 +522,13 @@ impl Cli {
         }
         av = av.into_iter().map(long).collect();
         let c = cmd.as_str();
-        let (enc, dec, sm) = (c == "encode", c == "decode", c == "smooth");
-        let rd = sm || dec || c == "index";
-        let inf = enc || sm || dec;
+        // --smooth SET turns decompress or query into the smoothed track
+        let smf = av.windows(2).any(|w| w[0] == "--smooth");
+        let (enc, qry) = (c == "compress", c == "query");
+        let rdr = c == "decompress" || qry;
+        let (sm, dec) = (rdr && smf, rdr && !smf);
+        let rd = rdr || c == "index";
+        let inf = enc || rdr;
         let pack = c == "aln-pack";
         let mut o = Cli::default();
         let mut i = 0;
@@ -542,7 +547,7 @@ impl Cli {
                         if n == "drop:" { die("--names drop:FILE needs a file"); }
                         enc
                     } else if enc {
-                        die("encode takes --names drop or drop:FILE; a name file is --aln-names")
+                        die("compress takes --names drop or drop:FILE; a name file is --aln-names")
                     } else { rd };
                     o.names.push(n); ok
                 }
@@ -570,23 +575,25 @@ impl Cli {
                 "--out-dir" => { o.out = Some(val()); dec }
                 "--input" => { o.input.push(val()); !pack }
                 "--output" => { o.output = Some(val()); c != "index" }
-                "--region" => { o.region = Some(val()); sm || dec }
-                "--halo" => { o.halo = Some(val()); dec }
-                "--feature-set" => { o.feature_set = Some(val()); sm }
+                "--region" => { o.region = Some(val()); qry }
+                "--halo" => { o.halo = Some(val()); qry && !sm }
+                "--smooth" => { o.feature_set = Some(val()); rdr }
                 "--set" => { o.set = Some(val()); dec }
                 "--raw" => { o.raw = true; dec }
                 _ => { i += 1; continue; }
             };
             if !ok {
                 if cmd.is_empty() { die(USAGE); }
-                die(&format!("{a} does not apply to {cmd}"));
+                if rdr && matches!(a.as_str(), "--max-gap" | "--v1" | "--chunk") { die(&format!("{a} needs --smooth")); }
+                die(&format!("{a} does not apply to {cmd}{}", if sm { " --smooth" } else { "" }));
             }
             av.drain(i..i + if matches!(a.as_str(), "--profile" | "--v1" | "--raw") || a.starts_with("--sort") { 1 } else { 2 });
         }
         if cmd.is_empty() { die(USAGE); }
+        o.query = qry;
         o.cmd = Some(match c {
-            "encode" => Cmd::Encode, "decode" => Cmd::Decode,
-            "smooth" => Cmd::Smooth, "index" => Cmd::Index, "aln-pack" => Cmd::AlnPack,
+            "compress" => Cmd::Encode, "decompress" | "query" if sm => Cmd::Smooth,
+            "decompress" | "query" => Cmd::Decode, "index" => Cmd::Index, "aln-pack" => Cmd::AlnPack,
             _ => die("bad command or missing arguments"),
         });
         if let Some(a) = av.get(1) {   // every argument is a flag now
@@ -598,8 +605,8 @@ impl Cli {
 
     pub fn name(&self) -> &'static str {
         match self.cmd.as_ref().unwrap() {
-            Cmd::Encode => "encode", Cmd::Decode => "decode",
-            Cmd::Smooth => "smooth", Cmd::Index => "index", Cmd::AlnPack => "aln-pack",
+            Cmd::Encode => "compress", Cmd::Decode | Cmd::Smooth => if self.query { "query" } else { "decompress" },
+            Cmd::Index => "index", Cmd::AlnPack => "aln-pack",
         }
     }
 }

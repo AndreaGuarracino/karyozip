@@ -247,7 +247,7 @@ pub fn run(path: &str, hier: &str, fs: &[u8], seq: Option<&[u8]>,
     let mut r = Reader::open_with(path, ro);
     if let Some(f) = feats { f.check_hash(&r); }
     let setk = feats.map(|f| f.sets.iter().position(|s| s == fs)
-        .unwrap_or_else(|| crate::bail("smooth: the set is not in features.tsv")));
+        .unwrap_or_else(|| crate::bail("--smooth: the set is not in features.tsv")));
     // The track's own labels join the hierarchy, so the tables are rebuilt.
     // Under --aln "=" and under --db a non-featureID are resolved per row.
     let (mut labmap, mut novelid, known) = (Vec::new(), Vec::new(), h.node.len());

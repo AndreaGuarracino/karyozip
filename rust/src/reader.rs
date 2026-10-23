@@ -91,7 +91,7 @@ pub struct Reader {
     /// side, perm_ext, dropped, int, tok, perm, perm_tok
     nf: u8,
     /// the appended index: offset of its key table, and its trailer's binding word
-    idx: Option<(u64, u64, u64, u64)>,   // index base, binding, bucket bits, payload
+    idx: Option<(u64, u64, u64, u64, std::fs::File)>,   // index base, binding, bucket bits, payload, TRACK.kzi
     /// name -> rank, built on the first lookup, which is also where the C
     /// notices that two sequences share a name.
     /// as the C's buildhash: a power-of-two table of ordinals over the
@@ -101,7 +101,6 @@ pub struct Reader {
     /// starts at, and the one chunk decoded now, as the C's loadichunk
     iz: Vec<u8>, coff: Vec<u64>, cpend: Vec<u64>, ibx: Vec<u8>, cur_chunk: u64,
     runhead: bool, ilv: bool, grp: bool, rtab: std::sync::Arc<Vec<u32>>,   // run-count prefix sums, lifted out of the lengths; 32 bits, as the C's offsets
-    hasidx: bool,
     mhash: u64,
     cur_ri: u64,
     cur_q: usize,
@@ -150,19 +149,17 @@ impl Reader {
             *v = u64::from_le_bytes(hb[i * 8..i * 8 + 8].try_into().unwrap());
         }
         let h1_raw = h[1];
-        let mut fsz = rd(f.seek(SeekFrom::End(0)), "seek");
-        let mut hasidx = false;
+        let fsz = rd(f.seek(SeekFrom::End(0)), "seek");
+        // the name index, TRACK.kzi beside the track, as the C reads it
         let mut idx = None;
-        // An index trailer sits past the data: take it off, so every size
-        // check below still bounds the data alone.
-        if fsz >= 40 + 8 + 128 {                    // n, bucket bits, binding, payload, magic
+        if let Ok(mut xf) = std::fs::File::open(format!("{path}.kzi")) {
+            let xsz = xf.seek(SeekFrom::End(0)).unwrap_or(0);
             let mut t = [0u8; 40];
-            rd(f.seek(SeekFrom::Start(fsz - 40)), "seek");
-            rd(f.read_exact(&mut t), "seek");
-            let w: Vec<u64> = (0..5)
-                .map(|i| u64::from_le_bytes(t[i * 8..i * 8 + 8].try_into().unwrap())).collect();
-            if w[4] == IDXMAGIC && w[0] == h[0] && w[1] < 40 && w[3] <= fsz - 40 - 8 - 128 {
-                fsz -= 40 + w[3]; hasidx = true; idx = Some((fsz, w[2], w[1], w[3]));
+            if xsz >= 40 && xf.seek(SeekFrom::Start(xsz - 40)).is_ok() && xf.read_exact(&mut t).is_ok() {
+                let w: Vec<u64> = (0..5).map(|i| u64::from_le_bytes(t[i * 8..i * 8 + 8].try_into().unwrap())).collect();
+                if w[4] == IDXMAGIC && w[0] == h[0] && w[1] < 40 && w[3] <= xsz - 40 {
+                    idx = Some((xsz - 40 - w[3], w[2], w[1], w[3], xf));
+                }
             }
         }
         let nml = h[1] & !FLAGS;
@@ -201,19 +198,19 @@ impl Reader {
         let dropped = h[1] & DROPPED != 0;
         if !o.raw && !o.index {
             if h[1] & ALNFLAG != 0 && o.aln.is_none() {
-                crate::bail("this track was written with --aln: decode it with --aln PAF --ref R, or --raw to see what is stored");
+                crate::bail("this track was written with --aln: read it with --aln PAF --ref R, or --raw to see what is stored");
             }
             if h[1] & ALNFLAG == 0 && o.aln.is_some() {
                 crate::bail("this track was not written with --aln");
             }
             if h[1] & DBFLAG != 0 && !o.db {
-                crate::bail("this track holds featureIDs: decode it with --db features.tsv --out-dir DIR, or --raw to see what is stored");
+                crate::bail("this track holds featureIDs: read it with --db features.tsv --out-dir DIR, or --raw to see what is stored");
             }
             if h[1] & DBFLAG == 0 && o.db {
                 crate::bail("this track does not hold featureIDs");
             }
             if h[1] & LENFLAG != 0 && o.aln.is_none() {
-                crate::bail("this track leaves out every length the reference implies: decode it with --aln PAF --ref R");
+                crate::bail("this track leaves out every length the reference implies: read it with --aln PAF --ref R");
             }
             if was_side && o.names_file.is_none()
                && std::fs::metadata(format!("{path}.names")).is_err() {
@@ -387,7 +384,7 @@ impl Reader {
             runhead, ilv, grp, rtab: Default::default(),
             names: std::cell::OnceCell::new(), nz, pz, names_file: o.names_file.clone(),
             nf, idx,
-            hasidx, mhash: h[15], cur_ri: 0, cur_q: 0, cur_pend: 0, cached: None, sc: None,
+            mhash: h[15], cur_ri: 0, cur_q: 0, cur_pend: 0, cached: None, sc: None,
             rowhash: if h1_raw & ALNFLAG != 0 { 0 } else { h[13] >> 8 },
             plainref: h1_raw & (ALNFLAG | DBFLAG | SIDEFLAG | DROPPED | PERMFLAG) == 0,
             feathash: (h[5] >> 32) | ((h[9] >> 32) << 32),
@@ -901,7 +898,7 @@ impl Reader {
             read_name_file(f, n)
         } else if dropped && nz.is_empty() {
             if !self.raw {
-                crate::bail("the names of this track were dropped at encode time: give them back with --names FILE");
+                crate::bail("the names of this track were dropped at compress time: give them back with --names FILE");
             }
             ordinals(n)
         } else if nz.is_empty() {
@@ -977,13 +974,14 @@ impl Reader {
     /// fingerprints, and a name decoded only when one fingerprint is not enough.
     fn idxlookup(&self, nm: &[u8]) -> i64 {
         use std::os::unix::fs::FileExt;
-        let Some((base, bind, k, pay)) = self.idx else { return -1 };
+        let Some((base, bind, k, pay, xf)) = &self.idx else { return -1 };
+        let (base, bind, k, pay) = (*base, *bind, *k, *pay);
         let n = self.nreads;
         let (nb, w) = (1u64 << k, ixw(n.max(1)));
         let ns = nb.div_ceil(1024);
         if bind != self.mhash ^ self.namesrc() || pay != nb + ns * 8 + (n * (32 + w)).div_ceil(8) + 8 { return -1; }
         let mut t = vec![0u8; crate::ckalloc(pay as usize)];
-        rd(self.f.read_exact_at(&mut t, base), "index read");
+        rd(xf.read_exact_at(&mut t, base), "index read");
         let h = h64b(nm);
         let b = if k > 0 { h >> (64 - k) } else { 0 };
         let mut at = u64::from_le_bytes(t[(nb + (b >> 10) * 8) as usize..][..8].try_into().unwrap());
@@ -1168,7 +1166,6 @@ impl Reader {
     /// Appends a name index to the track, magic last so a torn write is
     /// simply not seen. One file, not two.
     pub fn build_index(&mut self, path: &str) {
-        if self.hasidx { eprintln!("karyozip: {path} already carries an index"); return; }
         if self.nreads > u32::MAX as u64 {
             crate::bail("more than 2^32 sequences: the index stores the ordinal in 32 bits");
         }
@@ -1207,16 +1204,13 @@ impl Reader {
             for b in g * 1024..nb.min((g + 1) * 1024) { sum += t[b as usize] as u64; }
         }
         for v in [n, k as u64, self.mhash ^ self.namesrc(), pay, IDXMAGIC] { t.extend_from_slice(&v.to_le_bytes()); }
+        // beside the track in TRACK.kzi, written whole, then renamed into place
         use std::io::Write;
-        let mut f = rd(std::fs::OpenOptions::new().append(true).open(path),
-                       "cannot append the index to the track");
-        let off0 = rd(f.metadata(), "cannot append the index to the track").len();
-        // as the C: a failed append is cut back, not left half written
-        if f.write_all(&t).and_then(|_| f.flush()).is_err() {
-            let _ = f.set_len(off0);
-            crate::bail("index write failed");
-        }
-        eprintln!("index: {n} sequences, {} B appended, {dup} fingerprint collisions", pay + 40);
+        let (ip, tp) = (format!("{path}.kzi"), format!("{path}.kzi.{}", std::process::id()));
+        let ok = std::fs::File::create(&tp).and_then(|mut f| { f.write_all(&t)?; f.flush() }).is_ok()
+            && std::fs::rename(&tp, &ip).is_ok();
+        if !ok { let _ = std::fs::remove_file(&tp); crate::bail("index write failed"); }
+        eprintln!("index: {n} sequences, {} B in {ip}, {dup} fingerprint collisions", pay + 40);
     }
 }
 

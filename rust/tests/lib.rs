@@ -23,7 +23,7 @@ fn build(bed: &[u8], opt: Options) -> Vec<u8> {
 fn cli(args: &[&str], bed: &[u8]) -> Vec<u8> {
     let exe = env!("CARGO_BIN_EXE_karyozip");
     let mut c = std::process::Command::new(exe)
-        .args(args).arg("encode")
+        .args(args).arg("compress")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())

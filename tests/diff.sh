@@ -123,6 +123,8 @@ with open('$W/ch.bed','w') as f:
 printf 'feature_set\tchild\tparent\nfs\tG1\tcategorized\nfs\tG2\tcategorized\nfs\ta\tG1\nfs\tb\tG1\nfs\tc\tG2\nfs\td\tG2\n' > "$W/ch.tsv"
 "$C" compress < "$W/ch.bed" > "$W/ch.kst" 2>/dev/null
 for q in "--chunk 1" "--chunk 7" "--chunk 64" "--chunk 64 --v1" "--chunk 100000"; do both "decompress --chunk [$q]" decompress -i "$W/ch.kst" --hier "$W/ch.tsv" --smooth --set fs $q; done
+both "decompress --smooth, set inferred" decompress -i "$W/ch.kst" --hier "$W/ch.tsv" --smooth
+both "query --smooth -r, set inferred" query -i "$W/ch.kst" --hier "$W/ch.tsv" --smooth -r s1:10-20
 both "query --chunk -r" query -i "$W/ch.kst" --hier "$W/ch.tsv" --smooth --set fs --chunk 64 -r s1:1000-2000
 tally decompress
 

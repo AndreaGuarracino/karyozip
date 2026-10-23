@@ -238,13 +238,51 @@ fn emit(h: &Hier, out: &mut Vec<u8>, seq: &[u8], st: &[u64], en: &[u64],
     }
 }
 
+/// The set a one-set track holds, as the C's inferset: the one hierarchy
+/// set whose tree has every label but novel; none or several is a refusal.
+fn infer_set(hier: &str, r: &Reader) -> Vec<u8> {
+    let data = crate::slurp(hier, "cannot open the hierarchy file");
+    let (mut set, mut node): (Vec<Vec<u8>>, Vec<(Vec<u8>, usize)>) = (Vec::new(), Vec::new());
+    for raw in data.split(|&c| c == b'\n') {
+        let line = raw.strip_suffix(b"\r").unwrap_or(raw);
+        let cols: Vec<&[u8]> = line.split(|&c| c == b'\t').collect();
+        if cols.len() < 3 { continue; }
+        if cols.len() > 3 { crate::bail("hierarchy: a row has more than three columns"); }
+        if cols[0] == b"feature_set" { continue; }
+        let k = set.iter().position(|s| s == cols[0]).unwrap_or_else(|| {
+            if set.len() == 64 { crate::bail("hierarchy: more than 64 feature sets"); }
+            set.push(cols[0].to_vec()); set.len() - 1 });
+        for x in &cols[1..] {
+            if node.len() == 4096 { crate::bail("too many hierarchy nodes"); }
+            node.push((x.to_vec(), k));
+        }
+    }
+    let mut fit = vec![true; set.len()];
+    for i in 0..r.nlabels() {
+        let l = r.label_at(i);
+        if l == b"novel" || (r.has_aln() && l == b"=") { continue; }
+        let mut inn = vec![false; set.len()];
+        for (n, k) in &node { if n == l { inn[*k] = true; } }
+        for k in 0..set.len() { fit[k] &= inn[k]; }
+    }
+    let ok: Vec<&Vec<u8>> = set.iter().zip(&fit).filter(|(_, f)| **f).map(|(s, _)| s).collect();
+    match ok.len() {
+        1 => ok[0].clone(),
+        0 => crate::bail("the track's labels fit no set of the hierarchy: is it the hierarchy of the track's database?"),
+        _ => crate::bail(&format!("the track's labels fit more than one set, give --set: {}",
+                                  ok.iter().map(|s| String::from_utf8_lossy(s)).collect::<Vec<_>>().join(", "))),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
-pub fn run(path: &str, hier: &str, fs: &[u8], seq: Option<&[u8]>,
+pub fn run(path: &str, hier: &str, fs: Option<&[u8]>, seq: Option<&[u8]>,
            lo: u64, hi: u64, v1: bool, maxgap: u64, smchunk: usize,
            ro: &crate::reader::ReadOpts, feats: Option<&crate::db::Feats>,
            out: &mut (impl Write + Send)) {
-    let mut h = Hier::load(hier, fs);
     let mut r = Reader::open_with(path, ro);
+    let fs = fs.map_or_else(|| infer_set(hier, &r), |f| f.to_vec());
+    let fs = fs.as_slice();
+    let mut h = Hier::load(hier, fs);
     if let Some(f) = feats { f.check_hash(&r); }
     let setk = feats.map(|f| f.sets.iter().position(|s| s == fs)
         .unwrap_or_else(|| crate::bail("--smooth: the set is not in features.tsv")));

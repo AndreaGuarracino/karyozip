@@ -17,7 +17,7 @@ The C needs zstd, zlib and an OpenMP compiler; the Rust needs cargo and libgomp.
 karyozip compress   -i sample.chromosome.presmoothed.bed.gz -o sample.kst
 karyozip decompress -i sample.kst -o sample.bed                           # the original BED, byte for byte
 karyozip query      -i sample.kst -r chr1_hap1:1000000-1200000            # the runs overlapping a range
-karyozip decompress -i sample.kst --smooth --set chromosome --hier hierarchy.tsv   # KaryoScope's smoothed track, from the presmoothed one
+karyozip decompress -i sample.kst --smooth --hier hierarchy.tsv     # KaryoScope's smoothed track, from the presmoothed one
 ```
 
 Every text input may be plain or gzipped. Without `-i`, `compress` reads stdin, so it can sit behind `karyoscope annotate` in a pipe; without `-o`, decompress and query write stdout.
@@ -48,7 +48,7 @@ The index costs 7.5 B a read: on short reads it is larger than the track (223334
 
 A KaryoScope run writes one BED per feature set, presmoothed and smoothed.
 
-- **Smoothed tracks need not be stored.** `--smooth --set SET --hier hierarchy.tsv` on decompress or query rebuilds the smoothed track of SET from the presmoothed one, row for row as KaryoScope writes it. Tracks written by KaryoScope 1.x, whose smoothed labels carry no `_specific` suffix, need `--v1`; those its first release (2025-12-10) smoothed also need `--chunk 20000`, its chunks of 20000 runs per sequence.
+- **Smoothed tracks need not be stored.** `--smooth --hier hierarchy.tsv` on decompress or query rebuilds the smoothed track from the presmoothed one, row for row as KaryoScope writes it. The set is the one whose tree in hierarchy.tsv holds every label of the track; when two do, or for a `-d` track, `--set SET` names it. Tracks written by KaryoScope 1.x, whose smoothed labels carry no `_specific` suffix, need `--v1`; those its first release (2025-12-10) smoothed also need `--chunk 20000`, its chunks of 20000 runs per sequence.
 - **All feature sets in one file.** `-d features.tsv` merges one sample's per-set BEDs into a single, smaller track. Smoothed sets merged this way also need `--hier hierarchy.tsv`, on compress and on every read.
 
 ```
@@ -76,7 +76,7 @@ Read names are stored in the file by default.
 | `-i`, `--input FILE` | all but aln-pack | compress: the BED, one `-i` per set under `-d`, else stdin; the others: the track |
 | `-o`, `--output FILE` | all but index | where the output goes, else stdout; aln-pack: the packed file, required |
 | `-r`, `--region NAME[:START-END]` | query | a sequence, or a range of it |
-| `--smooth` | decompress, query | KaryoScope's smoothed track instead of the stored one, of the set `--set` names; with query the whole sequence is smoothed and the range printed |
+| `--smooth` | decompress, query | KaryoScope's smoothed track instead of the stored one; with query the whole sequence is smoothed and the range printed |
 | `--hier FILE` | `--smooth`; compress and readers with `-d` | the KaryoScope hierarchy.tsv |
 | `--v1`, `--chunk N` | `--smooth` | KaryoScope 1.x output; its chunked smoothing before 2026-01-08 |
 | `-e`, `--effort low\|medium\|high` | compress | see Size or speed; default medium |

@@ -660,6 +660,12 @@ $KT compress < "$W/ch.bed" > "$W/ch.kst" 2>/dev/null
 $KT decompress -i "$W/ch.kst" --hier "$W/ch.tsv" --smooth --set fs > "$W/ch.whole" 2>/dev/null
 $KT decompress -i "$W/ch.kst" --hier "$W/ch.tsv" --smooth --set fs --chunk 64 2>/dev/null | cmp -s - "$W/ch.whole" && no "--chunk 64: SAME as whole" || ok "--chunk 64: chunks change the smoothing"
 $KT decompress -i "$W/ch.kst" --hier "$W/ch.tsv" --smooth --set fs --chunk 5000 2>/dev/null | cmp -s - "$W/ch.whole" && ok "--chunk 5000 on 6000 runs: under 6250, smoothed whole" || no "--chunk 5000: WRONG"
+$KT decompress -i "$W/ch.kst" --hier "$W/ch.tsv" --smooth 2>/dev/null | cmp -s - "$W/ch.whole" && ok "--smooth without --set: the one set that fits" || no "--smooth without --set: WRONG"
+printf 'feature_set\tchild\tparent\nfs\ta\tcategorized\nzz\ta\tcategorized\n' > "$W/amb.tsv"
+printf 's\t0\t10\ta\ns\t10\t20\tnovel\n' | $KT compress > "$W/amb.kt" 2>/dev/null
+must_fail "--smooth without --set, two sets fit" $KT decompress -i "$W/amb.kt" --hier "$W/amb.tsv" --smooth
+$KT compress < "$D/ls.bed" > "$W/nofit.kt" 2>/dev/null
+must_fail "--smooth without --set, no set fits" $KT decompress -i "$W/nofit.kt" --hier "$W/ch.tsv" --smooth
 must_fail "--chunk 0" $KT decompress -i "$W/ch.kst" --hier "$W/ch.tsv" --smooth --set fs --chunk 0
 must_fail "--chunk on decompress" $KT decompress -i "$W/ch.kst" --chunk 64
 

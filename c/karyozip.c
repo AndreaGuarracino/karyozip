@@ -5152,10 +5152,51 @@ static void smooth_mt(const char *path, R *r0, int64_t first, int64_t last,
 }
 
 /* smooth TRACK HIER FS [SEQ [START END]] */
+/* The set a one-set track holds: the one hierarchy set whose tree has
+   every label but novel. None or several is a refusal that names them. */
+static const char *inferset(const char *hier, R *r) {
+    FILE *f = zfopen(hier);
+    if (!f) die("cannot open the hierarchy file");
+    char *line = NULL, *set[64], *node[4096]; size_t cap = 0; ssize_t len; int ns = 0, nn = 0, of[4096];
+    while ((len = getline(&line, &cap, f)) > 0) {
+        chomp(line, &len);
+        char *t1 = memchr(line, '\t', (size_t)len), *t2 = t1 ? strchr(t1 + 1, '\t') : NULL;
+        if (!t2) continue;
+        if (strchr(t2 + 1, '\t')) die("hierarchy: a row has more than three columns");
+        if (!strncmp(line, "feature_set\t", 12)) continue;
+        *t1 = *t2 = 0;
+        int k = 0; while (k < ns && strcmp(set[k], line)) k++;
+        if (k == ns) { if (ns == 64) die("hierarchy: more than 64 feature sets"); set[ns++] = xstrdup(line); }
+        for (char *x = t1 + 1; x; x = x == t1 + 1 ? t2 + 1 : NULL) {
+            if (nn == 4096) die("too many hierarchy nodes");
+            of[nn] = k; node[nn++] = xstrdup(x); }
+    }
+    if (ferror(f)) die("read error on a companion file");
+    free(line); fclose(f);
+    int fit[64]; for (int k = 0; k < ns; k++) fit[k] = 1;
+    for (uint64_t i = 0; i < r->nlab; i++) {
+        const char *L = r->lab[i];
+        if (!strcmp(L, "novel") || (ALNPAF && !strcmp(L, "="))) continue;
+        int in[64] = {0};
+        for (int j = 0; j < nn; j++) if (!strcmp(node[j], L)) in[of[j]] = 1;
+        for (int k = 0; k < ns; k++) fit[k] &= in[k];
+    }
+    char msg[4096] = ""; int nfit = 0; const char *one = NULL;
+    for (int k = 0; k < ns; k++) if (fit[k]) {
+        nfit++; one = set[k];
+        snprintf(msg + strlen(msg), sizeof msg - strlen(msg), "%s%s", nfit > 1 ? ", " : "", set[k]); }
+    for (int j = 0; j < nn; j++) free(node[j]);
+    if (nfit == 1) { const char *s = xstrdup(one); for (int k = 0; k < ns; k++) free(set[k]); return s; }
+    if (!nfit) die("the track's labels fit no set of the hierarchy: is it the hierarchy of the track's database?");
+    die2("the track's labels fit more than one set, give --set: ", msg);
+    return NULL;
+}
+
 static void smoothcmd(const char *path, const char *hier, const char *fs,
                       const char *seq, uint64_t lo, uint64_t hi, int v1) {
-    loadhier(hier, fs);
     R *r = ropen_informed(path);
+    if (!fs) fs = inferset(hier, r);
+    loadhier(hier, fs);
     if (r->nblk == 1) loadblk(r, 0);   /* the block before the names, as dump */
     ensurenames(r);   /* emit prints names */
     int *labmap = labnodes(r, fs);
@@ -5569,7 +5610,8 @@ int main(int argc, char **argv) {
             "  compress reads stdin without -i; decompress and query write stdout without -o\n"
             "  -e, --effort: low is quick and fast to query, medium the default, high the smallest file\n"
             "  -r NAME:START-END is BED, 0-based, END excluded; -r NAME alone is the whole sequence\n"
-            "  --smooth --set SET --hier H: decompress and query give KaryoScope's smoothed track of SET;\n"
+            "  --smooth --hier H [--set SET]: decompress and query give KaryoScope's smoothed track; the\n"
+            "               set is the one whose tree holds the track's labels, or --set when two do\n"
             "               --v1 for tracks of KaryoScope 1.x, --chunk 20000 for those before 2026-01-08\n"
             "  readers take -n, -d, --hier, -a, --ref as compress was given; -n FILE takes the names\n"
             "               from drop:FILE, a FASTA, FASTQ or list\n"
@@ -5755,8 +5797,8 @@ int main(int argc, char **argv) {
     }
     else if (!strcmp(cmd, "index")) { INDEXING = 1; buildindex(INS[0]); }
     else if (sm) {
-        if (!FSA) die("--smooth needs --set SET");
-        if (strchr(FSA, ',')) die("--smooth smooths one set: give one name to --set");
+        if (!FSA && DBFEATS) die("--smooth of a -d track needs --set SET");
+        if (FSA && strchr(FSA, ',')) die("--smooth smooths one set: give one name to --set");
         if (!HIERA) die("--smooth needs --hier HIER");
         uint64_t slo = 0, shi = 0; const char *nm = REGA ? regparse(REGA, &slo, &shi) : NULL;
         loadinformed(qry ? "query " : "decompress ");

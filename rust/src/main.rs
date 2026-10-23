@@ -136,8 +136,9 @@ fn main() {
         }
         Cmd::Smooth => {
             let track = track();
-            let Some(fs) = c.feature_set.as_deref() else { die("--smooth needs --set SET") };
-            if fs.contains(',') { die("--smooth smooths one set: give one name to --set"); }
+            let fs = c.feature_set.as_deref();
+            if fs.is_none() && c.db.is_some() { die("--smooth of a -d track needs --set SET"); }
+            if fs.is_some_and(|f| f.contains(',')) { die("--smooth smooths one set: give one name to --set"); }
             let Some(hier) = c.hier.as_deref() else { die("--smooth needs --hier HIER") };
             let maxgap = num(&c.max_gap, 0, u64::MAX, "--max-gap needs a number").unwrap_or(1000);
             let smchunk = cnt(&c.chunk, 1, 1000000000, "--chunk is a number of runs, 1 to 1000000000").unwrap_or(0) as usize;
@@ -146,7 +147,7 @@ fn main() {
             // not stdout().lock(): a lock guard cannot cross to the smooth
             // workers, and they are serialized by turn anyway
             let mut o = BufWriter::new(std::io::stdout());
-            smooth::run(track, hier, fs.as_bytes(), c.region.as_ref().map(|_| seq.as_bytes()),
+            smooth::run(track, hier, fs.map(str::as_bytes), c.region.as_ref().map(|_| seq.as_bytes()),
                         lo, hi, c.v1, maxgap, smchunk, &ro, feats.as_ref(), &mut o);
             o.flush().unwrap_or_else(|e| die(&e.to_string()));
         }

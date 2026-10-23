@@ -54,8 +54,8 @@ lk "region SEQ POS"               "$LK" query -i "$L/p.kt" -r r1:150-151
 lk "region SEQ START END HALO"    "$LK" query -i "$L/p.kt" -r r1:0-200 --halo 3
 lk "index"                        "$LK" index -i "$L/p.kt"
 lk "region, after index"          "$LK" query -i "$L/p.kt" -r r1:150-151
-lk "decompress"                       "$LK" decompress -i "$L/p.kt" --hier "$L/h.tsv" --smooth fs
-lk "query, one sequence"         "$LK" query -i "$L/p.kt" --hier "$L/h.tsv" --smooth fs -r r1
+lk "decompress"                       "$LK" decompress -i "$L/p.kt" --hier "$L/h.tsv" --smooth --set fs
+lk "query, one sequence"         "$LK" query -i "$L/p.kt" --hier "$L/h.tsv" --smooth --set fs -r r1
 lk "aln-pack"                     "$LK" aln-pack -a "$D/lp.paf" --ref "$D/lref.bed" -o "$L/pk"
 lk "--help"                       "$LK" --help
 lk "--version"                    "$LK" --version
@@ -317,14 +317,14 @@ hh = list(h); hh[13] = 3; open("%s/fidx%d.kt" % (W, k), "wb").write(build(frames
 PY
 $KT query -i "$W/t5.kt" -r s69999 2>/dev/null > "$W/want5"
 printf 'feature_set\tchild\tparent\nfs\tA\tcategorized\nfs\tB\tcategorized\n' > "$W/hier.tsv"
-$KT decompress -i "$W/t5.kt" --hier "$W/hier.tsv" --smooth fs 2>/dev/null > "$W/want5s"
+$KT decompress -i "$W/t5.kt" --hier "$W/hier.tsv" --smooth --set fs 2>/dev/null > "$W/want5s"
 one_fidx() {
   local m=$1 e="$1.err" out rc
   out=$(ASAN_OPTIONS=detect_leaks=0 timeout 30 $SAN query -i "$m" -r s69999 2>"$e"); rc=$?
   [ $rc -gt 1 ] && { echo "fuzz: forged index $(basename $m) crashed rc=$rc"; return 1; }
   grep -qE "AddressSanitizer|runtime error" "$e" && { echo "fuzz: forged index $(basename $m) sanitizer report"; return 1; }
   [ $rc -eq 0 ] && { printf '%s\n' "$out" | cmp -s - "$W/want5" || { echo "fuzz: forged index $(basename $m) WRONG rows with exit 0"; return 1; }; }
-  out=$(ASAN_OPTIONS=detect_leaks=0 timeout 60 $SAN decompress -i "$m" --hier "$W/hier.tsv" --smooth fs 2>"$e"); rc=$?
+  out=$(ASAN_OPTIONS=detect_leaks=0 timeout 60 $SAN decompress -i "$m" --hier "$W/hier.tsv" --smooth --set fs 2>"$e"); rc=$?
   [ $rc -gt 1 ] && { echo "fuzz: forged index $(basename $m) decompress crashed rc=$rc"; return 1; }
   [ $rc -eq 0 ] && { printf '%s\n' "$out" | cmp -s - "$W/want5s" || { echo "fuzz: forged index $(basename $m) decompress WRONG rows with exit 0"; return 1; }; }
   return 0

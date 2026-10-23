@@ -5569,7 +5569,7 @@ int main(int argc, char **argv) {
             "  compress reads stdin without -i; decompress and query write stdout without -o\n"
             "  -e, --effort: low is quick and fast to query, medium the default, high the smallest file\n"
             "  -r NAME:START-END is BED, 0-based, END excluded; -r NAME alone is the whole sequence\n"
-            "  --smooth SET --hier H: decompress and query give KaryoScope's smoothed track of SET;\n"
+            "  --smooth --set SET --hier H: decompress and query give KaryoScope's smoothed track of SET;\n"
             "               --v1 for tracks of KaryoScope 1.x, --chunk 20000 for those before 2026-01-08\n"
             "  readers take -n, -d, --hier, -a, --ref as compress was given; -n FILE takes the names\n"
             "               from drop:FILE, a FASTA, FASTQ or list\n"
@@ -5608,7 +5608,7 @@ int main(int argc, char **argv) {
         {"--effort",1},
         {"--block",1},{"--db",1},{"--aln",1},
         {"--ref",1},{"--out-dir",1},{"--set",1},{"--raw",0},{"--hier",1},
-        {"--input",1},{"--output",1},{"--region",1},{"--halo",1},{"--smooth",1},
+        {"--input",1},{"--output",1},{"--region",1},{"--halo",1},{"--smooth",0},
     };
     static const char *const SHORT[][2] = {   /* each short form is its long one */
         {"-i","--input"},{"-o","--output"},{"-r","--region"},
@@ -5630,9 +5630,9 @@ int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++)   /* short forms past the command too */
         for (size_t k = 0; k < sizeof SHORT / sizeof *SHORT; k++)
             if (!strcmp(argv[i], SHORT[k][0])) { argv[i] = (char *)SHORT[k][1]; break; }
-    /* --smooth SET turns decompress or query into the smoothed track */
+    /* --smooth turns decompress or query into the smoothed track */
     int smf = 0;
-    for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], "--smooth")) smf = 1;
+    for (int i = 1; i < argc; i++) if (!strcmp(argv[i], "--smooth")) smf = 1;
     int enc = !strcmp(cmd, "compress"), qry = !strcmp(cmd, "query");
     int rdr = !strcmp(cmd, "decompress") || qry;
     int sm = rdr && smf, dec = rdr && !smf;
@@ -5681,8 +5681,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--output")) { ok = strcmp(cmd, "index") != 0; OUTPUT = v; take = 2; }
         else if (!strcmp(a, "--region")) { ok = qry; REGA = (char *)v; take = 2; }
         else if (!strcmp(a, "--halo")) { ok = qry && !sm; HALOA = v; take = 2; }
-        else if (!strcmp(a, "--smooth")) { ok = rdr; FSA = v; take = 2; }
-        else if (!strcmp(a, "--set")) { ok = dec; SETNAME = v; take = 2; }
+        else if (!strcmp(a, "--smooth")) { ok = rdr; take = 1; }
+        else if (!strcmp(a, "--set")) { ok = rdr; if (sm) FSA = v; else SETNAME = v; take = 2; }   /* --smooth: the one set smoothed */
         else if (!strcmp(a, "--raw")) { ok = dec; RAW = 1; take = 1; }
         if (take && !ok) { if (!*cmd) die(USAGE);   /* flags but no command */
             if (rdr && (!strcmp(a, "--max-gap") || !strcmp(a, "--v1") || !strcmp(a, "--chunk"))) die2(a, " needs --smooth");
@@ -5755,6 +5755,8 @@ int main(int argc, char **argv) {
     }
     else if (!strcmp(cmd, "index")) { INDEXING = 1; buildindex(INS[0]); }
     else if (sm) {
+        if (!FSA) die("--smooth needs --set SET");
+        if (strchr(FSA, ',')) die("--smooth smooths one set: give one name to --set");
         if (!HIERA) die("--smooth needs --hier HIER");
         uint64_t slo = 0, shi = 0; const char *nm = REGA ? regparse(REGA, &slo, &shi) : NULL;
         loadinformed(qry ? "query " : "decompress ");

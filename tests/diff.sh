@@ -108,9 +108,9 @@ tally "reader flags"
 for f in ls.bed s.bed db.rall.bed; do
   { printf 'feature_set\tchild\tparent\n'; cut -f4 "$D/$f" | sort -u | sed 's/^/fs\t/; s/$/\tcategorized/'; } > "$W/h.tsv"
   "$C" compress < "$D/$f" > "$W/t.kst" 2>/dev/null
-  for q in "" "--v1" "--max-gap 5" "--max-gap 100000"; do both "decompress $f [$q]" $q decompress -i "$W/t.kst" --hier "$W/h.tsv" --smooth fs; done
+  for q in "" "--v1" "--max-gap 5" "--max-gap 100000"; do both "decompress $f [$q]" $q decompress -i "$W/t.kst" --hier "$W/h.tsv" --smooth --set fs; done
   for seq in $(awk -F'\t' '{print $1}' "$D/$f" | uniq | head -2); do
-    for q in "-r $seq" "-r $seq:0-100"; do both "query $f [$q]" query -i "$W/t.kst" --hier "$W/h.tsv" --smooth fs $q; done
+    for q in "-r $seq" "-r $seq:0-100"; do both "query $f [$q]" query -i "$W/t.kst" --hier "$W/h.tsv" --smooth --set fs $q; done
   done
 done
 # --chunk on a two-level hierarchy, one long sequence
@@ -122,8 +122,8 @@ with open('$W/ch.bed','w') as f:
 "
 printf 'feature_set\tchild\tparent\nfs\tG1\tcategorized\nfs\tG2\tcategorized\nfs\ta\tG1\nfs\tb\tG1\nfs\tc\tG2\nfs\td\tG2\n' > "$W/ch.tsv"
 "$C" compress < "$W/ch.bed" > "$W/ch.kst" 2>/dev/null
-for q in "--chunk 1" "--chunk 7" "--chunk 64" "--chunk 64 --v1" "--chunk 100000"; do both "decompress --chunk [$q]" decompress -i "$W/ch.kst" --hier "$W/ch.tsv" --smooth fs $q; done
-both "query --chunk -r" query -i "$W/ch.kst" --hier "$W/ch.tsv" --smooth fs --chunk 64 -r s1:1000-2000
+for q in "--chunk 1" "--chunk 7" "--chunk 64" "--chunk 64 --v1" "--chunk 100000"; do both "decompress --chunk [$q]" decompress -i "$W/ch.kst" --hier "$W/ch.tsv" --smooth --set fs $q; done
+both "query --chunk -r" query -i "$W/ch.kst" --hier "$W/ch.tsv" --smooth --set fs --chunk 64 -r s1:1000-2000
 tally decompress
 
 # 9. --db, both directions.
@@ -277,9 +277,9 @@ cli -t; cli -t 0; cli -t 99999; cli --tmp-dir; cli decompress --raw x --raw
 cli index --block 0; cli aln-pack -a a --ref b; cli decompress -i f --hier h; cli query -i f -r s:5-5
 cli compress --sort=0; cli compress --names foo; cli --effort low; cli -r x
 cli aln-pack --names foo -a a --ref b -o c; cli compress --db; cli --version compress
-cli index -i f x; cli decompress -i f x; cli query -i f --hier h --smooth fs -r s:9-3; cli aln-pack -a a --ref b -o c d
-cli query -i f --hier h --smooth fs -r s:1-2; cli query -i f -r s --halo 3; cli query -i f -r s:1-2
-cli decompress --max-gap x -i f --hier h --smooth fs
+cli index -i f x; cli decompress -i f x; cli query -i f --hier h --smooth --set fs -r s:9-3; cli aln-pack -a a --ref b -o c d
+cli query -i f --hier h --smooth --set fs -r s:1-2; cli query -i f -r s --halo 3; cli query -i f -r s:1-2
+cli decompress --max-gap x -i f --hier h --smooth --set fs
 cli decompress --out-dir D; cli decompress -i f --halo 2; cli query -i f -r s:+1-5; cli query -i f -r s:99999999999999999999-1
 cli compress --block +5; cli compress --aln p; cli compress --ref r
 cli decompress --aln-names f; cli index --names ordinal; cli compress --sort --sort=1M

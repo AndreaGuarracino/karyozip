@@ -136,8 +136,9 @@ fn main() {
         }
         Cmd::Smooth => {
             let track = track();
-            let (Some(hier), Some(fs)) = (c.hier.as_deref(), c.feature_set.as_deref())
-                else { die("--smooth needs --hier HIER") };
+            let Some(fs) = c.feature_set.as_deref() else { die("--smooth needs --set SET") };
+            if fs.contains(',') { die("--smooth smooths one set: give one name to --set"); }
+            let Some(hier) = c.hier.as_deref() else { die("--smooth needs --hier HIER") };
             let maxgap = num(&c.max_gap, 0, u64::MAX, "--max-gap needs a number").unwrap_or(1000);
             let smchunk = cnt(&c.chunk, 1, 1000000000, "--chunk is a number of runs, 1 to 1000000000").unwrap_or(0) as usize;
             let (seq, lo, hi) = c.region.as_deref().map_or(("", 0, 0), regparse);
@@ -485,7 +486,7 @@ const FLAGS: &[(&str, bool)] = &[
     ("--names", true), ("--max-gap", true), ("--v1", false), ("--chunk", true), ("--aln-names", true), ("--sort", false),
     ("--effort", true), ("--block", true), ("--db", true), ("--aln", true), ("--ref", true),
     ("--out-dir", true), ("--set", true), ("--raw", false), ("--hier", true), ("--input", true),
-    ("--output", true), ("--region", true), ("--halo", true), ("--smooth", true),
+    ("--output", true), ("--region", true), ("--halo", true), ("--smooth", false),
 ];
 const SHORT: &[(&str, &str)] = &[
     ("-i", "--input"), ("-o", "--output"), ("-r", "--region"),
@@ -522,8 +523,8 @@ impl Cli {
         }
         av = av.into_iter().map(long).collect();
         let c = cmd.as_str();
-        // --smooth SET turns decompress or query into the smoothed track
-        let smf = av.windows(2).any(|w| w[0] == "--smooth");
+        // --smooth turns decompress or query into the smoothed track
+        let smf = av.iter().any(|a| a == "--smooth");
         let (enc, qry) = (c == "compress", c == "query");
         let rdr = c == "decompress" || qry;
         let (sm, dec) = (rdr && smf, rdr && !smf);
@@ -577,8 +578,8 @@ impl Cli {
                 "--output" => { o.output = Some(val()); c != "index" }
                 "--region" => { o.region = Some(val()); qry }
                 "--halo" => { o.halo = Some(val()); qry && !sm }
-                "--smooth" => { o.feature_set = Some(val()); rdr }
-                "--set" => { o.set = Some(val()); dec }
+                "--smooth" => rdr,
+                "--set" => { if sm { o.feature_set = Some(val()) } else { o.set = Some(val()) } rdr }   // --smooth: the one set smoothed
                 "--raw" => { o.raw = true; dec }
                 _ => { i += 1; continue; }
             };
@@ -587,7 +588,7 @@ impl Cli {
                 if rdr && matches!(a.as_str(), "--max-gap" | "--v1" | "--chunk") { die(&format!("{a} needs --smooth")); }
                 die(&format!("{a} does not apply to {cmd}{}", if sm { " --smooth" } else { "" }));
             }
-            av.drain(i..i + if matches!(a.as_str(), "--profile" | "--v1" | "--raw") || a.starts_with("--sort") { 1 } else { 2 });
+            av.drain(i..i + if matches!(a.as_str(), "--profile" | "--v1" | "--raw" | "--smooth") || a.starts_with("--sort") { 1 } else { 2 });
         }
         if cmd.is_empty() { die(USAGE); }
         o.query = qry;

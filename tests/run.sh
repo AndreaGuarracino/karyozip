@@ -679,6 +679,10 @@ mkdir -p "$W/good"; $KT decompress --db "$D/db.features.tsv" --out-dir "$W/good"
 cp "$W/f.kt" "$W/fbad.kt"; sz=$(stat -c%s "$W/fbad.kt"); printf '\xff' | dd of="$W/fbad.kt" bs=1 seek=$((sz-100)) conv=notrunc status=none
 $KT decompress --db "$D/db.features.tsv" --out-dir "$W/good" -i "$W/fbad.kt" >/dev/null 2>&1 && { echo "decompress of a damaged db track: EXIT 0"; fail=1; }
 [ "$(cat "$W/good"/*.bed | md5sum)" = "$m1" ] && [ -z "$(ls "$W/good" | grep tmp)" ] && ok "failed decompress --db: previous output intact, no temporaries" || no "failed decompress --db: OUTPUT DAMAGED"
+mkdir -p "$W/oo"; echo old > "$W/oo/k.kt"; $KT compress -i "$W/nonexist" -o "$W/oo/k.kt" >/dev/null 2>&1 || :
+$KT decompress -i "$W/fbad.kt" -o "$W/oo/k.kt" >/dev/null 2>&1 || :; $KT compress -i "$W/nonexist" -o "$W/oo/n.kt" >/dev/null 2>&1 || :
+[ "$(cat "$W/oo/k.kt")" = old ] && [ "$(ls "$W/oo")" = k.kt ] && ok "failed -o: previous file intact, no temporaries" || no "failed -o: OUTPUT DAMAGED"
+$KT decompress -i "$W/nx.kt" -o "$W/oo/k.kt" >/dev/null 2>&1 || :; [ "$(ls "$W/oo")" = k.kt ] && [ -s "$W/oo/k.kt" ] && ok "-o over an old file: replaced" || no "-o over an old file: WRONG"
 
 # round 27 findings, one case each
 printf 'r0\nr1\nr2\nr3\n' > "$W/pn.txt"

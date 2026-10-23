@@ -50,7 +50,6 @@ unsafe extern "C" {
 /// which is what the C does. SIGXFSZ is 25 on Linux, the only target this
 /// tree builds for: the reader already reads /proc.
 pub fn ignore_sigxfsz() {
-    unsafe extern "C" { fn signal(sig: c_int, handler: usize) -> usize; }
     // SAFETY: SIG_IGN is 1, and signal takes no argument we own.
     unsafe { signal(25, 1); }
 }
@@ -305,13 +304,64 @@ pub fn tok_decode(src: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
-unsafe extern "C" { fn dup2(a: i32, b: i32) -> i32; }
+unsafe extern "C" {
+    fn dup2(a: i32, b: i32) -> i32;
+    fn close(fd: i32) -> i32;
+    fn unlink(p: *const c_char) -> i32;
+    fn _exit(c: i32) -> !;
+    fn signal(sig: c_int, handler: usize) -> usize;
+}
 
-/// -i and -o: the file takes the place of stdin or stdout
+/// -o's temporary name and the final one, as the C's OUTTMP and OUTFIN.
+/// The signal handler reads the leaked C string, never the mutex.
+static OUT: std::sync::Mutex<Option<(std::ffi::CString, String)>> = std::sync::Mutex::new(None);
+static OUTSIG: std::sync::atomic::AtomicPtr<c_char> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+extern "C" fn outsig(_: c_int) {
+    let p = OUTSIG.load(std::sync::atomic::Ordering::SeqCst);
+    // SAFETY: unlink and _exit are async-signal-safe; p is a leaked CString.
+    unsafe { if !p.is_null() { unlink(p); } _exit(1) }
+}
+
+/// Removes -o's temporary file, on any failure.
+pub fn drop_out() {
+    OUTSIG.store(std::ptr::null_mut(), std::sync::atomic::Ordering::SeqCst);
+    if let Ok(mut o) = OUT.lock() { if let Some((t, _)) = o.take() { unsafe { unlink(t.as_ptr()); } } }
+}
+
+/// On success: -o's temporary file renamed into place.
+pub fn commit_out() {
+    use std::io::Write;
+    let Some((t, fin)) = OUT.lock().ok().and_then(|mut o| o.take()) else { return };
+    OUTSIG.store(std::ptr::null_mut(), std::sync::atomic::Ordering::SeqCst);
+    let tp = t.to_string_lossy().into_owned();   // made from a &str
+    // NFS reports some errors only at close
+    if std::io::stdout().flush().is_err() || unsafe { close(1) } != 0 {
+        let _ = std::fs::remove_file(&tp); crate::bail("write failed");
+    }
+    if std::fs::rename(&tp, &fin).is_err() { let _ = std::fs::remove_file(&tp); crate::bail(&format!("cannot rename into {fin}")) }
+}
+
+/// -i and -o: the file takes the place of stdin or stdout. -o to a regular
+/// file is written under a temporary name, renamed in by `commit_out`; a
+/// device or a FIFO is written in place.
 pub fn redirect(path: &str, fd: i32) {
-    use std::os::{fd::AsRawFd, unix::fs::OpenOptionsExt};
-    let f = if fd == 0 { std::fs::File::open(path) }
-            else { std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o644).open(path) };
+    use std::os::{fd::AsRawFd, unix::fs::{OpenOptionsExt, PermissionsExt}};
+    let old = std::fs::symlink_metadata(path).ok();
+    let mut f = None;
+    if fd == 1 && old.as_ref().is_none_or(|m| m.file_type().is_file()) {
+        let t = format!("{path}.tmp.{}", std::process::id());
+        if let Ok(h) = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o644).open(&t) {
+            if let Some(m) = &old { let _ = h.set_permissions(std::fs::Permissions::from_mode(m.permissions().mode() & 0o7777)); }
+            let c = std::ffi::CString::new(t).unwrap_or_else(|_| crate::bail("cannot open the output"));
+            OUTSIG.store(c.clone().into_raw(), std::sync::atomic::Ordering::SeqCst);
+            *OUT.lock().unwrap() = Some((c, path.to_string()));
+            // SAFETY: outsig only unlinks and exits.
+            unsafe { for s in [1, 2, 15] { signal(s, outsig as extern "C" fn(c_int) as usize); } }
+            f = Some(Ok(h));
+        }
+    }
+    let f = f.unwrap_or_else(|| if fd == 0 { std::fs::File::open(path) }
+            else { std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o644).open(path) });
     if !f.is_ok_and(|f| unsafe { dup2(f.as_raw_fd(), fd) } >= 0) { crate::bail(&format!("cannot open {path}")) }
 }
 

@@ -164,6 +164,7 @@ fn main() {
             aln::pack(&a, dest, rh);
         }
     }
+    ffi::commit_out();
     prof::dump();
 }
 

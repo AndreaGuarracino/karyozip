@@ -4574,10 +4574,13 @@ static void refwin(rcon *rc, uint64_t tpos, size_t *lo, size_t *hi, uint64_t *we
 
 static char out[1 << 22];
 static size_t eo = 0;
+/* -o's temporary name, set by redirect */
+static char *OUTTMP; static const char *OUTFIN;
+static void outclean(void) { if (OUTTMP) { unlink(OUTTMP); OUTTMP = NULL; } }
 static void emitflush(void) {   /* runs from atexit: die would recurse */
-    if (eo && fwrite(out, 1, eo, stdout) != eo) { fprintf(stderr, "karyozip: write failed\n"); _exit(1); }
+    if (eo && fwrite(out, 1, eo, stdout) != eo) { fprintf(stderr, "karyozip: write failed\n"); outclean(); _exit(1); }
     eo = 0;
-    if (fflush(stdout)) { fprintf(stderr, "karyozip: write failed\n"); _exit(1); }
+    if (fflush(stdout)) { fprintf(stderr, "karyozip: write failed\n"); outclean(); _exit(1); }
 }
 
 /* One row emitter. With a FILE it flushes a fixed buffer and can write a
@@ -4989,7 +4992,7 @@ static void owput(ow *w, const char *nm, size_t nl, uint64_t a, uint64_t b,
 
 static char **DBTMP; static size_t ndbtmp;
 static void dbtmpclean(void) { for (size_t i = 0; i < ndbtmp; i++) if (DBTMP[i]) remove(DBTMP[i]); }
-static void dbtmpsig(int s) { dbtmpclean(); (void)s; _exit(1); }   /* atexit does not run on a signal */
+static void dbtmpsig(int s) { dbtmpclean(); outclean(); (void)s; _exit(1); }   /* atexit does not run on a signal */
 
 /* --out-dir DIR: one staged BED a selected set, DBTMP[i] for SETK[i] */
 static void stage_open(const char *dir) {
@@ -5169,14 +5172,39 @@ static const char *regparse(char *r, uint64_t *lo, uint64_t *hi) {
     return r;
 }
 
+/* -o to a regular file: written under a temporary name, renamed in on
+   success, removed on failure; a device or a FIFO is written in place */
+static void outsig(int s) { outclean(); dbtmpclean(); (void)s; _exit(1); }
+static void outcommit(void) {
+    if (!OUTTMP) return;
+    emitflush();
+    if (close(1)) { fprintf(stderr, "karyozip: write failed\n"); exit(1); }   /* NFS reports some errors only here */
+    if (rename(OUTTMP, OUTFIN)) { fprintf(stderr, "karyozip: cannot rename into %s\n", OUTFIN); exit(1); }
+    free(OUTTMP); OUTTMP = NULL;
+}
+
 /* -i and -o: the file takes the place of stdin or stdout */
 static void redirect(const char *path, int fd) {
-    int f = fd ? open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644) : open(path, O_RDONLY);
+    struct stat st; int f, ex = !lstat(path, &st);
+    if (fd && (!ex || S_ISREG(st.st_mode)) && asprintf(&OUTTMP, "%s.tmp.XXXXXX", path) >= 0) {
+        mode_t um = umask(0); umask(um);
+        f = mkstemp(OUTTMP);
+        if (f < 0) { free(OUTTMP); OUTTMP = NULL; }
+        else {
+            (void)!fchmod(f, ex ? st.st_mode & 07777 : 0644 & ~um);   /* as a plain create, or the old file's */
+            OUTFIN = path; atexit(outclean);
+            signal(SIGINT, outsig); signal(SIGTERM, outsig); signal(SIGHUP, outsig);
+        }
+    } else f = -1;
+    if (f < 0) f = fd ? open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644) : open(path, O_RDONLY);
     if (f < 0 || dup2(f, fd) < 0) { fprintf(stderr, "karyozip: cannot open %s\n", path); exit(1); }
     close(f);
 }
 
-int main(int argc, char **argv) {
+static int kzmain(int argc, char **argv);
+int main(int argc, char **argv) { int rc = kzmain(argc, argv); if (!rc) outcommit(); return rc; }
+
+static int kzmain(int argc, char **argv) {
     /* glibc raises its mmap threshold to the first large mapped chunk it
        frees, after which every big buffer comes from a per-thread heap and
        stays resident: 113 MB against 57 on one -e high encode. Pin it. */

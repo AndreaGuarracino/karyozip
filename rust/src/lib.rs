@@ -14,6 +14,7 @@ pub mod writer;
 pub fn bail(msg: &str) -> ! {
     eprintln!("karyozip: {msg}");
     db::drop_tmp();
+    ffi::drop_out();
     prof::dump();
     std::process::exit(1);
 }

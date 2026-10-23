@@ -5190,7 +5190,7 @@ int main(int argc, char **argv) {
             "                      [-d features.tsv [--hier H] -i SET.bed ...] [-a P.paf --ref R.bed|R.kst]\n"
             "  karyozip decompress -i F [-o OUT.bed] [-n FILE] [-d features.tsv [--set A,B] [--out-dir DIR]]\n"
             "  karyozip query      -i F -r NAME[:START-END] [-o OUT.bed] [-n FILE]\n"
-            "  karyozip index      -i F        writes F.kzi, which makes query by name fast on many reads\n"
+            "  karyozip index      -i F        writes F.kzi, which makes query fast on tracks with many reads\n"
             "  compress reads stdin without -i; decompress and query write stdout without -o\n"
             "  -e, --effort: low is quick and fast to query, medium the default, high the smallest file\n"
             "  -r NAME:START-END is BED, 0-based, END excluded; -r NAME alone is the whole sequence\n"

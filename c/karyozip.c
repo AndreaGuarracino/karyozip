@@ -5192,6 +5192,13 @@ static const char *inferset(const char *hier, R *r) {
     return NULL;
 }
 
+/* a fresh hierarchy for the next set: the tables are per set */
+static void hierreset(void) {
+    for (int i = 0; i < NNODE; i++) free(NODE[i]);
+    NNODE = 0; ROOTID = -1;
+    free(ANC); ANC = NULL; free(LCA); LCA = NULL; free(isnovel); isnovel = NULL;
+}
+
 static void smoothcmd(const char *path, const char *hier, const char *fs,
                       const char *seq, uint64_t lo, uint64_t hi, int v1) {
     R *r = ropen_informed(path);
@@ -5435,6 +5442,74 @@ static char **DBTMP; static size_t ndbtmp;
 static void dbtmpclean(void) { for (size_t i = 0; i < ndbtmp; i++) if (DBTMP[i]) remove(DBTMP[i]); }
 static void dbtmpsig(int s) { dbtmpclean(); (void)s; _exit(1); }   /* atexit does not run on a signal */
 
+/* --out-dir DIR: one staged BED a selected set, DBTMP[i] for SETK[i] */
+static void stage_open(const char *dir) {
+    char pb[4096];
+    char *d = xstrdup(dir);                     /* mkdir -p, as the Rust does */
+    for (char *q = d + 1; ; q++) if (*q == '/' || !*q) {
+        char c = *q; *q = 0;
+        if (mkdir(d, 0777) && errno != EEXIST) die("cannot create the output directory");
+        *q = c; if (!c) break;
+    }
+    free(d);
+    for (size_t i = 0; i < NSETK; i++) {
+        struct stat ts; int pn = snprintf(pb, sizeof pb, "%s/%s.bed", dir, fset[SETK[i]]);
+        if (pn < 0 || (size_t)pn >= sizeof pb - 16) die("--out-dir: the output path is too long");
+        if (!lstat(pb, &ts) && !S_ISREG(ts.st_mode)) die("--out-dir: a set's BED exists and is not a regular file");
+    }
+    DBTMP = xcalloc(NSETK, sizeof *DBTMP); ndbtmp = NSETK; atexit(dbtmpclean);
+    signal(SIGINT, dbtmpsig); signal(SIGTERM, dbtmpsig); signal(SIGHUP, dbtmpsig);
+    for (size_t i = 0; i < NSETK; i++) {
+        int pn = snprintf(pb, sizeof pb, "%s/%s.bed.tmp.%d", dir, fset[SETK[i]], (int)getpid());
+        if (pn < 0 || (size_t)pn >= sizeof pb - 16) die("--out-dir: the output path is too long");
+        DBTMP[i] = xstrdup(pb);
+    }
+}
+/* the staged BEDs swapped in together, the old ones restored on a failure */
+static void stage_swap(const char *dir) {
+    char pb[4096];
+    char **old = xcalloc(NSETK, sizeof *old); size_t nmv = 0; int bad = 0;
+    for (size_t j = 0; j < NSETK && !bad; j++) {
+        snprintf(pb, sizeof pb, "%s/%s.bed", dir, fset[SETK[j]]);
+        char *o2; if (asprintf(&o2, "%s/%s.bed.old.%d", dir, fset[SETK[j]], (int)getpid()) < 0) die("oom");
+        if (!rename(pb, o2)) { old[j] = o2; } else { free(o2); if (errno != ENOENT) bad = 1; }
+    }
+    for (size_t j = 0; j < NSETK && !bad; j++) {
+        snprintf(pb, sizeof pb, "%s/%s.bed", dir, fset[SETK[j]]);
+        if (rename(DBTMP[j], pb)) bad = 1; else { free(DBTMP[j]); DBTMP[j] = NULL; nmv++; }
+    }
+    if (bad) {
+        for (size_t j = 0; j < nmv; j++) {   /* take the new ones back out */
+            snprintf(pb, sizeof pb, "%s/%s.bed", dir, fset[SETK[j]]);
+            if (asprintf(&DBTMP[j], "%s/%s.bed.tmp.%d", dir, fset[SETK[j]], (int)getpid()) >= 0)
+                (void)!rename(pb, DBTMP[j]);
+        }
+        for (size_t j = 0; j < NSETK; j++) if (old[j]) {
+            snprintf(pb, sizeof pb, "%s/%s.bed", dir, fset[SETK[j]]);
+            (void)!rename(old[j], pb); free(old[j]);
+        }
+        free(old); die("cannot rename a derived BED into place");
+    }
+    for (size_t j = 0; j < NSETK; j++) if (old[j]) { remove(old[j]); free(old[j]); }
+    free(old);
+}
+
+/* --smooth --out-dir DIR on a -d track: every --set smoothed into DIR/SET.bed */
+static void smoothsets(const char *path, const char *hier, int v1, const char *dir) {
+    stage_open(dir);
+    for (size_t i = 0; i < NSETK; i++) {
+        fflush(stdout);
+        int fd = open(DBTMP[i], O_WRONLY | O_CREAT | O_TRUNC, 0666);
+        if (fd < 0 || dup2(fd, 1) < 0) die("cannot write a derived BED");
+        close(fd);
+        if (i) hierreset();
+        smoothcmd(path, hier, fset[SETK[i]], NULL, 0, 0, v1);
+        emitflush();   /* the rows emit holds go to this set's file */
+    }
+    stage_swap(dir);
+    fprintf(stderr, "db: %zu smoothed tracks under %s\n", NSETK, dir);
+}
+
 static void decode_db(const char *path, const char *dir) {
     /* --out-dir DIR: one BED per selected set, staged then swapped in together.
        No --out-dir: the selected columns, tab-joined, merged where they all
@@ -5448,28 +5523,11 @@ static void decode_db(const char *path, const char *dir) {
     const char *cseq = NULL; size_t cseqn = 0;
     R *r = ropen_informed(path);
     ensurenames(r);
-    char pb[4096];
     if (tostd) { o[0].f = stdout; o[0].cap = 1 << 20; o[0].b = xmalloc(o[0].cap); }
     else {
-        char *d = xstrdup(dir);                     /* mkdir -p, as the Rust does */
-        for (char *q = d + 1; ; q++) if (*q == '/' || !*q) {
-            char c = *q; *q = 0;
-            if (mkdir(d, 0777) && errno != EEXIST) die("cannot create the output directory");
-            *q = c; if (!c) break;
-        }
-        free(d);
+        stage_open(dir);
         for (size_t i = 0; i < NSETK; i++) {
-            struct stat ts; int pn = snprintf(pb, sizeof pb, "%s/%s.bed", dir, fset[SETK[i]]);
-            if (pn < 0 || (size_t)pn >= sizeof pb - 16) die("--out-dir: the output path is too long");
-            if (!lstat(pb, &ts) && !S_ISREG(ts.st_mode)) die("--out-dir: a set's BED exists and is not a regular file");
-        }
-        DBTMP = xcalloc(NSETK, sizeof *DBTMP); ndbtmp = NSETK; atexit(dbtmpclean);
-        signal(SIGINT, dbtmpsig); signal(SIGTERM, dbtmpsig); signal(SIGHUP, dbtmpsig);
-        for (size_t i = 0; i < NSETK; i++) {
-            int pn = snprintf(pb, sizeof pb, "%s/%s.bed.tmp.%d", dir, fset[SETK[i]], (int)getpid());
-            if (pn < 0 || (size_t)pn >= sizeof pb - 16) die("--out-dir: the output path is too long");
-            DBTMP[i] = xstrdup(pb);
-            o[i].f = fopen(pb, "w");
+            o[i].f = fopen(DBTMP[i], "w");
             if (!o[i].f) die("cannot write a derived BED");
             o[i].cap = 1 << 20;
             o[i].b = xmalloc(o[i].cap);
@@ -5541,30 +5599,7 @@ static void decode_db(const char *path, const char *dir) {
     free(jb[0]); free(jb[1]); free(fidof);
     if (tostd) fprintf(stderr, "db: %llu rows, %zu sets on stdout\n", (unsigned long long)rows, NSETK);
     else {
-        char **old = xcalloc(NSETK, sizeof *old); size_t nmv = 0; int bad = 0;
-        for (size_t j = 0; j < NSETK && !bad; j++) {
-            snprintf(pb, sizeof pb, "%s/%s.bed", dir, fset[SETK[j]]);
-            char *o2; if (asprintf(&o2, "%s/%s.bed.old.%d", dir, fset[SETK[j]], (int)getpid()) < 0) die("oom");
-            if (!rename(pb, o2)) { old[j] = o2; } else { free(o2); if (errno != ENOENT) bad = 1; }
-        }
-        for (size_t j = 0; j < NSETK && !bad; j++) {
-            snprintf(pb, sizeof pb, "%s/%s.bed", dir, fset[SETK[j]]);
-            if (rename(DBTMP[j], pb)) bad = 1; else { free(DBTMP[j]); DBTMP[j] = NULL; nmv++; }
-        }
-        if (bad) {
-            for (size_t j = 0; j < nmv; j++) {   /* take the new ones back out */
-                snprintf(pb, sizeof pb, "%s/%s.bed", dir, fset[SETK[j]]);
-                if (asprintf(&DBTMP[j], "%s/%s.bed.tmp.%d", dir, fset[SETK[j]], (int)getpid()) >= 0)
-                    (void)!rename(pb, DBTMP[j]);
-            }
-            for (size_t j = 0; j < NSETK; j++) if (old[j]) {
-                snprintf(pb, sizeof pb, "%s/%s.bed", dir, fset[SETK[j]]);
-                (void)!rename(old[j], pb); free(old[j]);
-            }
-            free(old); die("cannot rename a derived BED into place");
-        }
-        for (size_t j = 0; j < NSETK; j++) if (old[j]) { remove(old[j]); free(old[j]); }
-        free(old);
+        stage_swap(dir);
         fprintf(stderr, "db: %llu rows into %zu tracks under %s\n", (unsigned long long)rows, NSETK, dir);
     }
     free(o); free(c0); free(c1); free(cl); free(cll); rclose(r);
@@ -5615,7 +5650,8 @@ int main(int argc, char **argv) {
             "               --v1 for tracks of KaryoScope 1.x, --chunk 20000 for those before 2026-01-08\n"
             "  readers take -n, -d, --hier, -a, --ref as compress was given; -n FILE takes the names\n"
             "               from drop:FILE, a FASTA, FASTQ or list\n"
-            "  -d: --set A,B picks feature sets, default all; without --out-dir they print as columns\n"
+            "  -d: --set A,B picks feature sets, default all; without --out-dir they print as columns;\n"
+            "               with --smooth, one set on stdout, or every picked set under --out-dir\n"
             "  any command: -t N, --threads N  --tmp-dir DIR  -h, --help  --version\n"
             "  long forms:  -i --input  -o --output  -r --region  -e --effort  -n --names  -d --db  -a --aln\n"
             "advanced:\n"
@@ -5716,7 +5752,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--hier")) { ok = inf; HIERA = v; take = 2; }
         else if (!strcmp(a, "--aln")) { ok = inf || pack; ALNPAF = v; take = 2; }
         else if (!strcmp(a, "--ref")) { ok = inf || pack; ALNREF = v; take = 2; }
-        else if (!strcmp(a, "--out-dir")) { ok = dec; OUTDIR = v; take = 2; }
+        else if (!strcmp(a, "--out-dir")) { ok = dec || (sm && !qry); OUTDIR = v; take = 2; }
         else if (!strcmp(a, "--input")) { ok = !pack;
             if (NIN == 64) die("too many input files");
             INS[NIN++] = v; take = 2; }
@@ -5797,7 +5833,15 @@ int main(int argc, char **argv) {
     }
     else if (!strcmp(cmd, "index")) { INDEXING = 1; buildindex(INS[0]); }
     else if (sm) {
-        if (!FSA && DBFEATS) die("--smooth of a -d track needs --set SET");
+        if (OUTDIR && !DBFEATS) die("--out-dir needs --db");
+        if (OUTDIR) {   /* every set, or those --set names, one BED each */
+            if (!HIERA) die("--smooth needs --hier HIER");
+            SETNAME = FSA;
+            loadinformed("decompress ");
+            smoothsets(INS[0], HIERA, V1, OUTDIR);
+            return 0;
+        }
+        if (!FSA && DBFEATS) die("--smooth of a -d track prints one set: give --set SET, or --out-dir DIR for every set");
         if (FSA && strchr(FSA, ',')) die("--smooth smooths one set: give one name to --set");
         if (!HIERA) die("--smooth needs --hier HIER");
         uint64_t slo = 0, shi = 0; const char *nm = REGA ? regparse(REGA, &slo, &shi) : NULL;

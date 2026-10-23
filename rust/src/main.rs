@@ -137,7 +137,25 @@ fn main() {
         Cmd::Smooth => {
             let track = track();
             let fs = c.feature_set.as_deref();
-            if fs.is_none() && c.db.is_some() { die("--smooth of a -d track needs --set SET"); }
+            if c.out.is_some() && c.db.is_none() { die("--out-dir needs --db"); }
+            if let Some(dir) = c.out.as_deref() {   // every set, or those --set names, one BED each
+                let Some(hier) = c.hier.as_deref() else { die("--smooth needs --hier HIER") };
+                let maxgap = num(&c.max_gap, 0, u64::MAX, "--max-gap needs a number").unwrap_or(1000);
+                let smchunk = cnt(&c.chunk, 1, 1000000000, "--chunk is a number of runs, 1 to 1000000000").unwrap_or(0) as usize;
+                let feats = informed(&c, &mut ro, "decompress ", Some(hier), aln::Lazy::Contig).unwrap();
+                let sets: Vec<Vec<u8>> = feats.setcols(fs).iter().map(|&k| feats.sets[k].clone()).collect();
+                let sr: Vec<&[u8]> = sets.iter().map(|s| s.as_slice()).collect();
+                let tmps = db::stage_open(dir, &sr);
+                for (s, t) in sr.iter().zip(&tmps) {
+                    let mut o = BufWriter::new(std::fs::File::create(t).unwrap_or_else(|_| die("cannot write a derived BED")));
+                    smooth::run(track, hier, Some(s), None, 0, 0, c.v1, maxgap, smchunk, &ro, Some(&feats), &mut o);
+                    o.flush().unwrap_or_else(|_| die("write failed"));
+                }
+                db::stage_done(dir, &sr, &tmps);
+                eprintln!("db: {} smoothed tracks under {dir}", sr.len());
+                return;
+            }
+            if fs.is_none() && c.db.is_some() { die("--smooth of a -d track prints one set: give --set SET, or --out-dir DIR for every set"); }
             if fs.is_some_and(|f| f.contains(',')) { die("--smooth smooths one set: give one name to --set"); }
             let Some(hier) = c.hier.as_deref() else { die("--smooth needs --hier HIER") };
             let maxgap = num(&c.max_gap, 0, u64::MAX, "--max-gap needs a number").unwrap_or(1000);
@@ -574,7 +592,7 @@ impl Cli {
                 "--hier" => { o.hier = Some(val()); inf }
                 "--aln" => { o.aln = Some(val()); inf || pack }
                 "--ref" => { o.refbed = Some(val()); inf || pack }
-                "--out-dir" => { o.out = Some(val()); dec }
+                "--out-dir" => { o.out = Some(val()); dec || (sm && !qry) }
                 "--input" => { o.input.push(val()); !pack }
                 "--output" => { o.output = Some(val()); c != "index" }
                 "--region" => { o.region = Some(val()); qry }

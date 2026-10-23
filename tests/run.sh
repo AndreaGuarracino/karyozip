@@ -200,6 +200,14 @@ must_fail "--set without --db" $KT --set gene decompress -i "$W/pa.kt"
 must_fail "--set not in features.tsv" $KT --db "$D/db.features.tsv" --set gene,nosuch decompress -i "$W/f.kt"
 must_fail "--set names a set twice" $KT --db "$D/db.features.tsv" --set gene,gene decompress -i "$W/f.kt"
 must_fail "--set all with a name" $KT --db "$D/db.features.tsv" --set all,gene decompress -i "$W/f.kt"
+{ printf 'feature_set\tchild\tparent\n'; for s in $(head -1 "$D/db.features.tsv" | cut -f2-); do cut -f4 "$D/db.$s.bed" | sort -u | grep -vx novel | sed "s/^/$s\t/; s/\$/\tcategorized/"; done; } > "$W/full.tsv"
+rm -rf "$W/sod"; $KT --db "$D/db.features.tsv" decompress -i "$W/f.kt" --hier "$W/full.tsv" --smooth --out-dir "$W/sod" 2>/dev/null; sok=1
+for s in $(head -1 "$D/db.features.tsv" | cut -f2-); do [ -s "$W/sod/$s.bed" ] || sok=0
+  $KT --db "$D/db.features.tsv" decompress -i "$W/f.kt" --hier "$W/full.tsv" --smooth --set $s 2>/dev/null | cmp -s - "$W/sod/$s.bed" || sok=0; done
+[ $sok = 1 ] && ok "--smooth --out-dir: every set, each as --set gives it" || no "--smooth --out-dir: WRONG"
+must_fail "--smooth of a -d track, no --set nor --out-dir" $KT --db "$D/db.features.tsv" decompress -i "$W/hv.kt" --hier "$W/hv.tsv" --smooth
+must_fail "--smooth --out-dir without --db" $KT decompress -i "$W/p.kt" --hier "$W/inf.tsv" --smooth --out-dir "$W/sod2"
+must_fail "query --smooth --out-dir" $KT --db "$D/db.features.tsv" query -i "$W/hv.kt" -r x --hier "$W/hv.tsv" --smooth --out-dir "$W/sod2"
 must_fail "--smooth with two sets" $KT --db "$D/db.features.tsv" decompress -i "$W/f.kt" --hier "$W/inf.tsv" --smooth --set gene,acrocentric
 must_fail "--smooth with no --set" $KT decompress -i "$W/f.kt" --hier "$W/inf.tsv" --smooth
 must_fail "decompress an --aln track without --aln" $KT decompress -i "$W/d.kt" --hier "$W/inf.tsv" --smooth --set acrocentric

@@ -144,6 +144,11 @@ else echo "--db decompress: DIFFERS"; fail=1; fi
 awk -F'\t' 'NR==5{$4="repeat"} {print}' OFS='\t' "$D/db.repeat.bed" > "$W/hv.repeat.bed"
 HV=${DB/$D\/db.repeat.bed/$W\/hv.repeat.bed}
 both "--db --hier" compress --db "$D/db.features.tsv" --hier "$W/hv.tsv" $HV; cp "$W/c.out" "$W/hv.kst"
+{ printf 'feature_set\tchild\tparent\n'; for s in $(head -1 "$D/db.features.tsv" | cut -f2-); do cut -f4 "$D/db.$s.bed" | sort -u | grep -vx novel | sed "s/^/$s\t/; s/\$/\tcategorized/"; done; } > "$W/full.tsv"
+"$C" --db "$D/db.features.tsv" compress $DB > "$W/fd.kst" 2>/dev/null
+both "--db decompress --smooth --out-dir" --db "$D/db.features.tsv" --hier "$W/full.tsv" decompress -i "$W/fd.kst" --smooth --out-dir "$W/sod"
+both "--db decompress --smooth --set gene,repeat --out-dir" --db "$D/db.features.tsv" --hier "$W/full.tsv" decompress -i "$W/fd.kst" --smooth --set gene,repeat --out-dir "$W/sod1"
+EXPECT=fail both "--db --hier decompress --smooth --out-dir, a set not in the hierarchy" --db "$D/db.features.tsv" --hier "$W/hv.tsv" decompress -i "$W/hv.kst" --smooth --out-dir "$W/sod2"; EXPECT=ok
 both "--db --hier decompress" --db "$D/db.features.tsv" --hier "$W/hv.tsv" --set repeat decompress -i "$W/hv.kst"; tally "--db --hier"
 dn=0
 for b in $DB; do [ "$b" = -i ] && continue;

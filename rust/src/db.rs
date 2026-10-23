@@ -347,24 +347,13 @@ pub fn drop_tmp() {
 /// together. Without: the picked columns, tab-joined, merged where they all
 /// agree, on stdout; one set gives that set's own track.
 pub fn decode(r: &mut crate::reader::Reader, feats: &Feats, dir: Option<&str>, cols: &[usize]) {
-    let pid = std::process::id();
     let sets: Vec<&[u8]> = cols.iter().map(|&k| feats.sets[k].as_slice()).collect();
     let mut tmps: Vec<std::path::PathBuf> = Vec::new();
     // each output its own 1 MB row buffer, written whole, as the C's ow:
     // a row through a BufWriter was a third copy and a virtual call a row
     let mut out: Vec<(Box<dyn Write>, Vec<u8>)> = Vec::new();
     if let Some(dir) = dir {
-        std::fs::create_dir_all(dir).unwrap_or_else(|_| crate::bail("cannot create the output directory"));
-        for s in &sets {
-            let p = setpath(dir, s, ".bed");
-            if p.as_os_str().len() + 16 >= 4096 { crate::bail("--out-dir: the output path is too long"); }
-            if let Ok(m) = std::fs::symlink_metadata(&p) {
-                if !m.is_file() { crate::bail("--out-dir: a set's BED exists and is not a regular file"); }
-            }
-        }
-        // Write beside the old BEDs, then swap them in together.
-        tmps = sets.iter().map(|s| setpath(dir, s, &format!(".bed.tmp.{pid}"))).collect();
-        *TMP.lock().unwrap() = tmps.clone();
+        tmps = stage_open(dir, &sets);
         out = tmps.iter().map(|p| (Box::new(std::fs::File::create(p)
                 .unwrap_or_else(|_| crate::bail("cannot write a derived BED"))) as Box<dyn Write>, Vec::with_capacity(OCAP))).collect();
     } else {
@@ -419,9 +408,7 @@ pub fn decode(r: &mut crate::reader::Reader, feats: &Feats, dir: Option<&str>, c
     match dir {
         None => eprintln!("db: {rows} rows, {} sets on stdout", cols.len()),
         Some(dir) => {
-            let owned: Vec<Vec<u8>> = sets.iter().map(|s| s.to_vec()).collect();
-            swap_in(dir, &owned, &tmps);
-            TMP.lock().unwrap().clear();
+            stage_done(dir, &sets, &tmps);
             eprintln!("db: {rows} rows into {n} tracks under {dir}");
         }
     }
@@ -436,6 +423,29 @@ fn wr(o: &mut (Box<dyn Write>, Vec<u8>), seq: &[u8], st: u64, en: u64, lab: &[u8
         v.clear();
     }
     crate::kst::put_row(v, seq, st, en, lab);
+}
+
+/// --out-dir DIR: one staged BED a set, beside the old ones, as the C's stage_open.
+pub fn stage_open(dir: &str, sets: &[&[u8]]) -> Vec<std::path::PathBuf> {
+    std::fs::create_dir_all(dir).unwrap_or_else(|_| crate::bail("cannot create the output directory"));
+    for s in sets {
+        let p = setpath(dir, s, ".bed");
+        if p.as_os_str().len() + 16 >= 4096 { crate::bail("--out-dir: the output path is too long"); }
+        if let Ok(m) = std::fs::symlink_metadata(&p) {
+            if !m.is_file() { crate::bail("--out-dir: a set's BED exists and is not a regular file"); }
+        }
+    }
+    let pid = std::process::id();
+    let tmps: Vec<std::path::PathBuf> = sets.iter().map(|s| setpath(dir, s, &format!(".bed.tmp.{pid}"))).collect();
+    *TMP.lock().unwrap() = tmps.clone();
+    tmps
+}
+
+/// The staged BEDs swapped in together, as the C's stage_swap.
+pub fn stage_done(dir: &str, sets: &[&[u8]], tmps: &[std::path::PathBuf]) {
+    let owned: Vec<Vec<u8>> = sets.iter().map(|s| s.to_vec()).collect();
+    swap_in(dir, &owned, tmps);
+    TMP.lock().unwrap().clear();
 }
 
 /// Move every staged BED into place, or put back what was there.

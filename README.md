@@ -55,6 +55,7 @@ A KaryoScope run writes one BED per feature set, presmoothed and smoothed.
 karyozip compress   -d features.tsv -i s.acrocentric.bed.gz -i s.chromosome.bed.gz ... -o s.all.kst
 karyozip decompress -d features.tsv -i s.all.kst --out-dir DIR      # every set's BED back
 karyozip decompress -d features.tsv -i s.all.kst --set gene         # one set
+karyozip decompress -d features.tsv -i s.all.kst --smooth --hier hierarchy.tsv --out-dir DIR   # every set smoothed, one BED each
 ```
 
 - **Against a reference.** With the reads aligned to a reference (a PAF) and the reference's own track, `-a P.paf --ref ref.bed` stores only what differs from the reference. Every read of such a file takes the same `-a` and `--ref`. Give `--ref` as a `.kst` track (`compress -e low`) for queries: a point query on the whole CHM13 reference takes 0.10 s against 13.0 s from the BED.

@@ -67,8 +67,7 @@ Read names are stored in the file by default.
 | flag | effect |
 |---|---|
 | `-n drop` | store none; the file is smaller, and every read of it needs `-n F` |
-| `-n drop:F` | write the names to `F` beside the track |
-| `-n F` | on decompress and query: take names from `F`, a `drop:F` file, a FASTA, a FASTQ or a list, one a line |
+| `-n F` | on decompress and query: take names from `F`, a FASTA, a FASTQ or a list, one a line |
 
 ## All flags
 
@@ -97,7 +96,6 @@ Flags work on either side of the command name. The readers are decompress and qu
 | command or flag | on | effect |
 |---|---|---|
 | `aln-pack -a P.paf --ref R -o OUT` | | cuts a PAF to what `-a` reads, for many tracks against one alignment |
-| `--sort`, `--sort=MEM` | compress | group records by labels, which pays on short reads with `-n drop`; spill to disk past `MEM`; decompress returns that order |
 | `--aln-names F` | compress, readers | with `-a`: read N is line N+1 of `F` |
 | `--max-gap N` | `--smooth` | KaryoScope's gap bound, 1000 by default |
 

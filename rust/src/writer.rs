@@ -4,11 +4,11 @@
 //! the same bytes.
 
 use crate::ffi;
-use crate::kst::{self, FNV0, TOKFLAG, INTFLAG, FLDFLAG, DROPPED, ALNFLAG, DBFLAG, SIDEFLAG, LENFLAG,
-                 TAILFLAG, RUNFLAG, ILVFLAG, GRPFLAG, PERMFLAG, PERMTOK, CARTFLAG, ICHUNK};
+use crate::kst::{self, FNV0, TOKFLAG, INTFLAG, FLDFLAG, DROPPED, ALNFLAG, DBFLAG, LENFLAG,
+                 TAILFLAG, RUNFLAG, ILVFLAG, GRPFLAG, CARTFLAG, ICHUNK};
 use rayon::prelude::*;
 use std::collections::HashSet;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Seek, SeekFrom, Write};
 
 pub const MAGIC: &[u8; 8] = b"KST00001";
 const TAILSKIP: usize = 64;
@@ -20,17 +20,12 @@ pub struct Options {
     pub slow: bool,
     pub whole: bool,       // -e high: decide on the whole file
     pub drop_names: bool,
-    pub names_out: Option<String>,
-    pub sort: bool,
-    /// --sort=MEM: bytes held before a spill, 0 for none.
-    pub sortmem: u64,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { block: u64::MAX, level: 17, levelset: false, slow: true, whole: false, sortmem: 0,
-                  drop_names: false, names_out: None,
-                  sort: false }
+        Options { block: u64::MAX, level: 17, levelset: false, slow: true, whole: false,
+                  drop_names: false }
     }
 }
 
@@ -69,20 +64,8 @@ pub struct Writer {
     tailsamp: Vec<u64>,
     tailpred: u64,
     tailon: Option<bool>,
-    /// --sort holds every record until close: (name, runs as (len, label id)).
-    srec: Vec<SRec>,
-    sortbp: u64,
-    natbuf: Vec<u8>,
-    perm_on: bool,
     /// The names sample, ranked during the parse: the winner, the sample's bytes.
     early: Option<std::thread::JoinHandle<(BestNames, usize)>>,
-    /// --sort writes ranks; the PAF still wants the real name.
-    alnname: Option<Vec<u8>>,
-    /// --sort=MEM: the bytes held, the runs already spilled, the next rank.
-    held: u64,
-    spill: Vec<std::fs::File>,
-    natn: u64,
-    natord: bool,
     feathash: Option<u64>,
     /// the input rows as text, stored so the track can serve as --ref
     rowhash: u64,
@@ -124,14 +107,12 @@ impl Writer {
     pub fn aln_hash(&self) -> u64 { self.aln.as_ref().map_or(0, |a| a.hash) }
 
     pub fn new(opt: Options, tmpdir: &std::path::Path) -> std::io::Result<Self> {
-        let perm_on = opt.sort && opt.names_out.is_none();
         Ok(Writer {
-            perm_on, early: None, alnname: None, held: 0, spill: Vec::new(), natn: 0,
-            opt, lens: Vec::new(), ids: Vec::new(), names: Vec::new(), ibx: Vec::new(),
+            early: None, opt, lens: Vec::new(), ids: Vec::new(), names: Vec::new(), ibx: Vec::new(),
             nidx: 0, ordok: true, lt: kst::Intern::default(),
             cur: Vec::new(), currun: 0, curbp: 0, blkbp0: 0, pend: 0, nblk: 0, curblk: 0, curoff: 0, rows: 0,
             plen: 0, pval: 0, phas: false, tailsamp: Vec::new(), tailpred: 0, tailon: None,
-            srec: Vec::new(), sortbp: 0, natbuf: Vec::new(), natord: true, feathash: None, cart: false, rowhash: kst::FNV0, curnh: 0,
+            feathash: None, cart: false, rowhash: kst::FNV0, curnh: 0,
             aln: None, alnq: None, alnhit: 0,
             lalt: [Vec::new(), Vec::new()], rawalt: [Vec::new(), Vec::new()],
             prev_rev: false,
@@ -216,7 +197,7 @@ impl Writer {
         // Late in the input it would only overlap the parse buffers: then
         // the close ranks them. 57 MB is zstd 17's state on a 4 MB sample.
         if self.early.is_none() && !INHALF.load(std::sync::atomic::Ordering::Relaxed)
-           && !self.opt.whole && !self.perm_on && !self.opt.drop_names && self.names.len() >= ncap {
+           && !self.opt.whole && !self.opt.drop_names && self.names.len() >= ncap {
             let (mut q, mut sn) = (0usize, 0u64);
             while q < ncap { q += crate::ffi::find(b'\n', &self.names[q..]).map_or(self.names.len() - q, |k| k + 1); sn += 1; }
             let (copy, level, slow, t) = (self.names[..q].to_vec(), self.opt.level, self.opt.slow, rayon::current_num_threads());
@@ -254,137 +235,6 @@ impl Writer {
         Ok(())
     }
 
-    /// --sort: hold the record; the order is decided at close.
-    fn sortpush(&mut self, name: &[u8], run_len: u64, label: &[u8], start: u64)
-        -> Result<(), String> {
-        if name.is_empty() { return Err("empty sequence name".into()); }
-        if name.len() >= 512 { return Err("name too long".into()); }
-        if run_len == 0 {
-            return Err("end equals start: a run must cover at least one base".into());
-        }
-        if start > u64::MAX - run_len {
-            return Err("a coordinate does not fit in 64 bits".into());
-        }
-        if run_len > 0xffff_ffff { return Err("run longer than 4 GB".into()); }
-        let newrec = start == 0
-            || self.srec.last().is_none_or(|r| r.nm != name);
-        if newrec && start != 0 { return Err("a sequence does not start at 0".into()); }
-        if !newrec && start != self.sortbp {
-            return Err("gap or overlap: start is not the previous end".into());
-        }
-        self.sortbp = if newrec { run_len } else { self.sortbp + run_len };
-        if newrec {
-            if self.perm_on {
-                let want = self.natn.to_string();
-                if self.natord && want.as_bytes() != name { self.natord = false; }
-                self.natbuf.extend_from_slice(name);
-                self.natbuf.push(b'\n');
-            }
-            if self.natn > u32::MAX as u64 { return Err("--sort takes at most 2^32 records".into()); }
-            self.srec.push(SRec { nm: name.to_vec(), runs: Vec::new(), idx: self.natn as u32 });
-            self.natn += 1;
-            self.held += name.len() as u64 + 1 + 24;   // the C's srec
-            // Spill at a record boundary only, holding the one just opened.
-            if self.opt.sortmem > 0 && self.held > self.opt.sortmem {
-                let last = self.srec.pop().unwrap();
-                self.spill_write()?;
-                self.held = last.nm.len() as u64 + 1 + 24;
-                self.srec.push(last);
-            }
-        }
-        let id = self.intern(label);
-        self.held += 8;
-        self.srec.last_mut().unwrap().runs.push((run_len as u32, id));
-        Ok(())
-    }
-
-    /// One sorted run to a temp file: nrun, name length, rank, name, runs.
-    fn spill_write(&mut self) -> Result<(), String> {
-        if self.srec.is_empty() { return Ok(()); }
-        self.srec.sort_by(srec_cmp);
-        let mut f = tmpfile(&self.tmpdir)
-            .map_err(|_| "cannot create a sort temp file: check --tmp-dir".to_string())?;
-        let mut buf = Vec::with_capacity(1 << 20);
-        for r in &self.srec {
-            buf.extend_from_slice(&(r.runs.len() as u32).to_le_bytes());
-            buf.extend_from_slice(&(r.nm.len() as u32).to_le_bytes());
-            buf.extend_from_slice(&r.idx.to_le_bytes());
-            buf.extend_from_slice(&r.nm);
-            for &(l, b) in &r.runs {
-                buf.extend_from_slice(&l.to_le_bytes());
-                buf.extend_from_slice(&b.to_le_bytes());
-            }
-            if buf.len() > (1 << 20) {
-                f.write_all(&buf).map_err(|_| "sort spill write failed: is --tmp-dir full?".to_string())?;
-                buf.clear();
-            }
-        }
-        f.write_all(&buf).map_err(|_| "sort spill write failed: is --tmp-dir full?".to_string())?;
-        f.flush().map_err(|_| "sort spill write failed: is --tmp-dir full?".to_string())?;
-        eprintln!("spill {}: {} records", self.spill.len(), self.srec.len());
-        self.spill.push(f);
-        self.srec.clear();
-        self.held = 0;
-        Ok(())
-    }
-
-    /// The k-way merge over the spilled runs, in the same order.
-    fn spillmerge(&mut self) -> Result<(), String> {
-        let mut files = std::mem::take(&mut self.spill);
-        let lt = self.lt.tab.clone();
-        let mut head: Vec<Option<SRec>> = Vec::with_capacity(files.len());
-        for f in files.iter_mut() {
-            f.seek(SeekFrom::Start(0)).map_err(io)?;
-            head.push(srd_next(f)?);
-        }
-        let mut out = 0u64;
-        loop {
-            let mut best = usize::MAX;
-            for i in 0..head.len() {
-                if head[i].is_none() { continue; }
-                if best == usize::MAX
-                   || srec_cmp(head[i].as_ref().unwrap(), head[best].as_ref().unwrap())
-                      == std::cmp::Ordering::Less { best = i; }
-            }
-            if best == usize::MAX { break; }
-            let r = head[best].take().unwrap();
-            self.sort_emit(&r, &lt)?;
-            out += 1;
-            head[best] = srd_next(&mut files[best])?;
-        }
-        eprintln!("external sort: {out} records merged from {} runs", files.len());
-        Ok(())
-    }
-
-    /// One sorted record to the writer, under its rank when names are permuted.
-    /// `lt` is the label table, copied once a flush, not once a row.
-    fn sort_emit(&mut self, r: &SRec, lt: &[Vec<u8>]) -> Result<(), String> {
-        let rank = if self.perm_on { r.idx.to_string() } else { String::new() };
-        let name: &[u8] = if self.perm_on { rank.as_bytes() } else { &r.nm };
-        if self.aln.is_some() { self.alnname = Some(r.nm.clone()); }   // the PAF wants the real name
-        let mut pos = 0u64;
-        for &(len, id) in &r.runs {
-            self.row_inner(name, len as u64, &lt[id as usize], pos, false)?;
-            pos += len as u64;
-        }
-        Ok(())
-    }
-
-    /// Order by label tuple, then run count, then lengths, then input rank.
-    fn sortflush(&mut self) -> Result<(), String> {
-        if self.opt.sortmem > 0 {   // the C always merges from disk
-            self.spill_write()?;
-            return if self.spill.is_empty() { Ok(()) } else { self.spillmerge() };
-        }
-        let mut recs = std::mem::take(&mut self.srec);
-        recs.sort_by(srec_cmp);
-        let n = recs.len();
-        let lt = self.lt.tab.clone();
-        for r in &recs { self.sort_emit(r, &lt)?; }
-        eprintln!("sorted {n} records by label tuple then lengths");
-        Ok(())
-    }
-
     /// The CLI gets these for free: its parser split on tabs and newlines,
     /// so a name or label can never hold one, and a zero-length run cannot
     /// reach the writer. A library caller can produce all of them, and a
@@ -410,13 +260,6 @@ impl Writer {
     #[inline(always)]
     pub fn push(&mut self, name: &[u8], run_len: u64, label: &[u8], start: u64, same: bool)
         -> Result<(), String> {
-        if self.opt.sort { return self.sortpush(name, run_len, label, start); }
-        self.row_inner(name, run_len, label, start, same)
-    }
-
-    #[inline(always)]
-    fn row_inner(&mut self, name: &[u8], run_len: u64, label: &[u8], start: u64, same: bool)
-        -> Result<(), String> {
         if name.is_empty() { return Err("empty sequence name".into()); }
         if run_len == 0 {
             return Err("end equals start: a run must cover at least one base".into());
@@ -432,9 +275,7 @@ impl Writer {
             self.cur.clear();
             self.cur.extend_from_slice(name);
             self.curnh = kst::fnv(kst::FNV0, name);
-            // --sort writes ranks; the PAF still wants the real name.
-            let ln: &[u8] = self.alnname.as_deref().unwrap_or(name);
-            self.alnq = self.aln.as_ref().and_then(|a| a.find(ln));
+            self.alnq = self.aln.as_ref().and_then(|a| a.find(name));
             self.currun = 0;
             self.curbp = 0;
             if self.pend > 0 && self.pend >= self.opt.block { self.flush().map_err(io)?; }
@@ -477,17 +318,16 @@ impl Writer {
     }
 
     pub fn close(mut self, out: &mut impl Write) -> Result<Stats, String> {
-        if self.opt.sort && !self.srec.is_empty() { self.sortflush()?; }
         self.tail();
         self.pushread()?;
         self.flush().map_err(io)?;
         let level = self.opt.level;
         let mut early = self.early.take();   // joined by the names job
         // The names rank beside the searches when nothing below changes
-        // them, as the C's: no permutation, no ordinals, none dropped, at
+        // them, as the C's: no ordinals, none dropped, at
         // most 64 MB. Their own pool: in the global one they would queue
         // behind the layout search's.
-        let bg = (!self.perm_on && !(self.ordok && self.nidx > 0) && !self.opt.drop_names
+        let bg = (!(self.ordok && self.nidx > 0) && !self.opt.drop_names
                   && !self.names.is_empty() && self.names.len() <= 64 << 20).then(|| {
             let (mut nm, n, whole, slow, e) = (std::mem::take(&mut self.names), self.nidx, self.opt.whole, self.opt.slow, early.take());
             let t = rayon::current_num_threads();
@@ -703,8 +543,7 @@ impl Writer {
         for l in &self.lt.tab { labs.extend_from_slice(l); labs.push(b'\n'); }
 
         // The C's decision, step for step: which of the names are stored,
-        // as text, as ordinals, in a sidecar, or as ranks plus a blob.
-        let mut perm_on = self.perm_on;
+        // as text or as ordinals.
         let mut ordinal = self.ordok && self.nidx > 0;
         let mut pre = None;
         if let Some(h) = bg {   // before check_unique, as the C's join
@@ -712,7 +551,7 @@ impl Writer {
             self.names = nm; pre = Some(r);
         }
         if !self.opt.drop_names && self.nidx > 1 {
-            check_unique(if perm_on { &self.natbuf } else { &self.names })?;
+            check_unique(&self.names)?;
         }
         let mut dropnames = self.opt.drop_names;
         // Dropping names that are not dense ordinals leaves --aln with no way
@@ -723,29 +562,13 @@ impl Writer {
                        integer deltas");
             dropnames = false;
         }
-        if dropnames && perm_on { dropnames = false; ordinal = false; }
-        else if dropnames { ordinal = true; }
-        if !ordinal && self.ordok && self.names.is_empty() && self.nidx > 0 {
-            for i in 0..self.nidx {
-                self.names.extend_from_slice(i.to_string().as_bytes());
-                self.names.push(b'\n');
-            }
-        }
-        if ordinal && self.opt.names_out.is_some() && !self.opt.drop_names {
-            return Err("--names drop:FILE: the names are already the record ordinals, so a \
-                        file beside the track would be redundant: the track rebuilds them".into());
-        }
-        if perm_on && !self.natord && ordinal && !self.opt.drop_names {
-            self.names = std::mem::take(&mut self.natbuf);
-            ordinal = false;
-            perm_on = false;
-        }
+        if dropnames { ordinal = true; }
         if ordinal { self.names.clear(); }
 
         // Rank the names codecs on whole names up to 4 MB -e low, DEFSAMPLE
         // MB the default, all -e high, then run the winner over the whole
         // buffer: a level 17 zstd of 9.4M ONT read names is 130 s on its own.
-        let (mut nz, mut tokused, mut intused, mut fldused) = if ordinal {
+        let (nz, tokused, intused, fldused) = if ordinal {
             (Vec::new(), false, false, false)
         } else {
             // the names are unchanged when ranked early
@@ -757,49 +580,6 @@ impl Writer {
             eprintln!("names: {k}{ck}, decided on {q} of {} B", self.names.len());
             r
         };
-        // --sort keeps identity by storing a rank per record. Storing the
-        // sorted names instead is sometimes smaller; the C compares and so
-        // does this.
-        let mut permblob: Vec<u8> = Vec::new();
-        let mut permtok = false;
-        if perm_on && self.opt.drop_names { self.natbuf.clear(); }
-        else if perm_on && !self.natord && !self.natbuf.is_empty() {
-            let nt: Vec<&[u8]> = self.natbuf.split(|&c| c == b'\n')
-                .filter(|l| !l.is_empty()).collect();
-            if nt.len() as u64 != self.nidx {
-                return Err("input-order names do not match the records".into());
-            }
-            let mut srt = Vec::new();
-            for line in self.names.split(|&c| c == b'\n') {
-                if line.is_empty() { continue; }
-                let v: u64 = std::str::from_utf8(line).ok()
-                    .and_then(|t| t.parse().ok())
-                    .ok_or("a stored rank is not a record number")?;
-                if v >= self.nidx { return Err("a stored rank is not a record number".into()); }
-                srt.extend_from_slice(nt[v as usize]);
-                srt.push(b'\n');
-            }
-            let q = srt.len();
-            let b = best_names(&mut srt, q, self.nidx, None, level, self.opt.slow);
-            let p1 = ffi::zstd(&self.natbuf, level);
-            let p2 = tok_best(&mut self.natbuf, self.opt.slow).map(|t| t.0);
-            let (pbest, ptok) = match p2 {
-                Some(t) if t.len() < p1.len() => (t, true),
-                _ => (p1, false),
-            };
-            if !b.bytes.is_empty() && b.bytes.len() <= nz.len() + pbest.len() {
-                nz = b.bytes;
-                tokused = b.kind == 2;
-                intused = b.kind == 1;
-                fldused = b.kind == 3;
-                perm_on = false;
-            } else {
-                permblob = pbest;
-                permtok = ptok;
-            }
-        }
-        let npl = if perm_on { permblob.len() } else { 0 };
-
         drop(_s);
         let _s = crate::prof::span(3);
         // The index is chunked so a lookup decodes 65536 entries, not all.
@@ -830,14 +610,11 @@ impl Writer {
 
         let mut h = [0u64; 16];
         h[0] = self.nidx;
-        h[1] = if self.opt.names_out.is_some() { 0 } else { nz.len() as u64 }
+        h[1] = nz.len() as u64
              | if tokused { TOKFLAG } else { 0 }
              | if dropnames && !(self.ordok && self.nidx > 0) { DROPPED } else { 0 }
-             | if self.opt.names_out.is_some() { SIDEFLAG } else { 0 }
              | if intused { INTFLAG } else { 0 }
              | if fldused { FLDFLAG } else { 0 }
-             | if npl > 0 || (perm_on && self.opt.drop_names) { PERMFLAG } else { 0 }
-             | if permtok { PERMTOK } else { 0 }
              | if self.feathash.is_some() { DBFLAG } else { 0 }
              | if self.cart { CARTFLAG } else { 0 }
              | if aln_on { ALNFLAG | LENFLAG } else { 0 }
@@ -857,7 +634,6 @@ impl Writer {
         h[11] = itz.len() as u64;
         h[12] = self.tailpred;
         h[13] = TAILSKIP as u64 | (if aln_on { self.aln_hash() } else { self.rowhash } << 8);
-        h[14] = npl as u64;
         let mut hb = Vec::with_capacity(128);
         for v in h { hb.extend_from_slice(&v.to_le_bytes()); }
         let mut mh = kst::fnv(FNV0, &hb);
@@ -866,7 +642,6 @@ impl Writer {
         mh = kst::fnv(mh, &ichunks);
         mh = kst::fnv(mh, &sz);
         mh = kst::fnv(mh, &itz);
-        mh = kst::fnv(mh, &permblob[..npl]);
         h[15] = mh;
         hb.truncate(120);
         hb.extend_from_slice(&h[15].to_le_bytes());
@@ -876,17 +651,10 @@ impl Writer {
         out.write_all(MAGIC).map_err(io)?;
         out.write_all(&hb).map_err(io)?;
         out.write_all(&lz).map_err(io)?;
-        match &self.opt.names_out {
-            Some(f) => {
-                let mut nf = std::fs::File::create(f).map_err(io)?;
-                nf.write_all(&nz).map_err(io)?;
-            }
-            None => out.write_all(&nz).map_err(io)?,
-        }
+        out.write_all(&nz).map_err(io)?;
         out.write_all(&ichunks).map_err(io)?;
         out.write_all(&sz).map_err(io)?;
         out.write_all(&itz).map_err(io)?;
-        out.write_all(&permblob[..npl]).map_err(io)?;
         body.seek(SeekFrom::Start(0)).map_err(io)?;
         std::io::copy(&mut body, out).map_err(io)?;
         out.flush().map_err(io)?;
@@ -988,23 +756,6 @@ pub fn candlist(slow: bool) -> Vec<i32> {
 // a query decodes a whole block: bzip3 at 8 MB/s, arith at 2.5x rANS
 fn fast_enough(codec: i32) -> bool {
     codec & (ffi::CODEC_BZIP3 | ffi::CODEC_ARITH | ffi::CODEC_LZMA) == 0
-}
-
-/// One --sort record: the name, its (length, label id) runs, and the input
-/// rank, which travels with it across a spill.
-struct SRec { nm: Vec<u8>, runs: Vec<(u32, u32)>, idx: u32 }
-
-/// Labels lead, then the run count, then the lengths, then the input rank.
-fn srec_cmp(a: &SRec, b: &SRec) -> std::cmp::Ordering {
-    let n = a.runs.len().min(b.runs.len());
-    for i in 0..n {
-        if a.runs[i].1 != b.runs[i].1 { return a.runs[i].1.cmp(&b.runs[i].1); }
-    }
-    if a.runs.len() != b.runs.len() { return a.runs.len().cmp(&b.runs.len()); }
-    for i in 0..n {
-        if a.runs[i].0 != b.runs[i].0 { return a.runs[i].0.cmp(&b.runs[i].0); }
-    }
-    a.idx.cmp(&b.idx)
 }
 
 pub struct Pick { pub id: i32, pub len: i32, pub lvl_id: i32, pub lvl_len: i32, pub level: i32 }
@@ -1668,26 +1419,4 @@ pub fn check_unique(names: &[u8]) -> Result<(), String> {
         }
     }
     Ok(())
-}
-/// One record back out of a spill file.
-fn srd_next(f: &mut std::fs::File) -> Result<Option<SRec>, String> {
-    let mut h = [0u8; 12];
-    match f.read_exact(&mut h) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(_) => return Err("sort temp is corrupt".into()),
-    }
-    let nrun = u32::from_le_bytes(h[0..4].try_into().unwrap()) as usize;
-    let nl = u32::from_le_bytes(h[4..8].try_into().unwrap()) as usize;
-    let idx = u32::from_le_bytes(h[8..12].try_into().unwrap());
-    if nl >= 512 { return Err("sort temp is corrupt".into()); }
-    let mut nm = vec![0u8; nl];
-    let mut rb = vec![0u8; nrun * 8];
-    f.read_exact(&mut nm).map_err(|_| "sort temp is corrupt".to_string())?;
-    f.read_exact(&mut rb).map_err(|_| "sort temp is corrupt".to_string())?;
-    let runs = rb.chunks_exact(8)
-        .map(|c| (u32::from_le_bytes(c[0..4].try_into().unwrap()),
-                  u32::from_le_bytes(c[4..8].try_into().unwrap())))
-        .collect();
-    Ok(Some(SRec { nm, runs, idx }))
 }

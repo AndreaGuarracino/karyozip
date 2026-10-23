@@ -180,34 +180,6 @@ static long int_arg(const char *p, long lo, long hi, const char *what) {   /* di
     return v;
 }
 
-static uint64_t mem_arg(const char *p) {   /* bytes, with a K, M, G or T suffix */
-    if (!p || !*p) die("--sort=MEM must be positive");
-    /* Digits only, like every other number on the command line. This used
-       strtod, which quietly took " 1M", "+1M", "1e9" and "1.5M", though the
-       README says a sign and an exponent are refused. */
-    uint64_t val = 0; const char *q = p;
-    for (; *q >= '0' && *q <= '9'; q++) {
-        if (val > (UINT64_MAX - (uint64_t)(*q - '0')) / 10)
-            die("--sort=MEM is larger than the address space");
-        val = val * 10 + (uint64_t)(*q - '0');
-    }
-    if (q == p || !val) die("--sort=MEM must be positive");
-    uint64_t mul = 1;
-    if (*q) {
-        switch (*q) {
-        case 'k': case 'K': mul = 1ULL << 10; break;
-        case 'm': case 'M': mul = 1ULL << 20; break;
-        case 'g': case 'G': mul = 1ULL << 30; break;
-        case 't': case 'T': mul = 1ULL << 40; break;
-        default: die("--sort=MEM: use a plain number of bytes or a K, M, G or T suffix");
-        }
-        if (q[1]) die("--sort=MEM: nothing may follow the unit");
-    }
-    if (val > UINT64_MAX / mul) die("--sort=MEM is larger than the address space");
-    uint64_t m = val * mul;
-    if (m < (1u << 20)) die("--sort=MEM must be at least 1M");
-    return m;
-}
 static uint64_t num_arg(const char *p, uint64_t max, const char *what) {
     uint64_t v = bedcoord(p, p + strlen(p), what);
     if (v > max) die(what);
@@ -518,9 +490,6 @@ static char *unz(const void *src, size_t n, size_t *len, const char *what) {
 #define ALNFLAG (1ULL << 59)          /* rows deltaed against a reference */
 #define DBFLAG  (1ULL << 58)          /* labels are featureIDs, not labels */
 #define CARTFLAG (1ULL << 52)         /* some featureIDs are 2^26 + a vocabulary rank */
-#define PERMFLAG (1ULL << 54)         /* names in input order + a permutation */
-#define PERMTOK  (1ULL << 53)         /* that blob went through the tokeniser */
-#define SIDEFLAG (1ULL << 57)
 #define LENFLAG  (1ULL << 56)         /* lengths the reference implies are 0 */
 #define TAILFLAG (1ULL << 55)
 /* Every read's run count heads its own lengths, so the index blob holds
@@ -538,13 +507,9 @@ static int ILV = 0;                   /* and whether the two frames are one */
 static int GRP = 0;                   /* and whether the lengths are grouped */
 
 static int NAMEMODE = 0;              /* 0 store, 1 drop */
-static int PERMON;                    /* --sort keeps names: store a permutation */
 static _Atomic int INHALF;            /* stdin, a file, is read past its half */
 static const char *NAMEFILE = NULL;
-static const char *NAMESIN = NULL;
-/* One flag, two kinds of file: the blob "--names drop:F" wrote, or the
- * sequences themselves. The track says which, so the file is never sniffed
- * (a pipe cannot be reopened). Resolved in ropen, see NAMESARG. */
+/* --names FILE, resolved to NAMEFILE in ropen */
 static const char *NAMESARG = NULL;
 /* the default searches hard; -e low trades size for encode time */
 static int SLOW = 0;                  /* -e high: every codec over the whole file */
@@ -552,9 +517,6 @@ static int SLOW = 0;                  /* -e high: every codec over the whole fil
 #define DEFSAMPLE 16                  /* MB the default ranks every codec on */
 #endif
 static int FASTMODE = 0;              /* -e low: the sampled search */
-static int SORT = 0;                  /* --sort: order records by label tuple */
-static uint64_t SORTBP;               /* end of the run --sort last took */
-static uint64_t SORTMEM = 0;
 static const char *DBFEATS = NULL;    /* --db features.tsv */
 static const char *HIERTAB = NULL;    /* --hier hierarchy.tsv, with --db */
 static int DBIDS = 0;
@@ -1099,8 +1061,6 @@ static size_t paydecomp(const uint8_t *src, size_t n, int codec, uint8_t *dst, s
     return ul;
 }
 
-static const char *NAMES_OUT = NULL;
-
 static uint64_t TAILPRED = 0;
 static int TAILSEEN = 0;   /* how many totals sampled so far */
 
@@ -1319,7 +1279,7 @@ static void ktw_pushread(ktw *w) {
     size_t ncap = (size_t)(FASTMODE ? 4 : DEFSAMPLE) << 20;
     /* Late in the input it would only overlap the parse buffers: then the
        close ranks them. 57 MB is zstd 17's state on a 4 MB sample. */
-    if (!w->eon && !INHALF && !SLOW && !PERMON && NAMEMODE != 1 && w->names.n >= ncap) {
+    if (!w->eon && !INHALF && !SLOW && NAMEMODE != 1 && w->names.n >= ncap) {
         w->eon = 1;
         const char *q = (const char *)w->names.d, *e2 = q + w->names.n; uint64_t sn = 0;
         while (q < e2 && (size_t)(q - (const char *)w->names.d) < ncap) { q = memchr(q, '\n', (size_t)(e2 - q)) + 1; sn++; }
@@ -1354,7 +1314,6 @@ static __thread int LENDEC = 0;      /* the file being read leaves lengths out *
 static uint64_t refend_at(const char *nm, uint64_t pos);
 static uint32_t refrow_at(const char *nm, uint64_t st, uint64_t len);
 static __thread int LASTREV;   /* strand of the last refend answer */
-static const char *ALNNAME = NULL;    /* --sort writes ranks; the PAF wants names */
 
 /* same: the caller already knows this row's name equals the previous row's,
    which the parse threads work out in parallel. It saves one memcmp per row,
@@ -1377,10 +1336,8 @@ static void ktw_row(ktw *w, const char *name, size_t nlen,
     if (start != w->curbp) die("gap or overlap: start is not the previous end");
     uint64_t id = (uint64_t)intern(label, llen);   /* once, not once per check */
     ROWHASH = rowmix(ROWHASH, w->curnh, start, start + run_len, labh[id]);
-    /* A label the reference already gives is stored as "=". Done here, on
-       the row as written, so a --sort track orders on the input's own labels
-       and its order is the same with or without --aln. */
-    if (ALNPAF && refrow_at(ALNNAME ? ALNNAME : w->cur, start, run_len) == (uint32_t)id) {
+    /* A label the reference already gives is stored as "=". */
+    if (ALNPAF && refrow_at(w->cur, start, run_len) == (uint32_t)id) {
         id = (uint64_t)intern("=", 1); ALNHIT++;
     }
 
@@ -1389,7 +1346,7 @@ static void ktw_row(ktw *w, const char *name, size_t nlen,
     if (!w->pend) w->blkbp0 = w->curbp;   /* where this block opens */
     w->plen = run_len; w->phas = 1;
     w->pval = ALNPAF
-              && refend_at(ALNNAME ? ALNNAME : w->cur, start) == start + run_len
+              && refend_at(w->cur, start) == start + run_len
               ? 0 : run_len;
     w->prev = LASTREV;
     bvar(&w->ids, id);
@@ -2191,230 +2148,6 @@ static const char *flab(uint32_t id, size_t k) {   /* the label of set k for a f
     return VOC[k][(id - CARTBASE) / VSTRIDE[k] % NVOC[k]];
 }
 
-/* --sort  Records are a set: */
-typedef struct { uint64_t nam; uint32_t off, nrun, idx; } srec;  /* name in rbuf, runs in rrun */
-typedef struct { uint32_t len; uint32_t lab; } srun;
-
-static char *rbuf; static size_t rbufn, rbufc;      /* names, NUL separated */
-static srun *rrun; static size_t rrunn, rrunc;      /* runs of every record */
-static srec *rrec; static size_t rrecn, rrecc;
-static buf natbuf; static uint64_t NATN;            /* names, input order */
-static int NATORD = 1;
-static uint8_t *PERMBLOB; static size_t PERMBLOBLEN; static int PERMBLOBTOK;
-
-static void psort(srec *v, size_t n);
-
-/* labels lead, then the run count, then lengths; 0 on a tie */
-static int runcmp(const srun *p, uint32_t pn, const srun *q, uint32_t qn) {
-    uint32_t n = pn < qn ? pn : qn;
-    for (uint32_t i = 0; i < n; i++)
-        if (p[i].lab != q[i].lab) return p[i].lab < q[i].lab ? -1 : 1;
-    if (pn != qn) return pn < qn ? -1 : 1;
-    for (uint32_t i = 0; i < n; i++)
-        if (p[i].len != q[i].len) return p[i].len < q[i].len ? -1 : 1;
-    return 0;
-}
-static int srec_cmp(const void *a, const void *b) {   /* a tie keeps input order */
-    const srec *x = a, *y = b;
-    int c = runcmp(rrun + x->off, x->nrun, rrun + y->off, y->nrun);
-    return c ? c : (x->nam > y->nam) - (x->nam < y->nam);
-}
-/* one sorted record to the writer, under its rank when names are permuted */
-static void sortemit(ktw *w, const char *nm, uint32_t idx, const srun *rs, uint32_t n) {
-    char ib[24]; size_t nl;
-    ALNNAME = nm;
-    if (PERMON) { nl = (size_t)sprintf(ib, "%u", idx); nm = ib; } else nl = strlen(nm);
-    uint64_t pos = 0;
-    for (uint32_t k = 0; k < n; k++) {
-        const char *lb = labtab[rs[k].lab];
-        ktw_row(w, nm, nl, rs[k].len, lb, strlen(lb), pos, 0);
-        pos += rs[k].len;
-    }
-}
-
-static void psort(srec *v, size_t n) {
-    int P = nthreads();
-    if (P > 64) P = 64;
-    while (P & (P - 1)) P &= P - 1;        /* the merge needs a power of two */
-    if (n < 1u << 16 || P < 2) { qsort(v, n, sizeof *v, srec_cmp); return; }
-    size_t bnd[65];
-    for (int i = 0; i <= P; i++) bnd[i] = n * (size_t)i / (size_t)P;
-#pragma omp parallel for schedule(dynamic, 1) num_threads(P)
-    for (int i = 0; i < P; i++)
-        qsort(v + bnd[i], bnd[i + 1] - bnd[i], sizeof *v, srec_cmp);
-    srec *tmp = malloc(n * sizeof *tmp);
-    if (!tmp) { qsort(v, n, sizeof *v, srec_cmp); return; }   /* fall back */
-    srec *src = v, *dst = tmp;
-    for (int w = 1; w < P; w *= 2) {
-#pragma omp parallel for schedule(dynamic, 1) num_threads(P)
-        for (int i = 0; i < P; i += 2 * w) {
-            size_t a = bnd[i], m = bnd[i + w < P ? i + w : P], e = bnd[i + 2 * w < P ? i + 2 * w : P];
-            size_t p = a, q = m, o = a;
-            while (p < m && q < e)
-                dst[o++] = srec_cmp(src + p, src + q) <= 0 ? src[p++] : src[q++];
-            while (p < m) dst[o++] = src[p++];
-            while (q < e) dst[o++] = src[q++];
-        }
-        srec *t = src; src = dst; dst = t;
-    }
-    if (src != v) memcpy(v, src, n * sizeof *v);
-    free(tmp);
-}
-
-static void sortflush(ktw *w) {
-    psort(rrec, rrecn);
-    for (size_t i = 0; i < rrecn; i++)
-        sortemit(w, rbuf + rrec[i].nam, rrec[i].idx, rrun + rrec[i].off, rrec[i].nrun);
-    fprintf(stderr, "sorted %zu records by label tuple then lengths\n", rrecn);
-    rrecn = 0; rrunn = 0; rbufn = 0;
-}
-
-typedef struct { FILE *f; uint32_t nrun, idx; char nm[512];
-                 srun *rs; size_t cap; int eof; } srun_rd;
-
-static FILE **SPILL;
-static size_t nspill, cspill;
-
-static void spillwrite(void) {
-    if (!rrecn) return;
-    psort(rrec, rrecn);
-    if (nspill == cspill) {
-        cspill = cspill ? cspill * 2 : 16;
-        SPILL = xrealloc(SPILL, cspill * sizeof *SPILL);
-    }
-    const char *sd = *TMPD ? TMPD : "/tmp";
-    char *tp; if (asprintf(&tp, "%s/karyozip.sort.XXXXXX", sd) < 0) die("oom");
-    int fd = mkstemp(tp);
-    if (fd < 0) die("cannot create a sort temp file: check --tmp-dir");
-    unlink(tp); free(tp);
-    FILE *f = fdopen(fd, "w+b");
-    if (!f) die("cannot create a sort temp file: check --tmp-dir");
-    SPILL[nspill++] = f;
-    for (size_t i = 0; i < rrecn; i++) {
-        const char *nm = rbuf + rrec[i].nam;
-        uint32_t nl = (uint32_t)strlen(nm), nr = rrec[i].nrun;
-        if (fwrite(&nr, 4, 1, f) != 1 || fwrite(&nl, 4, 1, f) != 1 ||
-            fwrite(&rrec[i].idx, 4, 1, f) != 1 ||
-            fwrite(nm, 1, nl, f) != nl ||
-            fwrite(rrun + rrec[i].off, sizeof(srun), nr, f) != nr)
-            die("sort spill write failed: is --tmp-dir full?");
-    }
-    if (fflush(f)) die("sort spill write failed: is --tmp-dir full?");
-    fprintf(stderr, "spill %zu: %zu records\n", nspill - 1, rrecn);
-    rrecn = 0; rrunn = 0; rbufn = 0;
-}
-
-static int srd_next(srun_rd *r) {
-    uint32_t nl;
-    if (fread(&r->nrun, 4, 1, r->f) != 1) { r->eof = 1; return 0; }
-    if (fread(&nl, 4, 1, r->f) != 1 || nl >= sizeof r->nm) die("sort temp is corrupt");
-    if (fread(&r->idx, 4, 1, r->f) != 1) die("sort temp is corrupt");
-    if (fread(r->nm, 1, nl, r->f) != nl) die("sort temp is corrupt");
-    r->nm[nl] = 0;
-    if (r->nrun > r->cap) { r->cap = r->nrun; r->rs = xrealloc(r->rs, r->cap * sizeof *r->rs); }
-    if (fread(r->rs, sizeof(srun), r->nrun, r->f) != r->nrun) die("sort temp is corrupt");
-    return 1;
-}
-
-static int srd_cmp(const srun_rd *a, const srun_rd *b) {
-    int c = runcmp(a->rs, a->nrun, b->rs, b->nrun);
-    return c ? c : (a->idx > b->idx) - (a->idx < b->idx);
-}
-
-static void spillmerge(ktw *w) {
-    srun_rd *rd = xcalloc(nspill, sizeof *rd);
-    for (size_t i = 0; i < nspill; i++) {
-        rd[i].f = SPILL[i]; rewind(rd[i].f);
-        srd_next(&rd[i]);
-    }
-    uint64_t out = 0;
-    for (;;) {
-        size_t best = nspill;
-        for (size_t i = 0; i < nspill; i++) {
-            if (rd[i].eof) continue;
-            if (best == nspill || srd_cmp(&rd[i], &rd[best]) < 0) best = i;
-        }
-        if (best == nspill) break;
-        srun_rd *r = &rd[best];
-        sortemit(w, r->nm, r->idx, r->rs, r->nrun);
-        out++;
-        srd_next(r);
-    }
-    for (size_t i = 0; i < nspill; i++) {
-        fclose(rd[i].f); free(rd[i].rs);
-    }
-    fprintf(stderr, "external sort: %llu records merged from %zu runs\n",
-            (unsigned long long)out, nspill);
-    free(rd); free(SPILL); SPILL = NULL; nspill = 0;
-}
-
-/* Both encode paths end the same way: spill what is held, merge, free. */
-static void sortfinish(ktw *w) {
-    if (SORTMEM) {
-        if (rrecn) spillwrite();
-        if (nspill) spillmerge(w);
-    } else if (SORT && rrecn) sortflush(w);
-    if (SORT) { free(rbuf); free(rrun); free(rrec); }
-}
-
-static void sortpush(const char *nm, size_t nlen, uint64_t st, uint64_t len,
-                     const char *lab, size_t llen) {
-
-    if (nlen >= 512) die("name too long");
-    int newrec = st == 0;
-    if (!newrec && rrecn) {
-        const char *cur = rbuf + rrec[rrecn - 1].nam;
-        if (strlen(cur) != nlen || memcmp(cur, nm, nlen)) newrec = 1;
-    }
-    if (newrec && st != 0) die("a sequence does not start at 0");
-
-    if (!newrec && st != SORTBP) die("gap or overlap: start is not the previous end");
-    SORTBP = newrec ? len : SORTBP + len;
-    if (newrec) {
-        if (rrecn == rrecc) { rrecc = rrecc ? rrecc * 2 : 1 << 16;
-            rrec = xrealloc(rrec, rrecc * sizeof *rrec); }
-        if (rbufn + nlen + 1 > rbufc) { rbufc = (rbufn + nlen + 1) * 2;
-            rbuf = xrealloc(rbuf, rbufc); }
-        rrec[rrecn].off = (uint32_t)rrunn;
-        rrec[rrecn].nrun = 0;
-        rrec[rrecn].nam = rbufn;
-        memcpy(rbuf + rbufn, nm, nlen); rbuf[rbufn + nlen] = 0;
-        rbufn += nlen + 1;
-        if (NATN > UINT32_MAX) die("--sort takes at most 2^32 records");
-        rrec[rrecn].idx = (uint32_t)NATN;
-        if (PERMON) {
-            char ob[24];
-            int on = sprintf(ob, "%llu", (unsigned long long)NATN);
-            if (NATORD && ((size_t)on != nlen || memcmp(ob, nm, nlen))) NATORD = 0;
-            bput(&natbuf, nm, nlen); bput(&natbuf, "\n", 1);
-        }
-        NATN++; rrecn++;
-    }
-    uint64_t held = rbufn + rrunn * sizeof(srun) + rrecn * sizeof(srec);
-    if (SORTMEM && held > SORTMEM && st == 0) {
-
-        srec last = rrec[rrecn - 1];
-        char nmb[512];
-        size_t nl3 = strlen(rbuf + last.nam);
-        if (nl3 >= sizeof nmb) die("name too long");
-        memcpy(nmb, rbuf + last.nam, nl3 + 1);
-        rrecn--;
-        spillwrite();
-        memcpy(rbuf, nmb, nl3 + 1); rbufn = nl3 + 1;
-        rrec[0].nam = 0; rrec[0].off = 0; rrec[0].nrun = 0;
-        rrec[0].idx = last.idx;          /* the rank travels with the record */
-        rrecn = 1; rrunn = 0;
-    }
-    if (!rrecn) die("a sequence does not start at 0");
-    if (rrunn == UINT32_MAX) die("--sort=MEM: more than 2^32 runs held; give a smaller MEM");
-    if (rrunn == rrunc) { rrunc = rrunc ? rrunc * 2 : 1 << 20;
-        rrun = xrealloc(rrun, rrunc * sizeof *rrun); }
-    if (len > 0xffffffffu) die("run longer than 4 GB");
-    rrun[rrunn].len = (uint32_t)len;
-    rrun[rrunn].lab = (uint32_t)intern(lab, llen);
-    rrunn++; rrec[rrecn - 1].nrun++;
-}
-
 typedef struct { const char *nm; uint32_t nlen, llen; const char *lab;
                  uint64_t st, len; int same; } prow;   /* same: name equals the row before */
 /* One slab of whole lines, split into rows by T threads. The fault
@@ -2530,8 +2263,7 @@ static void encode(void) {
                 prow *q = &A->pr[t][k];
                 const char *lab = q->lab; size_t llen = q->llen;
                 if (ALNPAF && llen == 1 && *lab == '=') die("a label \"=\" is reserved under --aln");
-                if (SORT) sortpush(q->nm, q->nlen, q->st, q->len, lab, llen);
-                else ktw_row(w, q->nm, q->nlen, q->len, lab, llen, q->st, q->same);
+                ktw_row(w, q->nm, q->nlen, q->len, lab, llen, q->st, q->same);
             }
         PH_ADD(6, _tser);                       /* serial: append the rows */
         if (!more) break;
@@ -2539,7 +2271,6 @@ static void encode(void) {
     }
     for (int k = 0; k < 2; k++) { for (int t = 0; t < T; t++) free(sb[k].pr[t]); free(sb[k].b); }
     fclose(IN);
-    sortfinish(w);
     PH_ADD(0, _tp);
     ktw_tail(w);
     ktw_pushread(w);
@@ -3039,13 +2770,13 @@ static void ktw_close(ktw *w) {
     FILE *tmp = w->tmp;
     const blkmeta *bm = w->bm; size_t nraw = w->nraw;
     /* The names rank beside the searches when nothing below changes them:
-       no permutation, no ordinals, none dropped, and at most 64 MB, since
+       no ordinals, none dropped, and at most 64 MB, since
        their working memory adds to the search's. Joined before
        namesunique, which reads the buffer tok3 rewrites in place. */
     njob nj = { .names = &names, .n = nidx };
     if (w->eon) { nj.early = 1; nj.ej = &w->ej; nj.eth = w->eth; nj.ec = &w->ecopy; }   /* its ranking holds for these names */
     pthread_t nth;
-    int nbg = !PERMON && !(w->ordok && nidx > 0) && NAMEMODE != 1 && names.n && names.n <= 64u << 20
+    int nbg = !(w->ordok && nidx > 0) && NAMEMODE != 1 && names.n && names.n <= 64u << 20
               && !pthread_create(&nth, NULL, namespick, &nj);
 
     double _ts = nowsec();
@@ -3261,7 +2992,7 @@ static void ktw_close(ktw *w) {
     int ordinal = w->ordok && nidx > 0;   /* the writer tracked this */
     double _tn = nowsec();                /* the check counts, as the Rust's */
     if (nbg) pthread_join(nth, NULL);
-    if (NAMEMODE != 1 && nidx > 1) namesunique(PERMON ? &natbuf : &names, PERMON ? NATN : nidx);
+    if (NAMEMODE != 1 && nidx > 1) namesunique(&names, nidx);
 
     int dropnames = NAMEMODE == 1;
     if (dropnames && ALNPAF && !ordinal) {
@@ -3271,26 +3002,8 @@ static void ktw_close(ktw *w) {
         dropnames = 0;
     }
 
-    if (dropnames && PERMON) { dropnames = 0; ordinal = 0; }
-    else if (dropnames) ordinal = 1;                   /* drop: store none */
-
-    if (!ordinal && w->ordok && !names.n && nidx) {
-        for (uint64_t i2 = 0; i2 < nidx; i2++) {
-            char ob[24];
-            int on = sprintf(ob, "%llu\n", (unsigned long long)i2);
-            bput(&names, ob, (size_t)on);
-        }
-    }
-
-    if (ordinal && NAMES_OUT && NAMEMODE != 1)
-        die("--names drop:FILE: the names are already the record ordinals, so a "
-            "file beside the track would be redundant: the track rebuilds them");
-
-    if (PERMON && !NATORD && ordinal && NAMEMODE != 1) {
-        free(names.d); names = natbuf; natbuf.n = 0; natbuf.d = NULL;
-        ordinal = 0; PERMON = 0;
-    }
-    if (ordinal) { names.n = 0; NAMES_OUT = NULL; }
+    if (dropnames) ordinal = 1;                        /* dropped: store none */
+    if (ordinal) names.n = 0;
 
     size_t nzl = 0; int tokused = 0, intused = 0, fldused = 0;
     if (!ordinal) {
@@ -3304,49 +3017,6 @@ static void ktw_close(ktw *w) {
           fprintf(stderr, "names: %s", NK[k]);
           if (k == 2) fprintf(stderr, " chunk %u", TOKPICK);
           fprintf(stderr, ", decided on %zu of %zu B\n", nj.sn, names.n); }
-        /* The rows carry a rank per record. */
-        if (PERMON && NAMEMODE == 1) { free(natbuf.d); natbuf.n = 0; natbuf.d = NULL; }
-        else if (PERMON && !NATORD && natbuf.n) {
-            char **nt = xmalloc((size_t)nidx * sizeof *nt);
-            { char *q3 = (char *)natbuf.d; uint64_t k3 = 0;
-              char *e3 = q3 + natbuf.n;
-              while (k3 < nidx && q3 < e3) {
-                  char *nl3 = memchr(q3, 10, (size_t)(e3 - q3));
-                  if (!nl3) break;
-                  nt[k3++] = q3; *nl3 = 0; q3 = nl3 + 1; }
-              if (k3 != nidx) die("input-order names do not match the records"); }
-            buf srt = {0};
-            { const char *q4 = (const char *)names.d, *e4 = q4 + names.n;
-              while (q4 < e4) {
-                  const char *nl4 = memchr(q4, 10, (size_t)(e4 - q4));
-                  if (!nl4) break;
-                  char *e5; unsigned long long v = strtoull(q4, &e5, 10);
-                  if (e5 != nl4 || e5 == q4 || v >= nidx) die("a stored rank is not a record number");
-                  bput(&srt, nt[v], strlen(nt[v])); bput(&srt, "\n", 1);
-                  q4 = nl4 + 1; } }
-            /* nt[] NUL-terminated every name in place and the tokeniser
-               chunks on newlines: without this the whole buffer is one
-               chunk and tok3 refuses it, which cost 6.7% on 20547946 reads */
-            for (uint64_t k5 = 0; k5 < nidx; k5++) nt[k5][strlen(nt[k5])] = '\n';
-            uint8_t *bp = NULL; int bpick;
-            size_t best = bestnames(&srt, nidx, NULL, 0, &bp, &bpick);
-            uint8_t *na = NULL, *nb2 = NULL;
-            size_t p1 = zc(&natbuf, &na), p2 = tokbest(&natbuf, &nb2);
-            size_t pbest = p1; uint8_t *pp = na; int ptok = 0;
-            if (p2 && p2 < pbest) { pbest = p2; pp = nb2; ptok = 1; }
-            if (best && best <= nzl + pbest) {     /* sorted names win: no rank */
-                free(nz); nz = bp; nzl = best;
-                tokused = bpick == 2; intused = bpick == 1; fldused = bpick == 3;
-                free(na); free(nb2); free(natbuf.d); natbuf.n = 0; natbuf.d = NULL;
-                PERMON = 0;
-            } else {
-                PERMBLOB = pp; PERMBLOBLEN = pbest; PERMBLOBTOK = ptok;
-                if (pp != na) free(na);
-                if (pp != nb2) free(nb2);
-                free(bp);                          /* the sorted-name form loses */
-            }
-            free(srt.d); free(nt);
-        }
     }
     PH_ADD(2, _tn);
     double _ti = nowsec();
@@ -3362,42 +3032,30 @@ static void ktw_close(ktw *w) {
 #define WR(buf, n) do { size_t _n = (n); \
     if (_n && fwrite((buf), 1, _n, w->out) != _n) die("write failed"); } while (0)
 
-    uint8_t *npz = PERMBLOB; size_t npl = PERMON ? PERMBLOBLEN : 0;
-    int permtok = PERMBLOBTOK;
     WR(MAGIC, 8);
     uint64_t fh = CARTUSED ? HIERHASH : FEATHASH;
     if (tokused + intused + fldused > 1) die("internal: names flagged more than one way");
-    uint64_t h[16] = { nidx, (NAMES_OUT ? 0 : nzl) | (tokused ? TOKFLAG : 0) | (CARTUSED ? CARTFLAG : 0)
+    uint64_t h[16] = { nidx, nzl | (tokused ? TOKFLAG : 0) | (CARTUSED ? CARTFLAG : 0)
                              | (intused ? INTFLAG : 0) | (fldused ? FLDFLAG : 0) | (dropnames && !(w->ordok && nidx > 0) ? DROPPED : 0)
                              | (ALNPAF ? LENFLAG : 0) | (TAILON > 0 ? TAILFLAG : 0)
                              | (RUNHEAD ? RUNFLAG : 0) | (ILV ? ILVFLAG : 0) | (GRP ? GRPFLAG : 0)
-                             | (ALNPAF ? ALNFLAG : 0) | (DBFEATS ? DBFLAG : 0)
-                             | (NAMES_OUT ? SIDEFLAG : 0)
-                             | (npl || (PERMON && NAMEMODE == 1) ? PERMFLAG : 0)
-                             | (permtok ? PERMTOK : 0), izl, szl, rows,
+                             | (ALNPAF ? ALNFLAG : 0) | (DBFEATS ? DBFLAG : 0), izl, szl, rows,
                       (uint64_t)(uint32_t)LENCODEC | (DBFEATS ? (fh & 0xffffffffu) << 32 : 0),
                       lzl, (uint64_t)nlabtab, BLOCK,
                       (uint64_t)(uint32_t)IDCODEC | (DBFEATS ? (fh >> 32) << 32 : 0), nichunk, itl,
-                      TAILPRED, (uint64_t)TAILSKIP | ((ALNPAF ? ALNHASH : ROWHASH) << 8), npl, 0 };
+                      TAILPRED, (uint64_t)TAILSKIP | ((ALNPAF ? ALNHASH : ROWHASH) << 8), 0, 0 };
 
     {   uint64_t mh = fnvbuf(FNV0, h, 128); mh = fnvbuf(mh, lz, lzl);
         mh = fnvbuf(mh, nz, nzl);
-        mh = fnvbuf(mh, iz, izl); mh = fnvbuf(mh, sz, szl); mh = fnvbuf(mh, itz, itl);
-        h[15] = fnvbuf(mh, npz, npl);
+        mh = fnvbuf(mh, iz, izl); mh = fnvbuf(mh, sz, szl);
+        h[15] = fnvbuf(mh, itz, itl);
     }
     if (fwrite(h, 8, 16, w->out) != 16) die("write failed");
     WR(lz, lzl);
-    if (NAMES_OUT) {
-        FILE *nf = fopen(NAMES_OUT, "wb");
-        if (!nf) die("cannot open the names file");
-        if (fwrite(nz, 1, nzl, nf) != nzl || fclose(nf)) die("names write failed");
-    } else {
-        WR(nz, nzl);
-    }
+    WR(nz, nzl);
     WR(iz, izl);
     WR(sz, szl);
     WR(itz, itl);
-    WR(npz, npl);
     double _tw = nowsec();
     rewind(tmp);
     char cp[1 << 20]; size_t r;
@@ -3418,7 +3076,7 @@ static void ktw_close(ktw *w) {
 
     free(itab.d); free(ichunks.d); free(altbuf); free(lk);
     for (int v = 1; v < 3; v++) free(altv[v]);
-    free(lz); free(nz); free(sz); free(itz); free(npz);
+    free(lz); free(nz); free(sz); free(itz);
     free(names.d); free(sizes.d); free(labs.d);
     free(w->bm);
     for (int v = 0; v < 2; v++) { free(w->rawalt[v].d); free(w->lalt[v].d); }
@@ -3504,8 +3162,7 @@ typedef struct {
     uint64_t ci, cpend; int cvalid; rec crec;
     off_t nz_off; uint64_t mhash, feathash; int cart;
     uint64_t fsz;   /* data size */
-    uint8_t *pz; size_t pzl; int perm_tok, perm_ext;  /* names in input order */
-    char *namebuf, *natbufp;
+    char *namebuf;
     int name_borrowed;         /* the table belongs to another reader */
     int blk_borrowed;          /* so do the one block and its run counts */
     uint8_t *ichunk; uint64_t nichunk, *coff, *cpendv, curchunk;
@@ -3597,12 +3254,10 @@ static R *ropen(const char *path) {
     ALLOCMAX = (size_t)1 << 38;
     if (fseeko(r->f, 8 + 128, SEEK_SET)) die("seek");
     uint64_t nml = h[1] & ~(TOKFLAG | INTFLAG | FLDFLAG | DROPPED | ALNFLAG | DBFLAG
-                            | SIDEFLAG | LENFLAG | TAILFLAG | PERMFLAG
-                            | PERMTOK | CARTFLAG | RUNFLAG | ILVFLAG | GRPFLAG);   /* h[1] also holds flags */
+                            | LENFLAG | TAILFLAG | CARTFLAG | RUNFLAG | ILVFLAG | GRPFLAG);   /* h[1] also holds flags */
 
     if (nml > fsz || h[2] > fsz || h[3] > fsz || h[6] > fsz || h[11] > fsz
-        || h[14] > fsz || h[11] + h[14] > fsz
-        || 8 + 128 + nml + h[2] + h[3] + h[6] + h[11] + h[14] > fsz)
+        || 8 + 128 + nml + h[2] + h[3] + h[6] + h[11] > fsz)
         die("corrupt header: the stream sizes do not fit the file");
     r->block = h[8] ? h[8] : 512;
     r->nreads = h[0]; r->rows = h[4];
@@ -3628,9 +3283,8 @@ static R *ropen(const char *path) {
     int names_fld = (h[1] & FLDFLAG) != 0;
     if (names_tok + names_int + names_fld > 1) die("corrupt file: names flagged more than one way");
     int was_aln = (h[1] & ALNFLAG) != 0, was_db = (h[1] & DBFLAG) != 0;
-    int was_side = (h[1] & SIDEFLAG) != 0, was_len = (h[1] & LENFLAG) != 0;
-    if (NAMESARG) { if (was_side) NAMESIN = NAMESARG; else NAMEFILE = NAMESARG; }
-    int was_perm = (h[1] & PERMFLAG) != 0, perm_tok = (h[1] & PERMTOK) != 0;
+    int was_len = (h[1] & LENFLAG) != 0;
+    if (NAMESARG) NAMEFILE = NAMESARG;
 
     if (!RAW && !INDEXING) {   /* index reads names only: no companion to bind */
         if (was_aln && !ALNPAF)
@@ -3646,13 +3300,6 @@ static R *ropen(const char *path) {
         if (was_len && !ALNPAF)
             die("this track leaves out every length the reference implies: "
                 "read it with --aln PAF --ref R");
-        if (was_side && !NAMESIN) {
-            char dflt[4096]; snprintf(dflt, sizeof dflt, "%s.names", path);
-            FILE *tf = fopen(dflt, "rb");
-            if (!tf) die("the names of this track are in a sidecar: give it with "
-                         "--names FILE, or --raw to see the ordinals");
-            fclose(tf);                 /* <track>.names is beside it: use it */
-        }
     }
     int dropped = (h[1] & DROPPED) != 0;
 
@@ -3670,33 +3317,14 @@ static R *ropen(const char *path) {
     if (r->grp && (ilv || !runhead)) die("corrupt file: grouped lengths without their run counts");
     if (runhead) r->rtab = xmalloc(mul(h[0] ? h[0] : 1, sizeof *r->rtab));
     if (r->cart && !was_db) die("corrupt file: vocabulary featureIDs without --db");
-    h[1] &= ~(TOKFLAG | INTFLAG | DROPPED | ALNFLAG | DBFLAG | SIDEFLAG | LENFLAG
-              | TAILFLAG | PERMFLAG | PERMTOK | CARTFLAG | RUNFLAG | ILVFLAG | FLDFLAG | GRPFLAG);
+    h[1] &= ~(TOKFLAG | INTFLAG | DROPPED | ALNFLAG | DBFLAG | LENFLAG
+              | TAILFLAG | CARTFLAG | RUNFLAG | ILVFLAG | FLDFLAG | GRPFLAG);
     uint8_t *iz = xmalloc(h[2]), *sz = xmalloc(h[3]);
     uint8_t *nz = NULL;
     r->nz_off = ftello(r->f);
     if (fseeko(r->f, (off_t)h[1], SEEK_CUR)) die("seek past names");
     if (fread(iz, 1, h[2], r->f) != h[2]) die("short index");
     if (fread(sz, 1, h[3], r->f) != h[3]) die("short sizes");
-    size_t nzl_eff = (size_t)h[1]; uint8_t *sidebuf = NULL;
-    if (!nzl_eff && was_side) {
-        /* the sidecar: whatever --names drop:FILE named, else <track>.names */
-        char side[4096];
-        if (NAMESIN) snprintf(side, sizeof side, "%s", NAMESIN);
-        else snprintf(side, sizeof side, "%s.names", path);
-        FILE *nf = fopen(side, "rb");
-        if (nf) {
-            fseeko(nf, 0, SEEK_END); nzl_eff = (size_t)ftello(nf); rewind(nf);
-            sidebuf = xmalloc(nzl_eff ? nzl_eff : 1);
-            if (fread(sidebuf, 1, nzl_eff, nf) != nzl_eff) die("short names file");
-            fclose(nf);
-        } else if (!RAW) {
-
-            fprintf(stderr, "cannot open the names sidecar %s\n", side);
-            die("this track keeps its names in a sidecar and it is missing");
-        } else fprintf(stderr, "sidecar missing: names are ordinals and the metadata hash is unchecked\n");
-    }
-    if (!(was_side && !sidebuf && RAW))
     {
         uint64_t want = h[15], mh = FNV0, hz[16];
         memcpy(hz, h, 128); hz[15] = 0;
@@ -3709,35 +3337,20 @@ static R *ropen(const char *path) {
                 die("short names");
             mh = fnvbuf(mh, nb, h[1]); free(nb);
             if (fseeko(r->f, keep, SEEK_SET)) die("seek"); }
-        else if (sidebuf) mh = fnvbuf(mh, sidebuf, nzl_eff);
         mh = fnvbuf(mh, iz, h[2]); mh = fnvbuf(mh, sz, h[3]);
         {   off_t keep = ftello(r->f);
-            uint8_t *tb = xmalloc(h[11] + h[14]);
-            if (fread(tb, 1, h[11] + h[14], r->f) != h[11] + h[14]) die("short label table");
-            mh = fnvbuf(mh, tb, h[11] + h[14]); free(tb);
+            uint8_t *tb = xmalloc(h[11]);
+            if (fread(tb, 1, h[11], r->f) != h[11]) die("short label table");
+            mh = fnvbuf(mh, tb, h[11]); free(tb);
             if (fseeko(r->f, keep, SEEK_SET)) die("seek"); }
         free(lzraw);
-        if (mh != want) {
-            if (sidebuf) die("this names file does not belong to this track: give the "
-                             "file --names drop:FILE wrote, not a FASTA or a list");
-            die("corrupt file: the metadata does not match its hash");
-        }
+        if (mh != want) die("corrupt file: the metadata does not match its hash");
     }
     r->mhash = h[15];
     r->feathash = (h[5] >> 32) | ((h[9] >> 32) << 32);
-    if (was_perm) {                     /* it sits between itz and the rows */
-        r->pzl = (size_t)h[14]; r->perm_tok = perm_tok;
-        r->perm_ext = r->pzl == 0;          /* the text is in the FASTA */
-        r->pz = r->pzl ? xmalloc(r->pzl) : NULL;
-        off_t here = ftello(r->f);
-        if (fseeko(r->f, (off_t)h[11], SEEK_CUR)) die("seek past the label table");
-        if (r->pzl && fread(r->pz, 1, r->pzl, r->f) != r->pzl)
-            die("short input-order names");
-        if (fseeko(r->f, here, SEEK_SET)) die("seek back");
-    }
-    r->data0 = 8 + 128 + lzl + h[1] + h[2] + h[3] + h[11] + r->pzl;
+    r->data0 = 8 + 128 + lzl + h[1] + h[2] + h[3] + h[11];
 
-    r->nz_keep = sidebuf ? sidebuf : nz; r->nzl_keep = nzl_eff; r->names_ready = 0; r->names_tok = names_tok; r->names_int = names_int; r->names_fld = names_fld; r->dropped = dropped;
+    r->nz_keep = nz; r->nzl_keep = (size_t)h[1]; r->names_ready = 0; r->names_tok = names_tok; r->names_int = names_int; r->names_fld = names_fld; r->dropped = dropped;
     r->name = NULL;                    /* 160 MB, allocated by ensurenames */
 
     /* Walk varints with a cursor, allocate nothing. */
@@ -3906,10 +3519,10 @@ static void ensurenames(R *r) {
     }
     char *names;
 
-    if (NAMEFILE && !r->perm_ext && !r->dropped && r->nzl_keep)
+    if (NAMEFILE && !r->dropped && r->nzl_keep)
         die("this track stores its own names: --names FILE would replace "
             "them, so it is refused. Unset it to read the names in the file");
-    if (NAMEFILE && !r->perm_ext) {                        /* rank N is the Nth record */
+    if (NAMEFILE) {                    /* the Nth name is the Nth record */
         names = readnamefile(r->nreads);
     } else if (r->dropped && !RAW) {
         die("the names of this track were dropped at compress time: give "
@@ -3941,38 +3554,6 @@ static void ensurenames(R *r) {
 
     if (i != r->nreads || *p)
         die("names stream does not match the track's sequence count");
-    if (r->pzl || r->perm_ext) {  /* ranks: resolve through the input order */
-        char *nat;
-        if (r->perm_ext) {
-            if (!NAMEFILE) {
-                if (RAW) goto ranks_are_names;
-                die("--sort --names drop keeps the rank of every record and no "
-                    "name text: give the original FASTA/FASTQ in --names FILE");
-            }
-            nat = readnamefile(r->nreads);
-        }
-        else if (r->perm_tok) { size_t nb; nat = tokd(r->pz, r->pzl, &nb); }
-        else {
-            size_t nb; nat = unz(r->pz, r->pzl, &nb, "input-order names");
-        }
-        r->natbufp = nat;             /* after the remap r->name[] points here */
-        char **tab = xmalloc(mul(r->nreads, sizeof(char *)));
-        char *q2 = nat; uint64_t k = 0;
-        for (; k < r->nreads; k++) {
-            char *nl2 = strchr(q2, 10);
-            if (!nl2) break;
-            tab[k] = q2; *nl2 = 0; q2 = nl2 + 1;
-        }
-        if (k != r->nreads || *q2)
-            die("input-order names do not match the track's sequence count");
-        for (uint64_t j = 0; j < r->nreads; j++) {
-            char *e2; unsigned long long v = strtoull(r->name[j], &e2, 10);
-            if (*e2 || v >= r->nreads) die("a stored rank is not a record number");
-            r->name[j] = tab[v];
-        }
-        free(tab);
-    }
-ranks_are_names: ;
 }
 
 
@@ -4836,8 +4417,8 @@ static void loadref_kst(const char *path) {
     {   FILE *f = fopen(path, "rb");
         if (!f || fseek(f, 8, SEEK_SET) || fread(hh, 8, 16, f) != 16) die("cannot read the reference track");
         fclose(f); }
-    if (hh[1] & (ALNFLAG | DBFLAG | SIDEFLAG | DROPPED | PERMFLAG))
-        die("the reference .kst must be a plain track: not --aln, not --db, and its names in the file, neither dropped nor in a sidecar");
+    if (hh[1] & (ALNFLAG | DBFLAG | DROPPED))
+        die("the reference .kst must be a plain track: not --aln, not --db, and its names in the file, not dropped");
     R *r = refopen(path);
     if (!r->rowhash) die("the reference .kst carries no row hash");
     ensurenames(r);
@@ -5063,12 +4644,12 @@ static void rclose(R *r) {
     if (!r) return;
     if (r->f) fclose(r->f);
     if (r->d) ZSTD_freeDCtx(r->d);
-    if (!r->name_borrowed) { free(r->namebuf); free(r->natbufp); free(r->name); }
+    if (!r->name_borrowed) { free(r->namebuf); free(r->name); }
     if (r->lab) { free(r->lab[0]); free(r->lab); }
     if (!r->blk_borrowed) { free(r->blkbuf); free(r->rtab); }
     free(r->cbuf);
     free(r->b);
-    free(r->nz_keep); free(r->pz); free(r->ibuf); free(r->ichunk);
+    free(r->nz_keep); free(r->ibuf); free(r->ichunk);
     free(r->coff); free(r->cpendv); free(r->htab);
     free(r->sst); free(r->sen); free(r->sfeat); free(r->snov);
     free(r);
@@ -5363,8 +4944,7 @@ static void encode_db(int nfiles, char **files) {
         const char *lab = idbuf; size_t llen = (size_t)(e2 - idbuf);
 
         if (ALNPAF && llen == 1 && *lab == '=') die("a label \"=\" is reserved under --aln");
-        if (SORT) sortpush(b[0].seq, seqlen, lo, hi - lo, lab, llen);
-        else ktw_row(w, b[0].seq, seqlen, hi - lo, lab, llen, lo, 0);
+        ktw_row(w, b[0].seq, seqlen, hi - lo, lab, llen, lo, 0);
         rows++;
         for (int i = 0; i < nfiles; i++) {
             b[i].st = hi;                            /* consume up to the cut */
@@ -5379,7 +4959,6 @@ static void encode_db(int nfiles, char **files) {
         fprintf(stderr, "aln: %llu of %llu rows matched the reference (%.1f%%)%s",
                 (unsigned long long)ALNHIT, (unsigned long long)rows,
                 rows ? 100.0 * (double)ALNHIT / (double)rows : 0.0, "\n");
-    sortfinish(w);
     ktw_tail(w);
     ktw_pushread(w);
     ktw_flush(w);
@@ -5607,7 +5186,7 @@ int main(int argc, char **argv) {
     atexit(profdump);
     atexit(emitflush);
     static const char *const USAGE = "usage:\n"
-            "  karyozip compress   [-i IN.bed[.gz]] [-o OUT.kst] [-e low|medium|high] [-n drop|drop:FILE]\n"
+            "  karyozip compress   [-i IN.bed[.gz]] [-o OUT.kst] [-e low|medium|high] [-n drop]\n"
             "                      [-d features.tsv [--hier H] -i SET.bed ...] [-a P.paf --ref R.bed|R.kst]\n"
             "  karyozip decompress -i F [-o OUT.bed] [-n FILE] [-d features.tsv [--set A,B] [--out-dir DIR]]\n"
             "  karyozip query      -i F -r NAME[:START-END] [-o OUT.bed] [-n FILE]\n"
@@ -5619,14 +5198,13 @@ int main(int argc, char **argv) {
             "               set is the one whose tree holds the track's labels, or --set when two do\n"
             "               --v1 for tracks of KaryoScope 1.x, --chunk 20000 for those before 2026-01-08\n"
             "  readers take -n, -d, --hier, -a, --ref as compress was given; -n FILE takes the names\n"
-            "               from drop:FILE, a FASTA, FASTQ or list\n"
+            "               from a FASTA, FASTQ or list\n"
             "  -d: --set A,B picks feature sets, default all; without --out-dir they print as columns;\n"
             "               with --smooth, one set on stdout, or every picked set under --out-dir\n"
             "  any command: -t N, --threads N  --tmp-dir DIR  -h, --help  --version\n"
             "  long forms:  -i --input  -o --output  -r --region  -e --effort  -n --names  -d --db  -a --aln\n"
             "advanced:\n"
             "  karyozip aln-pack -a P.paf --ref REF.bed|REF.kst -o OUT   cuts a PAF to what -a reads\n"
-            "  compress --sort[=MEM]: records grouped by labels, for short reads with -n drop\n"
             "  -a with --aln-names F: the track names rows by ordinal, F names them\n"
             "  --smooth --max-gap N: KaryoScope's gap bound, 1000 by default"
 /* Debug and profiling flags, out of the help:
@@ -5652,7 +5230,7 @@ int main(int argc, char **argv) {
     char *REGA = NULL;
     static const struct { const char *f; int nv; } FLAGS[] = {
         {"--version",0},{"--threads",1},{"-t",1},{"--profile",0},{"--tmp-dir",1},{"--names",1},
-        {"--max-gap",1},{"--v1",0},{"--chunk",1},{"--aln-names",1},{"--sort",0},
+        {"--max-gap",1},{"--v1",0},{"--chunk",1},{"--aln-names",1},
         {"--effort",1},
         {"--block",1},{"--db",1},{"--aln",1},
         {"--ref",1},{"--out-dir",1},{"--set",1},{"--raw",0},{"--hier",1},
@@ -5669,8 +5247,7 @@ int main(int argc, char **argv) {
         const char *a = argv[i];
         if (a[0] != '-' || !a[1]) { cmd = a; break; }
         int nv = -1;
-        if (!strncmp(a, "--sort=", 7)) nv = 0;        /* the value is in the flag */
-        else for (size_t k = 0; k < sizeof FLAGS / sizeof *FLAGS; k++)
+        for (size_t k = 0; k < sizeof FLAGS / sizeof *FLAGS; k++)
             if (!strcmp(a, FLAGS[k].f)) { nv = FLAGS[k].nv; break; }
         if (nv < 0) { fprintf(stderr, "karyozip: unknown flag %s\n", a); exit(1); }
         i += nv;
@@ -5698,18 +5275,14 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--tmp-dir")) { TMPD = v; take = 2; }
         else if (!strcmp(a, "--names")) {
             if (!strcmp(v, "drop")) { ok = enc; NAMEMODE = 1; }
-            else if (!strncmp(v, "drop:", 5)) { ok = enc; NAMES_OUT = v + 5;
-                                                if (!*NAMES_OUT) die("--names drop:FILE needs a file"); }
-            else if (enc) die("compress takes --names drop or drop:FILE; a name file is --aln-names");
-            else { ok = rd; NAMESARG = v; }   /* the blob drop:FILE wrote, or a FASTA, FASTQ or list */
+            else if (enc) die("compress takes --names drop; a name file is --aln-names");
+            else { ok = rd; NAMESARG = v; }   /* a FASTA, FASTQ or list */
             take = 2; }
         else if (!strcmp(a, "--max-gap")) { ok = sm; MAXGAP = num_arg(v, UINT64_MAX, "--max-gap needs a number"); take = 2; }
         else if (!strcmp(a, "--v1")) { ok = sm; V1 = 1; take = 1; }
         else if (!strcmp(a, "--chunk")) { ok = sm; SMCHUNK = (uint64_t)int_arg(v, 1, 1000000000, "--chunk is a number of runs, 1 to 1000000000"); take = 2; }
         else if (!strcmp(a, "--aln-names")) {   /* the alignment's own table: ordinal N is line N+1 */
             ok = inf; ALNNAMES = v; take = 2; }
-        else if (!strcmp(a, "--sort")) { ok = enc; SORT = 1; take = 1; }
-        else if (!strncmp(a, "--sort=", 7)) { ok = enc; SORT = 1; SORTMEM = mem_arg(a + 7); take = 1; }
         else if (!strcmp(a, "--effort")) { ok = enc;
             if (strcmp(v, "low") && strcmp(v, "medium") && strcmp(v, "high")) die("--effort is low, medium or high");
             FASTMODE = !strcmp(v, "low"); SLOW = !strcmp(v, "high"); take = 2; }
@@ -5761,7 +5334,6 @@ int main(int argc, char **argv) {
         return 0;
     }
     if (enc) {
-        if (NAMEMODE == 1 && NAMES_OUT) die("--names drop and --names drop:FILE are exclusive");
         if (ALNPAF && !ALNREF) die("--aln needs --ref");
         if (ALNREF && !ALNPAF) die("--ref does nothing without --aln");
 
@@ -5769,12 +5341,8 @@ int main(int argc, char **argv) {
             die("--aln with --names drop needs --aln-names: without the names "
                 "decompress cannot reach the alignment");
 
-        if (ALNPAF && SORT && NAMEMODE == 1)
-            die("--aln with --sort and --names drop cannot be decoded: sorting "
-                "reorders the records, so the ordinal name map is invalid");
         if (ALNNAMES && !ALNPAF) die("--aln-names does nothing without --aln");
 
-        PERMON = SORT && !NAMES_OUT;
         if (ALNPAF) { if (ALNNAMES) loadordinals(ALNNAMES);
                       loadref(ALNREF); loadaln(ALNPAF); }
 

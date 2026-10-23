@@ -42,25 +42,14 @@ fn main() {
     opt.slow = effort != "low";
     opt.whole = effort == "high";
     if effort == "low" && c.block.is_none() { opt.block = 262144; }   // -e low: blocks and an index, for queries
-    if let Some(m) = &c.sort {
-        opt.sort = true;
-        if !m.is_empty() { opt.sortmem = mem_arg(m); }
-    }
 
     let Some(cmd) = c.cmd.as_ref() else { die(USAGE) };
     prof::start(c.profile, n);
     let mut ro = reader::ReadOpts { raw: c.raw, db: c.db.is_some(), ..Default::default() };
     // The C keeps a mode and a file separately, so a repeat of one does not
-    // clear the other, and drop plus drop:FILE is a refusal.
+    // clear the other.
     for n in &c.names {
-        match n.as_str() {
-            "drop" => opt.drop_names = true,
-            _ if n.starts_with("drop:") => {
-                if n.len() == 5 { die("--names drop:FILE needs a file"); }
-                opt.names_out = Some(n[5..].to_string());
-            }
-            _ => ro.names_file = Some(n.clone()),
-        }
+        if n == "drop" { opt.drop_names = true } else { ro.names_file = Some(n.clone()) }
     }
 
     let name = c.name();
@@ -71,17 +60,10 @@ fn main() {
         .unwrap_or_else(|| die(&format!("{name} needs -i TRACK")));
     match cmd {
         Cmd::Encode => {
-            if opt.drop_names && opt.names_out.is_some() {
-                die("--names drop and --names drop:FILE are exclusive");
-            }
             if c.aln.is_some() && c.refbed.is_none() { die("--aln needs --ref"); }
             if c.aln.is_some() && opt.drop_names && c.aln_names.is_none() {
                 die("--aln with --names drop needs --aln-names: without the names \
                      decompress cannot reach the alignment");
-            }
-            if c.aln.is_some() && opt.sort && opt.drop_names {
-                die("--aln with --sort and --names drop cannot be decoded: sorting \
-                     reorders the records, so the ordinal name map is invalid");
             }
             if c.db.is_some() && c.input.is_empty() { die("--db: give one -i BED per feature set"); }
             let a = load_aln(&c.aln, &c.refbed, &c.aln_names, "", aln::Lazy::No);
@@ -198,35 +180,6 @@ fn finish(w: writer::Writer, aln_on: bool) {
     report(&st);
 }
 
-
-/// --sort=MEM: digits and an optional K, M, G or T. The C spells the
-/// refusals this way, so these do too.
-fn mem_arg(p: &str) -> u64 {
-    if p.is_empty() { die("--sort=MEM must be positive"); }
-    let b = p.as_bytes();
-    let mut val: u64 = 0;
-    let mut i = 0;
-    while i < b.len() && b[i].is_ascii_digit() {
-        if val > (u64::MAX - (b[i] - b'0') as u64) / 10 {
-            die("--sort=MEM is larger than the address space");
-        }
-        val = val * 10 + (b[i] - b'0') as u64;
-        i += 1;
-    }
-    if i == 0 || val == 0 { die("--sort=MEM must be positive"); }
-    let mul: u64 = if i == b.len() { 1 } else {
-        if i + 1 != b.len() { die("--sort=MEM: nothing may follow the unit"); }
-        match b[i] {
-            b'k' | b'K' => 1 << 10, b'm' | b'M' => 1 << 20,
-            b'g' | b'G' => 1 << 30, b't' | b'T' => 1 << 40,
-            _ => die("--sort=MEM: use a plain number of bytes or a K, M, G or T suffix"),
-        }
-    };
-    if val > u64::MAX / mul { die("--sort=MEM is larger than the address space"); }
-    let m = val * mul;
-    if m < (1 << 20) { die("--sort=MEM must be at least 1M"); }
-    m
-}
 
 /// -r NAME or NAME:START-END, the range BED's: 0-based, END excluded. A
 /// name may hold ':' itself, so only a digits-digits tail is a range.
@@ -478,7 +431,6 @@ pub struct Cli {
     pub query: bool,
     pub block: Option<String>,
     pub effort: Option<String>,
-    pub sort: Option<String>,        // "" for a bare --sort
     pub names: Vec<String>,
     pub db: Option<String>,
     pub hier: Option<String>,
@@ -499,7 +451,7 @@ pub struct Cli {
 /// Every flag and whether it takes a value, as the C's FLAGS.
 const FLAGS: &[(&str, bool)] = &[
     ("--version", false), ("--threads", true), ("-t", true), ("--profile", false), ("--tmp-dir", true),
-    ("--names", true), ("--max-gap", true), ("--v1", false), ("--chunk", true), ("--aln-names", true), ("--sort", false),
+    ("--names", true), ("--max-gap", true), ("--v1", false), ("--chunk", true), ("--aln-names", true),
     ("--effort", true), ("--block", true), ("--db", true), ("--aln", true), ("--ref", true),
     ("--out-dir", true), ("--set", true), ("--raw", false), ("--hier", true), ("--input", true),
     ("--output", true), ("--region", true), ("--smooth", false),
@@ -533,8 +485,7 @@ impl Cli {
         while i < av.len() {
             let a = long(av[i].clone());
             if !a.starts_with('-') || a.len() == 1 { cmd = a; break; }
-            let nv = if a.starts_with("--sort=") { Some(false) }
-                     else { FLAGS.iter().find(|(f, _)| *f == a).map(|f| f.1) };
+            let nv = FLAGS.iter().find(|(f, _)| *f == a).map(|f| f.1);
             match nv { Some(v) => i += 1 + v as usize, None => die(&format!("unknown flag {a}")) }
         }
         av = av.into_iter().map(long).collect();
@@ -560,11 +511,8 @@ impl Cli {
                 "--tmp-dir" => { o.tmp_dir = Some(val()); true }
                 "--names" => {
                     let n = val();
-                    let ok = if n == "drop" || n.starts_with("drop:") {
-                        if n == "drop:" { die("--names drop:FILE needs a file"); }
-                        enc
-                    } else if enc {
-                        die("compress takes --names drop or drop:FILE; a name file is --aln-names")
+                    let ok = if n == "drop" { enc } else if enc {
+                        die("compress takes --names drop; a name file is --aln-names")
                     } else { rd };
                     o.names.push(n); ok
                 }
@@ -572,11 +520,6 @@ impl Cli {
                 "--v1" => { o.v1 = true; sm }
                 "--chunk" => { cnt(&v, 1, 1000000000, "--chunk is a number of runs, 1 to 1000000000"); o.chunk = Some(val()); sm }
                 "--aln-names" => { o.aln_names = Some(val()); inf }
-                "--sort" => { o.sort = Some(String::new()); enc }
-                s if s.starts_with("--sort=") => {
-                    crate::mem_arg(&s[7..]);
-                    o.sort = Some(s[7..].to_string()); enc
-                }
                 "--effort" => {
                     if !["low", "medium", "high"].contains(&val().as_str()) { die("--effort is low, medium or high"); }
                     o.effort = Some(val()); enc
@@ -603,7 +546,7 @@ impl Cli {
                 if rdr && matches!(a.as_str(), "--max-gap" | "--v1" | "--chunk") { die(&format!("{a} needs --smooth")); }
                 die(&format!("{a} does not apply to {cmd}{}", if sm { " --smooth" } else { "" }));
             }
-            av.drain(i..i + if matches!(a.as_str(), "--profile" | "--v1" | "--raw" | "--smooth") || a.starts_with("--sort") { 1 } else { 2 });
+            av.drain(i..i + if matches!(a.as_str(), "--profile" | "--v1" | "--raw" | "--smooth") { 1 } else { 2 });
         }
         if cmd.is_empty() { die(USAGE); }
         o.query = qry;

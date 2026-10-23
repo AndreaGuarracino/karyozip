@@ -1,15 +1,15 @@
 """Forging helpers for the suite: parse a track, patch it, re-sign its hashes."""
 import struct, subprocess, sys, random, os
 FNV0 = 0xcbf29ce484222325; P = 0x100000001b3; M = (1 << 64) - 1
-FLAGS = M ^ ((1 << 49) - 1)   # bits 49-63: flags; below: names length
+FLAGS = sum(1 << b for b in (49, 50, 51, 52, 55, 56, 58, 59, 60, 61, 62, 63))   # flags; the rest: names length
 def fnv(h, b):
     for x in b: h = ((h ^ x) * P) & M
     return h
 def load(path):
     d = bytearray(open(path, "rb").read()); return d, list(struct.unpack_from("<16Q", d, 8))
-def sign(d, h):   # hash header (h[15]=0), then lz..np sections
+def sign(d, h):   # hash header (h[15]=0), then lz..itz sections
     hz = list(h); hz[15] = 0; mh = fnv(FNV0, struct.pack("<16Q", *hz)); off = 136
-    for n in (h[6], h[1] & ~FLAGS, h[2], h[3], h[11], h[14]): mh = fnv(mh, d[off:off + n]); off += n
+    for n in (h[6], h[1] & ~FLAGS, h[2], h[3], h[11]): mh = fnv(mh, d[off:off + n]); off += n
     h[15] = mh; struct.pack_into("<16Q", d, 8, *h)
 def vget(d, i):
     v = 0; s = 0

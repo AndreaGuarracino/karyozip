@@ -31,21 +31,19 @@ lk() {   # fails on refusal unless "(refused)" in DESC
 L=$W/lk.d; mkdir -p "$L/out"
 printf 'feature_set\tchild\tparent\nfs\tA\tcategorized\nfs\tB\tcategorized\nfs\tC\tcategorized\nfs\tD\tcategorized\nfs\tX\tcategorized\nfs\tZ\tcategorized\n' > "$L/h.tsv"
 "$LK" compress < "$D/ls.bed" > "$L/p.kt" 2>/dev/null
-"$LK" compress --names drop:"$L/side" < "$D/ls.bed" > "$L/s.kt" 2>/dev/null
+"$LK" compress --names drop < "$D/ls.bed" > "$L/s.kt" 2>/dev/null; cut -f1 "$D/ls.bed" | uniq > "$L/s.names"
 "$LK" compress --aln "$D/lp.paf" --ref "$D/lref.bed" < "$D/ls.bed" > "$L/a.kt" 2>/dev/null
 DB="-i $D/db.acrocentric.bed -i $D/db.chromosome.bed -i $D/db.gene.bed -i $D/db.region.bed -i $D/db.repeat.bed -i $D/db.subtelomeric.bed"
 "$LK" compress --db "$D/db.features.tsv" $DB > "$L/f.kt" 2>/dev/null
 lk "compress"                       "$LK" compress < "$D/ls.bed"
 lk "compress --effort low"          "$LK" --effort low compress < "$D/ls.bed"
 lk "compress --block 262144"        "$LK" --block 262144 compress < "$D/ls.bed"
-lk "compress --sort"                "$LK" --sort compress < "$D/ls.bed"
-lk "compress --sort=1M"             "$LK" --tmp-dir "$L" --sort=1M compress < "$D/ls.bed"
-lk "compress --names drop:F"        "$LK" compress --names drop:"$L/side2" < "$D/ls.bed"
+lk "compress --names drop"          "$LK" compress --names drop < "$D/ls.bed"
 lk "compress --aln --ref"           "$LK" compress --aln "$D/lp.paf" --ref "$D/lref.bed" < "$D/ls.bed"
 lk "compress --db"                  "$LK" compress --db "$D/db.features.tsv" $DB
 lk "decompress"                       "$LK" decompress -i "$L/p.kt"
 lk "decompress --raw"                 "$LK" decompress --raw -i "$L/p.kt"
-lk "decompress --names F"             "$LK" --names "$L/side" decompress -i "$L/s.kt"
+lk "decompress --names F"             "$LK" --names "$L/s.names" decompress -i "$L/s.kt"
 lk "decompress --aln --ref"           "$LK" decompress --aln "$D/lp.paf" --ref "$D/lref.bed" -i "$L/a.kt"
 lk "decompress --db --out"            "$LK" decompress --db "$D/db.features.tsv" --out-dir "$L/out" -i "$L/f.kt"
 lk "region, a name that is there" "$LK" query -i "$L/p.kt" -r r1
@@ -81,10 +79,8 @@ for i, b in enumerate(bad):
 PY
 n=0
 for f in "$W"/bad*.bed; do
-  for m in "" "--sort=1G"; do
-    $KT compress --block 4 $m < "$f" > /dev/null 2>&1 && { echo "fuzz: malformed BED ACCEPTED ($f $m)"; fail=1; }
-    n=$((n+1))
-  done
+  $KT compress --block 4 < "$f" > /dev/null 2>&1 && { echo "fuzz: malformed BED ACCEPTED ($f)"; fail=1; }
+  n=$((n+1))
 done
 echo "fuzz: $n malformed encodes, all refused"
 
@@ -92,10 +88,9 @@ echo "fuzz: $n malformed encodes, all refused"
 python3 "$D/kt.py" gen "$W" "$N"
 v=0
 for f in "$W"/ok*.bed; do
-  for m in "" "--block 4" "--block 262144" "--sort" "--names drop" "--effort low --block 3"; do
+  for m in "" "--block 4" "--block 262144" "--names drop" "--effort low --block 3"; do
     $KT compress $m < "$f" > "$W/v.kt" 2>"$W/err" || { echo "fuzz: valid BED REFUSED ($f $m): $(tail -1 "$W/err")"; fail=1; continue; }
-    case "$m" in *sort*)  $KT decompress -i "$W/v.kt" 2>/dev/null | sort | cmp -s - <(sort "$f") ;;
-                 *drop*)  $KT decompress --raw -i "$W/v.kt" 2>/dev/null | cut -f2- | cmp -s - <(cut -f2- "$f") ;;
+    case "$m" in *drop*)  $KT decompress --raw -i "$W/v.kt" 2>/dev/null | cut -f2- | cmp -s - <(cut -f2- "$f") ;;
                  *)       $KT decompress -i "$W/v.kt" 2>/dev/null | cmp -s - "$f" ;; esac \
       || { echo "fuzz: valid BED did not come back ($f $m)"; fail=1; }
     v=$((v+1))
@@ -116,7 +111,7 @@ PY
 # decoded rows must match; sanitizer reports fail
 check() {
   local f=$1 what=$2 rc out
-  out=$(ASAN_OPTIONS=detect_leaks=0 timeout 30 $SAN decompress --raw $NIN -i "$f" 2>"$W/err"); rc=$?
+  out=$(ASAN_OPTIONS=detect_leaks=0 timeout 30 $SAN decompress --raw -i "$f" 2>"$W/err"); rc=$?
   if [ $rc -gt 1 ]; then echo "fuzz: $what crashed rc=$rc"; fail=1; return; fi
   grep -qE "AddressSanitizer|runtime error" "$W/err" && { echo "fuzz: $what sanitizer report"; fail=1; return; }
   if [ $rc -eq 0 ] && [ -s "$W/want" ]; then
@@ -125,14 +120,11 @@ check() {
   fi
 }
 d=0
-# every writer path, including a sidecar
-$KT compress --block 32 --names drop:"$W/side.names" < "$W/ok.bed" > "$W/side.kt" 2>/dev/null
-for m in "--block 32" "--block 262144" "--block 32 --effort low" "--block 32 --sort=1G" \
-         "--block 32 --sort=1G --names drop" "names-in"; do
-  case "$m" in *names-in*) cp "$W/side.kt" "$W/t.kt";; *) $KT compress $m < "$W/ok.bed" > "$W/t.kt" 2>/dev/null || { echo "fuzz: compress $m FAILED"; fail=1; continue; };; esac
+# every writer path
+for m in "--block 32" "--block 262144" "--block 32 --effort low" "--block 32 --names drop"; do
+  $KT compress $m < "$W/ok.bed" > "$W/t.kt" 2>/dev/null || { echo "fuzz: compress $m FAILED"; fail=1; continue; }
   sz=$(stat -c%s "$W/t.kt")
-  NIN=""; case "$m" in *names-in*) NIN="--names $W/side.names";; esac
-  $KT decompress --raw $NIN -i "$W/t.kt" 2>/dev/null | cut -f2,3,4 > "$W/want"
+  $KT decompress --raw -i "$W/t.kt" 2>/dev/null | cut -f2,3,4 > "$W/want"
   for cut in 1 8 64 512; do
     [ "$cut" -ge "$sz" ] && continue
     head -c $((sz - cut)) "$W/t.kt" > "$W/m.kt"
@@ -252,7 +244,7 @@ for bi in sorted(set([0, len(rows) // 2, len(rows) - 1])):
             d = bytearray(src[:o_sz]) + z + src[o_end:]
             hh = list(h); hh[3] = len(z); hh[15] = 0
             mh = fnv(FNV0, struct.pack("<16Q", *hh)); off = 136
-            for n in (hh[6], nzl, hh[2], hh[3], hh[11], hh[14]):
+            for n in (hh[6], nzl, hh[2], hh[3], hh[11]):
                 mh = fnv(mh, d[off:off + n]); off += n
             hh[15] = mh; struct.pack_into("<16Q", d, 8, *hh)
             open("%s/fsz%d.kt" % (W, k), "wb").write(d); k += 1
@@ -278,7 +270,7 @@ python3 - "$W" "$D" <<'PY' || { echo "fuzz: stage 5 generator FAILED"; exit 1; }
 import struct, sys; sys.path.insert(0, sys.argv[2]); from kt import *
 W = sys.argv[1]
 src = bytearray(open(W + "/t5.kt", "rb").read()); h = list(struct.unpack_from("<16Q", src, 8))
-nzl = h[1] & ~FLAGS; o_nz = 136 + h[6]; o_iz = o_nz + nzl; o_sz = o_iz + h[2]; o_it = o_sz + h[3]; o_np = o_it + h[11]; o_end = o_np + h[14]
+nzl = h[1] & ~FLAGS; o_nz = 136 + h[6]; o_iz = o_nz + nzl; o_sz = o_iz + h[2]; o_it = o_sz + h[3]; o_np = o_it + h[11]
 tab = unzst(src[o_it:o_np])
 i = 0; chunks = []
 while i < len(tab):
@@ -290,7 +282,7 @@ def build(frames, chunks, hh):
     hh = list(hh); hh[2] = len(iz); hh[11] = len(it); hh[15] = 0
     d = bytearray(src[:o_iz]) + iz + src[o_sz:o_it] + it + src[o_np:]
     mh = fnv(FNV0, struct.pack("<16Q", *hh)); off = 136
-    for n in (hh[6], nzl, hh[2], hh[3], hh[11], hh[14]): mh = fnv(mh, d[off:off + n]); off += n
+    for n in (hh[6], nzl, hh[2], hh[3], hh[11]): mh = fnv(mh, d[off:off + n]); off += n
     hh[15] = mh; struct.pack_into("<16Q", d, 8, *hh); return d
 k = 0
 ent = unzst(frames[0])

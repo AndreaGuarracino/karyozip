@@ -2,8 +2,8 @@
 //! are meant to be interchangeable.
 
 use crate::ffi;
-use crate::kst::{self, FNV0, TOKFLAG, INTFLAG, FLDFLAG, DROPPED, ALNFLAG, DBFLAG, SIDEFLAG, LENFLAG,
-                 TAILFLAG, RUNFLAG, ILVFLAG, GRPFLAG, PERMFLAG, PERMTOK, CARTFLAG, ICHUNK, FLAGS};
+use crate::kst::{self, FNV0, TOKFLAG, INTFLAG, FLDFLAG, DROPPED, ALNFLAG, DBFLAG, LENFLAG,
+                 TAILFLAG, RUNFLAG, ILVFLAG, GRPFLAG, CARTFLAG, ICHUNK, FLAGS};
 use std::io::{Read, Seek, SeekFrom};
 
 const IDXMAGIC: u64 = 0x3130_5844_4954_534b;   // "KSTIDX01"
@@ -83,12 +83,11 @@ pub struct Reader {
     tailpred: u64,
     tailskip: u64,
     /// every name, newline-free, back to back, and noff[i]..noff[i+1] is
-    /// name i: decoded from nz/pz on first use
+    /// name i: decoded from nz on first use
     names: std::cell::OnceCell<std::sync::Arc<(Vec<u8>, Vec<u64>)>>,
     nz: Vec<u8>,
-    pz: Vec<u8>,
     names_file: Option<String>,
-    /// side, perm_ext, dropped, int, tok, perm, perm_tok
+    /// dropped, int, tok, fld
     nf: u8,
     /// the appended index: offset of its key table, and its trailer's binding word
     idx: Option<(u64, u64, u64, u64, std::fs::File)>,   // index base, binding, bucket bits, payload, TRACK.kzi
@@ -108,7 +107,7 @@ pub struct Reader {
     cached: Option<Cached>,
     /// the rows as text, what binds this track when it serves as --ref
     pub rowhash: u64,
-    /// not --aln, --db, --sort, --names drop, names in the file: fit for --ref
+    /// not --aln, --db, --names drop, names in the file: fit for --ref
     pub plainref: bool,
     /// where the last seq_rows stopped: (block, rows into it, cursor), so a
     /// walk in order continues instead of re-skipping the block's rows
@@ -164,8 +163,7 @@ impl Reader {
         }
         let nml = h[1] & !FLAGS;
         if nml > fsz || h[2] > fsz || h[3] > fsz || h[6] > fsz || h[11] > fsz
-            || h[14] > fsz || h[11] + h[14] > fsz
-            || 8 + 128 + nml + h[2] + h[3] + h[6] + h[11] + h[14] > fsz {
+            || 8 + 128 + nml + h[2] + h[3] + h[6] + h[11] > fsz {
             crate::bail("corrupt header: the stream sizes do not fit the file");
         }
         rd(f.seek(SeekFrom::Start(8 + 128)), "seek");
@@ -194,7 +192,6 @@ impl Reader {
         if names_tok as u8 + names_int as u8 + names_fld as u8 > 1 {
             crate::bail("corrupt file: names flagged more than one way");
         }
-        let was_side = h[1] & SIDEFLAG != 0;
         let dropped = h[1] & DROPPED != 0;
         if !o.raw && !o.index {
             if h[1] & ALNFLAG != 0 && o.aln.is_none() {
@@ -212,18 +209,12 @@ impl Reader {
             if h[1] & LENFLAG != 0 && o.aln.is_none() {
                 crate::bail("this track leaves out every length the reference implies: read it with --aln PAF --ref R");
             }
-            if was_side && o.names_file.is_none()
-               && std::fs::metadata(format!("{path}.names")).is_err() {
-                crate::bail("the names of this track are in a sidecar: give it with --names FILE, or --raw to see the ordinals");
-            }
         }
         if let Some(a) = &o.aln {
             if h[1] & ALNFLAG != 0 && (h[13] >> 8) != (a.hash & ((1u64 << 56) - 1)) {
                 crate::bail("this PAF, reference or name map is not the one the track was encoded with");
             }
         }
-        let was_perm = h[1] & PERMFLAG != 0;
-        let perm_tok = h[1] & PERMTOK != 0;
         let taildec = h[1] & TAILFLAG != 0;
         let runhead = h[1] & RUNFLAG != 0;
         let ilv = h[1] & ILVFLAG != 0;
@@ -248,27 +239,9 @@ impl Reader {
         let mut itz = vec![0u8; crate::ckalloc(h[11] as usize)];
         rd(f.read_exact(&mut itz), "short index table");
 
-        // A sidecar holds the names --names drop:FILE wrote.
-        let mut nzl = nzl;
-        if nzl == 0 && was_side {
-            let side = o.names_file.clone()
-                .unwrap_or_else(|| format!("{path}.names"));
-            match std::fs::read(&side) {
-                Ok(v) => { nzl = v.len(); nz = v; }
-                Err(_) if o.raw => {}
-                Err(_) => {
-                    eprintln!("cannot open the names sidecar {side}");
-                    crate::bail("this track keeps its names in a sidecar and it is missing");
-                }
-            }
-        }
-        let mut pz = vec![0u8; crate::ckalloc(if was_perm { h[14] as usize } else { 0 })];
-        if !pz.is_empty() { rd(f.read_exact(&mut pz), "short input-order names"); }
-
         // The metadata hash covers the header with h[15] zeroed, then every
-        // stream, and the sidecar's bytes stand in for the names when they
-        // are not in the file. A foreign sidecar is caught here.
-        if !(was_side && nzl == 0 && o.raw) {
+        // stream.
+        {
             let mut hz = h;
             hz[15] = 0;
             hz[1] = h1_raw;
@@ -280,16 +253,7 @@ impl Reader {
             mh = kst::fnv(mh, &iz);
             mh = kst::fnv(mh, &sz);
             mh = kst::fnv(mh, &itz);
-            mh = kst::fnv(mh, &pz);
-            if mh != h[15] {
-                if was_side {
-                    crate::bail("this names file does not belong to this track: give the file --names drop:FILE wrote, not a FASTA or a list");
-                }
-                crate::bail("corrupt file: the metadata does not match its hash");
-            }
-        }
-        if was_side && nzl == 0 && o.raw {
-            eprintln!("sidecar missing: names are ordinals and the metadata hash is unchecked");
+            if mh != h[15] { crate::bail("corrupt file: the metadata does not match its hash"); }
         }
 
         // The block table.
@@ -358,14 +322,10 @@ impl Reader {
             crate::bail("corrupt file: index chunk starts are not in order");
         }
 
-        // A permutation track with no stored blob keeps its names outside,
-        // so --names FILE is the source there, not a replacement.
-        let perm_ext = was_perm && pz.is_empty();
-
         // The names are decoded on first use: a query through the index
         // never needs them, and a short-read track has 20 million.
         let mut nf = 0u8;
-        for (bit, on) in [(1, was_side), (2, perm_ext), (4, dropped), (8, names_int), (16, names_tok), (32, was_perm), (64, perm_tok), (128, names_fld)] {
+        for (bit, on) in [(1, dropped), (2, names_int), (4, names_tok), (8, names_fld)] {
             if on { nf |= bit; }
         }
         let (lenc, idc) = (h[5] as u32 as i32, h[9] as u32 as i32);
@@ -375,18 +335,18 @@ impl Reader {
         if h[5] as u32 >> 31 != 0 || h[9] as u32 >> 31 != 0 {
             crate::bail("corrupt file: codec id out of range");
         }
-        let data0 = 8 + 128 + lzl as u64 + nml + h[2] + h[3] + h[11] + pz.len() as u64;
+        let data0 = 8 + 128 + lzl as u64 + nml + h[2] + h[3] + h[11];
         Reader {
             f, nreads: h[0], rows: h[4], lab, block: blk, b, data0,
             nameix: std::cell::OnceCell::new(),
             idcodec: idc, lencodec: lenc,
             taildec, tailpred: h[12], tailskip: h[13] & 0xff, iz, coff, cpend, ibx: Vec::new(), cur_chunk: u64::MAX,
             runhead, ilv, grp, rtab: Default::default(),
-            names: std::cell::OnceCell::new(), nz, pz, names_file: o.names_file.clone(),
+            names: std::cell::OnceCell::new(), nz, names_file: o.names_file.clone(),
             nf, idx,
             mhash: h[15], cur_ri: 0, cur_q: 0, cur_pend: 0, cached: None, sc: None,
             rowhash: if h1_raw & ALNFLAG != 0 { 0 } else { h[13] >> 8 },
-            plainref: h1_raw & (ALNFLAG | DBFLAG | SIDEFLAG | DROPPED | PERMFLAG) == 0,
+            plainref: h1_raw & (ALNFLAG | DBFLAG | DROPPED) == 0,
             feathash: (h[5] >> 32) | ((h[9] >> 32) << 32),
             cart: h[1] & CARTFLAG != 0,
             aln: o.aln.clone(), lenfile: h[1] & LENFLAG != 0 && !o.raw, raw: o.raw,
@@ -887,11 +847,10 @@ impl Reader {
     /// What the C's ensurenames does: the names, by whichever codec stored
     /// them, or from --names FILE, or the ordinals.
     fn decode_names(&self) -> (Vec<u8>, Vec<u64>) {
-        let (side, perm_ext, dropped) = (self.nf & 1 != 0, self.nf & 2 != 0, self.nf & 4 != 0);
-        let (names_int, names_tok, was_perm, perm_tok) = (self.nf & 8 != 0, self.nf & 16 != 0, self.nf & 32 != 0, self.nf & 64 != 0);
-        let names_fld = self.nf & 128 != 0;
-        let (nz, pz, n) = (&self.nz, &self.pz, self.nreads);
-        let mut names = if let (Some(f), false) = (&self.names_file, side || perm_ext) {
+        let (dropped, names_int) = (self.nf & 1 != 0, self.nf & 2 != 0);
+        let (names_tok, names_fld) = (self.nf & 4 != 0, self.nf & 8 != 0);
+        let (nz, n) = (&self.nz, self.nreads);
+        let mut names = if let Some(f) = &self.names_file {
             if !dropped && !nz.is_empty() {
                 crate::bail("this track stores its own names: --names FILE would replace them, so it is refused. Unset it to read the names in the file");
             }
@@ -922,36 +881,6 @@ impl Reader {
         if noff.len() as u64 - 1 != n {
             crate::bail("names stream does not match the track's sequence count");
         }
-        // --sort stores a rank per record; the input-order names sit beside
-        // them, or come from --names FILE when the blob is empty.
-        if (was_perm && !pz.is_empty()) || perm_ext {
-            let resolve = if perm_ext {
-                match &self.names_file {
-                    Some(f) => Some(read_name_file(f, n)),
-                    None if self.raw => None,
-                    None => crate::bail("--sort --names drop keeps the rank of every record and no name text: give the original FASTA/FASTQ in --names FILE"),
-                }
-            } else if perm_tok {
-                Some(tok_d(pz))
-            } else {
-                Some(zdec(pz, "input-order names"))
-            };
-            if let Some(nat) = resolve {
-                let tab: Vec<&[u8]> = nat.split(|&c| c == b'\n').filter(|l| !l.is_empty()).collect();
-                if tab.len() as u64 != n {
-                    crate::bail("input-order names do not match the track's sequence count");
-                }
-                let (mut nn, mut no) = (Vec::new(), vec![0u64]);
-                for i in 0..noff.len() - 1 {
-                    let nm = &names[noff[i] as usize..noff[i + 1] as usize - 1];
-                    let v: u64 = std::str::from_utf8(nm).ok().and_then(|t| t.parse().ok())
-                        .unwrap_or_else(|| crate::bail("a stored rank is not a record number"));
-                    if v >= n { crate::bail("a stored rank is not a record number"); }
-                    nn.extend_from_slice(tab[v as usize]); nn.push(b'\n'); no.push(nn.len() as u64);
-                }
-                names = nn; noff = no;
-            }
-        }
         (names, noff)
     }
 
@@ -959,7 +888,7 @@ impl Reader {
     /// under, by path and stat; a pipe binds nothing.
     fn namesrc(&self) -> u64 {
         use std::os::linux::fs::MetadataExt;
-        let Some(f) = self.names_file.as_ref().filter(|_| self.nf & 1 == 0) else { return 0 };
+        let Some(f) = self.names_file.as_ref() else { return 0 };
         let m = rd(std::fs::metadata(f), "cannot stat the file given to --names");
         if !m.is_file() { return 0; }
         let mut h = kst::fnv(FNV0, f.as_bytes());

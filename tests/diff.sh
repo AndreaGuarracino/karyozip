@@ -28,9 +28,7 @@ tally() { [ $bad = 0 ] && echo "$1: $ok forms identical" || { echo "$1: $bad of 
 # 2. encode, every fixture and flag
 for f in "$D"/*.bed; do
   for fl in "" "--block 4" "--block 262144" \
-            "--effort low" "--effort low --block 4" "--names drop" "--effort high" \
-            "--sort" "--sort --names drop" "--sort=1M" \
-            "--sort --block 4"; do
+            "--effort low" "--effort low --block 4" "--names drop" "--effort high"; do
     IN=$f both "compress $(basename "$f") [$fl]" $fl compress
   done
 done
@@ -78,27 +76,12 @@ if [ $irc = 0 ] && [ $irr = 0 ] && cmp -s "$W/ci.kst" "$W/ri.kst"; then echo "in
 else echo "index: TRAILERS DIFFER (rc $irc/$irr)"; fail=1; fi
 both "index cross-read" query -i "$W/ci.kst" -r seq0005; tally "index cross-read"
 
-# 6b. sorted tracks: same ranks resolved
-for f in ls.bed s.bed db.rall.bed ord.bed; do
-  for fl in "--sort"; do
-    "$C" $fl compress < "$D/$f" > "$W/t.kst" 2>/dev/null
-    both "sorted decompress $f [$fl]" decompress -i "$W/t.kst"
-  done
-  "$C" --sort --names drop compress < "$D/$f" > "$W/t.kst" 2>/dev/null
-  cut -f1 "$D/$f" | uniq > "$W/nm"
-  both "sorted+drop $f" --names "$W/nm" decompress -i "$W/t.kst"
-done
-tally "sorted decompress"
-
-# 7. reader flags: dropped names, sidecar, --raw
+# 7. reader flags: dropped names, --raw
 for f in ls.bed s.bed db.rall.bed ord.bed; do
   "$C" compress --names drop < "$D/$f" > "$W/d.kst" 2>/dev/null
   cut -f1 "$D/$f" | uniq > "$W/nm"
   for dfl in "--names $W/nm" "--raw"; do both "decompress $dfl on $f" $dfl decompress -i "$W/d.kst"; done
   EXPECT=fail both "decompress without names on $f" decompress -i "$W/d.kst"; EXPECT=ok
-  # ordinal names have no sidecar: refused
-  if "$C" compress --names "drop:$W/side" < "$D/$f" > "$W/s.kst" 2>/dev/null; then both "sidecar $f" --names "$W/side" decompress -i "$W/s.kst"
-  else EXPECT=fail both "sidecar $f refused" compress --names "drop:$W/side2" < "$D/$f"; EXPECT=ok; fi
   "$C" compress < "$D/$f" > "$W/p.kst" 2>/dev/null
   both "--raw $f" --raw decompress -i "$W/p.kst"
 done
@@ -217,7 +200,7 @@ echo "refusals: same message from both"
 python3 "$D/kt.py" gen "$W" 20
 gok=0; gbad=0
 for f in "$W"/ok*.bed; do
-  for fl in "" "--block 4" "--block 262144" "--sort" "--names drop" "--effort low --block 3"; do
+  for fl in "" "--block 4" "--block 262144" "--names drop" "--effort low --block 3"; do
     "$C" $fl compress < "$f" > "$W/c.kst" 2>/dev/null; c1=$?
     "$R" $fl compress < "$f" > "$W/r.kst" 2>/dev/null; c2=$?
     if cmp -s "$W/c.kst" "$W/r.kst" && [ $c1 = $c2 ]; then gok=$((gok+1))
@@ -278,27 +261,25 @@ cli() {
 cli; cli --help; cli -h; cli --version; cli --bogus; cli --bogus compress
 cli decompress; cli compress extra; cli --profile; cli --threads; cli --threads 4
 cli badcmd; cli region; cli decompress -i f; cli index; cli decompress -i f; cli aln-pack
-cli compress --names ordinal; cli decompress --sort; cli index --effort low
+cli compress --names ordinal; cli index --effort low
 cli compress --block; cli compress --effort max; cli compress --block 0
 cli -t; cli -t 0; cli -t 99999; cli --tmp-dir; cli decompress --raw x --raw
 cli index --block 0; cli aln-pack -a a --ref b; cli decompress -i f --hier h; cli query -i f -r s:5-5
-cli compress --sort=0; cli compress --names foo; cli --effort low; cli -r x
+cli compress --names foo; cli --effort low; cli -r x
 cli aln-pack --names foo -a a --ref b -o c; cli compress --db; cli --version compress
 cli index -i f x; cli decompress -i f x; cli query -i f --hier h --smooth --set fs -r s:9-3; cli aln-pack -a a --ref b -o c d
 cli query -i f --hier h --smooth --set fs -r s:1-2; cli query -i f -r s --halo 3; cli query -i f -r s:1-2
 cli decompress --max-gap x -i f --hier h --smooth --set fs
 cli decompress --out-dir D; cli decompress -i f --halo 2; cli query -i f -r s:+1-5; cli query -i f -r s:99999999999999999999-1
 cli compress --block +5; cli compress --aln p; cli compress --ref r
-cli decompress --aln-names f; cli index --names ordinal; cli compress --sort --sort=1M
+cli decompress --aln-names f; cli index --names ordinal
 cli decompress --aln p; cli decompress --ref r; cli decompress --aln p --ref r
 cli compress --names drop --aln p --ref r; cli decompress --db f; cli compress --db f
-cli compress --names drop --names drop:x; cli compress --names drop:
-cli compress --sort --names drop --aln p --ref r --aln-names q
 cli decompress -i a -i b; cli compress -i nosuch; cli index -i f -o x; cli query -i f -r s:2-1
 cli query -i f -r s --out-dir d; cli query -i f -r s --raw; cli decompress -i f --halo 2; cli region -i f -r s
 cli --tmp-dir /nonexistent compress; cli --tmp-dir /nonexistent --db $D/db.features.tsv compress -i $D/db.gene.bed
 cli --block=4 compress; cli -b4 compress; cli -t4 compress; cli --effort=low compress; cli -V; cli foo --raw
-cli decompress -i f --max-gap -1; cli query -i f -r -x; cli compress -- -x; cli decompress --sort=1Z; cli -o -i compress
+cli decompress -i f --max-gap -1; cli query -i f -r -x; cli compress -- -x; cli -o -i compress
 [ $cbad = 0 ] && echo "cli: $cok forms give the same words and code" \
   || { echo "cli: $cbad of $((cok+cbad)) DIFFER"; fail=1; }
 
@@ -314,9 +295,9 @@ for name, lens in (("tail1", [100]), ("tail2", [100, 150])):
             for k, e in enumerate(cuts + [tot]): f.write(f"q{r}\t{p}\t{e}\t{'ABCD'[(r + k) % 4]}\n"); p = e
 PY
 tok=0; tbad=0
-for f in tail1 tail2; do for flags in "" "-e low" "-e high" "--block 7" "--sort"; do
+for f in tail1 tail2; do for flags in "" "-e low" "-e high" "--block 7"; do
   "$C" $flags compress -i "$W/$f.bed" > "$W/c.kst" 2>/dev/null; "$R" $flags compress -i "$W/$f.bed" > "$W/r.kst" 2>/dev/null
-  if cmp -s "$W/c.kst" "$W/r.kst" && "$R" decompress -i "$W/c.kst" 2>/dev/null | sort | cmp -s - <(sort "$W/$f.bed"); then tok=$((tok+1)); else tbad=$((tbad+1)); echo "  tail differs: $f $flags"; fi
+  if cmp -s "$W/c.kst" "$W/r.kst" && "$R" decompress -i "$W/c.kst" 2>/dev/null | cmp -s - "$W/$f.bed"; then tok=$((tok+1)); else tbad=$((tbad+1)); echo "  tail differs: $f $flags"; fi
 done; done
 [ $tbad = 0 ] && echo "tail predictor: $tok forms identical" || { echo "tail predictor: $tbad DIFFER"; fail=1; }
 

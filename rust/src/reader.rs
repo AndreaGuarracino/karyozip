@@ -1040,7 +1040,7 @@ impl Reader {
     /// --db: the sequence's rows over the picked sets, touching equal tuples
     /// merged, so one set gives what its own track gives. Needs the whole sequence.
     #[allow(clippy::too_many_arguments)]
-    fn region_set(&mut self, ri: u64, seq: &[u8], lo: u64, hi: u64, halo: u64,
+    fn region_set(&mut self, ri: u64, seq: &[u8], lo: u64, hi: u64,
                   fe: &crate::db::Feats, cols: &[usize], out: &mut impl std::io::Write) {
         let (blk, off, nruns) = self.locate(ri);
         let tskip = self.tailskip;
@@ -1061,8 +1061,7 @@ impl Reader {
             let (mut f, mut l) = (n, 0usize);
             for i in 0..n { if en[i] > lo && st[i] < hi { if i < f { f = i; } l = i; } }
             if f > l { return; }
-            a = f.saturating_sub(halo as usize);
-            b = if n - l - 1 <= halo as usize { n } else { l + halo as usize + 1 };
+            a = f; b = l + 1;
         }
         let mut buf = Vec::with_capacity(1 << 20);
         for i in a..b {
@@ -1076,13 +1075,13 @@ impl Reader {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn region(&mut self, seq: &[u8], lo: u64, hi: u64, halo: u64,
+    pub fn region(&mut self, seq: &[u8], lo: u64, hi: u64,
                   feats: Option<&crate::db::Feats>, cols: &[usize], out: &mut impl std::io::Write) {
         let ri = self.find_seq(seq);
         if ri < 0 { crate::bail("sequence not found"); }
         let ri = ri as u64;
         self.alnq = self.aln.as_ref().and_then(|a| a.find(seq));
-        if let Some(fe) = feats { return self.region_set(ri, seq, lo, hi, halo, fe, cols, out); }
+        if let Some(fe) = feats { return self.region_set(ri, seq, lo, hi, fe, cols, out); }
         let (blk, off, nruns) = self.locate(ri);
         let tskip = self.tailskip;
         let last_of = |k: u64| k + 1 == nruns && ri >= tskip;
@@ -1097,36 +1096,13 @@ impl Reader {
         }
         if jump != blk { kskip = jump as u64 * bs - start; st0 = self.b[jump].bp; }
 
-        // With a halo the runs to print are found first, then reprinted with
-        // the neighbours the halo asks for.
-        let (mut kfirst, mut klast, mut lo, mut hi) = (0u64, nruns, lo, hi);
-        if halo > 0 && (lo > 0 || hi > 0) {
-            let mut c = if jump != blk { self.at(jump, 0) } else { self.at(blk, off) };
-            let (mut s2, mut first, mut last) = (st0, nruns, 0u64);
-            for k in kskip..nruns {
-                if hi > 0 && s2 >= hi { break; }
-                let (len, _) = self.step(&mut c, s2, last_of(k));
-                let e2 = s2 + len;
-                if e2 > lo && (hi == 0 || s2 < hi) {
-                    if k < first { first = k; }
-                    last = k;
-                }
-                s2 = e2;
-            }
-            if first > last { return; }
-            kfirst = first.saturating_sub(halo);
-            klast = if nruns - last - 1 <= halo { nruns } else { last + halo + 1 };
-            lo = 0; hi = 0;
-            if kfirst < kskip { jump = blk; kskip = 0; st0 = 0; }   // the halo reaches back
-        }
-
         let mut c = if jump != blk { self.at(jump, 0) } else { self.at(blk, off) };
         let mut buf = Vec::with_capacity(1 << 20);
         let mut st = st0;
-        for k in kskip..klast {
+        for k in kskip..nruns {
             let (len, f) = self.step(&mut c, st, last_of(k));
             let en = st + len;
-            if k >= kfirst && en > lo && (hi == 0 || st < hi) {
+            if en > lo && (hi == 0 || st < hi) {
                 buf.extend_from_slice(seq);
                 buf.push(b'\t');
                 kst::putu64(&mut buf, st);

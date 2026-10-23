@@ -99,7 +99,6 @@ Flags work on either side of the command name. The readers are decompress and qu
 | `aln-pack -a P.paf --ref R -o OUT` | | cuts a PAF to what `-a` reads, for many tracks against one alignment |
 | `--sort`, `--sort=MEM` | compress | group records by labels, which pays on short reads with `-n drop`; spill to disk past `MEM`; decompress returns that order |
 | `--aln-names F` | compress, readers | with `-a`: read N is line N+1 of `F` |
-| `--halo N` | query | N more runs each side of the range |
 | `--max-gap N` | `--smooth` | KaryoScope's gap bound, 1000 by default |
 
 ## Supplementary: technical notes

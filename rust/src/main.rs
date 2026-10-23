@@ -123,15 +123,13 @@ fn main() {
             if c.out.is_some() { die("-r and --out-dir: give one"); }
             if c.raw { die("-r and --raw: give one"); }
             let (seq, lo, hi) = regparse(c.region.as_deref().unwrap());
-            if c.halo.is_some() && hi == 0 { die("--halo needs -r NAME:START-END"); }
-            let hlo = c.halo.as_ref().map_or(0, |h| karyozip::bedcoord(h.as_bytes(), "--halo is not a number"));
             let feats = informed(&c, &mut ro, "query ", None, aln::Lazy::OneSeq);
             let mut r = reader::Reader::open_with(track, &ro);
             if let Some(f) = &feats { f.check_hash(&r); }
             let cols = feats.as_ref().map_or(Vec::new(), |f| f.setcols(c.set.as_deref()));
             let so = std::io::stdout();
             let mut o = BufWriter::new(so.lock());
-            r.region(seq.as_bytes(), lo, hi, hlo, feats.as_ref(), &cols, &mut o);
+            r.region(seq.as_bytes(), lo, hi, feats.as_ref(), &cols, &mut o);
             o.flush().unwrap_or_else(|e| die(&e.to_string()));
         }
         Cmd::Smooth => {
@@ -476,7 +474,6 @@ pub struct Cli {
     pub input: Vec<String>,
     pub output: Option<String>,
     pub region: Option<String>,
-    pub halo: Option<String>,
     pub feature_set: Option<String>,
     pub query: bool,
     pub block: Option<String>,
@@ -505,7 +502,7 @@ const FLAGS: &[(&str, bool)] = &[
     ("--names", true), ("--max-gap", true), ("--v1", false), ("--chunk", true), ("--aln-names", true), ("--sort", false),
     ("--effort", true), ("--block", true), ("--db", true), ("--aln", true), ("--ref", true),
     ("--out-dir", true), ("--set", true), ("--raw", false), ("--hier", true), ("--input", true),
-    ("--output", true), ("--region", true), ("--halo", true), ("--smooth", false),
+    ("--output", true), ("--region", true), ("--smooth", false),
 ];
 const SHORT: &[(&str, &str)] = &[
     ("-i", "--input"), ("-o", "--output"), ("-r", "--region"),
@@ -596,7 +593,6 @@ impl Cli {
                 "--input" => { o.input.push(val()); !pack }
                 "--output" => { o.output = Some(val()); c != "index" }
                 "--region" => { o.region = Some(val()); qry }
-                "--halo" => { o.halo = Some(val()); qry && !sm }
                 "--smooth" => rdr,
                 "--set" => { if sm { o.feature_set = Some(val()) } else { o.set = Some(val()) } rdr }   // --smooth: the one set smoothed
                 "--raw" => { o.raw = true; dec }

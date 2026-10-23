@@ -4488,7 +4488,7 @@ static char *putrow(char *o, const char *seq, size_t nlen, uint64_t st, uint64_t
 }
 /* --db: the sequence's rows over the selected sets, touching equal tuples
    merged, so one set gives what its own track gives; needs the whole sequence */
-static void region_set(R *r, int64_t ri, const char *seq, uint64_t lo, uint64_t hi, uint64_t halo) {
+static void region_set(R *r, int64_t ri, const char *seq, uint64_t lo, uint64_t hi) {
     rec q = getidx(r, ri);
     loadblk(r, q.blk);
     const uint8_t *lp = r->lp0, *ip = r->ip0;
@@ -4509,7 +4509,7 @@ static void region_set(R *r, int64_t ri, const char *seq, uint64_t lo, uint64_t 
     if (hi) {
         uint64_t f = n, l = 0;
         for (uint64_t k = 0; k < n; k++) if (en[k] > lo && st[k] < hi) { if (k < f) f = k; l = k; }
-        if (f > l) { b = 0; } else { a = f > halo ? f - halo : 0; b = n - l - 1 <= halo ? n : l + halo + 1; }
+        if (f > l) { b = 0; } else { a = f; b = l + 1; }
     }
     size_t nlen = strlen(seq), cap2 = 1 << 20;
     if (cap2 < nlen + maxlablen(r) + 48) cap2 = nlen + maxlablen(r) + 48;   /* the longest row fits */
@@ -4526,22 +4526,21 @@ static void region_set(R *r, int64_t ri, const char *seq, uint64_t lo, uint64_t 
     free(st); free(en); free(lab); free(ob); free(tmp); rclose(r);
 }
 
-static void region(const char *path, const char *seq, uint64_t lo, uint64_t hi,
-                   uint64_t halo) {
+static void region(const char *path, const char *seq, uint64_t lo, uint64_t hi) {
     R *r = ropen_informed(path);
 
     int64_t ri = idxlookup(r, path, seq);
     if (ri < 0) { if (r->nblk == 1) loadblk(r, 0);   /* the block before the names, as dump */
                   ri = rfind(r, seq); }
     if (ri < 0) die("sequence not found");
-    if (DBFEATS) { region_set(r, ri, seq, lo, hi, halo); return; }
+    if (DBFEATS) { region_set(r, ri, seq, lo, hi); return; }
     rec q = getidx(r, ri);
     loadblk(r, q.blk);
     const uint8_t *lp = r->lp0, *ip = r->ip0;
 
     uint64_t start = (uint64_t)q.blk * (uint64_t)r->block + q.off;
     uint64_t endrun = start + q.nruns, jump = q.blk, kskip = 0;
-    uint64_t st = 0, kfirst = 0, klast = q.nruns;
+    uint64_t st = 0;
     if (lo) {
         while (jump + 1 < r->nblk && (jump + 1) * (uint64_t)r->block < endrun
                && r->b[jump + 1].bp && r->b[jump + 1].bp <= lo) jump++;
@@ -4556,43 +4555,14 @@ static void region(const char *path, const char *seq, uint64_t lo, uint64_t hi,
         for (uint64_t k = 0; k < q.off; k++) { vget(&lp); vget(&ip); }
         sp.blk = q.blk; sp.left = r->b[q.blk].rows - q.off;
     }
-    if (halo && (lo || hi)) {
-
-        const uint8_t *lp2 = lp, *ip2 = ip;
-        span sp2 = sp;
-        uint64_t s2 = st, first = q.nruns, last = 0;
-        for (uint64_t k = kskip; k < q.nruns; k++) {
-            if (hi && s2 >= hi) break;
-            spannext(r, &sp2, &lp2, &ip2); sp2.left--;
-            uint64_t e2 = s2 + rlen(&lp2, seq, s2, k + 1 == q.nruns && (uint64_t)ri >= TAILSKIP_R); vget(&ip2);
-            if (e2 > lo && (hi == 0 || s2 < hi)) {
-                if (k < first) first = k;
-                last = k;
-            }
-            s2 = e2;
-        }
-        if (first > last) { rclose(r); return; }   /* atexit emitflush does the flush */
-        kfirst = first > halo ? first - halo : 0;
-        klast = q.nruns - last - 1 <= halo ? q.nruns : last + halo + 1;   /* no wrap */
-        if (klast > q.nruns) klast = q.nruns;
-        lo = 0; hi = 0;
-        if (kfirst < kskip) { jump = q.blk; kskip = 0; }   /* the halo reaches back */
-        loadblk(r, jump); lp = r->lp0; ip = r->ip0;   /* the pre-pass moved us */
-        sp.blk = jump;
-        if (jump != q.blk) sp.left = r->b[jump].rows;
-        else { for (uint64_t k = 0; k < q.off; k++) { vget(&lp); vget(&ip); }
-               sp.left = r->b[q.blk].rows - q.off; }
-        st = jump != q.blk ? r->b[jump].bp : 0;
-    }
-
     size_t nlen = strlen(seq), maxlab = maxlablen(r);
     size_t OCAP = 1 << 20;
     if (nlen + maxlab + 48 > OCAP) OCAP = nlen + maxlab + 48;
     char *ob = xmalloc(OCAP), *o = ob;
-    for (uint64_t k = kskip; k < klast; k++) {
+    for (uint64_t k = kskip; k < q.nruns; k++) {
         spannext(r, &sp, &lp, &ip); sp.left--;
         uint64_t en = st + rlen(&lp, seq, st, k + 1 == q.nruns && (uint64_t)ri >= TAILSKIP_R), f = vget(&ip);
-        if (k >= kfirst && en > lo && (hi == 0 || st < hi)) {
+        if (en > lo && (hi == 0 || st < hi)) {
             if ((size_t)(o - ob) + nlen + maxlab + 48 > OCAP) {
                 if (fwrite(ob, 1, (size_t)(o - ob), stdout) != (size_t)(o - ob))
                     die("write failed");
@@ -5658,7 +5628,7 @@ int main(int argc, char **argv) {
             "  karyozip aln-pack -a P.paf --ref REF.bed|REF.kst -o OUT   cuts a PAF to what -a reads\n"
             "  compress --sort[=MEM]: records grouped by labels, for short reads with -n drop\n"
             "  -a with --aln-names F: the track names rows by ordinal, F names them\n"
-            "  query --halo N: N more runs each side of the range;  --smooth --max-gap N"
+            "  --smooth --max-gap N: KaryoScope's gap bound, 1000 by default"
 /* Debug and profiling flags, out of the help:
                  -b, --block N|all   compress: rows per block by hand
                  --raw               decompress, query: what is stored, reversing no transform
@@ -5678,7 +5648,7 @@ int main(int argc, char **argv) {
     }
     if (argc < 2) die(USAGE);
     const char *INS[64]; int NIN = 0;
-    const char *OUTPUT = NULL, *HALOA = NULL, *FSA = NULL, *HIERA = NULL;
+    const char *OUTPUT = NULL, *FSA = NULL, *HIERA = NULL;
     char *REGA = NULL;
     static const struct { const char *f; int nv; } FLAGS[] = {
         {"--version",0},{"--threads",1},{"-t",1},{"--profile",0},{"--tmp-dir",1},{"--names",1},
@@ -5686,7 +5656,7 @@ int main(int argc, char **argv) {
         {"--effort",1},
         {"--block",1},{"--db",1},{"--aln",1},
         {"--ref",1},{"--out-dir",1},{"--set",1},{"--raw",0},{"--hier",1},
-        {"--input",1},{"--output",1},{"--region",1},{"--halo",1},{"--smooth",0},
+        {"--input",1},{"--output",1},{"--region",1},{"--smooth",0},
     };
     static const char *const SHORT[][2] = {   /* each short form is its long one */
         {"-i","--input"},{"-o","--output"},{"-r","--region"},
@@ -5758,7 +5728,6 @@ int main(int argc, char **argv) {
             INS[NIN++] = v; take = 2; }
         else if (!strcmp(a, "--output")) { ok = strcmp(cmd, "index") != 0; OUTPUT = v; take = 2; }
         else if (!strcmp(a, "--region")) { ok = qry; REGA = (char *)v; take = 2; }
-        else if (!strcmp(a, "--halo")) { ok = qry && !sm; HALOA = v; take = 2; }
         else if (!strcmp(a, "--smooth")) { ok = rdr; take = 1; }
         else if (!strcmp(a, "--set")) { ok = rdr; if (sm) FSA = v; else SETNAME = v; take = 2; }   /* --smooth: the one set smoothed */
         else if (!strcmp(a, "--raw")) { ok = dec; RAW = 1; take = 1; }
@@ -5821,15 +5790,14 @@ int main(int argc, char **argv) {
         if (DBFEATS) decode_db(INS[0], OUTDIR); else dump(INS[0]);
     }
     /* one sequence: -r NAME is all of it, NAME:START-END the runs
-       overlapping it, plus an optional halo */
+       overlapping it */
     else if (dec) {
         if (OUTDIR) die("-r and --out-dir: give one");
         if (RAW) die("-r and --raw: give one");
         uint64_t rlo, rhi; const char *nm = regparse(REGA, &rlo, &rhi);
-        if (HALOA && !rhi) die("--halo needs -r NAME:START-END");
         ONESEQ = 1;   /* the answer needs one contig, not the whole reference */
         loadinformed("query ");
-        region(INS[0], nm, rlo, rhi, HALOA ? num_arg(HALOA, UINT64_MAX, "--halo is not a number") : 0);
+        region(INS[0], nm, rlo, rhi);
     }
     else if (!strcmp(cmd, "index")) { INDEXING = 1; buildindex(INS[0]); }
     else if (sm) {

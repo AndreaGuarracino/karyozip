@@ -61,7 +61,7 @@ for f in ls.bed s.bed db.rall.bed ord.bed; do
   for bl in "" "--block 4"; do
     "$C" $bl compress < "$D/$f" > "$W/t.kst" 2>/dev/null
     for seq in $(awk -F'\t' '{print $1}' "$D/$f" | uniq | head -3); do
-      for q in "-r $seq" "-r $seq:50-51" "-r $seq:0-100" "-r $seq:0-100 --halo 2" "-r $seq:999999-1000000"; do
+      for q in "-r $seq" "-r $seq:50-51" "-r $seq:0-100" "-r $seq:999999-1000000"; do
         both "region $f [$bl] [$q]" query $q -i "$W/t.kst"
       done
     done

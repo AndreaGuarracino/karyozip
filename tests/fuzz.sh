@@ -51,7 +51,6 @@ lk "decompress --db --out"            "$LK" decompress --db "$D/db.features.tsv"
 lk "region, a name that is there" "$LK" query -i "$L/p.kt" -r r1
 lk "region, a name that is not (refused)" "$LK" query -i "$L/p.kt" -r nosuchname
 lk "region SEQ POS"               "$LK" query -i "$L/p.kt" -r r1:150-151
-lk "region SEQ START END HALO"    "$LK" query -i "$L/p.kt" -r r1:0-200 --halo 3
 lk "index"                        "$LK" index -i "$L/p.kt"
 lk "region, after index"          "$LK" query -i "$L/p.kt" -r r1:150-151
 lk "decompress"                       "$LK" decompress -i "$L/p.kt" --hier "$L/h.tsv" --smooth --set fs
@@ -212,8 +211,8 @@ PY
 printf 'feature_set\tchild\tparent\nfs\tL0\tcategorized\nfs\tL1\tcategorized\nfs\tL2\tcategorized\nfs\tL3\tcategorized\nfs\tL4\tcategorized\nfs\tL5\tcategorized\n' > "$W/hier.tsv"
 one_forged() {   # three commands on one file
   local m=$1 e="$1.err"
-  for c in "query --raw" "query --raw -r read1" query; do
-    case $c in decompress) args="-i $m --hier $W/hier.tsv -f fs";; *) args="-i $m";; esac
+  for c in "decompress --raw" "query --raw -r read1" "decompress --smooth --set fs"; do
+    case $c in *smooth*) args="-i $m --hier $W/hier.tsv";; *) args="-i $m";; esac
     ASAN_OPTIONS=detect_leaks=0 timeout 30 $SAN $c $args > /dev/null 2>"$e"; rc=$?
     [ $rc -gt 1 ] && { echo "fuzz: forged $(basename $m) $c crashed rc=$rc"; return 1; }
     grep -qE "AddressSanitizer|runtime error" "$e" && { echo "fuzz: forged $(basename $m) $c sanitizer report"; return 1; }

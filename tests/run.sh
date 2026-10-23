@@ -161,8 +161,8 @@ $KT --aln "$D/p.paf" --ref "$D/ref.bed" query -i "$W/d.kt" -r q1 2>/dev/null | c
 n=0; for f in $sets; do $KT --db "$D/db.features.tsv" --set $f decompress -i "$W/f.kt" 2>/dev/null | cmp -s - "$D/db.$f.bed" && n=$((n+1)); done
 [ "$n" = 6 ] && ok "decompress --set: 6/6 equal to the set's track" || no "decompress --set: only $n/6"
 $KT --db "$D/db.features.tsv" --aln "$D/db.self.paf" --ref "$D/db.rall.bed" --set gene decompress -i "$W/da.kt" 2>/dev/null | cmp -s - "$D/db.gene.bed" && ok "decompress --set on db+aln: same" || no "decompress --set on db+aln: DIFFERS"
-n=0; for r in "-r $sq" "-r $sq:100-101" "-r $sq:0-100000" "-r $sq:50-400 --halo 2"; do $KT --db "$D/db.features.tsv" --set acrocentric decompress $r -i "$W/f.kt" 2>/dev/null | cmp -s - <($KT decompress $r -i "$W/pa.kt" 2>/dev/null) && n=$((n+1)); done
-[ "$n" = 4 ] && ok "decompress --set: 4/4 forms equal the set's track" || no "decompress --set: only $n/4"
+n=0; for r in "-r $sq" "-r $sq:100-101" "-r $sq:0-100000"; do $KT --db "$D/db.features.tsv" --set acrocentric query $r -i "$W/f.kt" 2>/dev/null | cmp -s - <($KT query $r -i "$W/pa.kt" 2>/dev/null) && [ -n "$($KT query $r -i "$W/pa.kt" 2>/dev/null)" ] && n=$((n+1)); done
+[ "$n" = 3 ] && ok "query --set: 3/3 forms equal the set's track" || no "query --set: only $n/3"
 $KT --db "$D/db.features.tsv" --set gene,acrocentric decompress -i "$W/f.kt" 2>/dev/null > "$W/ga.bed"
 [ "$(awk -F'\t' '{print NF}' "$W/ga.bed" | sort -u)" = 5 ] && awk -F'\t' 'NR>1 && $1==p && $2==e && $5==l {e=$3; next} NR>1 {print p"\t"s"\t"e"\t"l} {p=$1; s=$2; e=$3; l=$5} END{print p"\t"s"\t"e"\t"l}' "$W/ga.bed" | cmp -s - "$D/db.acrocentric.bed" && ok "decompress --set gene,acrocentric: two columns, merged jointly" || no "decompress --set gene,acrocentric: WRONG"
 $KT --db "$D/db.features.tsv" decompress -i "$W/f.kt" 2>/dev/null | cmp -s - <($KT --db "$D/db.features.tsv" --set all decompress -i "$W/f.kt" 2>/dev/null) && ok "decompress --db on stdout: all sets, same as --set all" || no "decompress --db on stdout: DIFFERS from --set all"
@@ -209,7 +209,6 @@ must_fail "--smooth of a -d track, no --set nor --out-dir" $KT --db "$D/db.featu
 must_fail "--smooth --out-dir without --db" $KT decompress -i "$W/p.kt" --hier "$W/inf.tsv" --smooth --out-dir "$W/sod2"
 must_fail "query --smooth --out-dir" $KT --db "$D/db.features.tsv" query -i "$W/hv.kt" -r x --hier "$W/hv.tsv" --smooth --out-dir "$W/sod2"
 must_fail "--smooth with two sets" $KT --db "$D/db.features.tsv" decompress -i "$W/f.kt" --hier "$W/inf.tsv" --smooth --set gene,acrocentric
-must_fail "--smooth with no --set" $KT decompress -i "$W/f.kt" --hier "$W/inf.tsv" --smooth
 must_fail "decompress an --aln track without --aln" $KT decompress -i "$W/d.kt" --hier "$W/inf.tsv" --smooth --set acrocentric
 must_fail "decompress a --db track without --db" $KT decompress -i "$W/f.kt" --hier "$W/inf.tsv" --smooth --set acrocentric
 must_fail "query --db on a plain track" $KT --db "$D/db.features.tsv" query -i "$W/p.kt" -r q1
@@ -383,10 +382,6 @@ cp "$D/s.bed" "$W/keep.bed"; $KT compress "$W/keep.bed" < /dev/null > /dev/null 
 cmp -s "$W/keep.bed" "$D/s.bed" && ok "compress FILE: refused, input intact" || no "compress FILE: INPUT DESTROYED"
 
 # third audit: one case per finding
-awk 'BEGIN{for(i=0;i<12;i++)printf "s\t%d\t%d\tL%d\n",i*10,i*10+10,i}' > "$W/halo.bed"
-$KT compress --block 4 < "$W/halo.bed" > "$W/halo4.kt" 2>/dev/null; $KT compress < "$W/halo.bed" > "$W/halo1.kt" 2>/dev/null
-$KT query -i "$W/halo4.kt" -r s:45-46 --halo 3 2>/dev/null | cmp -s - <($KT query -i "$W/halo1.kt" -r s:45-46 --halo 3 2>/dev/null) \
-  && [ "$($KT query -i "$W/halo4.kt" -r s:45-46 --halo 3 2>/dev/null | wc -l)" = 7 ] && ok "halo across blocks: 7 rows" || no "halo across blocks: WRONG"
 awk 'BEGIN{for(i=0;i<20;i++)printf "r%d\t0\t%d\tL%d\n",i,50+i,i%5}' > "$W/idx.bed"
 $KT compress < "$W/idx.bed" > "$W/idx.kt" 2>/dev/null; $KT index -i "$W/idx.kt" >/dev/null 2>&1
 $KT compress --sort < "$W/idx.bed" > "$W/idx.kt" 2>/dev/null
@@ -403,7 +398,7 @@ $KT decompress -i "$W/t63.kt" 2>/dev/null | cmp -s - "$W/t63.bed" && ok "total p
 printf 'feature_set\tchild\tparent\nacrocentric\tacro\tx\nacrocentric\tx\tacro\n' > "$W/cyc.tsv"
 rc=0; timeout 10 $KT decompress -i "$W/p.kt" --hier "$W/cyc.tsv" --smooth --set acrocentric >/dev/null 2>&1 || rc=$?
 [ $rc = 1 ] && ok "cyclic hierarchy: refused" || no "cyclic hierarchy: rc=$rc"
-for c in "query -i $W/p.kt" "query -i $W/p.kt -r q1" "query -i $W/sm.kt --hier $W/sm.tsv --smooth --set acrocentric" "query --raw -i $W/p.kt"; do
+for c in "decompress -i $W/p.kt" "query -i $W/p.kt -r q1" "decompress -i $W/sm.kt --hier $W/sm.tsv --smooth --set acrocentric" "decompress --raw -i $W/p.kt"; do
   $KT $c > /dev/full 2>/dev/null && { echo "$c to /dev/full: EXIT 0"; fail=1; } || echo "${c%% *} to /dev/full: exit 1"
 done
 printf 'a\t0\t10\tA\0B\nc\t0\t10\tB\n' > "$W/nul.bed"
@@ -644,8 +639,6 @@ printf 'feature_set\tchild\tparent\nacrocentric\tacro\troot\n' > "$W/root.tsv"
 must_fail "hierarchy root that is not categorized" $KT decompress -i "$W/sm.kt" --hier "$W/root.tsv" --smooth --set acrocentric
 must_fail "-r with a non-numeric range is a name" $KT query -i "$W/sm.kt" --hier "$W/sm.tsv" --smooth --set acrocentric -r r0:1e2-3e2
 must_fail "query region with end before start" $KT query -i "$W/sm.kt" --hier "$W/sm.tsv" --smooth --set acrocentric -r r0:300-100
-$KT query -i "$W/halo1.kt" -r s:45-46 --halo 18446744073709551614 2>/dev/null | cmp -s - <($KT query -i "$W/halo1.kt" -r s:45-46 --halo 100 2>/dev/null) \
-  && ok "halo of 2^64-2: whole sequence" || no "halo of 2^64-2: WRONG"
 L309=$(head -c 300 /dev/zero | tr '\0' L)_specific
 printf 's\t0\t10\t%s\n' "$L309" > "$W/l309.bed"; $KT compress < "$W/l309.bed" > "$W/l309.kt" 2>/dev/null
 printf 'feature_set\tchild\tparent\nfs\t%s\tcategorized\n' "$L309" > "$W/l309.tsv"

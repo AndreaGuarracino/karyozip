@@ -143,6 +143,10 @@ done
 sets="acrocentric chromosome gene region repeat subtelomeric"; in=""; for f in $sets; do in="$in -i $D/db.$f.bed"; done
 $KT compress --db "$D/db.features.tsv" $in > "$W/db.kt" 2>/dev/null
 $KT compress --aln "$D/p.paf" --ref "$D/ref.bed" < "$D/s.bed" > "$W/al.kt" 2>/dev/null
+# a forged read count, before the metadata hash
+cp "$W/al.kt" "$W/m.kt"; printf '\x0c' | dd of="$W/m.kt" bs=1 seek=12 conv=notrunc status=none 2>/dev/null
+ASAN_OPTIONS=detect_leaks=0 timeout 30 $SAN decompress --aln "$D/p.paf" --ref "$D/ref.bed" -i "$W/m.kt" >/dev/null 2>"$W/err"
+grep -q "does not match its hash" "$W/err" && echo "fuzz: forged read count: refused by the hash" || { echo "fuzz: forged read count: $(head -c 200 "$W/err")"; fail=1; }
 for kind in db al; do
   sz=$(stat -c%s "$W/$kind.kt")
   for i in $(seq 1 "$N"); do

@@ -17,6 +17,7 @@ fn cnt(v: &Option<String>, lo: u64, hi: u64, what: &'static str) -> Option<u64> 
 
 fn main() {
     ffi::ignore_sigxfsz();
+    ffi::panic_clean();
     if !ffi::STDFDS_OPEN.load(std::sync::atomic::Ordering::Relaxed) { die("stdin, stdout or stderr is closed"); }
     let c = Cli::get();
     // --threads, else one per core capped at 8, as the C. The pool is

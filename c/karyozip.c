@@ -3315,7 +3315,6 @@ static R *ropen(const char *path) {
     r->cart = (h[1] & CARTFLAG) != 0;
     r->runhead = runhead; r->ilv = ilv; r->grp = (h[1] & GRPFLAG) != 0;
     if (r->grp && (ilv || !runhead)) die("corrupt file: grouped lengths without their run counts");
-    if (runhead) r->rtab = xmalloc(mul(h[0] ? h[0] : 1, sizeof *r->rtab));
     if (r->cart && !was_db) die("corrupt file: vocabulary featureIDs without --db");
     h[1] &= ~(TOKFLAG | INTFLAG | DROPPED | ALNFLAG | DBFLAG | LENFLAG
               | TAILFLAG | CARTFLAG | RUNFLAG | ILVFLAG | FLDFLAG | GRPFLAG);
@@ -3347,6 +3346,8 @@ static R *ropen(const char *path) {
         if (mh != want) die("corrupt file: the metadata does not match its hash");
     }
     r->mhash = h[15];
+    /* after the hash: a forged read count must not size an allocation */
+    if (runhead) r->rtab = xmalloc(mul(h[0] ? h[0] : 1, sizeof *r->rtab));
     r->feathash = (h[5] >> 32) | ((h[9] >> 32) << 32);
     r->data0 = 8 + 128 + lzl + h[1] + h[2] + h[3] + h[11];
 

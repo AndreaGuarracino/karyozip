@@ -316,23 +316,67 @@ unsafe extern "C" {
 /// The signal handler reads the leaked C string, never the mutex.
 static OUT: std::sync::Mutex<Option<(std::ffi::CString, String)>> = std::sync::Mutex::new(None);
 static OUTSIG: std::sync::atomic::AtomicPtr<c_char> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+/// --out-dir's staged BEDs, for the handler: a leaked array of leaked C strings
+static STAGE: std::sync::atomic::AtomicPtr<*mut c_char> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+static STAGEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 extern "C" fn outsig(_: c_int) {
-    let p = OUTSIG.load(std::sync::atomic::Ordering::SeqCst);
-    // SAFETY: unlink and _exit are async-signal-safe; p is a leaked CString.
-    unsafe { if !p.is_null() { unlink(p); } _exit(1) }
+    use std::sync::atomic::Ordering::SeqCst;
+    let (p, a, n) = (OUTSIG.load(SeqCst), STAGE.load(SeqCst), STAGEN.load(SeqCst));
+    // SAFETY: unlink and _exit are async-signal-safe; every pointer is leaked.
+    unsafe {
+        if !p.is_null() { unlink(p); }
+        if !a.is_null() { for i in 0..n { unlink(*a.add(i)); } }
+        _exit(1)
+    }
 }
 
-/// Removes -o's temporary file, on any failure.
+/// SIGINT, SIGTERM and SIGHUP remove -o's and --out-dir's temporaries, as the C.
+fn catch_signals() {
+    // SAFETY: outsig only unlinks and exits.
+    unsafe { for s in [1, 2, 15] { signal(s, outsig as extern "C" fn(c_int) as usize); } }
+}
+
+/// The staged BEDs a signal removes; an empty list once they are swapped in.
+pub fn sig_stage(paths: &[std::path::PathBuf]) {
+    use std::{os::unix::ffi::OsStrExt, sync::atomic::Ordering::SeqCst};
+    let n = STAGEN.swap(0, SeqCst);
+    let a = STAGE.swap(std::ptr::null_mut(), SeqCst);
+    // SAFETY: a and its strings came from the leaks below, n long.
+    if !a.is_null() { unsafe { for c in Box::from_raw(std::ptr::slice_from_raw_parts_mut(a, n)) { drop(std::ffi::CString::from_raw(c)); } } }
+    if paths.is_empty() { return; }
+    let v: Vec<*mut c_char> = paths.iter().filter_map(|p| std::ffi::CString::new(p.as_os_str().as_bytes()).ok())
+        .map(|c| c.into_raw()).collect();
+    let n = v.len();
+    STAGE.store(Box::leak(v.into_boxed_slice()).as_mut_ptr(), SeqCst);
+    STAGEN.store(n, SeqCst);
+    catch_signals();
+}
+
+/// Frees the handler's copy of -o's temporary name.
+fn sig_out_clear() {
+    let p = OUTSIG.swap(std::ptr::null_mut(), std::sync::atomic::Ordering::SeqCst);
+    // SAFETY: p came from CString::into_raw in redirect.
+    if !p.is_null() { unsafe { drop(std::ffi::CString::from_raw(p)); } }
+}
+
+/// A panic is a bug, yet leaves no temporaries behind either.
+pub fn panic_clean() {
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |i| { crate::db::drop_tmp(); drop_out(); hook(i) }));
+}
+
+/// Removes -o's temporary file, on any failure. try_lock: a panic hook may
+/// run with the lock held.
 pub fn drop_out() {
-    OUTSIG.store(std::ptr::null_mut(), std::sync::atomic::Ordering::SeqCst);
-    if let Ok(mut o) = OUT.lock() { if let Some((t, _)) = o.take() { unsafe { unlink(t.as_ptr()); } } }
+    sig_out_clear();
+    if let Ok(mut o) = OUT.try_lock() { if let Some((t, _)) = o.take() { unsafe { unlink(t.as_ptr()); } } }
 }
 
 /// On success: -o's temporary file renamed into place.
 pub fn commit_out() {
     use std::io::Write;
     let Some((t, fin)) = OUT.lock().ok().and_then(|mut o| o.take()) else { return };
-    OUTSIG.store(std::ptr::null_mut(), std::sync::atomic::Ordering::SeqCst);
+    sig_out_clear();
     let tp = t.to_string_lossy().into_owned();   // made from a &str
     // NFS reports some errors only at close
     if std::io::stdout().flush().is_err() || unsafe { close(1) } != 0 {
@@ -355,8 +399,7 @@ pub fn redirect(path: &str, fd: i32) {
             let c = std::ffi::CString::new(t).unwrap_or_else(|_| crate::bail("cannot open the output"));
             OUTSIG.store(c.clone().into_raw(), std::sync::atomic::Ordering::SeqCst);
             *OUT.lock().unwrap() = Some((c, path.to_string()));
-            // SAFETY: outsig only unlinks and exits.
-            unsafe { for s in [1, 2, 15] { signal(s, outsig as extern "C" fn(c_int) as usize); } }
+            catch_signals();
             f = Some(Ok(h));
         }
     }

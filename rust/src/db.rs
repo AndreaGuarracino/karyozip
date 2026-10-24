@@ -338,7 +338,8 @@ fn setpath(dir: &str, s: &[u8], suffix: &str) -> std::path::PathBuf {
 }
 
 pub fn drop_tmp() {
-    if let Ok(mut v) = TMP.lock() {
+    crate::ffi::sig_stage(&[]);
+    if let Ok(mut v) = TMP.try_lock() {
         for p in v.drain(..) { let _ = std::fs::remove_file(&p); }
     }
 }
@@ -438,6 +439,7 @@ pub fn stage_open(dir: &str, sets: &[&[u8]]) -> Vec<std::path::PathBuf> {
     let pid = std::process::id();
     let tmps: Vec<std::path::PathBuf> = sets.iter().map(|s| setpath(dir, s, &format!(".bed.tmp.{pid}"))).collect();
     *TMP.lock().unwrap() = tmps.clone();
+    crate::ffi::sig_stage(&tmps);
     tmps
 }
 
@@ -445,6 +447,7 @@ pub fn stage_open(dir: &str, sets: &[&[u8]]) -> Vec<std::path::PathBuf> {
 pub fn stage_done(dir: &str, sets: &[&[u8]], tmps: &[std::path::PathBuf]) {
     let owned: Vec<Vec<u8>> = sets.iter().map(|s| s.to_vec()).collect();
     swap_in(dir, &owned, tmps);
+    crate::ffi::sig_stage(&[]);
     TMP.lock().unwrap().clear();
 }
 

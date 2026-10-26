@@ -797,6 +797,18 @@ $KT decompress --aln "$D/p.paf" --ref "$D/ref.bed" -i "$W/vba.kt" 2>/dev/null | 
 $KT compress -i "$W/vb.bed" -o "$W/vb1.kt" 2>/dev/null; $KT compress --read-blocks 7 -i "$W/vb.bed" -o "$W/vb.kt" 2>/dev/null
 for t in 1 4; do $KT decompress -t $t -i "$W/vb.kt" --smooth --hier "$W/vbh.tsv" 2>/dev/null | cmp -s - <($KT decompress -i "$W/vb1.kt" --smooth --hier "$W/vbh.tsv" 2>/dev/null) && ok "--read-blocks 7 --smooth -t $t: same as one block" || no "--read-blocks 7 --smooth -t $t: DIFFERS"; done
 
+# decode ahead: other threads decode the next blocks; same rows, same stop on a damaged block
+awk 'BEGIN { x = 7; for (r = 0; r < 120000; r++) { n = 1 + r % 4; p = 0; for (i = 0; i < n; i++) { x = (x * 1103515245 + 12345) % 2147483648; l = i + 1 == n ? 151 - p : 1 + x % 37; printf "q%d\t%d\t%d\t%s\n", r, p, p + l, x % 7 ? "chr" (1 + x % 3) : "novel"; p += l } } }' > "$W/pf.bed"
+for bl in "--read-blocks 70000" "--block 70000"; do
+  $KT compress $bl -i "$W/pf.bed" -o "$W/pf.kt" 2>/dev/null
+  $KT decompress -t 4 -i "$W/pf.kt" 2>/dev/null | cmp -s - "$W/pf.bed" && ok "decode ahead [$bl]: byte-identical" || no "decode ahead [$bl]: WRONG"
+  cp "$W/pf.kt" "$W/pfb.kt"; sz=$(stat -c%s "$W/pfb.kt"); printf '\xff' | dd of="$W/pfb.kt" bs=1 seek=$((sz - 300)) conv=notrunc status=none
+  a=0; $KT decompress -t 1 -i "$W/pfb.kt" > "$W/pf1.out" 2> "$W/pf1.err" || a=$?
+  b=0; $KT decompress -t 4 -i "$W/pfb.kt" > "$W/pf4.out" 2> "$W/pf4.err" || b=$?
+  cmp -s "$W/pf1.out" "$W/pf4.out" && cmp -s "$W/pf1.err" "$W/pf4.err" && [ $a = $b ] && [ $a = 1 ] && ok "decode ahead [$bl], damaged: stops at the same byte, $(wc -c < "$W/pf1.out") B" || no "decode ahead [$bl], damaged: DIFFERS from one thread"
+done
+if [ "$SAN" != "$KT" ]; then ASAN_OPTIONS=detect_leaks=1 $SAN decompress -t 4 -i "$W/pf.kt" 2> "$W/pfs.err" | cmp -s - "$W/pf.bed" && ! grep -qE "Sanitizer|runtime error" "$W/pfs.err" && ok "decode ahead: sanitizer clean" || no "decode ahead: SANITIZER REPORT"; fi
+
 # pin the stored bytes to codec versions
 want=55b6e9eadfe851a4374e094e045ee8ecb4ffac9a2fdd83de126ff076724e700b
 got=$($KT --block 4 compress < "$D/db.rall.bed" 2>/dev/null | sha256sum | cut -d' ' -f1)

@@ -121,6 +121,64 @@ pub struct Reader {
     raw: bool,
     alnq: Option<usize>,
     blk_nos: Vec<u8>,
+    path: String,
+    pf: Option<Pf>,   // the blocks ahead, decoding on other threads
+}
+
+/// What decoding one block needs, copied for each decode-ahead thread.
+#[derive(Clone)]
+struct Dec { b: Vec<Blk>, data0: u64, rows: u64, lencodec: i32, idcodec: i32, ilv: bool, runhead: bool, grp: bool }
+
+/// One block's frames, its two regions back to back, the split, its rows,
+/// and its run-count prefix sums when the counts head the lengths.
+fn block_dec(f: &mut std::fs::File, d: &Dec, b: usize) -> (Vec<u8>, usize, u64, Option<Vec<u32>>) {
+    if b >= d.b.len() { crate::bail("corrupt index: a block number is past the end"); }
+    let m = d.b[b];
+    let mut cb = ffi::raw_buf(crate::ckalloc(m.size as usize));
+    cb.resize(m.size as usize, 0);
+    rd(f.seek(SeekFrom::Start(d.data0 + m.off)), "seek");
+    rd(f.read_exact(&mut cb), "file is truncated: a block is missing or short");
+    if kst::fnv(FNV0, &cb) != m.hash {
+        crate::bail("corrupt block: its bytes do not match the stored hash");
+    }
+    let (la, lb) = (m.l as usize, (m.size - m.l) as usize);
+    let (lraw, raw) = (m.lraw as usize, m.raw as usize);
+    // both frames into one buffer, the labels behind the lengths, as the C's blkbuf
+    let mut data = ffi::raw_buf(crate::ckalloc(lraw + raw));
+    frame(&cb[..la], d.lencodec, &mut data, if d.ilv { lraw + raw } else { lraw });
+    if !d.ilv { frame(&cb[la..la + lb], d.idcodec, &mut data, raw); }
+    // as the C frees it: not needed past its frames; kept for the next
+    // block only when there is one, or a one-block decode holds it to the end
+    if d.b.len() > 1 { ffi::recycle(cb); } else { drop(cb); }
+    let mut data = if d.ilv { ilv_split(data, lraw, raw, m.rows) } else { data };
+    let (mut split, mut tab) = (lraw, None);
+    if d.runhead {   // close the gap the run counts leave, as the C's memmove
+        let (sp, t) = rmheads(&mut data[..lraw], d.rows, m.rows, m.nrd);
+        split = sp;
+        data.copy_within(lraw.., split);
+        data.truncate(split + raw); data.shrink_to_fit();   // the heads' touched tail goes back
+        tab = Some(t);
+    }
+    if d.grp {
+        let out = grp_unpack(&data[..split], &data[split..], tab.as_deref().unwrap_or(&[]));
+        data[..split].copy_from_slice(&out);
+    }
+    (data, split, m.rows, tab)
+}
+
+type Got = Result<(Vec<u8>, usize, u64, Option<Vec<u32>>), String>;
+struct PfSt { used: usize, next: usize, stop: bool, got: std::collections::HashMap<usize, Got>, spare: Vec<Vec<u8>> }
+/// Decode ahead, as the C's: on a walk over every block, threads decode the
+/// next ones, each on its own handle of the file, and load takes a ready
+/// block in place of decoding it. A refusal waits for its block, so the
+/// output stops where one thread stops.
+struct Pf { st: std::sync::Arc<(std::sync::Mutex<PfSt>, std::sync::Condvar)>, th: Vec<std::thread::JoinHandle<()>> }
+impl Drop for Pf {
+    fn drop(&mut self) {
+        { let mut g = self.st.0.lock().unwrap(); g.stop = true; }
+        self.st.1.notify_all();
+        for t in self.th.drain(..) { let _ = t.join(); }
+    }
 }
 
 fn rd<T>(r: Result<T, std::io::Error>, what: &str) -> T {
@@ -365,7 +423,7 @@ impl Reader {
             feathash: (h[5] >> 32) | ((h[9] >> 32) << 32),
             cart: h[1] & CARTFLAG != 0,
             aln: o.aln.clone(), lenfile: h[1] & LENFLAG != 0 && !o.raw, raw: o.raw,
-            alnq: None, blk_nos,
+            alnq: None, path: path.to_string(), pf: None, blk_nos,
         }
     }
 
@@ -405,6 +463,8 @@ impl Reader {
         let (mut emitted, mut restored) = (0u64, 0u64);
         let tskip = self.tailskip;
         let mut name = Vec::new();
+        if self.nreads > 0 { let _ = self.name_at(0); }   // the names first, then the blocks ahead, as the C
+        self.prefetch();
         for i in 0..self.nreads {
             let nruns = self.locate(i).2;
             name.clear(); name.extend_from_slice(self.name_at(i));
@@ -458,145 +518,171 @@ impl Reader {
         if let Some((cb, d, sp, r)) = &self.cached {
             if *cb == b { return (d.clone(), *sp, *r); }
         }
-        let (d, sp, r) = self.load_raw(b);
+        let (d, sp, r, tab) = match self.pf_take(b) { Some(x) => x, None => {
+            let dec = self.dec();
+            block_dec(&mut self.f, &dec, b)
+        } };
+        if let Some(t) = tab { self.rtab = std::sync::Arc::new(t); self.rtab_blk = b; }
         let d = std::sync::Arc::new(d);
         if let Some((_, old, _, _)) = self.cached.replace((b, d.clone(), sp, r)) {
-            if let Ok(v) = std::sync::Arc::try_unwrap(old) { ffi::recycle(v); }   // the cursor let it go first
+            if let Ok(v) = std::sync::Arc::try_unwrap(old) {   // the cursor let it go first
+                match &self.pf { Some(pf) => pf.st.0.lock().unwrap().spare.push(v), None => ffi::recycle(v) }
+            }
         }
         (d, sp, r)
     }
 
-    /// One stream a read, its run count then a label beside its own length.
-    /// Split it back into the two regions the walks expect; the counts stay
-    /// in front of the lengths for rmheads to lift out.
-    fn ilv_split(&self, v: Vec<u8>, nl: usize, ni: usize, rows: u64) -> Vec<u8> {
-        let (mut lens, mut ids) = (Vec::with_capacity(nl + ni), Vec::with_capacity(ni));   // the ids join lens: no regrowth
-        let (mut i, mut seen) = (0usize, 0u64);
-        while i < v.len() {
-            let h0 = i;
-            let (k, n) = vget(&v, i); i = n;
-            if k == 0 || k > rows - seen { crate::bail("corrupt block: a run count is out of range"); }
-            lens.extend_from_slice(&v[h0..i]);
-            for _ in 0..k {
-                if i >= v.len() { crate::bail("corrupt block: the interleaved frame is short"); }
-                let (lb, n2) = vget(&v, i);
-                kst::put(&mut ids, crate::writer::ilv_flip(lb)); i = n2;
-                if i >= v.len() { crate::bail("corrupt block: the interleaved frame is short"); }
-                let n2 = skip(&v, i); lens.extend_from_slice(&v[i..n2]); i = n2;
-            }
-            seen += k;
-        }
-        if seen != rows || lens.len() != nl || ids.len() != ni {
-            crate::bail("corrupt block: the interleaved frame does not split into its two regions");
-        }
-        lens.extend_from_slice(&ids);
-        lens
+    fn dec(&self) -> Dec {
+        Dec { b: self.b.clone(), data0: self.data0, rows: self.rows, lencodec: self.lencodec, idcodec: self.idcodec,
+              ilv: self.ilv, runhead: self.runhead, grp: self.grp }
     }
 
-    /// The run count heads every read on disk. Lift them into rtab and close
-    /// the gap, so every walk below sees the layout it always saw.
-    /// In place, as the C's memmove: a second copy of the lengths was the
-    /// largest buffer of an assembly decode.
-    fn rmheads(&mut self, lens: &mut [u8], b: usize) -> usize {
-        let (rows, nrd) = (self.b[b].rows, self.b[b].nrd);
-        let (mut w, mut i, mut seen) = (0usize, 0usize, 0u64);
-        // 4 B a read, as the C's counts: 8 B was 295 MB more on 73.7M reads
-        if self.rows > u32::MAX as u64 { crate::bail("corrupt index: a sequence offset past 32 bits"); }
-        let mut tab: Vec<u32> = Vec::with_capacity(nrd as usize + 1);
-        tab.push(0);
-        while i < lens.len() {
-            if tab.len() as u64 > nrd { crate::bail("corrupt block: more reads than the header claims"); }
-            let (k, n) = vget(&lens, i); i = n;
-            if k == 0 || k > rows - seen { crate::bail("corrupt block: a run count is out of range"); }
-            seen += k; tab.push(seen as u32);
-            let s0 = i;   // the read's lengths sit together: one move a read
-            for _ in 0..k {
-                if i >= lens.len() { crate::bail("corrupt block: a read runs past its lengths"); }
-                i = skip(&lens, i);
-                if i > lens.len() { crate::bail("corrupt block: a length runs past the lengths"); }
-            }
-            lens.copy_within(s0..i, w); w += i - s0;
+    /// Start the decode-ahead threads, as the C's pfstart.
+    fn prefetch(&mut self) {
+        let nth = rayon::current_num_threads().saturating_sub(1).min(self.b.len().saturating_sub(1));
+        // small blocks: the hand-off costs more than the decode, as the C's
+        if nth < 1 || self.b.len() < 2 || self.rows / (self.b.len() as u64) < 65536 { return; }
+        let st = std::sync::Arc::new((std::sync::Mutex::new(PfSt { used: 0, next: 0, stop: false,
+                    got: Default::default(), spare: Vec::new() }), std::sync::Condvar::new()));
+        let (nb, win) = (self.b.len(), nth + 1);
+        let mut th = Vec::new();
+        for _ in 0..nth {
+            let Ok(mut f) = std::fs::File::open(&self.path) else { break };
+            let (st, dec) = (st.clone(), self.dec());
+            th.push(std::thread::spawn(move || loop {
+                let (b, sp) = {
+                    let mut g = st.0.lock().unwrap();
+                    while !g.stop && g.next < nb && g.next >= g.used + win { g = st.1.wait(g).unwrap(); }
+                    if g.stop || g.next >= nb { break; }
+                    g.next += 1;
+                    (g.next - 1, g.spare.pop())
+                };
+                if let Some(v) = sp { ffi::recycle(v); }
+                crate::DEFER.with(|x| x.set(true));
+                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| block_dec(&mut f, &dec, b)));
+                crate::DEFER.with(|x| x.set(false));
+                let r: Got = r.map_err(|e| e.downcast::<crate::Deferred>().map_or_else(|_| "a decode thread failed".to_string(), |d| d.0));
+                let mut g = st.0.lock().unwrap();
+                if r.is_err() { g.stop = true; }   // past a refusal nothing is read
+                g.got.insert(b, r);
+                st.1.notify_all();
+            }));
         }
-        if tab.len() as u64 != nrd + 1 || seen != rows {
-            crate::bail("corrupt block: the run counts do not add up to the row count");
-        }
-        self.rtab = std::sync::Arc::new(tab); self.rtab_blk = b;
-        w
+        if !th.is_empty() { self.pf = Some(Pf { st, th }); }
     }
 
-    /// Undo grp_pack: the labels, still in their own order, say which group
-    /// each length came from. Runs after rmheads, so rtab holds the counts.
-    fn grp_unpack(&self, lens: &[u8], ids: &[u8]) -> Vec<u8> {
-        let mut out = Vec::with_capacity(lens.len() + ids.len());   // the ids join it next: no regrowth
-        let (mut p, mut q) = (0usize, 0usize);
-        // 8 B a run in each, as the C's: positions as pairs were 16 B in two
-        let (mut kv, mut gv, mut lv, mut cnt): (Vec<u64>, Vec<u64>, Vec<u64>, Vec<u64>) = Default::default();
-        for w in self.rtab.windows(2) {
-            let k = (w[1] - w[0]) as u64;
-            let mut top = 0u64;
-            kv.clear(); gv.clear();
-            for j in 0..k {
-                if p >= lens.len() || q >= ids.len() { crate::bail("corrupt block: a grouped read runs past its frames"); }
-                let (v, n2) = vget(lens, p); gv.push(v); p = n2;
-                let (id, n3) = vget(ids, q); q = n3;
-                if p > lens.len() || q > ids.len() { crate::bail("corrupt block: a grouped value runs past its frame"); }
-                if id >> 32 != 0 { crate::bail("corrupt block: a grouped label is out of range"); }
-                kv.push((id << 32) | j); top = top.max(id);
+    /// The walk's next block, decoded ahead.
+    fn pf_take(&mut self, b: usize) -> Option<(Vec<u8>, usize, u64, Option<Vec<u32>>)> {
+        let pf = self.pf.as_ref()?;
+        let (m, cv) = &*pf.st;
+        let mut g = m.lock().unwrap();
+        if b != g.used { return None; }   // off the walk: decode it here
+        loop {
+            if let Some(x) = g.got.remove(&b) {
+                g.used = b + 1; cv.notify_all(); drop(g);
+                return Some(x.unwrap_or_else(|e| crate::bail(&e)));
             }
-            lv.clear(); lv.resize(k as usize, 0);
-            // label order, stable in j, as the C's: a few runs sort, many count
-            if k <= 32 || top > 4 * k + 1024 {
-                kv.sort_unstable();
-                for (j, key) in kv.iter().enumerate() { lv[(key & 0xffff_ffff) as usize] = gv[j]; }
-            } else {
-                cnt.clear(); cnt.resize(top as usize + 2, 0);
-                for key in &kv { cnt[(key >> 32) as usize + 1] += 1; }
-                for c in 1..=top as usize { cnt[c] += cnt[c - 1]; }
-                for (j, key) in kv.iter().enumerate() {
-                    let g = &mut cnt[(key >> 32) as usize];
-                    lv[j] = gv[*g as usize]; *g += 1;   // j's length is the next of its label
-                }
-            }
-            for &v in lv.iter() { kst::put(&mut out, v); }
+            g = cv.wait(g).unwrap();
         }
-        if p != lens.len() || q != ids.len() { crate::bail("corrupt block: the grouped frames do not line up"); }
-        if out.len() != lens.len() { crate::bail("corrupt block: the grouped lengths change size"); }   // as the C: re-spelled, not copied
-        out
-    }
-
-    fn load_raw(&mut self, b: usize) -> (Vec<u8>, usize, u64) {
-        if b >= self.b.len() { crate::bail("corrupt index: a block number is past the end"); }
-        let m = self.b[b].clone();
-        let mut cb = ffi::raw_buf(crate::ckalloc(m.size as usize));
-        cb.resize(m.size as usize, 0);
-        rd(self.f.seek(SeekFrom::Start(self.data0 + m.off)), "seek");
-        rd(self.f.read_exact(&mut cb), "file is truncated: a block is missing or short");
-        if kst::fnv(FNV0, &cb) != m.hash {
-            crate::bail("corrupt block: its bytes do not match the stored hash");
-        }
-        let (la, lb) = (m.l as usize, (m.size - m.l) as usize);
-        let (lraw, raw) = (m.lraw as usize, m.raw as usize);
-        // both frames into one buffer, the labels behind the lengths, as the C's blkbuf
-        let mut data = ffi::raw_buf(crate::ckalloc(lraw + raw));
-        frame(&cb[..la], self.lencodec, &mut data, if self.ilv { lraw + raw } else { lraw });
-        if !self.ilv { frame(&cb[la..la + lb], self.idcodec, &mut data, raw); }
-        // as the C frees it: not needed past its frames; kept for the next
-        // block only when there is one, or a one-block decode holds it to the end
-        if self.b.len() > 1 { ffi::recycle(cb); } else { drop(cb); }
-        let mut data = if self.ilv { self.ilv_split(data, lraw, raw, m.rows) } else { data };
-        let mut split = lraw;
-        if self.runhead {   // close the gap the run counts leave, as the C's memmove
-            split = self.rmheads(&mut data[..lraw], b);
-            data.copy_within(lraw.., split);
-            data.truncate(split + raw); data.shrink_to_fit();   // the heads' touched tail goes back
-        }
-        if self.grp {
-            let out = self.grp_unpack(&data[..split], &data[split..]);
-            data[..split].copy_from_slice(&out);
-        }
-        (data, split, m.rows)
     }
 }
+
+/// One stream a read, its run count then a label beside its own length.
+/// Split it back into the two regions the walks expect; the counts stay
+/// in front of the lengths for rmheads to lift out.
+fn ilv_split(v: Vec<u8>, nl: usize, ni: usize, rows: u64) -> Vec<u8> {
+    let (mut lens, mut ids) = (Vec::with_capacity(nl + ni), Vec::with_capacity(ni));   // the ids join lens: no regrowth
+    let (mut i, mut seen) = (0usize, 0u64);
+    while i < v.len() {
+        let h0 = i;
+        let (k, n) = vget(&v, i); i = n;
+        if k == 0 || k > rows - seen { crate::bail("corrupt block: a run count is out of range"); }
+        lens.extend_from_slice(&v[h0..i]);
+        for _ in 0..k {
+            if i >= v.len() { crate::bail("corrupt block: the interleaved frame is short"); }
+            let (lb, n2) = vget(&v, i);
+            kst::put(&mut ids, crate::writer::ilv_flip(lb)); i = n2;
+            if i >= v.len() { crate::bail("corrupt block: the interleaved frame is short"); }
+            let n2 = skip(&v, i); lens.extend_from_slice(&v[i..n2]); i = n2;
+        }
+        seen += k;
+    }
+    if seen != rows || lens.len() != nl || ids.len() != ni {
+        crate::bail("corrupt block: the interleaved frame does not split into its two regions");
+    }
+    lens.extend_from_slice(&ids);
+    lens
+}
+
+/// The run count heads every read on disk. Lift them into rtab and close
+/// the gap, so every walk below sees the layout it always saw.
+/// In place, as the C's memmove: a second copy of the lengths was the
+/// largest buffer of an assembly decode.
+fn rmheads(lens: &mut [u8], total: u64, rows: u64, nrd: u64) -> (usize, Vec<u32>) {
+    let (mut w, mut i, mut seen) = (0usize, 0usize, 0u64);
+    // 4 B a read, as the C's counts: 8 B was 295 MB more on 73.7M reads
+    if total > u32::MAX as u64 { crate::bail("corrupt index: a sequence offset past 32 bits"); }
+    let mut tab: Vec<u32> = Vec::with_capacity(nrd as usize + 1);
+    tab.push(0);
+    while i < lens.len() {
+        if tab.len() as u64 > nrd { crate::bail("corrupt block: more reads than the header claims"); }
+        let (k, n) = vget(&lens, i); i = n;
+        if k == 0 || k > rows - seen { crate::bail("corrupt block: a run count is out of range"); }
+        seen += k; tab.push(seen as u32);
+        let s0 = i;   // the read's lengths sit together: one move a read
+        for _ in 0..k {
+            if i >= lens.len() { crate::bail("corrupt block: a read runs past its lengths"); }
+            i = skip(&lens, i);
+            if i > lens.len() { crate::bail("corrupt block: a length runs past the lengths"); }
+        }
+        lens.copy_within(s0..i, w); w += i - s0;
+    }
+    if tab.len() as u64 != nrd + 1 || seen != rows {
+        crate::bail("corrupt block: the run counts do not add up to the row count");
+    }
+    (w, tab)
+}
+
+/// Undo grp_pack: the labels, still in their own order, say which group
+/// each length came from. Runs after rmheads, so rtab holds the counts.
+fn grp_unpack(lens: &[u8], ids: &[u8], rtab: &[u32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(lens.len() + ids.len());   // the ids join it next: no regrowth
+    let (mut p, mut q) = (0usize, 0usize);
+    // 8 B a run in each, as the C's: positions as pairs were 16 B in two
+    let (mut kv, mut gv, mut lv, mut cnt): (Vec<u64>, Vec<u64>, Vec<u64>, Vec<u64>) = Default::default();
+    for w in rtab.windows(2) {
+        let k = (w[1] - w[0]) as u64;
+        let mut top = 0u64;
+        kv.clear(); gv.clear();
+        for j in 0..k {
+            if p >= lens.len() || q >= ids.len() { crate::bail("corrupt block: a grouped read runs past its frames"); }
+            let (v, n2) = vget(lens, p); gv.push(v); p = n2;
+            let (id, n3) = vget(ids, q); q = n3;
+            if p > lens.len() || q > ids.len() { crate::bail("corrupt block: a grouped value runs past its frame"); }
+            if id >> 32 != 0 { crate::bail("corrupt block: a grouped label is out of range"); }
+            kv.push((id << 32) | j); top = top.max(id);
+        }
+        lv.clear(); lv.resize(k as usize, 0);
+        // label order, stable in j, as the C's: a few runs sort, many count
+        if k <= 32 || top > 4 * k + 1024 {
+            kv.sort_unstable();
+            for (j, key) in kv.iter().enumerate() { lv[(key & 0xffff_ffff) as usize] = gv[j]; }
+        } else {
+            cnt.clear(); cnt.resize(top as usize + 2, 0);
+            for key in &kv { cnt[(key >> 32) as usize + 1] += 1; }
+            for c in 1..=top as usize { cnt[c] += cnt[c - 1]; }
+            for (j, key) in kv.iter().enumerate() {
+                let g = &mut cnt[(key >> 32) as usize];
+                lv[j] = gv[*g as usize]; *g += 1;   // j's length is the next of its label
+            }
+        }
+        for &v in lv.iter() { kst::put(&mut out, v); }
+    }
+    if p != lens.len() || q != ids.len() { crate::bail("corrupt block: the grouped frames do not line up"); }
+    if out.len() != lens.len() { crate::bail("corrupt block: the grouped lengths change size"); }   // as the C: re-spelled, not copied
+    out
+}
+
 
 fn frame(src: &[u8], codec: i32, out: &mut Vec<u8>, raw: usize) {
     let ok = if codec != 0 { ffi::paydecomp_into(src, codec, out, raw) } else { ffi::zstd_decompress_into(src, out, raw) };

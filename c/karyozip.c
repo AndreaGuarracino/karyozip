@@ -20,6 +20,7 @@
 #include <signal.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <setjmp.h>
 #include <sched.h>
 #include <math.h>
 #ifdef _OPENMP
@@ -110,7 +111,11 @@ static void profdump(void) {
    exit() at once is undefined, so the first one through takes the lock,
    prints and exits, and any other waits there until the process ends. */
 static pthread_mutex_t DIELOCK = PTHREAD_MUTEX_INITIALIZER;
+/* a decode-ahead worker keeps its refusal for the block it was decoding */
+static __thread jmp_buf *DIEJMP;
+static __thread char DIEMSG[512];
 static void die2(const char *a, const char *b) {
+    if (DIEJMP) { snprintf(DIEMSG, sizeof DIEMSG, "%s%s", a, b); longjmp(*DIEJMP, 1); }
     pthread_mutex_lock(&DIELOCK);
     fprintf(stderr, "karyozip: %s%s\n", a, b); exit(1);
 }
@@ -3198,6 +3203,7 @@ typedef struct {
     int runhead, ilv, grp, rfilled; uint32_t *rtab;   /* run counts lifted out of the lengths */
     int varblk;                     /* blocks of whole reads, sizes vary */
     uint64_t crows, crd0, crdn;     /* the decoded block's rows and reads */
+    struct pf *pf;                  /* the blocks ahead, decoding on other threads */
 } R;
 
 static void loadichunk(R *r, uint64_t c) {
@@ -3879,6 +3885,7 @@ static void grp_unpack(R *r, uint8_t *lens, size_t nl, const uint8_t *ids, size_
     memcpy(lens, out, nl); free(out);
 }
 
+static int pftake(R *r, uint64_t b);
 static void loadblk(R *r, uint64_t b) {
 
     if (b >= r->nblk) die("corrupt index: a block number is past the end");
@@ -3886,6 +3893,7 @@ static void loadblk(R *r, uint64_t b) {
        interleave under --ref R.kst: re-establish them even when this
        reader's block is already decoded. */
     if (r->cached == b) { PAYEND = r->payend; LENDEC = r->lenfile && r->b[b].nos != 1; return; }
+    if (r->pf && pftake(r, b)) return;
     r->curblk = UINT64_MAX;   /* a new block invalidates the cursor */
     /* a buffer per block was an mmap per block: 12480 page faults on an
        -e low assembly decode against the Rust's 2024; one block frees it */
@@ -3933,6 +3941,109 @@ static void loadblk(R *r, uint64_t b) {
     r->lp0 = r->blkbuf; r->ip0 = r->blkbuf + g;
     r->payend = PAYEND = r->blkbuf + g + h2;
     r->cached = b;
+}
+
+/* Decode ahead: on a walk over every block, worker threads decode the next
+   ones, each on its own handle of the file, and loadblk takes a ready block
+   in place of decoding it. Buffers go round, as the one-thread walk's do. A
+   refusal waits for its block, so the output stops where one thread stops. */
+typedef struct { uint8_t *buf; uint32_t *rt; size_t g, h2; char *err; int ok; } pfslot;
+typedef struct pf {
+    pfslot *s; uint64_t nblk, win, used, next; size_t rtn;
+    int nth, stop; pthread_t *th; R **w; struct pfarg *a; pthread_mutex_t m; pthread_cond_t c;
+    uint8_t **fb; uint32_t **fr; size_t nfb, nfr;   /* spare buffers */
+} pf;
+typedef struct pfarg { pf *q; R *w; } pfarg;
+static void *pfwork(void *p) {
+    pf *q = ((pfarg *)p)->q; R *w = ((pfarg *)p)->w;
+    jmp_buf jb;
+    for (;;) {
+        pthread_mutex_lock(&q->m);
+        while (!q->stop && q->next < q->nblk && q->next >= q->used + q->win) pthread_cond_wait(&q->c, &q->m);
+        if (q->stop || q->next >= q->nblk) { pthread_mutex_unlock(&q->m); break; }
+        uint64_t b = q->next++;
+        w->blkbuf = q->nfb ? q->fb[--q->nfb] : NULL;
+        w->rtab = q->nfr ? q->fr[--q->nfr] : NULL;
+        pthread_mutex_unlock(&q->m);
+        pfslot *s = &q->s[b];
+        DIEJMP = &jb;
+        if (!setjmp(jb)) {
+            if (!w->blkbuf) w->blkbuf = xmalloc(w->blkcap + VGUARD);
+            if (w->runhead && !w->rtab) w->rtab = xmalloc(mul(q->rtn, sizeof *w->rtab));
+            w->cached = UINT64_MAX;
+            loadblk(w, b);
+            s->g = (size_t)(w->ip0 - w->blkbuf); s->h2 = (size_t)(w->payend - w->ip0);
+        } else s->err = strdup(DIEMSG);
+        DIEJMP = NULL;
+        s->buf = w->blkbuf; s->rt = w->rtab; w->blkbuf = NULL; w->rtab = NULL;
+        pthread_mutex_lock(&q->m);
+        s->ok = 1; if (s->err) q->stop = 1;   /* past a refusal nothing is read */
+        pthread_cond_broadcast(&q->c); pthread_mutex_unlock(&q->m);
+    }
+    return NULL;
+}
+static void pfstart(R *r, const char *path) {
+    int nth = nthreads() - 1;
+    /* small blocks: the hand-off costs more than the decode (-b 4: 3.35 s against 0.73) */
+    if (nth < 1 || r->nblk < 2 || r->rows / r->nblk < 65536) return;
+    if ((uint64_t)nth > r->nblk - 1) nth = (int)(r->nblk - 1);
+    pf *q = xcalloc(1, sizeof *q);
+    q->nblk = r->nblk; q->win = (uint64_t)nth + 1;
+    for (uint64_t i = 0; i < r->nblk; i++) if (r->b[i].nrd > q->rtn) q->rtn = r->b[i].nrd;
+    q->s = xcalloc(r->nblk, sizeof *q->s);
+    q->fb = xmalloc((q->win + (size_t)nth + 2) * sizeof *q->fb); q->fr = xmalloc((q->win + (size_t)nth + 2) * sizeof *q->fr);
+    pthread_mutex_init(&q->m, NULL); pthread_cond_init(&q->c, NULL);
+    q->th = xmalloc((size_t)nth * sizeof *q->th); q->w = xcalloc((size_t)nth, sizeof *q->w);
+    pfarg *a = xmalloc((size_t)nth * sizeof *a);
+    for (int i = 0; i < nth; i++) {   /* the tables are shared, read only */
+        R *w = xmalloc(sizeof *w); *w = *r;
+        w->f = fopen(path, "rb"); w->d = ZSTD_createDCtx();
+        w->cbuf = NULL; w->cbcap = 0; w->blkbuf = NULL; w->rtab = NULL; w->pf = NULL; w->ibuf = NULL;
+        if (!w->f || !w->d) { if (w->f) fclose(w->f); if (w->d) ZSTD_freeDCtx(w->d); free(w); break; }
+        q->w[i] = w; a[i] = (pfarg){ q, w };
+        if (pthread_create(&q->th[i], NULL, pfwork, &a[i])) { fclose(w->f); ZSTD_freeDCtx(w->d); free(w); q->w[i] = NULL; break; }
+        q->nth++;
+    }
+    if (!q->nth) { pthread_mutex_destroy(&q->m); pthread_cond_destroy(&q->c);
+                   free(q->th); free(q->w); free(q->s); free(q->fb); free(q->fr); free(q); free(a); return; }
+    q->a = a; r->pf = q;   /* a stays until the threads end */
+}
+static void pfstop(R *r) {
+    pf *q = r->pf;
+    if (!q) return;
+    pthread_mutex_lock(&q->m); q->stop = 1; pthread_cond_broadcast(&q->c); pthread_mutex_unlock(&q->m);
+    for (int i = 0; i < q->nth; i++) {
+        pthread_join(q->th[i], NULL);
+        fclose(q->w[i]->f); ZSTD_freeDCtx(q->w[i]->d); free(q->w[i]->cbuf); free(q->w[i]);
+    }
+    for (uint64_t b = q->used; b < q->nblk; b++) { free(q->s[b].buf); free(q->s[b].rt); free(q->s[b].err); }
+    while (q->nfb) free(q->fb[--q->nfb]);
+    while (q->nfr) free(q->fr[--q->nfr]);
+    pthread_mutex_destroy(&q->m); pthread_cond_destroy(&q->c);
+    free(q->s); free(q->fb); free(q->fr); free(q->th); free(q->w); free(q->a); free(q);
+    r->pf = NULL;
+}
+/* the walk's next block, decoded ahead: swap it in */
+static int pftake(R *r, uint64_t b) {
+    pf *q = r->pf;
+    if (b != q->used) return 0;         /* off the walk: decode it here */
+    pfslot *s = &q->s[b];
+    pthread_mutex_lock(&q->m);
+    while (!s->ok) pthread_cond_wait(&q->c, &q->m);
+    if (s->err) { pthread_mutex_unlock(&q->m); die(s->err); }
+    q->fb[q->nfb++] = r->blkbuf;
+    if (r->rtab) q->fr[q->nfr++] = r->rtab;
+    q->used = b + 1;
+    pthread_cond_broadcast(&q->c); pthread_mutex_unlock(&q->m);
+    r->blkbuf = s->buf; r->rtab = s->rt; s->buf = NULL; s->rt = NULL;
+    if (r->runhead) r->rfilled = 1;
+    r->curblk = UINT64_MAX;
+    LENDEC = r->lenfile && r->b[b].nos != 1;
+    r->crows = r->b[b].rows; r->crd0 = r->b[b].rd0; r->crdn = r->b[b].nrd;
+    r->lp0 = r->blkbuf; r->ip0 = r->blkbuf + s->g;
+    r->payend = PAYEND = r->ip0 + s->h2;
+    r->cached = b;
+    return 1;
 }
 
 typedef struct { uint64_t blk, left; } span;
@@ -4056,6 +4167,7 @@ static void dump(const char *path) {
        the names held under a two-block bzip3 decode) */
     if (r->nblk == 1) loadblk(r, 0);
     ensurenames(r);
+    pfstart(r, path);
     size_t OCAP = 1 << 22;
     char *ob = xmalloc(OCAP), *o = ob;
     size_t *lablen = NULL, maxlab = 20;      /* 20 covers an integer label */
@@ -4706,6 +4818,7 @@ static void emit_buf(char **ob, size_t *cap, size_t *len, const char *seq,
 
 static void rclose(R *r) {
     if (!r) return;
+    pfstop(r);
     if (r->f) fclose(r->f);
     if (r->d) ZSTD_freeDCtx(r->d);
     if (!r->name_borrowed) { free(r->namebuf); free(r->name); }

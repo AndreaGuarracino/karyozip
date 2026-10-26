@@ -10,8 +10,16 @@ pub mod reader;
 pub mod smooth;
 pub mod writer;
 
+thread_local! {
+    /// set on a decode-ahead thread: a refusal is kept for its block
+    pub static DEFER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+/// A decode-ahead thread's refusal, carried to the walk.
+pub struct Deferred(pub String);
+
 /// Every refusal is the C's own wording, and exits 1 as the C does.
 pub fn bail(msg: &str) -> ! {
+    if DEFER.with(|d| d.get()) { std::panic::panic_any(Deferred(msg.to_string())); }
     eprintln!("karyozip: {msg}");
     db::drop_tmp();
     ffi::drop_out();

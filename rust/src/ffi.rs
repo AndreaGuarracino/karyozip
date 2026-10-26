@@ -362,7 +362,10 @@ fn sig_out_clear() {
 /// A panic is a bug, yet leaves no temporaries behind either.
 pub fn panic_clean() {
     let hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |i| { crate::db::drop_tmp(); drop_out(); hook(i) }));
+    std::panic::set_hook(Box::new(move |i| {
+        if i.payload().is::<crate::Deferred>() { return; }   // a refusal on its way to the walk
+        crate::db::drop_tmp(); drop_out(); hook(i)
+    }));
 }
 
 /// Removes -o's temporary file, on any failure. try_lock: a panic hook may

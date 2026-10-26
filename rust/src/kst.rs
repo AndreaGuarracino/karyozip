@@ -14,8 +14,9 @@ pub const CARTFLAG: u64 = 1 << 52;  // vocabulary featureIDs
 pub const ILVFLAG: u64 = 1 << 51;   // labels interleaved with lengths
 pub const FLDFLAG: u64 = 1 << 50;   // names as field deltas
 pub const GRPFLAG: u64 = 1 << 49;   // lengths grouped by label
+pub const VARFLAG: u64 = 1 << 57;   // blocks of whole reads, a read count each
 pub const FLAGS: u64 = TOKFLAG | INTFLAG | RUNFLAG | DROPPED | ALNFLAG | DBFLAG | LENFLAG
-                      | TAILFLAG | CARTFLAG | ILVFLAG | FLDFLAG | GRPFLAG;
+                      | TAILFLAG | CARTFLAG | ILVFLAG | FLDFLAG | GRPFLAG | VARFLAG;
 pub const ICHUNK: u64 = 65536;      // sequences per index chunk
 
 #[inline]

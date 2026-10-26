@@ -28,7 +28,8 @@ tally() { [ $bad = 0 ] && echo "$1: $ok forms identical" || { echo "$1: $bad of 
 # 2. encode, every fixture and flag
 for f in "$D"/*.bed; do
   for fl in "" "--block 4" "--block 262144" \
-            "--effort low" "--effort low --block 4" "--names drop" "--effort high"; do
+            "--effort low" "--effort low --block 4" "--names drop" "--effort high" \
+            "--read-blocks 1" "--read-blocks 3" "--read-blocks 40" "--effort low --read-blocks 3"; do
     IN=$f both "compress $(basename "$f") [$fl]" $fl compress
   done
 done
@@ -37,7 +38,7 @@ tally compress
 # 3. Rust decodes what C encoded
 dok=0; dbad=0
 for f in "$D"/*.bed; do
-  for fl in "" "--block 4" "--block 262144"; do
+  for fl in "" "--block 4" "--block 262144" "--read-blocks 3" "--read-blocks 40"; do
     "$C" $fl compress < "$f" > "$W/t.kst" 2>/dev/null
     "$R" decompress -i "$W/t.kst" 2>/dev/null | cmp -s - "$f" && dok=$((dok+1)) \
       || { dbad=$((dbad+1)); echo "  decompress differs: $(basename "$f") [$fl]"; }
@@ -56,7 +57,7 @@ echo "cross-decompress: the C reads the Rust's files"
 
 # 5. region: same rows, every query shape
 for f in ls.bed s.bed db.rall.bed ord.bed; do
-  for bl in "" "--block 4"; do
+  for bl in "" "--block 4" "--read-blocks 3"; do
     "$C" $bl compress < "$D/$f" > "$W/t.kst" 2>/dev/null
     for seq in $(awk -F'\t' '{print $1}' "$D/$f" | uniq | head -3); do
       for q in "-r $seq" "-r $seq:50-51" "-r $seq:0-100" "-r $seq:999999-1000000"; do

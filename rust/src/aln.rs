@@ -497,7 +497,7 @@ impl Aln {
             let (fb, row0, n) = r.seq_span(self.rc[t as usize].ri);
             *f = Blkfill { st: vec![0; n as usize], lab: vec![0; n as usize],
                            bend: vec![0; r.nblk()], in_: vec![false; r.nblk()],
-                           row0, n, first: fb, last: ((row0 + n - 1) / r.blocksz()) as usize, nin: 0 };
+                           row0, n, first: fb, last: r.blk_at(row0 + n - 1, false), nin: 0 };
         }
         let (mut b, mut e) = (f.first, f.last);
         while b < e {                                   // the block holding tpos
@@ -506,7 +506,7 @@ impl Aln {
         }
         if !f.in_[b] {
             let (runs, bend) = r.blk_runs(self.rc[t as usize].ri, b);
-            let lo = if b == f.first { 0 } else { b as u64 * r.blocksz() - f.row0 } as usize;
+            let lo = if b == f.first { 0 } else { r.blk_row0(b) - f.row0 } as usize;
             for (i, (p, l)) in runs.iter().enumerate() {
                 f.st[lo + i] = *p;
                 f.lab[lo + i] = self.reflab[*l as usize];
@@ -515,9 +515,9 @@ impl Aln {
             f.in_[b] = true;
             f.nin += 1;
         }
-        let lo = if b == f.first { 0 } else { b as u64 * r.blocksz() - f.row0 } as usize;
-        let hi = if f.row0 + f.n <= (b as u64 + 1) * r.blocksz() { f.n as usize }
-                 else { ((b as u64 + 1) * r.blocksz() - f.row0) as usize };
+        let be = r.blk_row0(b) + r.blk_rows(b);
+        let lo = if b == f.first { 0 } else { r.blk_row0(b) - f.row0 } as usize;
+        let hi = if f.row0 + f.n <= be { f.n as usize } else { (be - f.row0) as usize };
         let wend = f.bend[b];
         if tpos >= wend { return None; }
         let a = lo + f.st[lo..hi].partition_point(|&x| x <= tpos);

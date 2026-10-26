@@ -775,6 +775,28 @@ awk 'BEGIN{p=0; for(k=0;k<400000;k++){printf "r1\t%d\t%d\tchr%d\n", p, p+20, k%2
   || echo "a full staging filesystem: refused"
 [ -z "$(ls -A "$W/tinytmp" 2>/dev/null)" ] && ok "a full staging filesystem: no temp files left" || no "a full staging filesystem: TEMP FILES LEFT"
 
+# whole-read blocks: every layout, queries, --db, --aln, --smooth
+awk 'BEGIN { for (r = 0; r < 3000; r++) { n = 1 + r % 4; p = 0; for (i = 0; i < n; i++) { l = i + 1 == n ? 151 - p : 20 + (r * 7 + i * 13) % 40; printf "q%d\t%d\t%d\t%s\n", r, p, p + l, (r + i) % 5 ? "chr" (1 + (r + i) % 3) : "novel"; p += l } } }' > "$W/vb.bed"
+for n in 1 7 500; do
+  $KT compress --read-blocks $n -i "$W/vb.bed" -o "$W/vb.kt" 2> "$W/vb.err"
+  $KT decompress -i "$W/vb.kt" 2>/dev/null | cmp -s - "$W/vb.bed" && ok "--read-blocks $n: byte-identical, $(grep -o 'layout: [a-z]*' "$W/vb.err"), $(grep -o 'blocks=[0-9]*' "$W/vb.err")" || no "--read-blocks $n: WRONG"
+  for ix in 0 1; do [ $ix = 1 ] && $KT index -i "$W/vb.kt" 2>/dev/null; q=0
+    for r in q0 q1 q499 q500 q1777 q2999; do $KT query -i "$W/vb.kt" -r $r 2>/dev/null | cmp -s - <(awk -v r=$r '$1 == r' "$W/vb.bed") && q=$((q+1)); done
+    $KT query -i "$W/vb.kt" -r q1777:30-90 2>/dev/null | cmp -s - <(awk '$1 == "q1777" && $3 > 30 && $2 < 90' "$W/vb.bed") && q=$((q+1))
+    [ $q = 7 ] && ok "--read-blocks $n query, index $ix: 7/7" || no "--read-blocks $n query, index $ix: only $q/7"; done
+  rm -f "$W/vb.kt.kzi"
+done
+grep -q "layout: plain" "$W/vb.err" && no "--read-blocks 500: PLAIN, the layout search did not run" || ok "--read-blocks 500: a one-block layout on every block"
+$KT compress --read-blocks 3 --db "$D/db.features.tsv" $in -o "$W/vbd.kt" 2>/dev/null; rm -rf "$W/vbo"; mkdir -p "$W/vbo"
+$KT decompress --db "$D/db.features.tsv" --out-dir "$W/vbo" -i "$W/vbd.kt" 2>/dev/null
+n=0; for f in $sets; do cmp -s "$W/vbo/$f.bed" "$D/db.$f.bed" && n=$((n+1)); done
+[ "$n" = 6 ] && ok "--read-blocks 3 --db: 6/6 identical" || no "--read-blocks 3 --db: only $n/6 identical"
+$KT compress --read-blocks 3 --aln "$D/p.paf" --ref "$D/ref.bed" -i "$D/s.bed" -o "$W/vba.kt" 2>/dev/null
+$KT decompress --aln "$D/p.paf" --ref "$D/ref.bed" -i "$W/vba.kt" 2>/dev/null | cmp -s - "$D/s.bed" && ok "--read-blocks 3 --aln: byte-identical" || no "--read-blocks 3 --aln: WRONG"
+{ printf 'feature_set\tchild\tparent\n'; for l in chr1 chr2 chr3 novel; do printf 'fs\t%s\tcategorized\n' $l; done; } > "$W/vbh.tsv"
+$KT compress -i "$W/vb.bed" -o "$W/vb1.kt" 2>/dev/null; $KT compress --read-blocks 7 -i "$W/vb.bed" -o "$W/vb.kt" 2>/dev/null
+for t in 1 4; do $KT decompress -t $t -i "$W/vb.kt" --smooth --hier "$W/vbh.tsv" 2>/dev/null | cmp -s - <($KT decompress -i "$W/vb1.kt" --smooth --hier "$W/vbh.tsv" 2>/dev/null) && ok "--read-blocks 7 --smooth -t $t: same as one block" || no "--read-blocks 7 --smooth -t $t: DIFFERS"; done
+
 # pin the stored bytes to codec versions
 want=55b6e9eadfe851a4374e094e045ee8ecb4ffac9a2fdd83de126ff076724e700b
 got=$($KT --block 4 compress < "$D/db.rall.bed" 2>/dev/null | sha256sum | cut -d' ' -f1)

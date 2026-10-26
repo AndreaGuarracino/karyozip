@@ -3,7 +3,7 @@
 
 use crate::ffi;
 use crate::kst::{self, FNV0, TOKFLAG, INTFLAG, FLDFLAG, DROPPED, ALNFLAG, DBFLAG, LENFLAG,
-                 TAILFLAG, RUNFLAG, ILVFLAG, GRPFLAG, CARTFLAG, ICHUNK, FLAGS};
+                 TAILFLAG, RUNFLAG, ILVFLAG, GRPFLAG, CARTFLAG, VARFLAG, ICHUNK, FLAGS};
 use std::io::{Read, Seek, SeekFrom};
 
 const IDXMAGIC: u64 = 0x3130_5844_4954_534b;   // "KSTIDX01"
@@ -53,7 +53,7 @@ fn read_name_file(path: &str, nreads: u64) -> Vec<u8> {
 /// One block: where it is, both frame sizes, both decoded sizes, its rows,
 /// the bases before it, and its own hash.
 #[derive(Clone, Copy)]
-struct Blk { off: u64, size: u64, l: u64, raw: u64, lraw: u64, rows: u64, bp: u64, hash: u64 }
+struct Blk { off: u64, size: u64, l: u64, raw: u64, lraw: u64, rows: u64, bp: u64, hash: u64, row0: u64, rd0: u64, nrd: u64 }
 
 /// seq, start, end, label, as decode hands each row out.
 /// name, start, end, label, and the label's table index when the label is that entry's own text
@@ -100,6 +100,7 @@ pub struct Reader {
     /// starts at, and the one chunk decoded now, as the C's loadichunk
     iz: Vec<u8>, coff: Vec<u64>, cpend: Vec<u64>, ibx: Vec<u8>, cur_chunk: u64,
     runhead: bool, ilv: bool, grp: bool, rtab: std::sync::Arc<Vec<u32>>,   // run-count prefix sums, lifted out of the lengths; 32 bits, as the C's offsets
+    varblk: bool, rtab_blk: usize,   // blocks of whole reads; the block rtab counts
     mhash: u64,
     cur_ri: u64,
     cur_q: usize,
@@ -220,9 +221,6 @@ impl Reader {
         let ilv = h[1] & ILVFLAG != 0;
         let grp = h[1] & GRPFLAG != 0;
         if grp && (ilv || !runhead) { crate::bail("corrupt file: grouped lengths without their run counts"); }
-        if runhead {   // the C allocates its u32 run table here
-            crate::ckalloc(h[0].max(1).checked_mul(4).unwrap_or_else(|| crate::bail("allocation size overflows")) as usize);
-        }
         if h[1] & CARTFLAG != 0 && h[1] & DBFLAG == 0 {
             crate::bail("corrupt file: vocabulary featureIDs without --db");
         }
@@ -258,6 +256,7 @@ impl Reader {
 
         // The block table.
         let was_len = h[1] & LENFLAG != 0;
+        let varblk = h[1] & VARFLAG != 0;
         let mut blk_nos: Vec<u8> = Vec::new();
         let sbuf = zdec(&sz, "block sizes");
         let mut b = Vec::new();
@@ -272,7 +271,8 @@ impl Reader {
             let (e2, n5) = vget(&sbuf, n4);
             let (bp, n6) = vget(&sbuf, n5);
             let (g2, n7) = vget(&sbuf, n6);
-            q = n7;
+            let (k2, n8) = if varblk { vget(&sbuf, n7) } else { (0, n7) };
+            q = n8;
             if a > fsz || b2 > fsz || a + b2 > fsz || acc + a + b2 > fsz {
                 crate::bail("corrupt index: a block runs past the end of the file");
             }
@@ -283,19 +283,34 @@ impl Reader {
             if c2 > h[4] * 16 + 64 || d2 > h[4] * 16 + 64 {
                 crate::bail("corrupt index: a block claims an impossible decoded size");
             }
-            b.push(Blk { off: acc, size: a + b2, l: a, raw: c2, lraw: d2, rows: e2, bp, hash: g2 });
+            if varblk && (k2 == 0 || e2 == 0 || k2 > e2) { crate::bail("corrupt index: a block's read count is out of range"); }
+            b.push(Blk { off: acc, size: a + b2, l: a, raw: c2, lraw: d2, rows: e2, bp, hash: g2, row0: 0, rd0: 0, nrd: k2 });
             acc += a + b2;
         }
-        let tot: u64 = b.iter().map(|x| x.rows).sum();
+        if runhead && b.len() != 1 && !varblk {
+            crate::bail("corrupt file: run counts head the lengths but the track has more than one block");
+        }
+        if varblk && b.len() < 2 { crate::bail("corrupt file: whole-read blocks flagged on fewer than two blocks"); }
         let blk = if h[8] != 0 { h[8] } else { 512 };
-        for (i, x) in b.iter().enumerate() {
-            let last = i + 1 == b.len();
+        let (mut tot, mut trd, mut mrd) = (0u64, 0u64, 0u64);
+        let nb = b.len();
+        for (i, x) in b.iter_mut().enumerate() {
+            x.row0 = tot; x.rd0 = trd;
+            tot += x.rows; trd += x.nrd; mrd = mrd.max(x.nrd);
+            if varblk { continue; }
+            let last = i + 1 == nb;
             if (!last && x.rows != blk) || (last && (x.rows == 0 || x.rows > blk)) {
                 crate::bail("corrupt index: a block does not hold the block size of rows");
             }
         }
         if tot != h[4] || (b.is_empty() && h[4] != 0) {
             crate::bail("corrupt index: the blocks do not add up to the row count");
+        }
+        if varblk && trd != h[0] { crate::bail("corrupt index: the blocks' read counts do not add up to the read count"); }
+        if !varblk && nb > 0 { b[0].nrd = h[0]; }   // one block holds them all
+        if runhead {   // after the hash, as the C allocates its u32 run table
+            let n = if varblk { mrd } else { h[0].max(1) };
+            crate::ckalloc(n.checked_mul(4).unwrap_or_else(|| crate::bail("allocation size overflows")) as usize);
         }
 
         // The index: chunk table, then the concatenated chunk frames.
@@ -341,7 +356,7 @@ impl Reader {
             nameix: std::cell::OnceCell::new(),
             idcodec: idc, lencodec: lenc,
             taildec, tailpred: h[12], tailskip: h[13] & 0xff, iz, coff, cpend, ibx: Vec::new(), cur_chunk: u64::MAX,
-            runhead, ilv, grp, rtab: Default::default(),
+            runhead, ilv, grp, rtab: Default::default(), varblk, rtab_blk: usize::MAX,
             names: std::cell::OnceCell::new(), nz, names_file: o.names_file.clone(),
             nf, idx,
             mhash: h[15], cur_ri: 0, cur_q: 0, cur_pend: 0, cached: None, sc: None,
@@ -437,7 +452,7 @@ impl Reader {
         self.load(0);
         Some((self.cached.clone().unwrap(), self.rtab.clone()))
     }
-    pub fn adopt_block(&mut self, s: Shared) { self.cached = Some(s.0); self.rtab = s.1; }
+    pub fn adopt_block(&mut self, s: Shared) { self.cached = Some(s.0); self.rtab = s.1; self.rtab_blk = 0; }
 
     fn load(&mut self, b: usize) -> (std::sync::Arc<Vec<u8>>, usize, u64) {
         if let Some((cb, d, sp, r)) = &self.cached {
@@ -454,13 +469,13 @@ impl Reader {
     /// One stream a read, its run count then a label beside its own length.
     /// Split it back into the two regions the walks expect; the counts stay
     /// in front of the lengths for rmheads to lift out.
-    fn ilv_split(&self, v: Vec<u8>, nl: usize, ni: usize) -> Vec<u8> {
+    fn ilv_split(&self, v: Vec<u8>, nl: usize, ni: usize, rows: u64) -> Vec<u8> {
         let (mut lens, mut ids) = (Vec::with_capacity(nl + ni), Vec::with_capacity(ni));   // the ids join lens: no regrowth
         let (mut i, mut seen) = (0usize, 0u64);
         while i < v.len() {
             let h0 = i;
             let (k, n) = vget(&v, i); i = n;
-            if k == 0 || k > self.rows - seen { crate::bail("corrupt block: a run count is out of range"); }
+            if k == 0 || k > rows - seen { crate::bail("corrupt block: a run count is out of range"); }
             lens.extend_from_slice(&v[h0..i]);
             for _ in 0..k {
                 if i >= v.len() { crate::bail("corrupt block: the interleaved frame is short"); }
@@ -471,7 +486,7 @@ impl Reader {
             }
             seen += k;
         }
-        if seen != self.rows || lens.len() != nl || ids.len() != ni {
+        if seen != rows || lens.len() != nl || ids.len() != ni {
             crate::bail("corrupt block: the interleaved frame does not split into its two regions");
         }
         lens.extend_from_slice(&ids);
@@ -482,16 +497,17 @@ impl Reader {
     /// the gap, so every walk below sees the layout it always saw.
     /// In place, as the C's memmove: a second copy of the lengths was the
     /// largest buffer of an assembly decode.
-    fn rmheads(&mut self, lens: &mut [u8]) -> usize {
+    fn rmheads(&mut self, lens: &mut [u8], b: usize) -> usize {
+        let (rows, nrd) = (self.b[b].rows, self.b[b].nrd);
         let (mut w, mut i, mut seen) = (0usize, 0usize, 0u64);
         // 4 B a read, as the C's counts: 8 B was 295 MB more on 73.7M reads
         if self.rows > u32::MAX as u64 { crate::bail("corrupt index: a sequence offset past 32 bits"); }
-        let mut tab: Vec<u32> = Vec::with_capacity(self.nreads as usize + 1);
+        let mut tab: Vec<u32> = Vec::with_capacity(nrd as usize + 1);
         tab.push(0);
         while i < lens.len() {
-            if tab.len() as u64 > self.nreads { crate::bail("corrupt block: more reads than the header claims"); }
+            if tab.len() as u64 > nrd { crate::bail("corrupt block: more reads than the header claims"); }
             let (k, n) = vget(&lens, i); i = n;
-            if k == 0 || k > self.rows - seen { crate::bail("corrupt block: a run count is out of range"); }
+            if k == 0 || k > rows - seen { crate::bail("corrupt block: a run count is out of range"); }
             seen += k; tab.push(seen as u32);
             let s0 = i;   // the read's lengths sit together: one move a read
             for _ in 0..k {
@@ -501,10 +517,10 @@ impl Reader {
             }
             lens.copy_within(s0..i, w); w += i - s0;
         }
-        if tab.len() as u64 != self.nreads + 1 || seen != self.rows {
+        if tab.len() as u64 != nrd + 1 || seen != rows {
             crate::bail("corrupt block: the run counts do not add up to the row count");
         }
-        self.rtab = std::sync::Arc::new(tab);
+        self.rtab = std::sync::Arc::new(tab); self.rtab_blk = b;
         w
     }
 
@@ -567,10 +583,10 @@ impl Reader {
         // as the C frees it: not needed past its frames; kept for the next
         // block only when there is one, or a one-block decode holds it to the end
         if self.b.len() > 1 { ffi::recycle(cb); } else { drop(cb); }
-        let mut data = if self.ilv { self.ilv_split(data, lraw, raw) } else { data };
+        let mut data = if self.ilv { self.ilv_split(data, lraw, raw, m.rows) } else { data };
         let mut split = lraw;
         if self.runhead {   // close the gap the run counts leave, as the C's memmove
-            split = self.rmheads(&mut data[..lraw]);
+            split = self.rmheads(&mut data[..lraw], b);
             data.copy_within(lraw.., split);
             data.truncate(split + raw); data.shrink_to_fit();   // the heads' touched tail goes back
         }
@@ -741,11 +757,20 @@ impl Reader {
     fn locate(&mut self, ri: u64) -> (usize, u64, u64) {
         if self.runhead {
             if ri >= self.nreads { crate::bail("corrupt index: a sequence past the end"); }
-            if self.rtab.is_empty() { self.load(0); }
-            let start = self.rtab[ri as usize] as u64;
-            let n = self.rtab[ri as usize + 1] as u64 - start;
-            if start + n > self.rows { crate::bail("corrupt index: a sequence points outside the block table"); }
-            return (0, start, n);
+            if !self.varblk {   // one block: its counts, from read 0
+                if self.rtab.is_empty() { self.load(0); }
+                let start = self.rtab[ri as usize] as u64;
+                let n = self.rtab[ri as usize + 1] as u64 - start;
+                if start + n > self.rows { crate::bail("corrupt index: a sequence points outside the block table"); }
+                return (0, start, n);
+            }
+            let b = self.blk_at(ri, true);
+            if self.rtab_blk != b { self.load(b); }   // rtab holds one block's reads
+            let i = (ri - self.b[b].rd0) as usize;
+            let start = self.rtab[i] as u64;
+            let n = self.rtab[i + 1] as u64 - start;
+            if start + n > self.b[b].rows { crate::bail("corrupt index: a sequence points outside the block table"); }
+            return (b, start, n);
         }
         let want = ri / ICHUNK;
         if want != self.cur_chunk || ri < self.cur_ri { self.load_ichunk(want); }
@@ -753,7 +778,7 @@ impl Reader {
         while self.cur_ri <= ri {
             let (n, next) = vget(&self.ibx, self.cur_q);
             self.cur_q = next;
-            if self.cur_pend / self.block > u32::MAX as u64 {
+            if !self.varblk && self.cur_pend / self.block > u32::MAX as u64 {
                 crate::bail("corrupt index: a block number past 32 bits");
             }
             nruns = n;
@@ -761,8 +786,19 @@ impl Reader {
             self.cur_ri += 1;
         }
         let start = self.cur_pend - nruns;
-        ((start / self.block) as usize, start % self.block, nruns)
+        if !self.varblk { return ((start / self.block) as usize, start % self.block, nruns); }
+        if start >= self.rows { crate::bail("corrupt index: a sequence points outside the block table"); }
+        let b = self.blk_at(start, false);
+        (b, start - self.b[b].row0, nruns)
     }
+
+    /// The block holding row i, or read i when rd: a search under whole-read blocks.
+    pub fn blk_at(&self, i: u64, rd: bool) -> usize {
+        if !self.varblk { return if rd { 0 } else { (i / self.block) as usize }; }
+        self.b.partition_point(|x| (if rd { x.rd0 } else { x.row0 }) <= i) - 1
+    }
+    /// The first row of block b.
+    pub fn blk_row0(&self, b: usize) -> u64 { self.b[b].row0 }
 
     fn at(&mut self, blk: usize, off: u64) -> Cursor {
         let (data, split, rows) = self.load(blk);
@@ -1017,13 +1053,13 @@ impl Reader {
         // As the C: a block that opens inside this sequence records where,
         // so with a START the walk begins at the last block opening at or
         // before it, not at the sequence's first run.
-        let (start, bs) = (blk as u64 * self.block + off, self.block);
+        let start = self.b[blk].row0 + off;
         let (mut jump, mut kskip, mut st0) = (blk, 0u64, 0u64);
         if lo > 0 {
-            while jump + 1 < self.b.len() && (jump as u64 + 1) * bs < start + nruns
+            while jump + 1 < self.b.len() && self.b[jump + 1].row0 < start + nruns
                   && self.b[jump + 1].bp != 0 && self.b[jump + 1].bp <= lo { jump += 1; }
         }
-        if jump != blk { kskip = jump as u64 * bs - start; st0 = self.b[jump].bp; }
+        if jump != blk { kskip = self.b[jump].row0 - start; st0 = self.b[jump].bp; }
 
         let mut c = if jump != blk { self.at(jump, 0) } else { self.at(blk, off) };
         let mut buf = Vec::with_capacity(1 << 20);
@@ -1156,19 +1192,21 @@ impl Reader {
     pub fn blocksz(&self) -> u64 { self.block }
     /// where block `b` opens inside the sequence its first row belongs to
     pub fn blk_bp(&self, b: usize) -> u64 { self.b[b].bp }
+    /// the rows of block b
+    pub fn blk_rows(&self, b: usize) -> u64 { self.b[b].rows }
     /// (first block, first row, run count) of sequence `ri`
     pub fn seq_span(&mut self, ri: u64) -> (usize, u64, u64) {
         let (blk, off, n) = self.locate(ri);
-        (blk, blk as u64 * self.block + off, n)
+        (blk, self.b[blk].row0 + off, n)
     }
     /// The rows of sequence `ri` that lie in block `b`, as (start, label id),
     /// and the position after the last of them. The sequence's own
     /// coordinates: block `b` opens at blk_bp(b) unless it is the first.
     pub fn blk_runs(&mut self, ri: u64, b: usize) -> (Vec<(u64, u32)>, u64) {
         let (fb, row0, n) = self.seq_span(ri);
-        let (mut row, mut pos) = if b == fb { (row0, 0) } else { (b as u64 * self.block, self.b[b].bp) };
-        let mut c = self.at(b, row - b as u64 * self.block);
-        let end = (b as u64 * self.block + self.b[b].rows).min(row0 + n);
+        let (mut row, mut pos) = if b == fb { (row0, 0) } else { (self.b[b].row0, self.b[b].bp) };
+        let mut c = self.at(b, row - self.b[b].row0);
+        let end = (self.b[b].row0 + self.b[b].rows).min(row0 + n);
         let mut out = Vec::with_capacity((end - row) as usize);
         while row < end {
             let (len, f) = self.step(&mut c, pos, false);

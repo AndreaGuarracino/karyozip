@@ -28,6 +28,11 @@
 
 static uint64_t BLOCK = UINT64_MAX;      /* one block: the smallest file */
 static int BLOCKSET = 0;                 /* --block was given */
+/* -e medium: blocks close at the first read past MEDBLK rows, so every
+   block holds whole reads and takes the one-block layouts */
+#define MEDBLK 4194304
+static int VARBLK = 0;
+static int VARON = 0;                    /* this file: more than one such block */
 /* 0 means use every core; --threads overrides */
 static int NTHREADS = 0;
 static int LEVEL = 17;
@@ -502,6 +507,9 @@ static char *unz(const void *src, size_t n, size_t *len, const char *what) {
 /* Lengths grouped by label id within a read. The labels stay in their own
    order and are the permutation, so nothing else is stored. */
 #define GRPFLAG  (1ULL << 49)
+/* Blocks hold whole reads, their row counts vary, and the block table
+   gives each one's read count. */
+#define VARFLAG  (1ULL << 57)
 static int RUNHEAD = 0;               /* the writer is using that layout */
 static int ILV = 0;                   /* and whether the two frames are one */
 static int GRP = 0;                   /* and whether the lengths are grouped */
@@ -1075,6 +1083,7 @@ static __thread uint64_t TAILSKIP_R = 0;  /* sequences before this store a plain
 typedef struct {
     size_t off, len, lens, rows, bp;   /* into the staging file, then its two frames */
     size_t aoff[2], alen[2];           /* the same for the two --aln spellings */
+    size_t ibe, nrd;                   /* run counts and reads so far, at its close */
 } blkmeta;
 
 typedef struct ktw {
@@ -1210,6 +1219,7 @@ static void ktw_flush(ktw *w) {
     m->len = w->lens.n + w->ids.n;
     m->lens = w->lens.n; m->rows = w->pend;
     m->bp = w->blkbp0; w->blkbp0 = 0; w->nraw++;
+    m->ibe = w->ibx.n; m->nrd = w->nidx;
     rawput(w->rawfd, (off_t)m->off, w->lens.d, w->lens.n);
     rawput(w->rawfd, (off_t)(m->off + w->lens.n), w->ids.d, w->ids.n);
     w->nblk++;
@@ -1342,7 +1352,7 @@ static void ktw_row(ktw *w, const char *name, size_t nlen,
     }
 
     if (w->phas) { lensput(w, w->pval); w->phas = 0; }
-    if (w->pend >= BLOCK) ktw_flush(w);            /* mid-sequence is fine */
+    if (!VARBLK && w->pend >= BLOCK) ktw_flush(w);   /* mid-sequence is fine */
     if (!w->pend) w->blkbp0 = w->curbp;   /* where this block opens */
     w->plen = run_len; w->phas = 1;
     w->pval = ALNPAF
@@ -2759,6 +2769,7 @@ static void cflush(cslot *cs, size_t nraw, _Atomic size_t *wrote, const blkmeta 
         bvar(sizes, c->ni); bvar(sizes, ALNPAF ? c->nl << 2 | c->ns : c->nl);
         bvar(sizes, bm[*wrote].rows); bvar(sizes, bm[*wrote].bp);
         bvar(sizes, fnvbuf(fnvbuf(FNV0, c->fa, c->a), ids, c->b));
+        if (VARON) bvar(sizes, bm[*wrote].nrd - (*wrote ? bm[*wrote - 1].nrd : 0));
         free(c->fa); free(c->fb);
     }
 }
@@ -2780,7 +2791,10 @@ static void ktw_close(ktw *w) {
               && !pthread_create(&nth, NULL, namespick, &nj);
 
     double _ts = nowsec();
-    if (!(nraw == 1 && w->ibx.n)) pickcodecs(w->rawfd, bm, nraw);   /* else the layout search ranks it all */
+    VARON = VARBLK && nraw > 1;
+    /* one block, or whole-read blocks: the layout search ranks it all */
+    int laysearch = (nraw == 1 || (VARON && !ALNPAF)) && w->ibx.n;
+    if (!laysearch) pickcodecs(w->rawfd, bm, nraw);
     PH_ADD(8, _ts);
 
     size_t maxraw = 0;
@@ -2793,13 +2807,14 @@ static void ktw_close(ktw *w) {
     /* Four spellings of one block, all measured, the smallest kept: the two
        frames as they are; the run count heading each read's lengths, which
        empties the index; the two frames interleaved into one, where a
-       repeated read pattern is a single string; and both. One block only,
-       since a split read has no count to head it. */
+       repeated read pattern is a single string; and both. One block, or
+       blocks of whole reads, decided on the first: a split read has no
+       count to head it. */
     uint8_t *altbuf = NULL, *lk = NULL; size_t altlen = 0, alt_lens = 0, lkn = 0;
     uint8_t *altv[3] = {0}; size_t altvn[3] = {0}, altvl[3] = {0};
     double _tl = nowsec();
-    if (nraw == 1 && w->ibx.n) {
-        size_t nl0 = bm[0].lens, ni0 = bm[0].len - nl0;
+    if (laysearch) {
+        size_t nl0 = bm[0].lens, ni0 = bm[0].len - nl0, ibn0 = VARON ? bm[0].ibe : w->ibx.n;
         uint8_t *rb0 = xmalloc(bm[0].len);
         rawget(w->rawfd, (off_t)bm[0].off, rb0, bm[0].len);
         ZSTD_CCtx *mc = ZSTD_createCCtx();
@@ -2808,7 +2823,7 @@ static void ktw_close(ktw *w) {
            of them -e high. Each layout gets its own best codec there; only the
            winner is built whole, compressed once and read back. */
         size_t cap = SLOW ? SIZE_MAX : (size_t)(FASTMODE ? 4 : DEFSAMPLE) << 20, pl = 0, pi = 0, pb = 0;
-        {   const uint8_t *p = rb0, *e = rb0 + nl0, *q = rb0 + nl0, *qe = q + ni0, *r = w->ibx.d, *re = r + w->ibx.n;
+        {   const uint8_t *p = rb0, *e = rb0 + nl0, *q = rb0 + nl0, *qe = q + ni0, *r = w->ibx.d, *re = r + ibn0;
             while (r < re) {
                 uint64_t k = vgetb(&r, re);
                 for (uint64_t j = 0; j < k && p < e && q < qe; j++) { vgetb(&p, e); vgetb(&q, qe); }
@@ -2838,17 +2853,17 @@ static void ktw_close(ktw *w) {
         int L = 0;
         for (int k = 1; k < 4; k++) if (sz[k] && (!sz[L] || sz[k] < sz[L])) L = k;
         /* the sample is the whole block: its winner is built, keep it */
-        int whole = pl == nl0 && pi == ni0 && pb == w->ibx.n;
+        int whole = nraw == 1 && pl == nl0 && pi == ni0 && pb == w->ibx.n;
         for (int k = 1; k < 4; k++) if (!whole || k != L) { free(lay[k]); lay[k] = NULL; }
         IDCODEC = c5[0]; LEVEL_I = l5[0];
         LENCODEC = c5[L + 1]; LEVEL_L = l5[L + 1];
         if (whole && L) { altbuf = lay[L]; altlen = n4[L]; alt_lens = L == 3 ? n4[1] : n4[L]; }
         else {
             size_t hn = 0; uint8_t *hb = NULL;
-            if (L) hn = splice_heads(rb0, nl0, w->ibx.d, w->ibx.n, &hb);
+            if (L) hn = splice_heads(rb0, nl0, w->ibx.d, ibn0, &hb);
             if (L == 1) { altbuf = hb; altlen = alt_lens = hn; hb = NULL; }
-            if (L == 2) altlen = alt_lens = grp_pack(rb0, nl0, rb0 + nl0, ni0, w->ibx.d, w->ibx.n, &altbuf);
-            if (L == 3) { altlen = ilv_pack(rb0, nl0, rb0 + nl0, ni0, w->ibx.d, w->ibx.n, &altbuf); alt_lens = hn; }
+            if (L == 2) altlen = alt_lens = grp_pack(rb0, nl0, rb0 + nl0, ni0, w->ibx.d, ibn0, &altbuf);
+            if (L == 3) { altlen = ilv_pack(rb0, nl0, rb0 + nl0, ni0, w->ibx.d, ibn0, &altbuf); alt_lens = hn; }
             free(hb);
         }
         if (L == 2) GRP = 1;
@@ -2882,7 +2897,7 @@ static void ktw_close(ktw *w) {
         fprintf(stderr, ", labels %s, decided on the codec search's sample\n", cname(IDCODEC));
     }
     PH_ADD(9, _tl);
-    if (RUNHEAD) { free(w->ibx.d); w->ibx.d = NULL; w->ibx.n = 0; }
+    if (RUNHEAD && !VARON) { free(w->ibx.d); w->ibx.d = NULL; w->ibx.n = 0; }   /* blocks past the first still spell theirs */
 
     {
         /* Compress apart, write in order, as the Rust's: a thread takes
@@ -2922,7 +2937,15 @@ static void ktw_close(ktw *w) {
                     if (v == 1 && vs[1] && an == vn[1] && !memcmp(alt, vs[1], an)) continue;   /* plus equals plain */
                     vs[v + 1] = alt; vn[v + 1] = an;
                 }
-                if (RUNHEAD || ILV)
+                uint8_t *own = NULL; size_t ownl = 0;   /* this block's own spelling */
+                if ((RUNHEAD || ILV) && VARON && i) {
+                    const uint8_t *ib = w->ibx.d + bm[i - 1].ibe; size_t ibn = bm[i].ibe - bm[i - 1].ibe;
+                    size_t on = GRP ? grp_pack(src, nl, idsrc, ni, ib, ibn, &own)
+                              : ILV ? ilv_pack(src, nl, idsrc, ni, ib, ibn, &own)
+                              : splice_heads(src, nl, ib, ibn, &own);
+                    if (!on) { failed = 1; free(own); break; }
+                    vs[0] = own; vn[0] = on; ownl = ILV ? nl + ibn : on;
+                } else if (RUNHEAD || ILV)
                     for (int v = 0; v < 3; v++) {
                         if (altv[v]) { vs[v] = altv[v]; vn[v] = altvn[v]; }
                         else if (v) vs[v] = NULL;
@@ -2935,15 +2958,16 @@ static void ktw_close(ktw *w) {
                 for (int k = 0; k < 3; k++) {
                     int v = ORDER[k]; if (!vs[v]) continue;
                     uint8_t *f2 = NULL; size_t a2;
-                    if (!v && lk) { f2 = lk; a2 = lkn; lk = NULL; }   /* the one lensok made */
+                    if (!v && lk && !i) { f2 = lk; a2 = lkn; lk = NULL; }   /* the one lensok made */
                     else a2 = complens(tc, vs[v], vn[v], &f2, ZSTD_compressBound(vn[v]));
                     if (!a2) { failed = 1; break; }
                     if (bv < 0 || a2 < best) { free(fa); fa = f2; best = a2; bv = v; }
                     else free(f2);
                 }
                 if (lon) pthread_join(lth, NULL);
+                free(own);
                 if (failed) { free(fa); free(lj.o); break; }
-                a = best; nl = ILV ? altvl[bv] : vn[bv]; nosent = (uint64_t)bv;
+                a = best; nl = ILV ? (ownl ? ownl : altvl[bv]) : vn[bv]; nosent = (uint64_t)bv;
                 if (ILV) { b2 = 0; fb = NULL; }
                 else if (lon) { fb = lj.o; b2 = lj.z;
                                 if (!b2) { failed = 1; free(fa); free(fb); break; } }
@@ -2979,6 +3003,7 @@ static void ktw_close(ktw *w) {
         if (wfail) die("tmp write");
         if (failed) die("block compression failed");
         RAWHELD = nraw ? bm[nraw - 1].off + bm[nraw - 1].len : 0;   /* staged, not held */
+        if (RUNHEAD && VARON) { free(w->ibx.d); w->ibx.d = NULL; w->ibx.n = 0; }
         PH_ADD(1, _tc);
     }
 
@@ -3038,10 +3063,10 @@ static void ktw_close(ktw *w) {
     uint64_t h[16] = { nidx, nzl | (tokused ? TOKFLAG : 0) | (CARTUSED ? CARTFLAG : 0)
                              | (intused ? INTFLAG : 0) | (fldused ? FLDFLAG : 0) | (dropnames && !(w->ordok && nidx > 0) ? DROPPED : 0)
                              | (ALNPAF ? LENFLAG : 0) | (TAILON > 0 ? TAILFLAG : 0)
-                             | (RUNHEAD ? RUNFLAG : 0) | (ILV ? ILVFLAG : 0) | (GRP ? GRPFLAG : 0)
+                             | (RUNHEAD ? RUNFLAG : 0) | (ILV ? ILVFLAG : 0) | (GRP ? GRPFLAG : 0) | (VARON ? VARFLAG : 0)
                              | (ALNPAF ? ALNFLAG : 0) | (DBFEATS ? DBFLAG : 0), izl, szl, rows,
                       (uint64_t)(uint32_t)LENCODEC | (DBFEATS ? (fh & 0xffffffffu) << 32 : 0),
-                      lzl, (uint64_t)nlabtab, BLOCK,
+                      lzl, (uint64_t)nlabtab, VARBLK && !VARON ? UINT64_MAX : BLOCK,   /* one block: as before */
                       (uint64_t)(uint32_t)IDCODEC | (DBFEATS ? (fh >> 32) << 32 : 0), nichunk, itl,
                       TAILPRED, (uint64_t)TAILSKIP | ((ALNPAF ? ALNHASH : ROWHASH) << 8), 0, 0 };
 
@@ -3099,7 +3124,7 @@ kt_writer *kt_open(FILE *out) {
     for (int i = 0; i < nlabtab; i++) free(labtab[i]);
     free(labhash); labhash = NULL;
     nlabtab = 0; lastid = -1; labhash_init = 0; lcache_init = 0;
-    TAILSEEN = 0; TAILON = -1; TAILPRED = 0; ALNHIT = 0; RUNHEAD = ILV = GRP = 0;
+    TAILSEEN = 0; TAILON = -1; TAILPRED = 0; ALNHIT = 0; RUNHEAD = ILV = GRP = VARON = 0;
     return ktw_open(out);
 }
 void kt_block(kt_writer *w, uint64_t rows) { (void)w; BLOCK = rows ? rows : UINT64_MAX; BLOCKSET = 1; }
@@ -3144,7 +3169,7 @@ const char *kt_version(void) { return KARYOZIP_VERSION; }
 /* --------------------------------------------------------------- decoding */
 /* one block: file offset, both frame sizes, both decoded sizes, rows, bp,
    its FNV, and which of the three length spellings it used */
-typedef struct { uint64_t off, size, l, raw, lraw, rows, bp, hash; uint8_t nos; } blk;
+typedef struct { uint64_t off, size, l, raw, lraw, rows, bp, hash; uint8_t nos; uint64_t row0, rd0, nrd; } blk;
 typedef struct {
     FILE *f; uint64_t nreads, rows, data0, block;
     char **name; char **lab; uint64_t nlab;
@@ -3171,6 +3196,8 @@ typedef struct {
     const uint8_t *curlp, *curip;
     uint64_t rowhash, tailpred, tailskip; int taildec;   /* for a track read as --ref */
     int runhead, ilv, grp, rfilled; uint32_t *rtab;   /* run counts lifted out of the lengths */
+    int varblk;                     /* blocks of whole reads, sizes vary */
+    uint64_t crows, crd0, crdn;     /* the decoded block's rows and reads */
 } R;
 
 static void loadichunk(R *r, uint64_t c) {
@@ -3191,16 +3218,39 @@ static void loadichunk(R *r, uint64_t c) {
 static void loadblk(R *r, uint64_t b);
 
 /* the counts live in the lengths, so the first block load tabulates them */
+/* the block holding row i, or read i when rd: a search under whole-read blocks */
+static uint64_t blkat(const R *r, uint64_t i, int rd) {
+    if (!r->varblk) return rd ? 0 : i / r->block;
+    uint64_t lo = 0, hi = r->nblk - 1;
+    while (lo < hi) { uint64_t m = (lo + hi + 1) / 2;
+                      if ((rd ? r->b[m].rd0 : r->b[m].row0) <= i) lo = m; else hi = m - 1; }
+    return lo;
+}
+
 static rec runidx(R *r, uint64_t i) {
-    if (!r->rfilled) loadblk(r, 0);
+    if (!r->varblk) {               /* one block: its counts, from read 0 */
+        if (!r->rfilled) loadblk(r, 0);
+        if (r->cvalid && r->ci == i) return r->crec;
+        uint64_t off = 0, k0 = 0;
+        if (r->cvalid && r->ci < i) { k0 = r->ci + 1; off = (uint64_t)r->crec.off + r->crec.nruns; }
+        for (uint64_t k = k0; k < i; k++) off += r->rtab[k];
+        if (off > UINT32_MAX) die("corrupt index: a sequence offset past 32 bits");
+        rec out = { 0, (uint32_t)off, r->rtab[i] };
+        r->ci = i; r->crec = out; r->cvalid = 1;
+        if (out.off > r->b[0].rows || (uint64_t)out.off + out.nruns > r->rows)
+            die("corrupt index: a sequence points outside the block table");
+        return out;
+    }
+    uint64_t b = blkat(r, i, 1), d0 = r->b[b].rd0;
+    if (!r->rfilled || r->crd0 != d0) { loadblk(r, b); r->cvalid = 0; }   /* rtab holds one block's reads */
     if (r->cvalid && r->ci == i) return r->crec;
-    uint64_t off = 0, k0 = 0;
-    if (r->cvalid && r->ci < i) { k0 = r->ci + 1; off = (uint64_t)r->crec.off + r->crec.nruns; }
-    for (uint64_t k = k0; k < i; k++) off += r->rtab[k];
+    uint64_t off = 0, k0 = d0;
+    if (r->cvalid && r->ci < i && r->ci >= d0) { k0 = r->ci + 1; off = (uint64_t)r->crec.off + r->crec.nruns; }
+    for (uint64_t k = k0; k < i; k++) off += r->rtab[k - d0];
     if (off > UINT32_MAX) die("corrupt index: a sequence offset past 32 bits");
-    rec out = { 0, (uint32_t)off, r->rtab[i] };
+    rec out = { (uint32_t)b, (uint32_t)off, r->rtab[i - d0] };
     r->ci = i; r->crec = out; r->cvalid = 1;
-    if (out.off > r->b[0].rows || (uint64_t)out.off + out.nruns > r->rows)
+    if (out.off > r->b[b].rows || (uint64_t)out.off + out.nruns > r->b[b].rows)
         die("corrupt index: a sequence points outside the block table");
     return out;
 }
@@ -3220,9 +3270,11 @@ static rec getidx(R *r, uint64_t i) {
     for (uint64_t k = r->ci; k <= i; k++) {
 
         uint64_t nruns = vgetb(&r->cp, r->cpe);
-        if (r->cpend / (uint64_t)r->block > UINT32_MAX) die("corrupt index: a block number past 32 bits");
-        out.blk = (uint32_t)(r->cpend / (uint64_t)r->block);
-        out.off = (uint32_t)(r->cpend % (uint64_t)r->block);
+        uint64_t bk = !r->varblk ? r->cpend / (uint64_t)r->block
+                    : r->cpend < r->rows ? blkat(r, r->cpend, 0) : r->nblk;   /* past the end: refused below */
+        if (bk > UINT32_MAX) die("corrupt index: a block number past 32 bits");
+        out.blk = (uint32_t)bk;
+        out.off = (uint32_t)(!r->varblk ? r->cpend % (uint64_t)r->block : bk < r->nblk ? r->cpend - r->b[bk].row0 : 0);
         out.nruns = (uint32_t)nruns;
         r->cpend += nruns;
     }
@@ -3254,7 +3306,7 @@ static R *ropen(const char *path) {
     ALLOCMAX = (size_t)1 << 38;
     if (fseeko(r->f, 8 + 128, SEEK_SET)) die("seek");
     uint64_t nml = h[1] & ~(TOKFLAG | INTFLAG | FLDFLAG | DROPPED | ALNFLAG | DBFLAG
-                            | LENFLAG | TAILFLAG | CARTFLAG | RUNFLAG | ILVFLAG | GRPFLAG);   /* h[1] also holds flags */
+                            | LENFLAG | TAILFLAG | CARTFLAG | RUNFLAG | ILVFLAG | GRPFLAG | VARFLAG);   /* h[1] also holds flags */
 
     if (nml > fsz || h[2] > fsz || h[3] > fsz || h[6] > fsz || h[11] > fsz
         || 8 + 128 + nml + h[2] + h[3] + h[6] + h[11] > fsz)
@@ -3313,11 +3365,11 @@ static R *ropen(const char *path) {
     if (was_aln && ALNPAF && (h[13] >> 8) != (ALNHASH & ((1ull << 56) - 1)))
         die("this PAF, reference or name map is not the one the track was encoded with");
     r->cart = (h[1] & CARTFLAG) != 0;
-    r->runhead = runhead; r->ilv = ilv; r->grp = (h[1] & GRPFLAG) != 0;
+    r->runhead = runhead; r->ilv = ilv; r->grp = (h[1] & GRPFLAG) != 0; r->varblk = (h[1] & VARFLAG) != 0;
     if (r->grp && (ilv || !runhead)) die("corrupt file: grouped lengths without their run counts");
     if (r->cart && !was_db) die("corrupt file: vocabulary featureIDs without --db");
     h[1] &= ~(TOKFLAG | INTFLAG | DROPPED | ALNFLAG | DBFLAG | LENFLAG
-              | TAILFLAG | CARTFLAG | RUNFLAG | ILVFLAG | FLDFLAG | GRPFLAG);
+              | TAILFLAG | CARTFLAG | RUNFLAG | ILVFLAG | FLDFLAG | GRPFLAG | VARFLAG);
     uint8_t *iz = xmalloc(h[2]), *sz = xmalloc(h[3]);
     uint8_t *nz = NULL;
     r->nz_off = ftello(r->f);
@@ -3346,8 +3398,6 @@ static R *ropen(const char *path) {
         if (mh != want) die("corrupt file: the metadata does not match its hash");
     }
     r->mhash = h[15];
-    /* after the hash: a forged read count must not size an allocation */
-    if (runhead) r->rtab = xmalloc(mul(h[0] ? h[0] : 1, sizeof *r->rtab));
     r->feathash = (h[5] >> 32) | ((h[9] >> 32) << 32);
     r->data0 = 8 + 128 + lzl + h[1] + h[2] + h[3] + h[11];
 
@@ -3395,7 +3445,7 @@ static R *ropen(const char *path) {
       while (p < end) { if (n == cap) { cap *= 2; r->b = xrealloc(r->b, mul(cap, sizeof *r->b)); }
         uint64_t a = vgetb(&p, end), b2 = vgetb(&p, end),
                  c2 = vgetb(&p, end), d2 = vgetb(&p, end), e2 = vgetb(&p, end),
-                 f2 = vgetb(&p, end), g2 = vgetb(&p, end);
+                 f2 = vgetb(&p, end), g2 = vgetb(&p, end), k2 = r->varblk ? vgetb(&p, end) : 0;
         if (was_len) { r->b[n].nos = d2 & 3; d2 >>= 2; } else r->b[n].nos = 0;
 
         if (a > fsz || b2 > fsz || a + b2 > fsz || acc + a + b2 > fsz)
@@ -3404,18 +3454,26 @@ static R *ropen(const char *path) {
         if (e2 && (!c2 || !d2)) die("corrupt index: a block with rows but an empty stream");
         if (c2 > r->rows * 16 + 64 || d2 > r->rows * 16 + 64)
             die("corrupt index: a block claims an impossible decoded size");
-        r->b[n] = (blk){ acc, a + b2, a, c2, d2, e2, f2, g2, r->b[n].nos };
+        if (r->varblk && (!k2 || !e2 || k2 > e2)) die("corrupt index: a block's read count is out of range");
+        r->b[n] = (blk){ acc, a + b2, a, c2, d2, e2, f2, g2, r->b[n].nos, 0, 0, k2 };
         acc += a + b2; n++; }
       r->nblk = n;
-      if (r->runhead && n != 1)
+      if (r->runhead && n != 1 && !r->varblk)
           die("corrupt file: run counts head the lengths but the track has more than one block");
-      uint64_t tot = 0;
+      if (r->varblk && n < 2) die("corrupt file: whole-read blocks flagged on fewer than two blocks");
+      uint64_t tot = 0, trd = 0, mrd = 0;
       for (uint64_t i = 0; i < n; i++) {
-          tot += r->b[i].rows;
+          r->b[i].row0 = tot; r->b[i].rd0 = trd;
+          tot += r->b[i].rows; trd += r->b[i].nrd; if (r->b[i].nrd > mrd) mrd = r->b[i].nrd;
+          if (r->varblk) continue;
           if (i + 1 < n ? r->b[i].rows != r->block : !r->b[i].rows || r->b[i].rows > r->block)
               die("corrupt index: a block does not hold the block size of rows");
       }
-      if (tot != r->rows || (!n && r->rows)) die("corrupt index: the blocks do not add up to the row count"); }
+      if (tot != r->rows || (!n && r->rows)) die("corrupt index: the blocks do not add up to the row count");
+      if (r->varblk && trd != r->nreads) die("corrupt index: the blocks' read counts do not add up to the read count");
+      if (!r->varblk && n) { r->b[0].nrd = r->nreads; }   /* one block holds them all */
+      /* after the hash: a forged read count must not size an allocation */
+      if (r->runhead) r->rtab = xmalloc(mul(r->varblk ? mrd : r->nreads ? r->nreads : 1, sizeof *r->rtab)); }
     free(sz); free(sbuf);   /* both are consumed by the walk above */
 
     r->htab = NULL; r->hmask = 0;
@@ -3715,10 +3773,10 @@ static size_t rmheads(R *r, uint8_t *b, size_t n) {
     uint8_t *w = b; const uint8_t *p = b, *e = b + n;
     uint64_t i = 0, seen = 0;
     while (p < e) {
-        if (i >= r->nreads) die("corrupt block: more reads than the header claims");
+        if (i >= r->crdn) die("corrupt block: more reads than the header claims");
         uint64_t k = vget(&p);
         if (p > e) die("corrupt block: a run count runs past the lengths");
-        if (!k || k > r->rows - seen) die("corrupt block: a run count is out of range");
+        if (!k || k > r->crows - seen) die("corrupt block: a run count is out of range");
         r->rtab[i++] = (uint32_t)k; seen += k;
         for (uint64_t j = 0; j < k; j++) {
             const uint8_t *s0 = p;
@@ -3729,7 +3787,7 @@ static size_t rmheads(R *r, uint8_t *b, size_t n) {
             memmove(w, s0, len); w += len;
         }
     }
-    if (i != r->nreads || seen != r->rows)
+    if (i != r->crdn || seen != r->crows)
         die("corrupt block: the run counts do not add up to the row count");
     r->rfilled = 1;
     return (size_t)(w - b);
@@ -3757,7 +3815,7 @@ static size_t ilv_split(R *r, uint8_t *b, size_t n, size_t nl, size_t ni) {
         const uint8_t *h0 = p;
         uint64_t k = vget(&p);
         if (p > e) die("corrupt block: a run count runs past the frame");
-        if (!k || k > r->rows - seen) die("corrupt block: a run count is out of range");
+        if (!k || k > r->crows - seen) die("corrupt block: a run count is out of range");
         size_t hg = (size_t)(p - h0);
         if ((size_t)(wl - b) + hg > nl) die("corrupt block: the length region overflows");
         memmove(wl, h0, hg); wl += hg;
@@ -3774,7 +3832,7 @@ static size_t ilv_split(R *r, uint8_t *b, size_t n, size_t nl, size_t ni) {
         seen += k;
     }
     #undef TAKE
-    if (seen != r->rows || (size_t)(wl - b) != nl || (size_t)(wi - tmp) != ni)
+    if (seen != r->crows || (size_t)(wl - b) != nl || (size_t)(wi - tmp) != ni)
         die("corrupt block: the interleaved frame does not split into its two regions");
     memcpy(b + nl, tmp, ni);
     free(tmp);
@@ -3788,7 +3846,7 @@ static void grp_unpack(R *r, uint8_t *lens, size_t nl, const uint8_t *ids, size_
     const uint8_t *p = lens, *e = lens + nl, *q = ids, *qe = ids + ni;
     size_t cap = 64, ccap = 0;
     uint64_t *gv = xmalloc(mul(cap, 8)), *kv = xmalloc(mul(cap, 8)), *lv = xmalloc(mul(cap, 8)), *cnt = NULL;
-    for (uint64_t i = 0; i < r->nreads; i++) {
+    for (uint64_t i = 0; i < r->crdn; i++) {
         uint64_t k = r->rtab[i], top = 0;
         if (k > cap) { cap = (size_t)k; gv = xrealloc(gv, mul(cap, 8));
                        kv = xrealloc(kv, mul(cap, 8)); lv = xrealloc(lv, mul(cap, 8)); }
@@ -3842,6 +3900,7 @@ static void loadblk(R *r, uint64_t b) {
     if (fnvbuf(FNV0, cb, r->b[b].size) != r->b[b].hash)
         die("corrupt block: its bytes do not match the stored hash");
     LENDEC = r->lenfile && r->b[b].nos != 1;
+    r->crows = r->b[b].rows; r->crd0 = r->b[b].rd0; r->crdn = r->b[b].nrd;
     uint64_t la = r->b[b].l, lb = r->b[b].size - la;
     size_t g, h2;
     PAYEND = NULL;                    /* not valid until this block decodes */
@@ -4120,16 +4179,16 @@ static void region(const char *path, const char *seq, uint64_t lo, uint64_t hi) 
     loadblk(r, q.blk);
     const uint8_t *lp = r->lp0, *ip = r->ip0;
 
-    uint64_t start = (uint64_t)q.blk * (uint64_t)r->block + q.off;
+    uint64_t start = r->b[q.blk].row0 + q.off;
     uint64_t endrun = start + q.nruns, jump = q.blk, kskip = 0;
     uint64_t st = 0;
     if (lo) {
-        while (jump + 1 < r->nblk && (jump + 1) * (uint64_t)r->block < endrun
+        while (jump + 1 < r->nblk && r->b[jump + 1].row0 < endrun
                && r->b[jump + 1].bp && r->b[jump + 1].bp <= lo) jump++;
     }
     span sp;
     if (jump != q.blk) {           /* the block's first run is the sequence's */
-        kskip = jump * (uint64_t)r->block - start;
+        kskip = r->b[jump].row0 - start;
         st = r->b[jump].bp;
         loadblk(r, jump); lp = r->lp0; ip = r->ip0;
         sp.blk = jump; sp.left = r->b[jump].rows;
@@ -4498,19 +4557,19 @@ static void reffill_r(R *r, rcon *rc) {
    1 of chr1's 19, not 19. */
 static void refprep(R *r, rcon *rc) {
     rec q = getidx(r, (uint64_t)rc->ri);
-    rc->row0 = (uint64_t)q.blk * r->block + q.off;
+    rc->row0 = r->b[q.blk].row0 + q.off;
     rc->n = rc->cap = q.nruns;
     rc->st = xmalloc(mul(rc->n ? rc->n : 1, 8));
     rc->lab = xmalloc(mul(rc->n ? rc->n : 1, 4));
     rc->bend = xcalloc(r->nblk, 8);
     rc->firstblk = q.blk;
-    rc->lastblk = (uint32_t)((rc->row0 + (rc->n ? rc->n - 1 : 0)) / r->block);
+    rc->lastblk = (uint32_t)blkat(r, rc->row0 + (rc->n ? rc->n - 1 : 0), 0);
     rc->blkin = xcalloc(r->nblk, 1);            /* last: it is the ready flag */
 }
 static void refblk(R *r, rcon *rc, uint64_t b) {
     loadblk(r, b);
     const uint8_t *lp = r->lp0, *ip = r->ip0;
-    uint64_t row = b * r->block, pos = r->b[b].bp, end = row + r->b[b].rows;
+    uint64_t row = r->b[b].row0, pos = r->b[b].bp, end = row + r->b[b].rows;
     if (b == rc->firstblk) {                    /* skip the rows before it */
         for (; row < rc->row0; row++) { vget(&lp); vget(&ip); }
         pos = 0;
@@ -4567,8 +4626,9 @@ static void refwin(rcon *rc, uint64_t tpos, size_t *lo, size_t *hi, uint64_t *we
 #endif
         if (!rc->blkin[b]) refload(rc, b, 0);
     }
-    *lo = b == rc->firstblk ? 0 : (size_t)(b * r->block - rc->row0);
-    *hi = rc->row0 + rc->n <= (b + 1) * r->block ? rc->n : (size_t)((b + 1) * r->block - rc->row0);
+    uint64_t be = r->b[b].row0 + r->b[b].rows;
+    *lo = b == rc->firstblk ? 0 : (size_t)(r->b[b].row0 - rc->row0);
+    *hi = rc->row0 + rc->n <= be ? rc->n : (size_t)(be - rc->row0);
     *wend = rc->bend[b];
     WRC = rc; WLO = *lo; WHI = *hi; WST = rc->st[*lo]; WEN = *wend;   /* per block: st stays 8 bytes */
 }
@@ -5238,6 +5298,7 @@ static int kzmain(int argc, char **argv) {
             "  --smooth --max-gap N: KaryoScope's gap bound, 1000 by default"
 /* Debug and profiling flags, out of the help:
                  -b, --block N|all   compress: rows per block by hand
+                 --read-blocks N     compress: blocks of whole reads, N rows or more; -e medium's is 4194304
                  --raw               decompress, query: what is stored, reversing no transform
                  --profile           any command: time and memory per phase on stderr */;
     for (int i = 1; i < argc; i++) {
@@ -5261,7 +5322,7 @@ static int kzmain(int argc, char **argv) {
         {"--version",0},{"--threads",1},{"-t",1},{"--profile",0},{"--tmp-dir",1},{"--names",1},
         {"--max-gap",1},{"--v1",0},{"--chunk",1},{"--aln-names",1},
         {"--effort",1},
-        {"--block",1},{"--db",1},{"--aln",1},
+        {"--block",1},{"--read-blocks",1},{"--db",1},{"--aln",1},
         {"--ref",1},{"--out-dir",1},{"--set",1},{"--raw",0},{"--hier",1},
         {"--input",1},{"--output",1},{"--region",1},{"--smooth",0},
     };
@@ -5319,7 +5380,10 @@ static int kzmain(int argc, char **argv) {
             BLOCK = !strcmp(v, "all") ? UINT64_MAX      /* one block, no random access */
                   : (uint64_t)int_arg(v, 1, 0x7fffffffffffffffL,
                                       "--block is a number of runs, 1 or more, or \"all\"");
-            BLOCKSET = 1; take = 2; }
+            BLOCKSET = 1; VARBLK = 0; take = 2; }
+        else if (!strcmp(a, "--read-blocks")) { ok = enc;
+            BLOCK = (uint64_t)int_arg(v, 1, 0x7fffffffffffffffL, "--read-blocks is a number of runs, 1 or more");
+            BLOCKSET = 1; VARBLK = 1; take = 2; }
         else if (!strcmp(a, "--db")) { ok = inf; DBFEATS = v; take = 2; }
         else if (!strcmp(a, "--hier")) { ok = inf; HIERA = v; take = 2; }
         else if (!strcmp(a, "--aln")) { ok = inf || pack; ALNPAF = v; take = 2; }
@@ -5341,6 +5405,7 @@ static int kzmain(int argc, char **argv) {
     if (!*cmd) die(USAGE);   /* argv[1] is now past the end */
     if (!enc && !rd && !pack) die("bad command or missing arguments");
     if (FASTMODE && !BLOCKSET) BLOCK = 262144;   /* -e low: blocks and an index, for queries */
+    if (!FASTMODE && !SLOW && !BLOCKSET) { BLOCK = MEDBLK; VARBLK = 1; }   /* -e medium: whole-read blocks */
     for (int i = 2; i < argc; i++) {   /* every argument is a flag now */
         if (argv[i][0] == '-' && argv[i][1]) fprintf(stderr, "karyozip: unknown flag %s\n", argv[i]);
         else fprintf(stderr, "karyozip: unexpected argument %s\n", argv[i]);

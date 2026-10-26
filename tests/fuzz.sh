@@ -147,7 +147,8 @@ $KT compress --aln "$D/p.paf" --ref "$D/ref.bed" < "$D/s.bed" > "$W/al.kt" 2>/de
 cp "$W/al.kt" "$W/m.kt"; printf '\x0c' | dd of="$W/m.kt" bs=1 seek=12 conv=notrunc status=none 2>/dev/null
 ASAN_OPTIONS=detect_leaks=0 timeout 30 $SAN decompress --aln "$D/p.paf" --ref "$D/ref.bed" -i "$W/m.kt" >/dev/null 2>"$W/err"
 grep -q "does not match its hash" "$W/err" && echo "fuzz: forged read count: refused by the hash" || { echo "fuzz: forged read count: $(head -c 200 "$W/err")"; fail=1; }
-for kind in db al; do
+$KT compress --read-blocks 3 < "$D/s.bed" > "$W/vb.kt" 2>/dev/null   # whole-read blocks, headed
+for kind in db al vb; do
   sz=$(stat -c%s "$W/$kind.kt")
   for i in $(seq 1 "$N"); do
     off=$(( (RANDOM * 32768 + RANDOM) % sz ))
@@ -155,14 +156,16 @@ for kind in db al; do
     printf "\\x$(printf %02x $((RANDOM % 256)))" | dd of="$W/m.kt" bs=1 seek=$off conv=notrunc status=none 2>/dev/null
     if [ $kind = db ]; then mkdir -p "$W/o"; rm -f "$W/o"/*
       out=$(ASAN_OPTIONS=detect_leaks=0 timeout 30 $SAN decompress --db "$D/db.features.tsv" --out-dir "$W/o" -i "$W/m.kt" 2>"$W/err"); rc=$?
-    else
+    elif [ $kind = al ]; then
       out=$(ASAN_OPTIONS=detect_leaks=0 timeout 30 $SAN decompress --aln "$D/p.paf" --ref "$D/ref.bed" -i "$W/m.kt" 2>"$W/err"); rc=$?
+    else
+      out=$(ASAN_OPTIONS=detect_leaks=0 timeout 30 $SAN decompress -i "$W/m.kt" 2>"$W/err"); rc=$?
     fi
     [ $rc -gt 1 ] && { echo "fuzz: $kind mutation crashed rc=$rc off=$off"; fail=1; }
     grep -qE "AddressSanitizer|runtime error" "$W/err" && { echo "fuzz: $kind mutation sanitizer report off=$off"; fail=1; }
     if [ $rc = 0 ]; then   # what decodes must be the input
       if [ $kind = db ]; then for f in $sets; do cmp -s "$W/o/$f.bed" "$D/db.$f.bed" || { echo "fuzz: db mutation decoded WRONG $f off=$off"; fail=1; }; done
-      else printf '%s\n' "$out" | cmp -s - "$D/s.bed" || { echo "fuzz: al mutation decoded WRONG rows off=$off"; fail=1; }; fi
+      else printf '%s\n' "$out" | cmp -s - "$D/s.bed" || { echo "fuzz: $kind mutation decoded WRONG rows off=$off"; fail=1; }; fi
     fi
     d=$((d+1))
   done

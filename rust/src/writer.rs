@@ -5,7 +5,7 @@
 
 use crate::ffi;
 use crate::kst::{self, FNV0, TOKFLAG, INTFLAG, FLDFLAG, DROPPED, ALNFLAG, DBFLAG, LENFLAG,
-                 TAILFLAG, RUNFLAG, ILVFLAG, GRPFLAG, CARTFLAG, ICHUNK};
+                 TAILFLAG, RUNFLAG, ILVFLAG, GRPFLAG, CARTFLAG, VARFLAG, ICHUNK};
 use rayon::prelude::*;
 use std::collections::HashSet;
 use std::io::{Seek, SeekFrom, Write};
@@ -15,6 +15,7 @@ const TAILSKIP: usize = 64;
 
 pub struct Options {
     pub block: u64,
+    pub varblk: bool,      // blocks close at a read start: whole reads, sizes vary
     pub level: i32,
     pub levelset: bool,
     pub slow: bool,
@@ -24,7 +25,7 @@ pub struct Options {
 
 impl Default for Options {
     fn default() -> Self {
-        Options { block: u64::MAX, level: 17, levelset: false, slow: true, whole: false,
+        Options { block: u64::MAX, varblk: false, level: 17, levelset: false, slow: true, whole: false,
                   drop_names: false }
     }
 }
@@ -35,7 +36,7 @@ type Done = (Vec<u8>, Vec<u8>, usize, usize, u64, u64, u64);
 
 /// One staged block, while its payload waits in the staging file.
 struct BlkMeta { off: u64, len: usize, lens: usize, rows: u64, bp: u64,
-                 aoff: [usize; 2], alen: [usize; 2] }
+                 aoff: [usize; 2], alen: [usize; 2], ibe: usize, nrd: u64 }   // run counts and reads so far, at its close
 
 pub struct Writer {
     opt: Options,
@@ -226,7 +227,8 @@ impl Writer {
         self.raw.write_all(&self.lens)?;
         self.raw.write_all(&self.ids)?;
         let len = self.lens.len() + self.ids.len();
-        self.bm.push(BlkMeta { off, len, lens: self.lens.len(), rows: self.pend, bp: self.blkbp0, aoff, alen });
+        self.bm.push(BlkMeta { off, len, lens: self.lens.len(), rows: self.pend, bp: self.blkbp0, aoff, alen,
+                               ibe: self.ibx.len(), nrd: self.nidx });
         self.rawlen += len as u64;
         self.nblk += 1;
         self.lens.clear();
@@ -299,7 +301,7 @@ impl Writer {
         }
         let id = id as u64;
         if self.phas { self.lensput(self.pval); self.phas = false; }
-        if self.pend >= self.opt.block { self.flush().map_err(io)?; }
+        if !self.opt.varblk && self.pend >= self.opt.block { self.flush().map_err(io)?; }   // mid-sequence is fine
         if self.pend == 0 { self.blkbp0 = self.curbp; }
         self.plen = run_len;
         self.phas = true;
@@ -344,29 +346,33 @@ impl Writer {
         let get = |i: usize| self.read_block(i).unwrap_or_else(|_| crate::bail("cannot read back a staged block"));
         let _s = crate::prof::span(8);
         let maxstream = self.bm.iter().map(|m| m.lens.max(m.len - m.lens)).max().unwrap_or(0);
-        let onelay = self.bm.len() == 1 && !self.ibx.is_empty();   // the layout search ranks it all
+        let aln_on = self.aln.is_some();
+        let varon = self.opt.varblk && self.bm.len() > 1;
+        // one block, or whole-read blocks: the layout search ranks it all
+        let onelay = (self.bm.len() == 1 || (varon && !aln_on)) && !self.ibx.is_empty();
         let p = pick(&get, self.bm.len(), rawtot, maxstream, level, &self.opt, onelay);
         drop(_s);
         let level = p.level;
         let (mut lvl_id, mut lvl_len) = (if p.lvl_id < 0 { level } else { p.lvl_id },
                                          if p.lvl_len < 0 { level } else { p.lvl_len });
         let mut idc = p.id;
-        let aln_on = self.aln.is_some();
 
         // Compress apart, write in order, a batch at a time. Holding every
         // compressed block would cost the whole file in memory; the C stages
         // them in a temp file for the same reason.
         // The run count can head each read's lengths instead of living in the
-        // index. One block only, since a split read has no count to head it,
-        // and measured against the index it would replace.
+        // index. One block, or blocks of whole reads decided on the first,
+        // since a split read has no count to head it, and measured against
+        // the index it would replace.
         let mut altbuf: Vec<u8> = Vec::new();
         let mut lz: Option<Vec<u8>> = None;   // the checked lengths frame
         let (mut runhead, mut ilv, mut grp, mut alt_lens) = (false, false, false, 0usize);
         let mut ilvcodec = p.len;
         let mut altv: [Option<(Vec<u8>, usize)>; 3] = [None, None, None];
         let _l = crate::prof::span(9);
-        if self.bm.len() == 1 && !self.ibx.is_empty() {
+        if onelay {
             let (lens0, ids0) = self.read_block(0).unwrap_or_else(|_| crate::bail("cannot read back a staged block"));
+            let ib0 = &self.ibx[..if varon { self.bm[0].ibe } else { self.ibx.len() }];
             // The layout is decided on the mode's sample, as the codec is: whole
             // reads up to 4 MB of lengths -e low, DEFSAMPLE MB the default, all
             // of them -e high. Each layout gets its own best codec there; only
@@ -374,8 +380,8 @@ impl Writer {
             let (slow, whole) = (self.opt.slow, self.opt.whole);
             let cap = if whole { usize::MAX } else { (if slow { DEFSAMPLE } else { 4 }) << 20 };
             let (mut pl, mut pi, mut pb, mut x, mut y, mut z) = (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
-            while z < self.ibx.len() {
-                let (k, n) = vget(&self.ibx, z); z = n;
+            while z < ib0.len() {
+                let (k, n) = vget(ib0, z); z = n;
                 let mut j = 0;
                 while j < k && x < lens0.len() && y < ids0.len() {
                     x = crate::reader::skip(&lens0, x); y = crate::reader::skip(&ids0, y); j += 1;
@@ -383,7 +389,7 @@ impl Writer {
                 if x > cap && pl > 0 { break; }         // at least one read
                 pl = x; pi = y; pb = z;
             }
-            let (ls, is, bs) = (&lens0[..pl], &ids0[..pi], &self.ibx[..pb]);
+            let (ls, is, bs) = (&lens0[..pl], &ids0[..pi], &ib0[..pb]);
             let idx = idxsize(bs, if level < 19 { level } else { 19 });
             let mut lay = [None, splice_heads(ls, bs), if slow { grp_pack(ls, is, bs) } else { None }, ilv_pack(ls, is, bs)];
             // the labels and the four length spellings, ranked in one pool; a
@@ -405,14 +411,14 @@ impl Writer {
             (ilvcodec, lvl_len) = (r[l + 1].0, if r[l + 1].1 < 0 { level } else { r[l + 1].1 });
             // the sample is the whole block: its winner is built, keep it; the
             // rest go now, as the C frees them, not after the winner's frame
-            let whole = pl == lens0.len() && pi == ids0.len() && pb == self.ibx.len();
+            let whole = self.bm.len() == 1 && pl == lens0.len() && pi == ids0.len() && pb == self.ibx.len();
             let hlen = lay[1].as_ref().map_or(0, |h| h.len());
             for (k, v) in lay.iter_mut().enumerate() { if !whole || k != l { *v = None; } }
             match l {   // the winner built whole; only the headed one keeps its buffer
-                1 => { altbuf = if whole { lay[1].take() } else { splice_heads(&lens0, &self.ibx) }.unwrap_or_default(); alt_lens = altbuf.len(); }
-                2 => { altbuf = if whole { lay[2].take() } else { grp_pack(&lens0, &ids0, &self.ibx) }.unwrap_or_default(); alt_lens = altbuf.len(); grp = true; }
-                3 => { alt_lens = if whole { hlen } else { splice_heads(&lens0, &self.ibx).map_or(0, |h| h.len()) };
-                       altbuf = if whole { lay[3].take() } else { ilv_pack(&lens0, &ids0, &self.ibx) }.unwrap_or_default(); ilv = true; }
+                1 => { altbuf = if whole { lay[1].take() } else { splice_heads(&lens0, ib0) }.unwrap_or_default(); alt_lens = altbuf.len(); }
+                2 => { altbuf = if whole { lay[2].take() } else { grp_pack(&lens0, &ids0, ib0) }.unwrap_or_default(); alt_lens = altbuf.len(); grp = true; }
+                3 => { alt_lens = if whole { hlen } else { splice_heads(&lens0, ib0).map_or(0, |h| h.len()) };
+                       altbuf = if whole { lay[3].take() } else { ilv_pack(&lens0, &ids0, ib0) }.unwrap_or_default(); ilv = true; }
                 _ => {}
             }
             runhead = l > 0;
@@ -435,13 +441,13 @@ impl Writer {
                 }
             }
         }
-        if !(self.bm.len() == 1 && !self.ibx.is_empty()) {   // blocks: no layout search, the codec search's pick
+        if !onelay {   // blocks: no layout search, the codec search's pick
             eprintln!("layout: plain, lengths {}, labels {}, decided on the codec search's sample", cname(p.len), cname(p.id));
         }
         drop(_l);
         let lencodec = ilvcodec;
         let lz = std::sync::Mutex::new(lz);
-        if runhead { self.ibx.clear(); }
+        if runhead && !varon { self.ibx.clear(); }   // blocks past the first still spell theirs
 
         let _s = crate::prof::span(1);
         let mut sizes = Vec::new();
@@ -459,6 +465,12 @@ impl Writer {
             // spellings: every sentinel, plus-strand sentinels only,
             // or plain lengths. Zeros do not always compress better.
             let m = &self.bm[i];
+            // past the first whole-read block, this block's own spelling
+            let own = ((runhead || ilv) && varon && i > 0).then(|| {
+                let ib = &self.ibx[self.bm[i - 1].ibe..m.ibe];
+                let o = if grp { grp_pack(lens, ids, ib) } else if ilv { ilv_pack(lens, ids, ib) } else { splice_heads(lens, ib) };
+                (o.unwrap_or_else(|| crate::bail("block compression failed")), lens.len() + ib.len())
+            });
             let mut vs: [Option<&[u8]>; 3] = [Some(&lens), None, None];
             if aln_on {
                 for v in 0..2 {
@@ -470,7 +482,8 @@ impl Writer {
                     vs[v + 1] = Some(alt);
                 }
             }
-            if runhead || ilv {
+            if let Some((o, _)) = &own { vs[0] = Some(o); }
+            else if runhead || ilv {
                 for v in 0..3 {
                     match &altv[v] {
                         Some((b, _)) => vs[v] = Some(b),
@@ -483,7 +496,7 @@ impl Writer {
                 let (mut best, mut bv, mut fa) = (0usize, usize::MAX, Vec::new());
                 for &v in &ORDER {
                     let Some(src) = vs[v] else { continue };
-                    let kept = if v == 0 { lz.lock().unwrap().take() } else { None };   // the one lens_ok made
+                    let kept = if v == 0 && i == 0 { lz.lock().unwrap().take() } else { None };   // the one lens_ok made
                     let f = kept.or_else(|| comp_frame(src, lencodec, lvl_len)).unwrap_or_else(|| crate::bail("block compression failed"));
                     if bv == usize::MAX || f.len() < best { best = f.len(); bv = v; fa = f; }
                 }
@@ -499,7 +512,7 @@ impl Writer {
             let ((bv, fa), b) = if nb == 1 && !ilv && lone {
                 rayon::join(lens_job, || { ffi::omp_threads(lt); let b = ids_job(); ffi::omp_threads(nt); b })
             } else { (lens_job(), ids_job()) };
-            let nl = if ilv { altv[bv].as_ref().unwrap().1 } else { vs[bv].unwrap().len() };
+            let nl = if ilv { own.as_ref().map_or_else(|| altv[bv].as_ref().unwrap().1, |o| o.1) } else { vs[bv].unwrap().len() };
             (fa, b, nl, ids.len(), m.rows, m.bp, bv as u64)
         };
         std::thread::scope(|ts| -> Result<(), String> {
@@ -533,9 +546,11 @@ impl Writer {
                 kst::put(&mut sizes, *rows);
                 kst::put(&mut sizes, *bp);
                 kst::put(&mut sizes, kst::fnv(kst::fnv(FNV0, a), b));
+                if varon { kst::put(&mut sizes, self.bm[i].nrd - if i > 0 { self.bm[i - 1].nrd } else { 0 }); }
             }
             Ok(())
         })?;
+        if runhead { self.ibx.clear(); }
 
         drop(_s);
         let _s = crate::prof::span(2);
@@ -621,14 +636,15 @@ impl Writer {
              | if self.tailon == Some(true) { TAILFLAG } else { 0 }
              | if runhead { RUNFLAG } else { 0 }
              | if ilv { ILVFLAG } else { 0 }
-             | if grp { GRPFLAG } else { 0 };
+             | if grp { GRPFLAG } else { 0 }
+             | if varon { VARFLAG } else { 0 };
         h[2] = ichunks.len() as u64;
         h[3] = sz.len() as u64;
         h[4] = self.rows;
         h[5] = lencodec as u32 as u64 | self.feathash.map_or(0, |f| (f & 0xffff_ffff) << 32);
         h[6] = lz.len() as u64;
         h[7] = self.lt.tab.len() as u64;
-        h[8] = self.opt.block;
+        h[8] = if self.opt.varblk && !varon { u64::MAX } else { self.opt.block };   // one block: as before
         h[9] = idc as u32 as u64 | self.feathash.map_or(0, |f| (f >> 32) << 32);
         h[10] = nichunk;
         h[11] = itz.len() as u64;

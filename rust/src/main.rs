@@ -43,6 +43,8 @@ fn main() {
     opt.slow = effort != "low";
     opt.whole = effort == "high";
     if effort == "low" && c.block.is_none() { opt.block = 262144; }   // -e low: blocks and an index, for queries
+    opt.varblk = c.varblk;
+    if effort == "medium" && c.block.is_none() { opt.block = 4194304; opt.varblk = true; }   // -e medium: whole-read blocks
 
     let Some(cmd) = c.cmd.as_ref() else { die(USAGE) };
     prof::start(c.profile, n);
@@ -432,6 +434,7 @@ pub struct Cli {
     pub feature_set: Option<String>,
     pub query: bool,
     pub block: Option<String>,
+    pub varblk: bool,          // --read-blocks, the last of it and --block
     pub effort: Option<String>,
     pub names: Vec<String>,
     pub db: Option<String>,
@@ -454,7 +457,7 @@ pub struct Cli {
 const FLAGS: &[(&str, bool)] = &[
     ("--version", false), ("--threads", true), ("-t", true), ("--profile", false), ("--tmp-dir", true),
     ("--names", true), ("--max-gap", true), ("--v1", false), ("--chunk", true), ("--aln-names", true),
-    ("--effort", true), ("--block", true), ("--db", true), ("--aln", true), ("--ref", true),
+    ("--effort", true), ("--block", true), ("--read-blocks", true), ("--db", true), ("--aln", true), ("--ref", true),
     ("--out-dir", true), ("--set", true), ("--raw", false), ("--hier", true), ("--input", true),
     ("--output", true), ("--region", true), ("--smooth", false),
 ];
@@ -528,7 +531,11 @@ impl Cli {
                 }
                 "--block" => {
                     if val() != "all" { crate::count(&val(), 1, i64::MAX as u64, "--block is a number of runs, 1 or more, or \"all\""); }
-                    o.block = Some(val()); enc
+                    o.block = Some(val()); o.varblk = false; enc
+                }
+                "--read-blocks" => {
+                    crate::count(&val(), 1, i64::MAX as u64, "--read-blocks is a number of runs, 1 or more");
+                    o.block = Some(val()); o.varblk = true; enc
                 }
                 "--db" => { o.db = Some(val()); inf }
                 "--hier" => { o.hier = Some(val()); inf }

@@ -5,7 +5,8 @@ Compresses KaryoScope annotation tracks losslessly, and reads them back without 
 ## Install
 
 ```
-make rust       # builds rust/target/release/karyozip
+git clone https://github.com/AndreaGuarracino/karyozip && cd karyozip
+cargo install --path rust       # puts karyozip in ~/.cargo/bin
 ```
 
 It needs cargo, a C compiler and libgomp: the codecs under `c/` are compiled into the binary.

@@ -6,6 +6,7 @@ The [README](README.md) describes the Rust binary. The C in `c/` is the referenc
 
 ```
 make            # builds c/build/karyozip
+make rust       # builds rust/target/release/karyozip, the binary the tests use
 ```
 
 The C needs zstd, zlib and an OpenMP compiler. liblzma is vendored in `c/xz`.

@@ -5,11 +5,10 @@ Compresses KaryoScope annotation tracks losslessly, and reads them back without 
 ## Install
 
 ```
-make            # builds c/build/karyozip
 make rust       # builds rust/target/release/karyozip
 ```
 
-The C needs zstd, zlib and an OpenMP compiler; the Rust needs cargo and libgomp. liblzma is vendored in `c/xz`.
+It needs cargo, a C compiler and libgomp: the codecs under `c/` are compiled into the binary.
 
 ## Quick start
 
@@ -99,13 +98,7 @@ Flags work on either side of the command name. The readers are decompress and qu
 | `--aln-names F` | compress, readers | with `-a`: read N is line N+1 of `F` |
 | `--max-gap N` | `--smooth` | KaryoScope's gap bound, 1000 by default |
 
-## Supplementary: technical notes
-
-**Two implementations.** `c/` and `rust/` write the same bytes, print the same `--help` and refuse the same inputs with the same words; `rust/build.rs` takes the usage text from `c/karyozip.c`.
-`make test` (65 s) runs the shared suite in `tests/`, sanitizers and fuzzing on both and compares them compress by compress.
-The C finds zstd, zlib and libgomp at the path in its rpath; the Rust bundles zstd. Both compile the same liblzma from `c/xz`.
-The Rust compiles the C codecs too, through `rust/src/ffi.rs`: there is no Rust htscodecs, and the `bzip3` crate lacks the two fixes in `c/bzip3/PROVENANCE`. `zstd-sys` is pinned to `=2.0.16`, the zstd 1.5.7 the C links, because zstd does not promise the same bytes across releases.
-Outside `ffi.rs`, four hot loops write unchecked, each behind an assertion: the digit writer in `kst.rs`, the row writers in `reader.rs` and `smooth.rs`, and `smooth_one`.
+## How it works
 
 **How compress chooses.** The three efforts are one rule with two settings: `low` tries 8 of the 51 codecs plus zstd at 17 on 4 MB, `medium` all 51 plus zstd at 17 and 22 on 16 MB, `high` the same on the whole file.
 The smallest wins, with no margin, and must read back what it was ranked on.
@@ -118,16 +111,6 @@ Decompress decodes the next blocks on the other threads while it writes the rows
 
 **Name index.** `karyozip index` writes to `F.kzi` a 32-bit fingerprint and a bit-packed ordinal per name, 2,044,644 B for 300,000 reads; one fingerprint match is answered without decoding the names, so a name absent from the track passes for a present one about 4 times in 2^32 lookups; two or more matches are confirmed against the decoded names.
 
-**Real tracks.** `tests/cmp.sbatch` runs C and Rust on real tracks on the cluster, one Slurm task a track, and checks every operation's bytes, round trip, time and memory.
+## C and Rust
 
-**Library.** `make` also builds `c/build/libkaryozip.a`, six calls in `c/karyozip.h` (`kt_open`, `kt_block`, `kt_level`, `kt_row`, `kt_close`, `kt_version`), for an annotator that writes `.kst` directly.
-Rows must arrive grouped by sequence, each sequence once, starting at 0, gapless; anything else is refused with the CLI's message.
-
-```c
-kt_writer *w = kt_open(f);
-kt_row(w, name, nlen, run_len, label, llen, start);   /* once per run */
-kt_close(w);
-```
-
-**Vendored code.** htscodecs, bzip3, libdeflate and liblzma under `c/` are pinned; each `PROVENANCE` names the release and every local patch.
-The vendored bzip3 runs its independent blocks in parallel, writing the same bytes; `c/bzip3/lastblock_check.c` guards the last-block fix that bzip3 1.5.4 took from this tree.
+A C implementation in `c/` writes the same bytes. How to build it, its library, and how the two are kept equal: [C-and-Rust.md](C-and-Rust.md).

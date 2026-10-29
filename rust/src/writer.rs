@@ -718,7 +718,7 @@ fn io(e: std::io::Error) -> String { e.to_string() }
 /// -e low is the subset marked true, the codecs whose encode and decode stay
 /// reasonable, so it can never reach a candidate the default did not.
 /// Codec 0 means zstd, so bare rANS order 0 is spelled 0x100.
-pub const KCAND: [(i32, bool); 51] = [
+pub const KCAND: [(i32, bool); 54] = [
     (0x100, true), (0x80, false), (0x40, false), (0xc0, false),
     (0x8, false), (0x88, false), (0x48, false), (0xc8, false),
     (0x4, false), (0x84, false), (0x44, false), (0xc4, false),
@@ -733,6 +733,8 @@ pub const KCAND: [(i32, bool); 51] = [
     (ffi::CODEC_ARITH | 0x40, false), (ffi::CODEC_ARITH | 0xc0, false),
     (ffi::CODEC_ARITH | 1, true), (ffi::CODEC_ARITH | 0x81, false),
     (ffi::CODEC_ARITH | 0x41, false), (ffi::CODEC_ARITH | 0xc1, false),
+    // 1 to 4 MB: smaller BWT blocks win on assemblies and short reads
+    (ffi::CODEC_BZIP3 | 1, false), (ffi::CODEC_BZIP3 | 2, false), (ffi::CODEC_BZIP3 | 4, false),
     (ffi::CODEC_BZIP3 | 8, false), (ffi::CODEC_BZIP3 | 16, true), (ffi::CODEC_BZIP3 | 32, false),
     (ffi::CODEC_BZIP3 | 64, true), (ffi::CODEC_BZIP3 | 128, false), (ffi::CODEC_BZIP3 | 256, false),
     (ffi::CODEC_LZMA, false),

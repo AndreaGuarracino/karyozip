@@ -606,6 +606,8 @@ static const kcand KCAND[] = {
     { CODEC_ARITH | 0x40, 0 }, { CODEC_ARITH | 0xc0, 0 },
     { CODEC_ARITH | 1, 1 }, { CODEC_ARITH | 0x81, 0 },
     { CODEC_ARITH | 0x41, 0 }, { CODEC_ARITH | 0xc1, 0 },
+    /* 1 to 4 MB: smaller BWT blocks win on assemblies and short reads */
+    { CODEC_BZIP3 | 1, 0 }, { CODEC_BZIP3 | 2, 0 }, { CODEC_BZIP3 | 4, 0 },
     { CODEC_BZIP3 | 8, 0 }, { CODEC_BZIP3 | 16, 1 }, { CODEC_BZIP3 | 32, 0 },
     { CODEC_BZIP3 | 64, 1 }, { CODEC_BZIP3 | 128, 0 }, { CODEC_BZIP3 | 256, 0 },
     { CODEC_LZMA, 0 },

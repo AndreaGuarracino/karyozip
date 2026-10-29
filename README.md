@@ -17,7 +17,7 @@ The C needs zstd, zlib and an OpenMP compiler; the Rust needs cargo and libgomp.
 karyozip compress   -i sample.chromosome.presmoothed.bed.gz -o sample.kst
 karyozip decompress -i sample.kst -o sample.bed                           # the original BED, byte for byte
 karyozip query      -i sample.kst -r chr1_hap1:1000000-1200000            # the runs overlapping a range
-karyozip decompress -i sample.kst --smooth --hier hierarchy.tsv     # KaryoScope's smoothed track, from the presmoothed one
+karyozip decompress -i sample.kst --smooth --hier hierarchy.tsv           # KaryoScope's smoothed track, from the presmoothed one
 ```
 
 Every text input may be plain or gzipped. Without `-i`, `compress` reads stdin, so it can sit behind `karyoscope annotate` in a pipe; without `-o`, decompress and query write stdout.
@@ -40,9 +40,9 @@ The index costs 7.5 B a read: on short reads it is larger than the track (223334
 
 | you want | use |
 |---|---|
-| a small file, the usual choice | `compress`, or `-e medium` |
-| the smallest file, however long it takes | `compress -e high` |
-| a quick compress and fast `query`, a larger file | `compress -e low`, then `index` for many reads |
+| a small file and a `query` that decodes one block, the usual choice | `compress`, or `-e medium`, then `index` for many reads |
+| the smallest file; a `query` decodes the whole file | `compress -e high` |
+| the quickest compress and `query`, a larger file | `compress -e low`, then `index` for many reads |
 
 ## Smoothing, feature sets and alignments
 
@@ -113,6 +113,8 @@ A one-block file also chooses its layout on the same sample: lengths and labels 
 Names are ranked the same way among zstd, integer deltas, field deltas and the CRAM name tokeniser.
 Compress prints what it chose on stderr, on its `layout:` and `names:` lines.
 `-e low` also writes 262144-row blocks and a block index, which a query decodes one at a time, and so drops the codecs slow to decode, bzip3, arith and LZMA, on a track of more than one block.
+`-e medium` writes blocks of whole reads, each closed at the first read that starts past 4194304 rows; every block takes the layout the first block chose, so a query decodes one block. `-e high` writes one block.
+Decompress decodes the next blocks on the other threads while it writes the rows of one, when the blocks hold 65536 rows or more on average.
 
 **Name index.** `karyozip index` writes to `F.kzi` a 32-bit fingerprint and a bit-packed ordinal per name, 2,044,644 B for 300,000 reads; one fingerprint match is answered without decoding the names, so a name absent from the track passes for a present one about 4 times in 2^32 lookups; two or more matches are confirmed against the decoded names.
 

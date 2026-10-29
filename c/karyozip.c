@@ -3803,10 +3803,12 @@ static size_t rmheads(R *r, uint8_t *b, size_t n) {
    it back into the two regions the walks expect; the counts stay in front of
    the lengths for rmheads to lift out. */
 static size_t ilv_split(R *r, uint8_t *b, size_t n, size_t nl, size_t ni) {
-    uint8_t *tmp = xmalloc(ni ? ni : 1);
+    uint8_t *tmp = xmalloc(ni + 16);     /* a label's varint lands whole, then the count is checked */
     const uint8_t *p = b, *e = b + n;
     uint8_t *wl = b, *wi = tmp;
     uint64_t seen = 0;
+    /* a varint at a time, a byte loop: the lengths only move back, so it
+       is safe in place, and a memmove call a value was the Rust's 3x */
     #define TAKE(dst, cap, base) do {                                        \
         const uint8_t *s0 = p;                                               \
         if (p >= e) die("corrupt block: the interleaved frame is short");     \
@@ -3815,7 +3817,8 @@ static size_t ilv_split(R *r, uint8_t *b, size_t n, size_t nl, size_t ni) {
         size_t g = (size_t)(p - s0);                                         \
         if ((size_t)((dst) - (base)) + g > (cap))                            \
             die("corrupt block: the interleaved frame does not fit its regions"); \
-        memmove((dst), s0, g); (dst) += g;                                   \
+        for (size_t z = 0; z < g; z++) (dst)[z] = s0[z];                     \
+        (dst) += g;                                                          \
     } while (0)
     while (p < e) {
         const uint8_t *h0 = p;
@@ -3824,15 +3827,15 @@ static size_t ilv_split(R *r, uint8_t *b, size_t n, size_t nl, size_t ni) {
         if (!k || k > r->crows - seen) die("corrupt block: a run count is out of range");
         size_t hg = (size_t)(p - h0);
         if ((size_t)(wl - b) + hg > nl) die("corrupt block: the length region overflows");
-        memmove(wl, h0, hg); wl += hg;
+        for (size_t z = 0; z < hg; z++) wl[z] = h0[z];
+        wl += hg;
         for (uint64_t j = 0; j < k; j++) {
             if (p >= e) die("corrupt block: the interleaved frame is short");
             uint64_t lb = vget(&p);
             if (p > e) die("corrupt block: a label runs past the frame");
-            uint8_t lv[10], *lw = lv; vput(&lw, ilv_flip(lb));
-            size_t lg = (size_t)(lw - lv);
-            if ((size_t)(wi - tmp) + lg > ni) die("corrupt block: the label region overflows");
-            memcpy(wi, lv, lg); wi += lg;
+            if ((size_t)(wi - tmp) > ni) die("corrupt block: the label region overflows");
+            vput(&wi, ilv_flip(lb));
+            if ((size_t)(wi - tmp) > ni) die("corrupt block: the label region overflows");
             TAKE(wl, nl, b);
         }
         seen += k;

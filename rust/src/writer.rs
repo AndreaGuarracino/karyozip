@@ -398,7 +398,7 @@ impl Writer {
             let src: Vec<&[u8]> = vec![is, ls, lay[1].as_deref().unwrap_or(&e), lay[2].as_deref().unwrap_or(&e), lay[3].as_deref().unwrap_or(&e)];
             let scale = |m: usize| if pl > 0 { (m as u128 * lens0.len() as u128 / pl as u128) as usize } else { m };
             let n5 = [ids0.len(), lens0.len(), scale(src[2].len()), scale(src[3].len()), scale(src[4].len())];
-            let r = rank_all(&src, &n5, &self.opt);
+            let mut r = rank_all(&src, &n5, &self.opt);
             let idok = pi == 0 || r[0].2 > 0;
             let mut sz = [0usize; 4];
             if r[1].2 > 0 && idok { sz[0] = r[1].2 + r[0].2 + idx; }   // plain pays its index
@@ -407,6 +407,7 @@ impl Writer {
             if r[4].2 > 0 { sz[3] = r[4].2; }                          // interleaved: no ids frame
             let mut l = 0;
             for k in 1..4 { if sz[k] > 0 && (sz[l] == 0 || sz[k] < sz[l]) { l = k; } }
+            if self.opt.whole { bz3_fine(src[l + 1], &mut r[l + 1]); if l != 3 { bz3_fine(src[0], &mut r[0]); } }
             (idc, lvl_id) = (r[0].0, if r[0].1 < 0 { level } else { r[0].1 });
             (ilvcodec, lvl_len) = (r[l + 1].0, if r[l + 1].1 < 0 { level } else { r[l + 1].1 });
             // the sample is the whole block: its winner is built, keep it; the
@@ -1092,6 +1093,38 @@ fn rank_all(src: &[&[u8]], n: &[usize], o: &Options) -> Vec<(i32, i32, usize)> {
     if prof { eprintln!("  rank read-back: {:.3} s", tp.elapsed().as_secs_f64()); }
     rayon::broadcast(|_| ffi::omp_threads(nt));
     picked
+}
+
+/// -e high: bzip3 at every MB from half to twice the winner's, in eighths
+/// of it, as the C's bz3fine: the bytes do not follow the block size. Every
+/// piece of every size is one job; a frame is 13 B plus its pieces framed
+/// one by one.
+fn bz3_fine(s: &[u8], r: &mut (i32, i32, usize)) {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
+    if r.0 & ffi::CODEC_BZIP3 == 0 || r.2 == 0 { return; }
+    let b = r.0 & 0xffff;
+    let mb: Vec<i32> = (5..16).rev().map(|k| (k, b * k / 8))   // the largest pieces first
+        .filter(|&(k, m)| b * k % 8 == 0 && m & (m - 1) != 0 && m <= 256 && ((m as u64) << 20) < s.len() as u64)   // powers of 2: ranked
+        .map(|x| x.1).collect();
+    let jobs: Vec<(usize, usize)> = mb.iter().enumerate()
+        .flat_map(|(i, &m)| (0..s.len()).step_by((m as usize) << 20).map(move |o| (i, o))).collect();
+    let (tot, bad): (Vec<AtomicUsize>, Vec<AtomicBool>) = (mb.iter().map(|_| AtomicUsize::new(0)).collect(), mb.iter().map(|_| AtomicBool::new(false)).collect());
+    jobs.par_iter().for_each(|&(i, o)| {
+        let e = (o + ((mb[i] as usize) << 20)).min(s.len());
+        match ffi::paycomp(&s[o..e], ffi::CODEC_BZIP3 | mb[i]) {
+            Some(v) => { tot[i].fetch_add(v.len() - 13, Relaxed); }
+            None => bad[i].store(true, Relaxed),
+        }
+    });
+    // the smallest, the smaller size on a tie, read back
+    let mut order: Vec<usize> = (0..mb.len()).filter(|&i| !bad[i].load(Relaxed) && tot[i].load(Relaxed) + 13 < r.2).collect();
+    order.sort_by_key(|&i| (tot[i].load(Relaxed), mb[i]));
+    for i in order {
+        let c = ffi::CODEC_BZIP3 | mb[i];
+        if let Some(v) = ffi::paycomp(s, c) {
+            if ffi::paydecomp(&v, c, s.len()).as_deref() == Some(s) { *r = (c, r.1, v.len()); return; }
+        }
+    }
 }
 
 /// A respelt block is a different stream from the one the codec was chosen

@@ -2654,6 +2654,57 @@ static void rankall(int ns, const uint8_t *const *src, const size_t *m, const si
     free(jb); free(jt); free(bo); free(bj); free(vq); free(vf); free(left);
 }
 
+/* -e high: bzip3 at every MB from half to twice the winner's, in eighths
+   of it. The bytes do not follow the block size: a short-read track gave
+   184237480 B at 8 MB, 184391699 at 12, 183950371 at 14 (job 38947902).
+   Every piece of every size is one job, so a stream of a few pieces keeps
+   the threads busy; a frame is 13 B plus its pieces framed one by one. */
+static void bz3fine(const uint8_t *s, size_t n, int *cd, size_t *sz) {
+    if (!(*cd & CODEC_BZIP3) || !*sz) return;
+    int b = *cd & 0xffff, mb[11], nm = 0;
+    for (int k = 15; k > 4; k--) {   /* the largest pieces first */
+        int m = b * k / 8;
+        if (b * k % 8 || !(m & (m - 1)) || m > 256 || (uint64_t)m << 20 >= n) continue;   /* powers of 2: ranked */
+        mb[nm++] = m;
+    }
+    if (!nm) return;
+    size_t nj = 0, tot[11] = {0}, j = 0;
+    for (int i = 0; i < nm; i++) nj += (n + ((size_t)mb[i] << 20) - 1) / ((size_t)mb[i] << 20);
+    size_t *jo = xmalloc(nj * sizeof *jo); int *jm = xmalloc(nj * sizeof *jm); char bad[11] = {0};
+    for (int i = 0; i < nm; i++) for (size_t o = 0; o < n; o += (size_t)mb[i] << 20) { jo[j] = o; jm[j++] = i; }
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic, 1) num_threads(nthreads())
+#endif
+    for (size_t q = 0; q < nj; q++) {
+        size_t B = (size_t)mb[jm[q]] << 20, len = n - jo[q] < B ? n - jo[q] : B;
+        uint8_t *o = NULL; size_t z = paycomp(s + jo[q], len, CODEC_BZIP3 | mb[jm[q]], &o);
+        free(o);
+        if (!z) {
+#ifdef _OPENMP
+#pragma omp atomic write
+#endif
+            bad[jm[q]] = 1;
+        } else {
+#ifdef _OPENMP
+#pragma omp atomic
+#endif
+            tot[jm[q]] += z - 13;
+        }
+    }
+    free(jo); free(jm);
+    for (;;) {   /* the smallest, the smaller size on a tie, read back */
+        int w = -1;
+        for (int i = nm - 1; i >= 0; i--) if (!bad[i] && tot[i] + 13 < *sz && (w < 0 || tot[i] < tot[w])) w = i;
+        if (w < 0) return;
+        uint8_t *o = NULL, *v = NULL; int c = CODEC_BZIP3 | mb[w];
+        size_t z = paycomp(s, n, c, &o);
+        int ok = z && (v = malloc(n)) && paydecomp(o, z, c, v, n) == n && !memcmp(v, s, n);
+        free(o); free(v);
+        if (ok) { *cd = c; *sz = z; return; }
+        bad[w] = 1;
+    }
+}
+
 /* the checked frame is kept in *keep: the compress phase would make the same */
 static size_t lensok(ZSTD_CCtx *tc, const uint8_t *src, size_t n, uint8_t **keep) {
     uint8_t *c = NULL; size_t z = complens(tc, src, n, &c, ZSTD_compressBound(n));
@@ -2859,6 +2910,7 @@ static void ktw_close(ktw *w) {
         if (r5[4]) sz[3] = r5[4];                             /* interleaved: no ids frame */
         int L = 0;
         for (int k = 1; k < 4; k++) if (sz[k] && (!sz[L] || sz[k] < sz[L])) L = k;
+        if (SLOW) { bz3fine(src[L + 1], m5[L + 1], &c5[L + 1], &r5[L + 1]); if (L != 3) bz3fine(src[0], m5[0], &c5[0], &r5[0]); }
         /* the sample is the whole block: its winner is built, keep it */
         int whole = nraw == 1 && pl == nl0 && pi == ni0 && pb == w->ibx.n;
         for (int k = 1; k < 4; k++) if (!whole || k != L) { free(lay[k]); lay[k] = NULL; }

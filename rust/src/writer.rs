@@ -369,6 +369,7 @@ impl Writer {
         let (mut runhead, mut ilv, mut grp, mut alt_lens) = (false, false, false, 0usize);
         let mut ilvcodec = p.len;
         let mut altv: [Option<(Vec<u8>, usize)>; 3] = [None, None, None];
+        let (mut cutrows_l, mut cutrows_i) = (0u64, 0u64);   // -e high: the rows rule of each frame, 0 none
         let _l = crate::prof::span(9);
         if onelay {
             let (lens0, ids0) = self.read_block(0).unwrap_or_else(|_| crate::bail("cannot read back a staged block"));
@@ -398,8 +399,8 @@ impl Writer {
             let src: Vec<&[u8]> = vec![is, ls, lay[1].as_deref().unwrap_or(&e), lay[2].as_deref().unwrap_or(&e), lay[3].as_deref().unwrap_or(&e)];
             let scale = |m: usize| if pl > 0 { (m as u128 * lens0.len() as u128 / pl as u128) as usize } else { m };
             let n5 = [ids0.len(), lens0.len(), scale(src[2].len()), scale(src[3].len()), scale(src[4].len())];
-            let rs5 = [Rspec { ib: Some(bs), mult: 1, cs: 0 }, Rspec { ib: Some(bs), mult: 1, cs: 0 },
-                       Rspec { ib: None, mult: 1, cs: 0 }, Rspec { ib: None, mult: 1, cs: 0 }, Rspec { ib: None, mult: 2, cs: 0 }];
+            let mut rs5 = [Rspec { ib: Some(bs), mult: 1, cs: 0, rows: 0 }, Rspec { ib: Some(bs), mult: 1, cs: 0, rows: 0 },
+                           Rspec { ib: None, mult: 1, cs: 0, rows: 0 }, Rspec { ib: None, mult: 1, cs: 0, rows: 0 }, Rspec { ib: None, mult: 2, cs: 0, rows: 0 }];
             let mut r = rank_all(&src, &n5, &rs5, &self.opt);
             let idok = pi == 0 || r[0].2 > 0;
             let mut sz = [0usize; 4];
@@ -409,7 +410,16 @@ impl Writer {
             if r[4].2 > 0 { sz[3] = r[4].2; }                          // interleaved: no ids frame
             let mut l = 0;
             for k in 1..4 { if sz[k] > 0 && (sz[l] == 0 || sz[k] < sz[l]) { l = k; } }
-            if self.opt.whole { bz3_fine(src[l + 1], Some(&rs5[l + 1]), &mut r[l + 1]); if l != 3 { bz3_fine(src[0], Some(&rs5[0]), &mut r[0]); } }
+            for u in [l + 1, 0] {   // -e high: the lengths, then the labels beside them
+                if !self.opt.whole || (u == 0 && l == 3) { break; }
+                // two families, each refined, the smaller kept, pieces counted in bytes on a tie
+                let (mut rr, mut zr) = (rs5[u], (r[u].0, r[u].1, usize::MAX));
+                bz3_fine(src[u], Some(&rs5[u]), &mut r[u]);
+                bz3_rows(src[u], &mut rr, &mut zr, slow);
+                if rr.rows != 0 { bz3_fine(src[u], Some(&rr), &mut zr); }
+                if rr.rows != 0 && zr.2 < r[u].2 { r[u] = zr; rs5[u] = rr; }
+            }
+            (cutrows_l, cutrows_i) = (rs5[l + 1].rows, rs5[0].rows);
             (idc, lvl_id) = (r[0].0, if r[0].1 < 0 { level } else { r[0].1 });
             (ilvcodec, lvl_len) = (r[l + 1].0, if r[l + 1].1 < 0 { level } else { r[l + 1].1 });
             // the sample is the whole block: its winner is built, keep it; the
@@ -497,8 +507,8 @@ impl Writer {
             // the block's reads, where its bzip3 pieces end, as the C's
             let ib0 = if varon && i > 0 { self.bm[i - 1].ibe } else { 0 };
             let ibs = (!self.ibx.is_empty()).then(|| &self.ibx[ib0..if varon { m.ibe } else { self.ibx.len() }]);
-            let rln = if runhead || ilv { Rspec { ib: None, mult: if ilv { 2 } else { 1 }, cs: 0 } } else { Rspec { ib: ibs, mult: 1, cs: 0 } };
-            let rid = if ibs.is_none() && vs[0].is_some() { Rspec { ib: vs[0], mult: 1, cs: 1 } } else { Rspec { ib: ibs, mult: 1, cs: 0 } };   // one headed block: its heads are the index
+            let rln = if runhead || ilv { Rspec { ib: None, mult: if ilv { 2 } else { 1 }, cs: 0, rows: cutrows_l } } else { Rspec { ib: ibs, mult: 1, cs: 0, rows: cutrows_l } };
+            let rid = if ibs.is_none() && vs[0].is_some() { Rspec { ib: vs[0], mult: 1, cs: 1, rows: cutrows_i } } else { Rspec { ib: ibs, mult: 1, cs: 0, rows: cutrows_i } };   // one headed block: its heads are the index
             let (pid, pln) = (onelay.then_some(&rid), onelay.then_some(&rln));
             const ORDER: [usize; 3] = [1, 2, 0];
             let lens_job = || {
@@ -1106,9 +1116,13 @@ fn rank_all(src: &[&[u8]], n: &[usize], rs: &[Rspec], o: &Options) -> Vec<(i32, 
 /// Where a stream's reads start, as the C's rspec: ib, the run count of each
 /// read, cs varints a run after each count there (1 when ib is a headed
 /// lengths frame), or None when the stream heads each read with its own
-/// count; mult varints a run.
+/// count; mult varints a run; rows, when not 0, also ends a piece at the
+/// first read start past that many rows, as medium ends a block.
 #[derive(Clone, Copy)]
-pub struct Rspec<'a> { ib: Option<&'a [u8]>, mult: usize, cs: usize }
+pub struct Rspec<'a> { ib: Option<&'a [u8]>, mult: usize, cs: usize, rows: u64 }
+
+/// -e medium's block: it closes at the first read start past these rows
+pub const MEDBLK: u64 = 4194304;
 
 /// a varint that may run past the end, as the C's vsoft
 fn vsoft(s: &[u8], p: &mut usize) -> u64 {
@@ -1129,13 +1143,16 @@ fn vskip(s: &[u8], p: &mut usize) { while *p < s.len() { let b = s[*p]; *p += 1;
 fn bz3_cuts(s: &[u8], b: usize, rs: &Rspec) -> Vec<u32> {
     let n = s.len();
     let (mut c, mut s0, mut last, mut q, mut r) = (Vec::with_capacity(2 * (n / b) + 4), 0usize, 0usize, 0usize, 0usize);
+    let mut prow = 0u64;   // rows since the rows rule last cut
     loop {
         let end = q >= n || rs.ib.is_some_and(|ib| r >= ib.len());
         let at = if end { n } else { q };   // a read starts here
         while at > s0 + b { let t = if last > s0 { last } else { s0 + b }; c.push((t - s0) as u32); s0 = t; }
         if end { break; }
+        if rs.rows != 0 && prow >= rs.rows { if at > s0 { c.push((at - s0) as u32); s0 = at; } prow = 0; }
         if at > s0 { last = at; }
         let m = match rs.ib { Some(ib) => vsoft(ib, &mut r), None => vsoft(s, &mut q) };
+        prow = prow.wrapping_add(m);
         let mut j = 0u64;
         while j < m && q < n { for _ in 0..rs.mult { vskip(s, &mut q); } j += 1; }
         if let Some(ib) = rs.ib {
@@ -1156,18 +1173,13 @@ fn paycut(src: &[u8], codec: i32, rs: Option<&Rspec>) -> Option<Vec<u8>> {
     }
 }
 
-/// -e high: bzip3 at every MB from half to twice the winner's, in eighths
-/// of it, as the C's bz3fine: the bytes do not follow the block size. Every
-/// piece of every size is one job; a frame is 13 B plus its pieces framed
-/// one by one.
-fn bz3_fine(s: &[u8], rs: Option<&Rspec>, r: &mut (i32, i32, usize)) {
+/// bzip3 at each size over the pieces paycut makes, as the C's bz3try: every
+/// piece of every size one job; a frame is 13 B plus its pieces framed one
+/// by one. The smallest under r, the smaller size on a tie, read back, takes
+/// r: true when one did.
+fn bz3_try(s: &[u8], rs: Option<&Rspec>, mb: &[i32], r: &mut (i32, i32, usize)) -> bool {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
-    if r.0 & ffi::CODEC_BZIP3 == 0 || r.2 == 0 { return; }
-    let b = r.0 & 0xffff;
-    let mb: Vec<i32> = (5..16).rev().map(|k| (k, b * k / 8))   // the largest pieces first
-        .filter(|&(k, m)| b * k % 8 == 0 && m & (m - 1) != 0 && m <= 256 && ((m as u64) << 20) < s.len() as u64)   // powers of 2: ranked
-        .map(|x| x.1).collect();
-    let jobs: Vec<(usize, usize, usize)> = mb.iter().enumerate().flat_map(|(i, &m)| {   // the pieces paycut makes
+    let jobs: Vec<(usize, usize, usize)> = mb.iter().enumerate().flat_map(|(i, &m)| {
         let bs = (m as usize) << 20;
         let cut: Vec<usize> = match rs {
             Some(rs) => bz3_cuts(s, bs, rs).into_iter().map(|x| x as usize).collect(),
@@ -1183,15 +1195,51 @@ fn bz3_fine(s: &[u8], rs: Option<&Rspec>, r: &mut (i32, i32, usize)) {
             None => bad[i].store(true, Relaxed),
         }
     });
-    // the smallest, the smaller size on a tie, read back
     let mut order: Vec<usize> = (0..mb.len()).filter(|&i| !bad[i].load(Relaxed) && tot[i].load(Relaxed) + 13 < r.2).collect();
     order.sort_by_key(|&i| (tot[i].load(Relaxed), mb[i]));
     for i in order {
         let c = ffi::CODEC_BZIP3 | mb[i];
         if let Some(v) = paycut(s, c, rs) {
-            if ffi::paydecomp(&v, c, s.len()).as_deref() == Some(s) { *r = (c, r.1, v.len()); return; }
+            if ffi::paydecomp(&v, c, s.len()).as_deref() == Some(s) { *r = (c, r.1, v.len()); return true; }
         }
     }
+    false
+}
+
+/// the largest piece the rows rule alone makes, the length without one:
+/// every block size at or above it gives the same pieces, as the C's bz3cover
+fn bz3_cover(s: &[u8], rs: Option<&Rspec>) -> usize {
+    match rs {
+        Some(rs) if rs.rows != 0 && !s.is_empty() => bz3_cuts(s, s.len().min(512 << 20), rs).into_iter().max().unwrap_or(0) as usize,
+        _ => s.len(),
+    }
+}
+
+/// -e high: bzip3 at every MB from half to twice the winner's, in eighths
+/// of it, as the C's bz3fine: the bytes do not follow the block size.
+fn bz3_fine(s: &[u8], rs: Option<&Rspec>, r: &mut (i32, i32, usize)) {
+    if r.0 & ffi::CODEC_BZIP3 == 0 || r.2 == 0 { return; }
+    let (b, cover) = (r.0 & 0xffff, bz3_cover(s, rs) as u64);
+    let mb: Vec<i32> = (5..16).rev().map(|k| (k, b * k / 8))   // the largest pieces first
+        .filter(|&(k, m)| b * k % 8 == 0 && m & (m - 1) != 0 && m <= 256 && ((m as u64) << 20) < cover)   // powers of 2: ranked
+        .map(|x| x.1).collect();
+    if !mb.is_empty() { bz3_try(s, rs, &mb, r); }
+}
+
+/// -e high: bzip3 pieces that also end where medium ends a block, at the
+/// first read start past MEDBLK rows, at every listed size, as the C's
+/// bz3rows: medium's own pieces, which pieces counted in bytes never make.
+fn bz3_rows(s: &[u8], rs: &mut Rspec, r: &mut (i32, i32, usize), slow: bool) {
+    if s.is_empty() { return; }
+    let rr = Rspec { rows: MEDBLK, ..*rs };
+    let (cover, cand) = (bz3_cover(s, Some(&rr)), candlist(slow));
+    let mut mb = Vec::new();
+    for m in (0..9).map(|e| 1i32 << e) {   // the listed sizes, the smallest covering one for all above it
+        if !cand.contains(&(ffi::CODEC_BZIP3 | m)) { continue; }
+        mb.push(m);
+        if ((m as usize) << 20) >= cover { break; }
+    }
+    if !mb.is_empty() && bz3_try(s, Some(&rr), &mb, r) { rs.rows = MEDBLK; }
 }
 
 /// A respelt block is a different stream from the one the codec was chosen

@@ -625,9 +625,11 @@ static size_t candlist(int *out) {
 /* where a stream's reads start, for bzip3 pieces that end at one: ib, the
    run count of each read, cs varints a run after each count there (1 when
    ib is a headed lengths frame), or NULL when the stream heads each read
-   with its own count; mult varints a run */
-typedef struct { const uint8_t *ib; size_t ibn; int mult, cs; } rspec;
+   with its own count; mult varints a run; rows, when not 0, also ends a
+   piece at the first read start past that many rows, as medium ends a block */
+typedef struct { const uint8_t *ib; size_t ibn; int mult, cs; uint64_t rows; } rspec;
 static int RCUT = 0;                  /* blocks of whole reads: bzip3 cuts at read starts */
+static uint64_t CUTROWS_L = 0, CUTROWS_I = 0;   /* -e high: the rows rule of each frame, 0 none */
 static size_t paycomp(const uint8_t *src, size_t n, int codec, uint8_t **out);
 static size_t paycut(const uint8_t *src, size_t n, int codec, const rspec *rs, uint8_t **out);
 static size_t paydecomp(const uint8_t *src, size_t n, int codec, uint8_t *dst, size_t raw);
@@ -1043,20 +1045,25 @@ static uint64_t vsoft(const uint8_t **p, const uint8_t *e) {
    than its pieces do, 0.64% and 0.79% smaller on two (job 38947666) */
 static uint32_t *bz3cuts(const uint8_t *src, size_t n, size_t B, const rspec *rs, uint32_t *np) {
     size_t cap = 2 * (n / B) + 4, k = 0, s0 = 0, last = 0;   /* two pieces span over B */
+    uint64_t prow = 0;                                        /* rows since the rows rule last cut */
     uint32_t *c = xmalloc(cap * sizeof *c);
     const uint8_t *q = src, *e = src + n, *r = rs->ib, *re = rs->ib + rs->ibn;
+#define CPUT(v) do { if (k == cap) c = xrealloc(c, (cap *= 2) * sizeof *c); c[k++] = (uint32_t)(v); } while (0)
     for (;;) {
         int end = q >= e || (rs->ib && r >= re);
         size_t at = end ? n : (size_t)(q - src);          /* a read starts here */
-        while (at > s0 + B) { size_t t = last > s0 ? last : s0 + B; c[k++] = (uint32_t)(t - s0); s0 = t; }
+        while (at > s0 + B) { size_t t = last > s0 ? last : s0 + B; CPUT(t - s0); s0 = t; }
         if (end) break;
+        if (rs->rows && prow >= rs->rows) { if (at > s0) { CPUT(at - s0); s0 = at; } prow = 0; }
         if (at > s0) last = at;
         uint64_t m = rs->ib ? vsoft(&r, re) : vsoft(&q, e);
+        prow += m;
         for (uint64_t j = 0; j < m && q < e; j++)
             for (int u = 0; u < rs->mult; u++) while (q < e && (*q++ & 0x80)) {}
         for (uint64_t j = 0; rs->ib && j < m * (uint64_t)rs->cs && r < re; j++) while (r < re && (*r++ & 0x80)) {}
     }
-    if (n > s0) c[k++] = (uint32_t)(n - s0);
+    if (n > s0) CPUT(n - s0);
+#undef CPUT
     *np = (uint32_t)k;
     return c;
 }
@@ -2696,22 +2703,14 @@ static void rankall(int ns, const uint8_t *const *src, const size_t *m, const si
     free(jb); free(jt); free(bo); free(bj); free(vq); free(vf); free(left);
 }
 
-/* -e high: bzip3 at every MB from half to twice the winner's, in eighths
-   of it. The bytes do not follow the block size: a short-read track gave
-   184237480 B at 8 MB, 184391699 at 12, 183950371 at 14 (job 38947902).
-   Every piece of every size is one job, so a stream of a few pieces keeps
-   the threads busy; a frame is 13 B plus its pieces framed one by one. */
-static void bz3fine(const uint8_t *s, size_t n, const rspec *rs, int *cd, size_t *sz) {
-    if (!(*cd & CODEC_BZIP3) || !*sz) return;
-    int b = *cd & 0xffff, mb[11], nm = 0;
-    for (int k = 15; k > 4; k--) {   /* the largest pieces first */
-        int m = b * k / 8;
-        if (b * k % 8 || !(m & (m - 1)) || m > 256 || (uint64_t)m << 20 >= n) continue;   /* powers of 2: ranked */
-        mb[nm++] = m;
-    }
-    if (!nm) return;
-    size_t nj = 0, cap = 0, tot[11] = {0}, *jo = NULL, *jl = NULL; int *jm = NULL; char bad[11] = {0};
-    for (int i = 0; i < nm; i++) {   /* the pieces paycut makes */
+/* bzip3 at each of nm sizes over the pieces paycut makes. Every piece of
+   every size is one job, so a stream of a few pieces keeps the threads
+   busy; a frame is 13 B plus its pieces framed one by one. The smallest
+   under *sz, the smaller size on a tie, read back, takes *cd and *sz:
+   1 when one did. */
+static int bz3try(const uint8_t *s, size_t n, const rspec *rs, const int *mb, int nm, int *cd, size_t *sz) {
+    size_t nj = 0, cap = 0, tot[16] = {0}, *jo = NULL, *jl = NULL; int *jm = NULL; char bad[16] = {0};
+    for (int i = 0; i < nm; i++) {
         size_t B = (size_t)mb[i] << 20; uint32_t np = 0, *c = rs ? bz3cuts(s, n, B, rs, &np) : NULL;
         size_t k = c ? np : (n + B - 1) / B;
         if (nj + k > cap) { cap = 2 * (nj + k); jo = xrealloc(jo, cap * sizeof *jo); jl = xrealloc(jl, cap * sizeof *jl); jm = xrealloc(jm, cap * sizeof *jm); }
@@ -2737,17 +2736,62 @@ static void bz3fine(const uint8_t *s, size_t n, const rspec *rs, int *cd, size_t
         }
     }
     free(jo); free(jl); free(jm);
-    for (;;) {   /* the smallest, the smaller size on a tie, read back */
+    for (;;) {
         int w = -1;
-        for (int i = nm - 1; i >= 0; i--) if (!bad[i] && tot[i] + 13 < *sz && (w < 0 || tot[i] < tot[w])) w = i;
-        if (w < 0) return;
+        for (int i = 0; i < nm; i++)
+            if (!bad[i] && tot[i] + 13 < *sz && (w < 0 || tot[i] < tot[w] || (tot[i] == tot[w] && mb[i] < mb[w]))) w = i;
+        if (w < 0) return 0;
         uint8_t *o = NULL, *v = NULL; int c = CODEC_BZIP3 | mb[w];
         size_t z = paycut(s, n, c, rs, &o);
         int ok = z && (v = malloc(n)) && paydecomp(o, z, c, v, n) == n && !memcmp(v, s, n);
         free(o); free(v);
-        if (ok) { *cd = c; *sz = z; return; }
+        if (ok) { *cd = c; *sz = z; return 1; }
         bad[w] = 1;
     }
+}
+
+/* the largest piece the rows rule alone makes, n without one: every block
+   size at or above it gives the same pieces */
+static size_t bz3cover(const uint8_t *s, size_t n, const rspec *rs) {
+    if (!rs || !rs->rows || !n) return n;
+    uint32_t np = 0, *c = bz3cuts(s, n, n < (512u << 20) ? n : 512u << 20, rs, &np);
+    size_t top = 0;
+    for (uint32_t i = 0; i < np; i++) if (c[i] > top) top = c[i];
+    free(c);
+    return top;
+}
+
+/* -e high: bzip3 at every MB from half to twice the winner's, in eighths
+   of it. The bytes do not follow the block size: a short-read track gave
+   184237480 B at 8 MB, 184391699 at 12, 183950371 at 14 (job 38947902). */
+static void bz3fine(const uint8_t *s, size_t n, const rspec *rs, int *cd, size_t *sz) {
+    if (!(*cd & CODEC_BZIP3) || !*sz) return;
+    int b = *cd & 0xffff, mb[16], nm = 0; size_t cover = bz3cover(s, n, rs);
+    for (int k = 15; k > 4; k--) {   /* the largest pieces first */
+        int m = b * k / 8;
+        if (b * k % 8 || !(m & (m - 1)) || m > 256 || (uint64_t)m << 20 >= cover) continue;   /* powers of 2: ranked */
+        mb[nm++] = m;
+    }
+    if (nm) bz3try(s, n, rs, mb, nm, cd, sz);
+}
+
+/* -e high: bzip3 pieces that also end where medium ends a block, at the
+   first read start past MEDBLK rows, at every listed size: medium's own
+   pieces, which pieces counted in bytes never make; it beat them by 17301 B
+   on an assembly (job 38963751) */
+static void bz3rows(const uint8_t *s, size_t n, const rspec *rs, int *cd, size_t *sz, uint64_t *rows) {
+    if (!n) return;
+    rspec rr = *rs; rr.rows = MEDBLK;
+    size_t cover = bz3cover(s, n, &rr);
+    int cb[KCAND_N], mb[16], nm = 0; size_t nc = candlist(cb);
+    for (int m = 1; m <= 256; m *= 2) {   /* the listed sizes, the smallest covering one for all above it */
+        int listed = 0;
+        for (size_t j = 0; j < nc; j++) if (cb[j] == (CODEC_BZIP3 | m)) listed = 1;
+        if (!listed) continue;
+        mb[nm++] = m;
+        if ((size_t)m << 20 >= cover) break;
+    }
+    if (nm && bz3try(s, n, &rr, mb, nm, cd, sz)) *rows = MEDBLK;
 }
 
 /* the checked frame is kept in *keep: the compress phase would make the same */
@@ -2948,7 +2992,7 @@ static void ktw_close(ktw *w) {
         for (int k = 2; k < 5; k++) n5[k] = pl ? (size_t)((unsigned __int128)m5[k] * nl0 / pl) : m5[k];
         int c5[5], l5[5];
         RCUT = 1;                                 /* every block holds whole reads */
-        const rspec rs5[5] = { { bs, pb, 1, 0 }, { bs, pb, 1, 0 }, { NULL, 0, 1, 0 }, { NULL, 0, 1, 0 }, { NULL, 0, 2, 0 } };
+        rspec rs5[5] = { { bs, pb, 1, 0, 0 }, { bs, pb, 1, 0, 0 }, { NULL, 0, 1, 0, 0 }, { NULL, 0, 1, 0, 0 }, { NULL, 0, 2, 0, 0 } };
         rankall(5, src, m5, n5, rs5, c5, l5, r5);
         int idok = !pi || r5[0];
         if (r5[1] && idok) sz[0] = r5[1] + r5[0] + ic.n;      /* plain pays its index */
@@ -2957,7 +3001,19 @@ static void ktw_close(ktw *w) {
         if (r5[4]) sz[3] = r5[4];                             /* interleaved: no ids frame */
         int L = 0;
         for (int k = 1; k < 4; k++) if (sz[k] && (!sz[L] || sz[k] < sz[L])) L = k;
-        if (SLOW) { bz3fine(src[L + 1], m5[L + 1], &rs5[L + 1], &c5[L + 1], &r5[L + 1]); if (L != 3) bz3fine(src[0], m5[0], &rs5[0], &c5[0], &r5[0]); }
+        for (int t = 0; SLOW && t < 2; t++) {     /* -e high: the lengths, then the labels beside them */
+            int u = t ? 0 : L + 1;
+            if (t && L == 3) break;
+            /* two families, each refined, the smaller kept, pieces counted in
+               bytes on a tie: refining only the family the menu picked lost
+               183298 B on a short-read track (job 38965676) */
+            int cr = c5[u]; size_t zr = SIZE_MAX; rspec rr = rs5[u];
+            bz3fine(src[u], m5[u], &rs5[u], &c5[u], &r5[u]);
+            bz3rows(src[u], m5[u], &rr, &cr, &zr, &rr.rows);
+            if (rr.rows) bz3fine(src[u], m5[u], &rr, &cr, &zr);
+            if (rr.rows && zr < r5[u]) { c5[u] = cr; r5[u] = zr; rs5[u] = rr; }
+        }
+        CUTROWS_L = rs5[L + 1].rows; CUTROWS_I = rs5[0].rows;
         /* the sample is the whole block: its winner is built, keep it */
         int whole = nraw == 1 && pl == nl0 && pi == ni0 && pb == w->ibx.n;
         for (int k = 1; k < 4; k++) if (!whole || k != L) { free(lay[k]); lay[k] = NULL; }
@@ -3058,9 +3114,9 @@ static void ktw_close(ktw *w) {
                     }
                 /* the block's reads, where its bzip3 pieces end */
                 size_t ib0 = VARON && i ? bm[i - 1].ibe : 0;
-                rspec rid = { w->ibx.d ? w->ibx.d + ib0 : NULL, w->ibx.d ? (VARON ? bm[i].ibe : w->ibx.n) - ib0 : 0, 1, 0 };
-                const rspec rln = { RUNHEAD || ILV ? NULL : rid.ib, RUNHEAD || ILV ? 0 : rid.ibn, ILV ? 2 : 1, 0 };
-                if (!rid.ib && vs[0]) rid = (rspec){ vs[0], vn[0], 1, 1 };   /* one headed block: its heads are the index */
+                rspec rid = { w->ibx.d ? w->ibx.d + ib0 : NULL, w->ibx.d ? (VARON ? bm[i].ibe : w->ibx.n) - ib0 : 0, 1, 0, CUTROWS_I };
+                const rspec rln = { RUNHEAD || ILV ? NULL : rid.ib, RUNHEAD || ILV ? 0 : rid.ibn, ILV ? 2 : 1, 0, CUTROWS_L };
+                if (!rid.ib && vs[0]) rid = (rspec){ vs[0], vn[0], 1, 1, CUTROWS_I };   /* one headed block: its heads are the index */
                 const rspec *pid = RCUT ? &rid : NULL, *pln = RCUT ? &rln : NULL;
                 int lone = !(LENCODEC & CODEC_BZIP3) || nl <= (size_t)(LENCODEC & 0xffff) << 20;   /* one thread */
                 ljob lj = { idsrc, ni, NULL, 0, LENCODEC & CODEC_LZMA ? 2 : nthr > 1 ? nthr - 1 : 1, pid }; pthread_t lth;

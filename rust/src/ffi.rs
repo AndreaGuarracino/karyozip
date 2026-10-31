@@ -36,6 +36,8 @@ unsafe extern "C" {
     fn bz3_bound(size: usize) -> usize;
     fn bz3_compress(block_size: c_uint, inp: *const c_uchar, out: *mut c_uchar,
                     in_size: usize, out_size: *mut usize) -> c_int;
+    fn bz3_compress_cuts(block_size: c_uint, inp: *const c_uchar, out: *mut c_uchar,
+                         in_size: usize, out_size: *mut usize, cut: *const c_uint, ncut: c_uint) -> c_int;
     fn bz3_decompress(inp: *const c_uchar, out: *mut c_uchar,
                       in_size: usize, out_size: *mut usize) -> c_int;
     // c/xz/kzlzma.c: LZMA2 with every setting pinned there, for both binaries
@@ -177,6 +179,22 @@ pub fn lzma_version() -> String {
 pub fn zstd_version() -> String {
     // SAFETY: a static string from the linked libzstd.
     unsafe { std::ffi::CStr::from_ptr(zstd_sys::ZSTD_versionString()).to_string_lossy().into_owned() }
+}
+
+/// bzip3 with the pieces' sizes given, each at most the codec's block size,
+/// summing to the source: the C's bz3_compress_cuts.
+pub fn bz3_cuts(src: &[u8], codec: i32, cut: &[u32]) -> Option<Vec<u8>> {
+    let n = src.len();
+    // SAFETY: out is bz3_bound(n), cut holds cut.len() sizes; the C checks them.
+    unsafe {
+        let bb = bz3_bound(n);
+        let mut out = raw_buf(bb);
+        let mut got = bb;
+        let bs = ((codec & 0xffff) as c_uint) << 20;
+        if bz3_compress_cuts(bs, src.as_ptr(), out.as_mut_ptr(), n, &mut got, cut.as_ptr(), cut.len() as c_uint) != 0 { return None; }
+        out.set_len(got);
+        Some(out)
+    }
 }
 
 /// One payload codec, chosen by `codec`, exactly as the C `paycomp` does.

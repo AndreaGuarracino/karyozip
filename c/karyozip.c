@@ -622,8 +622,17 @@ static size_t candlist(int *out) {
     return n;
 }
 
+/* where a stream's reads start, for bzip3 pieces that end at one: ib, the
+   run count of each read, cs varints a run after each count there (1 when
+   ib is a headed lengths frame), or NULL when the stream heads each read
+   with its own count; mult varints a run */
+typedef struct { const uint8_t *ib; size_t ibn; int mult, cs; } rspec;
+static int RCUT = 0;                  /* blocks of whole reads: bzip3 cuts at read starts */
 static size_t paycomp(const uint8_t *src, size_t n, int codec, uint8_t **out);
+static size_t paycut(const uint8_t *src, size_t n, int codec, const rspec *rs, uint8_t **out);
 static size_t paydecomp(const uint8_t *src, size_t n, int codec, uint8_t *dst, size_t raw);
+int bz3_compress_cuts(uint32_t block_size, const uint8_t *in, uint8_t *out, size_t in_size, size_t *out_size,
+                      const uint32_t *cut, uint32_t ncut);
 
 /* Read names split on ':' into fields that are either the same in every name
    or a plain integer. The integers go down as zigzag deltas, interleaved so a
@@ -1022,7 +1031,39 @@ static void *namespick(void *p) {
 
 static int nosz(int c) { unsigned u = (unsigned)c; return u && !(u & CODEC_BZIP3) && (u & 0x10); }
 
-static size_t paycomp(const uint8_t *src, size_t n, int codec, uint8_t **out) {
+/* a varint that may run past the end: a cut is a size, never a fault */
+static uint64_t vsoft(const uint8_t **p, const uint8_t *e) {
+    uint64_t v = 0; int sh = 0;
+    while (*p < e) { uint8_t b = *(*p)++; if (sh < 64) v |= (uint64_t)(b & 0x7f) << sh; sh += 7; if (!(b & 0x80)) break; }
+    return v;
+}
+
+/* bzip3 pieces of at most B bytes, each ending at the last read start
+   within B of its own start, else at B: an assembly's contigs differ more
+   than its pieces do, 0.64% and 0.79% smaller on two (job 38947666) */
+static uint32_t *bz3cuts(const uint8_t *src, size_t n, size_t B, const rspec *rs, uint32_t *np) {
+    size_t cap = 2 * (n / B) + 4, k = 0, s0 = 0, last = 0;   /* two pieces span over B */
+    uint32_t *c = xmalloc(cap * sizeof *c);
+    const uint8_t *q = src, *e = src + n, *r = rs->ib, *re = rs->ib + rs->ibn;
+    for (;;) {
+        int end = q >= e || (rs->ib && r >= re);
+        size_t at = end ? n : (size_t)(q - src);          /* a read starts here */
+        while (at > s0 + B) { size_t t = last > s0 ? last : s0 + B; c[k++] = (uint32_t)(t - s0); s0 = t; }
+        if (end) break;
+        if (at > s0) last = at;
+        uint64_t m = rs->ib ? vsoft(&r, re) : vsoft(&q, e);
+        for (uint64_t j = 0; j < m && q < e; j++)
+            for (int u = 0; u < rs->mult; u++) while (q < e && (*q++ & 0x80)) {}
+        for (uint64_t j = 0; rs->ib && j < m * (uint64_t)rs->cs && r < re; j++) while (r < re && (*r++ & 0x80)) {}
+    }
+    if (n > s0) c[k++] = (uint32_t)(n - s0);
+    *np = (uint32_t)k;
+    return c;
+}
+
+static size_t paycomp(const uint8_t *src, size_t n, int codec, uint8_t **out) { return paycut(src, n, codec, NULL, out); }
+
+static size_t paycut(const uint8_t *src, size_t n, int codec, const rspec *rs, uint8_t **out) {
     unsigned int ol;
     if (codec & CODEC_LZMA) {
         size_t ob = n + n / 16 + 4096, op;
@@ -1034,10 +1075,11 @@ static size_t paycomp(const uint8_t *src, size_t n, int codec, uint8_t **out) {
     if (!(codec & CODEC_BZIP3) && n >= 0x7fffffffu) { *out = NULL; return 0; }   /* rANS and arith decode below INT_MAX */
     if (codec & CODEC_BZIP3) {
 
-        size_t bb = bz3_bound(n); *out = malloc(bb);
-        size_t got = bb;
-        if (!*out || bz3_compress((uint32_t)(codec & 0xffff) << 20,
-                                  src, *out, n, &got)) { free(*out); *out = NULL; return 0; }
+        size_t bb = bz3_bound(n), B = (size_t)(codec & 0xffff) << 20; *out = malloc(bb);
+        size_t got = bb; uint32_t nc = 0, *cut = rs && n > B ? bz3cuts(src, n, B, rs, &nc) : NULL;
+        int bad = !*out || bz3_compress_cuts((uint32_t)B, src, *out, n, &got, cut, nc);
+        free(cut);
+        if (bad) { free(*out); *out = NULL; return 0; }
         return got;
     }
     if (codec & CODEC_ARITH) {
@@ -2529,8 +2571,8 @@ static void pickcodecs(int rawfd, const blkmeta *bm, size_t nraw) {
                 LENCODEC, IDCODEC, np, seekable ? "seekable" : "one block");
 }
 
-static size_t complens(ZSTD_CCtx *tc, const uint8_t *src, size_t n, uint8_t **out, size_t bound) {
-    if (LENCODEC) return paycomp(src, n, LENCODEC, out);
+static size_t complens(ZSTD_CCtx *tc, const uint8_t *src, size_t n, const rspec *rs, uint8_t **out, size_t bound) {
+    if (LENCODEC) return paycut(src, n, LENCODEC, rs, out);
     *out = malloc(bound + 64);
     if (!*out) return 0;
     size_t a = ZSTD_compressCCtx(tc, *out, bound + 64, src, n, LEVEL_L < 0 ? LEVEL : LEVEL_L);
@@ -2554,7 +2596,7 @@ static int rjcmp(const void *a, const void *b) {
          : x->s != y->s ? x->s - y->s : x->r - y->r;
 }
 static void rankall(int ns, const uint8_t *const *src, const size_t *m, const size_t *n,
-                    int *cd, int *lv, size_t *sz) {
+                    const rspec *rs, int *cd, int *lv, size_t *sz) {
     int cb[KCAND_N]; size_t nc = candlist(cb), nj = 0;
     rjob *jb = xmalloc((size_t)ns * (nc + 2) * sizeof *jb);
     for (int t = 0; t < ns; t++) {
@@ -2605,7 +2647,7 @@ static void rankall(int ns, const uint8_t *const *src, const size_t *m, const si
         const uint8_t *p = src[jb[j].s]; size_t k = m[jb[j].s]; uint8_t *o = NULL;
         double t0 = PROF ? nowsec() : 0;
         int s = jb[j].s;
-        if (jb[j].c) jb[j].z = paycomp(p, k, jb[j].c, &o);   /* the stream's best so far is kept */
+        if (jb[j].c) jb[j].z = paycut(p, k, jb[j].c, rs ? &rs[s] : NULL, &o);   /* the stream's best so far is kept */
         else {
             size_t cap = ZSTD_compressBound(k); uint8_t *zo = malloc(cap);
             size_t z = zo ? ZSTD_compress(zo, cap, p, k, jb[j].lv) : 0;
@@ -2641,7 +2683,7 @@ static void rankall(int ns, const uint8_t *const *src, const size_t *m, const si
             int ok = 1;
             if (jb[q].c && !vf[q]) {              /* zstd is trusted, the rest read back */
                 uint8_t *o = NULL, *v = NULL;
-                size_t z = (long)q == bj[t] ? jb[q].z : paycomp(src[t], m[t], jb[q].c, &o);
+                size_t z = (long)q == bj[t] ? jb[q].z : paycut(src[t], m[t], jb[q].c, rs ? &rs[t] : NULL, &o);
                 if ((long)q == bj[t]) { o = bo[t]; bo[t] = NULL; }
                 ok = z && (v = malloc(m[t])) && paydecomp(o, z, jb[q].c, v, m[t]) == m[t] && !memcmp(v, src[t], m[t]);
                 free(o); free(v);
@@ -2659,7 +2701,7 @@ static void rankall(int ns, const uint8_t *const *src, const size_t *m, const si
    184237480 B at 8 MB, 184391699 at 12, 183950371 at 14 (job 38947902).
    Every piece of every size is one job, so a stream of a few pieces keeps
    the threads busy; a frame is 13 B plus its pieces framed one by one. */
-static void bz3fine(const uint8_t *s, size_t n, int *cd, size_t *sz) {
+static void bz3fine(const uint8_t *s, size_t n, const rspec *rs, int *cd, size_t *sz) {
     if (!(*cd & CODEC_BZIP3) || !*sz) return;
     int b = *cd & 0xffff, mb[11], nm = 0;
     for (int k = 15; k > 4; k--) {   /* the largest pieces first */
@@ -2668,16 +2710,19 @@ static void bz3fine(const uint8_t *s, size_t n, int *cd, size_t *sz) {
         mb[nm++] = m;
     }
     if (!nm) return;
-    size_t nj = 0, tot[11] = {0}, j = 0;
-    for (int i = 0; i < nm; i++) nj += (n + ((size_t)mb[i] << 20) - 1) / ((size_t)mb[i] << 20);
-    size_t *jo = xmalloc(nj * sizeof *jo); int *jm = xmalloc(nj * sizeof *jm); char bad[11] = {0};
-    for (int i = 0; i < nm; i++) for (size_t o = 0; o < n; o += (size_t)mb[i] << 20) { jo[j] = o; jm[j++] = i; }
+    size_t nj = 0, cap = 0, tot[11] = {0}, *jo = NULL, *jl = NULL; int *jm = NULL; char bad[11] = {0};
+    for (int i = 0; i < nm; i++) {   /* the pieces paycut makes */
+        size_t B = (size_t)mb[i] << 20; uint32_t np = 0, *c = rs ? bz3cuts(s, n, B, rs, &np) : NULL;
+        size_t k = c ? np : (n + B - 1) / B;
+        if (nj + k > cap) { cap = 2 * (nj + k); jo = xrealloc(jo, cap * sizeof *jo); jl = xrealloc(jl, cap * sizeof *jl); jm = xrealloc(jm, cap * sizeof *jm); }
+        for (size_t u = 0, o = 0; u < k; u++) { jl[nj] = c ? c[u] : n - o < B ? n - o : B; jo[nj] = o; jm[nj++] = i; o += jl[nj - 1]; }
+        free(c);
+    }
 #ifdef _OPENMP
 #pragma omp parallel for schedule(dynamic, 1) num_threads(nthreads())
 #endif
     for (size_t q = 0; q < nj; q++) {
-        size_t B = (size_t)mb[jm[q]] << 20, len = n - jo[q] < B ? n - jo[q] : B;
-        uint8_t *o = NULL; size_t z = paycomp(s + jo[q], len, CODEC_BZIP3 | mb[jm[q]], &o);
+        uint8_t *o = NULL; size_t z = paycomp(s + jo[q], jl[q], CODEC_BZIP3 | mb[jm[q]], &o);
         free(o);
         if (!z) {
 #ifdef _OPENMP
@@ -2691,13 +2736,13 @@ static void bz3fine(const uint8_t *s, size_t n, int *cd, size_t *sz) {
             tot[jm[q]] += z - 13;
         }
     }
-    free(jo); free(jm);
+    free(jo); free(jl); free(jm);
     for (;;) {   /* the smallest, the smaller size on a tie, read back */
         int w = -1;
         for (int i = nm - 1; i >= 0; i--) if (!bad[i] && tot[i] + 13 < *sz && (w < 0 || tot[i] < tot[w])) w = i;
         if (w < 0) return;
         uint8_t *o = NULL, *v = NULL; int c = CODEC_BZIP3 | mb[w];
-        size_t z = paycomp(s, n, c, &o);
+        size_t z = paycut(s, n, c, rs, &o);
         int ok = z && (v = malloc(n)) && paydecomp(o, z, c, v, n) == n && !memcmp(v, s, n);
         free(o); free(v);
         if (ok) { *cd = c; *sz = z; return; }
@@ -2706,8 +2751,8 @@ static void bz3fine(const uint8_t *s, size_t n, int *cd, size_t *sz) {
 }
 
 /* the checked frame is kept in *keep: the compress phase would make the same */
-static size_t lensok(ZSTD_CCtx *tc, const uint8_t *src, size_t n, uint8_t **keep) {
-    uint8_t *c = NULL; size_t z = complens(tc, src, n, &c, ZSTD_compressBound(n));
+static size_t lensok(ZSTD_CCtx *tc, const uint8_t *src, size_t n, const rspec *rs, uint8_t **keep) {
+    uint8_t *c = NULL; size_t z = complens(tc, src, n, rs, &c, ZSTD_compressBound(n));
     size_t ok = 0;
     if (z) {
         uint8_t *v = malloc(n ? n : 1); size_t g = 0;
@@ -2802,13 +2847,13 @@ static uint64_t idxbuild(const buf *ib, buf *ichunks, buf *itab) {
 /* Labels beside a lengths frame that takes one thread: the rest of
    the threads, or 2 beside LZMA, an hour on 3 GB, so bzip3 holds 2
    block states, not 8. */
-typedef struct { const uint8_t *s; size_t n; uint8_t *o; size_t z; int t; } ljob;
+typedef struct { const uint8_t *s; size_t n; uint8_t *o; size_t z; int t; const rspec *rs; } ljob;
 static void *labjob(void *p) {
     ljob *j = p;
 #ifdef _OPENMP
     omp_set_num_threads(j->t);
 #endif
-    if (IDCODEC) j->z = paycomp(j->s, j->n, IDCODEC, &j->o);
+    if (IDCODEC) j->z = paycut(j->s, j->n, IDCODEC, j->rs, &j->o);
     else { size_t zb = ZSTD_compressBound(j->n); j->o = xmalloc(zb);
            j->z = ZSTD_compress(j->o, zb, j->s, j->n, LEVEL_I < 0 ? LEVEL : LEVEL_I);
            if (ZSTD_isError(j->z)) j->z = 0; }
@@ -2902,7 +2947,9 @@ static void ktw_close(ktw *w) {
         size_t m5[5] = { pi, pl, n4[1], n4[2], n4[3] }, n5[5] = { ni0, nl0 }, r5[5];
         for (int k = 2; k < 5; k++) n5[k] = pl ? (size_t)((unsigned __int128)m5[k] * nl0 / pl) : m5[k];
         int c5[5], l5[5];
-        rankall(5, src, m5, n5, c5, l5, r5);
+        RCUT = 1;                                 /* every block holds whole reads */
+        const rspec rs5[5] = { { bs, pb, 1, 0 }, { bs, pb, 1, 0 }, { NULL, 0, 1, 0 }, { NULL, 0, 1, 0 }, { NULL, 0, 2, 0 } };
+        rankall(5, src, m5, n5, rs5, c5, l5, r5);
         int idok = !pi || r5[0];
         if (r5[1] && idok) sz[0] = r5[1] + r5[0] + ic.n;      /* plain pays its index */
         if (r5[2] && idok) sz[1] = r5[2] + r5[0];
@@ -2910,7 +2957,7 @@ static void ktw_close(ktw *w) {
         if (r5[4]) sz[3] = r5[4];                             /* interleaved: no ids frame */
         int L = 0;
         for (int k = 1; k < 4; k++) if (sz[k] && (!sz[L] || sz[k] < sz[L])) L = k;
-        if (SLOW) { bz3fine(src[L + 1], m5[L + 1], &c5[L + 1], &r5[L + 1]); if (L != 3) bz3fine(src[0], m5[0], &c5[0], &r5[0]); }
+        if (SLOW) { bz3fine(src[L + 1], m5[L + 1], &rs5[L + 1], &c5[L + 1], &r5[L + 1]); if (L != 3) bz3fine(src[0], m5[0], &rs5[0], &c5[0], &r5[0]); }
         /* the sample is the whole block: its winner is built, keep it */
         int whole = nraw == 1 && pl == nl0 && pi == ni0 && pb == w->ibx.n;
         for (int k = 1; k < 4; k++) if (!whole || k != L) { free(lay[k]); lay[k] = NULL; }
@@ -2928,7 +2975,7 @@ static void ktw_close(ktw *w) {
         if (L == 2) GRP = 1;
         if (L == 3) ILV = 1;
         RUNHEAD = L > 0;
-        if (L && !(lkn = lensok(mc, altbuf, altlen, &lk))) LENCODEC = 0;  /* it does not come back: zstd does */
+        if (L && !(lkn = lensok(mc, altbuf, altlen, &rs5[L + 1], &lk))) LENCODEC = 0;  /* it does not come back: zstd does */
         static const char *LN[4] = {"plain", "headed", "grouped", "interleaved"};
         fprintf(stderr, "layout: %s, lengths %s", LN[L], cname(LENCODEC));
         fprintf(stderr, "%s%s, decided on %zu of %zu B of lengths\n", L == 3 ? "" : ", labels ", L == 3 ? "" : cname(IDCODEC), pl, nl0);
@@ -3009,8 +3056,14 @@ static void ktw_close(ktw *w) {
                         if (altv[v]) { vs[v] = altv[v]; vn[v] = altvn[v]; }
                         else if (v) vs[v] = NULL;
                     }
+                /* the block's reads, where its bzip3 pieces end */
+                size_t ib0 = VARON && i ? bm[i - 1].ibe : 0;
+                rspec rid = { w->ibx.d ? w->ibx.d + ib0 : NULL, w->ibx.d ? (VARON ? bm[i].ibe : w->ibx.n) - ib0 : 0, 1, 0 };
+                const rspec rln = { RUNHEAD || ILV ? NULL : rid.ib, RUNHEAD || ILV ? 0 : rid.ibn, ILV ? 2 : 1, 0 };
+                if (!rid.ib && vs[0]) rid = (rspec){ vs[0], vn[0], 1, 1 };   /* one headed block: its heads are the index */
+                const rspec *pid = RCUT ? &rid : NULL, *pln = RCUT ? &rln : NULL;
                 int lone = !(LENCODEC & CODEC_BZIP3) || nl <= (size_t)(LENCODEC & 0xffff) << 20;   /* one thread */
-                ljob lj = { idsrc, ni, NULL, 0, LENCODEC & CODEC_LZMA ? 2 : nthr > 1 ? nthr - 1 : 1 }; pthread_t lth;
+                ljob lj = { idsrc, ni, NULL, 0, LENCODEC & CODEC_LZMA ? 2 : nthr > 1 ? nthr - 1 : 1, pid }; pthread_t lth;
                 int lon = nraw == 1 && !ILV && lone && !pthread_create(&lth, NULL, labjob, &lj);
                 static const int ORDER[3] = { 1, 2, 0 };
                 size_t best = 0; int bv = -1;
@@ -3018,7 +3071,7 @@ static void ktw_close(ktw *w) {
                     int v = ORDER[k]; if (!vs[v]) continue;
                     uint8_t *f2 = NULL; size_t a2;
                     if (!v && lk && !i) { f2 = lk; a2 = lkn; lk = NULL; }   /* the one lensok made */
-                    else a2 = complens(tc, vs[v], vn[v], &f2, ZSTD_compressBound(vn[v]));
+                    else a2 = complens(tc, vs[v], vn[v], pln, &f2, ZSTD_compressBound(vn[v]));
                     if (!a2) { failed = 1; break; }
                     if (bv < 0 || a2 < best) { free(fa); fa = f2; best = a2; bv = v; }
                     else free(f2);
@@ -3030,7 +3083,7 @@ static void ktw_close(ktw *w) {
                 if (ILV) { b2 = 0; fb = NULL; }
                 else if (lon) { fb = lj.o; b2 = lj.z;
                                 if (!b2) { failed = 1; free(fa); free(fb); break; } }
-                else if (IDCODEC) { b2 = paycomp(idsrc, ni, IDCODEC, &fb);
+                else if (IDCODEC) { b2 = paycut(idsrc, ni, IDCODEC, pid, &fb);
                                if (!b2) { failed = 1; free(fa); break; } }
                 else
                 { size_t zb = ZSTD_compressBound(ni); fb = xmalloc(zb);

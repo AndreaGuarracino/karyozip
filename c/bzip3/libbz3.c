@@ -876,7 +876,26 @@ BZIP3_API void bz3_decode_blocks(struct bz3_state * states[], u8 * buffers[], si
 
 /* High level API implementations. */
 
+// karyozip: bz3_compress with the pieces' sizes given, cut[i] bytes each,
+// none above block_size, summing to in_size; cut NULL: every block_size
+// bytes. The frame keeps each piece's size, so bz3_decompress reads both.
+BZIP3_API int bz3_compress_cuts(u32 block_size, const u8 * const in, u8 * out, size_t in_size, size_t * out_size,
+                                const u32 * cut, u32 ncut);
+
 BZIP3_API int bz3_compress(u32 block_size, const u8 * const in, u8 * out, size_t in_size, size_t * out_size) {
+    return bz3_compress_cuts(block_size, in, out, in_size, out_size, NULL, 0);
+}
+
+BZIP3_API int bz3_compress_cuts(u32 block_size, const u8 * const in, u8 * out, size_t in_size, size_t * out_size,
+                                const u32 * cut, u32 ncut) {
+    if (cut) {
+        size_t t = 0;
+        for (u32 i = 0; i < ncut; i++) {
+            if (!cut[i] || cut[i] > block_size) return BZ3_ERR_INIT;
+            t += cut[i];
+        }
+        if (t != in_size) return BZ3_ERR_INIT;
+    }
     if (block_size > in_size) block_size = bz3_bound(in_size);
     block_size = block_size <= KiB(65) ? KiB(65) : block_size;
 
@@ -894,6 +913,7 @@ BZIP3_API int bz3_compress(u32 block_size, const u8 * const in, u8 * out, size_t
 
     u32 n_blocks = in_size / block_size;
     if (in_size % block_size) n_blocks++;
+    if (cut) n_blocks = ncut;
 
     if (buf_max < 13 || buf_max < bz3_bound(in_size)) {
         bz3_free(state);
@@ -916,30 +936,34 @@ BZIP3_API int bz3_compress(u32 block_size, const u8 * const in, u8 * out, size_t
     free(compression_buf); compression_buf = NULL;
     u8 ** bufs = calloc(n_blocks, sizeof *bufs);
     s32 * osz = calloc(n_blocks, sizeof *osz);
-    s8 err = bufs && osz ? BZ3_OK : BZ3_ERR_INIT;
+    size_t * off = malloc(((size_t)n_blocks + 1) * sizeof *off);   // piece i: off[i] to off[i + 1]
+    s8 err = bufs && osz && off ? BZ3_OK : BZ3_ERR_INIT;
+    if (off) off[0] = 0;
+    for (u32 i = 0; off && i < n_blocks; i++)
+        off[i + 1] = off[i] + (cut ? cut[i] : i == n_blocks - 1 ? in_size - (size_t)i * block_size : block_size);
 #ifdef _OPENMP
 #pragma omp parallel for schedule(dynamic, 1) if (n_blocks > 1 && !omp_in_parallel())
 #endif
     for (u32 i = 0; i < n_blocks; i++) {
         if (err != BZ3_OK) continue;
-        s32 size = (s32)(i == n_blocks - 1 ? in_size - (size_t)i * block_size : block_size);
+        s32 size = (s32)(off[i + 1] - off[i]);
         struct bz3_state * st = bz3_new(block_size);
         bufs[i] = malloc(bz3_bound(block_size));
         if (!st || !bufs[i]) { err = BZ3_ERR_INIT; bz3_free(st); continue; }
-        memcpy(bufs[i], in + (size_t)i * block_size, size);
+        memcpy(bufs[i], in + off[i], size);
         osz[i] = bz3_encode_block(st, bufs[i], size);
         if (bz3_last_error(st) != BZ3_OK) err = st->last_error;
         bz3_free(st);
     }
     for (u32 i = 0; err == BZ3_OK && i < n_blocks; i++) {
-        s32 size = (s32)(i == n_blocks - 1 ? in_size - (size_t)i * block_size : block_size);
+        s32 size = (s32)(off[i + 1] - off[i]);
         memcpy(out + *out_size + 8, bufs[i], osz[i]);
         write_neutral_s32(out + *out_size, osz[i]);
         write_neutral_s32(out + *out_size + 4, size);
         *out_size += osz[i] + 8;
     }
     for (u32 i = 0; bufs && i < n_blocks; i++) free(bufs[i]);
-    free(bufs); free(osz);
+    free(bufs); free(osz); free(off);
     return err;
 }
 

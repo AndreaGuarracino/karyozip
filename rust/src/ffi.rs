@@ -11,11 +11,13 @@ use std::os::raw::{c_char, c_int, c_uchar, c_uint, c_void};
 pub const CODEC_ARITH: i32 = 0x10000;
 pub const CODEC_BZIP3: i32 = 0x20000;
 pub const CODEC_LZMA: i32 = 0x40000;
+/// 0x80000|MB: libzpaq level 5 on pieces of MB, -e high only
+pub const CODEC_ZPAQ: i32 = 0x80000;
 
 /// Stores no size, so a size check cannot be made.
 pub fn nosz(c: i32) -> bool {
     let u = c as u32;
-    u != 0 && u & CODEC_BZIP3 as u32 == 0 && u & 0x10 != 0
+    u != 0 && u & (CODEC_BZIP3 | CODEC_ZPAQ) as u32 == 0 && u & 0x10 != 0
 }
 
 unsafe extern "C" {
@@ -44,6 +46,10 @@ unsafe extern "C" {
     fn kz_lzma_encode(src: *const c_uchar, n: usize, out: *mut c_uchar, ob: usize) -> usize;
     fn kz_lzma_decode(src: *const c_uchar, n: usize, dst: *mut c_uchar, raw: usize) -> c_int;
     fn kz_lzma_version() -> *const c_char;
+    // c/zpaq/kzzpaq.cpp: libzpaq on the caller's pieces, for both binaries
+    fn kz_zpaq_encode(inp: *const c_uchar, n: usize, cut: *const c_uint, ncut: c_uint, method: *const c_char,
+                      out: *mut c_uchar, cap: usize) -> usize;
+    fn kz_zpaq_decode(inp: *const c_uchar, n: usize, dst: *mut c_uchar, raw: usize) -> c_int;
     fn bz3_version() -> *const c_char;
     fn free(p: *mut c_void);
 }
@@ -197,11 +203,30 @@ pub fn bz3_cuts(src: &[u8], codec: i32, cut: &[u32]) -> Option<Vec<u8>> {
     }
 }
 
+/// libzpaq level 5 on pieces of the given sizes, summing to the source: the
+/// C's zpaq branch of paycut, with its output bound.
+pub fn zpaq_cuts(src: &[u8], cut: &[u32]) -> Option<Vec<u8>> {
+    let cap = src.len() + src.len() / 8 + 4096 + 1024 * cut.len();
+    // SAFETY: out holds cap bytes, cut holds cut.len() sizes; the C checks them.
+    unsafe {
+        let mut out = raw_buf(cap);
+        let z = kz_zpaq_encode(src.as_ptr(), src.len(), cut.as_ptr(), cut.len() as c_uint, c"5".as_ptr(), out.as_mut_ptr(), cap);
+        if z == 0 { return None; }
+        out.set_len(z);
+        Some(out)
+    }
+}
+
 /// One payload codec, chosen by `codec`, exactly as the C `paycomp` does.
 /// Returns None when the codec refuses, which the caller treats as "did not
 /// win" rather than as an error.
 pub fn paycomp(src: &[u8], codec: i32) -> Option<Vec<u8>> {
     let n = src.len();
+    if codec & CODEC_ZPAQ != 0 {   // pieces of MB, as the C's
+        let b = ((codec & 0xffff) as usize) << 20;
+        let cut: Vec<u32> = (0..n).step_by(b.max(1)).map(|o| (n - o).min(b) as u32).collect();
+        return zpaq_cuts(src, &cut);
+    }
     if codec & CODEC_LZMA != 0 {
         let ob = n + n / 16 + 4096;
         // SAFETY: out is ob bytes and the encoder reports how many it wrote.
@@ -269,7 +294,9 @@ pub fn paydecomp_into(src: &[u8], codec: i32, out: &mut Vec<u8>, raw: usize) -> 
     // checked to have written all of them before the length moves.
     unsafe {
         let dst = out.as_mut_ptr().add(n0);
-        let ok = if codec & CODEC_LZMA != 0 {
+        let ok = if codec & CODEC_ZPAQ != 0 {
+            kz_zpaq_decode(src.as_ptr(), src.len(), dst, raw) == 0
+        } else if codec & CODEC_LZMA != 0 {
             kz_lzma_decode(src.as_ptr(), src.len(), dst, raw) != 0
         } else if codec & CODEC_BZIP3 != 0 {
             let mut got = raw;

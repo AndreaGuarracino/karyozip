@@ -9,7 +9,7 @@ make            # builds c/build/karyozip
 make rust       # builds rust/target/release/karyozip, the binary the tests use
 ```
 
-The C needs zstd, zlib and an OpenMP compiler. liblzma is vendored in `c/xz`.
+The C needs zstd, zlib, an OpenMP compiler and a C++ compiler for libzpaq. liblzma is vendored in `c/xz`, libzpaq in `c/zpaq`.
 
 ## C and Rust
 
@@ -34,5 +34,6 @@ kt_close(w);
 
 ## Vendored code
 
-htscodecs, bzip3, libdeflate and liblzma under `c/` are pinned; each `PROVENANCE` names the release and every local patch.
+htscodecs, bzip3, libdeflate, liblzma and libzpaq under `c/` are pinned; each `PROVENANCE` names the release and every local patch.
+The vendored bzip3 also takes each block's size from the caller (`bz3_compress_cuts`), so blocks end at read starts; its frame already recorded each block's size, so the decoder is unchanged.
 The vendored bzip3 runs its independent blocks in parallel, writing the same bytes; `c/bzip3/lastblock_check.c` guards the last-block fix that bzip3 1.5.4 took from this tree.

@@ -657,6 +657,11 @@ rc=0; (ulimit -f 1; $KT compress < "$W/pbig.bed" > "$W/lim.kt" 2> "$W/lim.err") 
 [ $rc = 1 ] && ok "file-size limit: exit 1, not a signal" || no "file-size limit: rc=$rc"
 sz=""; for e in high medium low; do sz="$sz $($KT -e $e compress < "$D/ls.bed" 2>/dev/null | wc -c)"; done
 [ "$(echo $sz | tr ' ' '\n' | sort -n | tr '\n' ' ')" = "$(echo $sz) " ] && ok "effort high <= medium <= low:$sz B" || no "effort sizes out of order:$sz B"
+# -e high's zpaq frames: six contigs where it wins both frames
+awk 'BEGIN { srand(5); for (c = 0; c < 6; c++) { g = c % 4; nr = 20000 + int(rand() * 20000); p = 0; for (r = 0; r < nr; r++) { l = 1 + int(rand() * (g ? 9 * g : 37)); u = rand(); printf "ctg%d\t%d\t%d\t%s\n", c, p, p + l, u < 0.5 + g / 10 ? "chr" (1 + g) : "novel" int(rand() * 3); p += l } } }' > "$W/zt.bed"
+$KT -t 4 -e high compress -i "$W/zt.bed" -o "$W/zt.kt" 2> "$W/zt.err"
+grep -q "lengths zpaq-64MB, labels zpaq-64MB" "$W/zt.err" && ok "high: zpaq on both frames of six contigs" || no "high: zpaq not picked: $(grep layout "$W/zt.err")"
+$KT -t 4 decompress -i "$W/zt.kt" 2>/dev/null | cmp -s - "$W/zt.bed" && ok "zpaq frames: round-trip" || no "zpaq frames: WRONG"
 must_fail "--tmp-dir that does not exist" $KT --tmp-dir /nonexistent/dir compress < "$D/s.bed"
 $KT --tmp-dir "$W" compress < "$D/s.bed" 2>/dev/null | cmp -s - "$W/p.kt" && ok "--tmp-dir honoured: same bytes" || no "--tmp-dir honoured: WRONG"
 

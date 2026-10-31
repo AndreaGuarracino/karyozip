@@ -302,6 +302,12 @@ for f in tail1 tail2; do for flags in "" "-e low" "-e high" "--block 7"; do
 done; done
 [ $tbad = 0 ] && echo "tail predictor: $tok forms identical" || { echo "tail predictor: $tbad DIFFER"; fail=1; }
 
+# 13b. -e high's zpaq frames, both ways
+awk 'BEGIN { srand(5); for (c = 0; c < 6; c++) { g = c % 4; nr = 20000 + int(rand() * 20000); p = 0; for (r = 0; r < nr; r++) { l = 1 + int(rand() * (g ? 9 * g : 37)); u = rand(); printf "ctg%d\t%d\t%d\t%s\n", c, p, p + l, u < 0.5 + g / 10 ? "chr" (1 + g) : "novel" int(rand() * 3); p += l } } }' > "$W/zt.bed"
+"$C" -t 4 -e high compress -i "$W/zt.bed" > "$W/c.kst" 2>/dev/null; "$R" -t 4 -e high compress -i "$W/zt.bed" > "$W/r.kst" 2>/dev/null
+if cmp -s "$W/c.kst" "$W/r.kst" && "$R" decompress -i "$W/c.kst" 2>/dev/null | cmp -s - "$W/zt.bed" && "$C" decompress -i "$W/r.kst" 2>/dev/null | cmp -s - "$W/zt.bed"
+then echo "zpaq frames: identical, each reads the other"; else echo "zpaq frames: DIFFER"; fail=1; fi
+
 # 14. damaged file: same rows before refusal
 python3 -c "
 import random; random.seed(9)

@@ -46,10 +46,24 @@ build/xz-san/%.o: %.c $(XZ_HDR)
 # binary and every library check "differs".
 all: build/karyozip build/libkaryozip.a build/libtest
 
+# libzpaq 7.15, C++: without OpenMP, since its divsufsort spawns its own
+# threads; the wrapper puts the pieces on threads. JIT on x86-64 only.
+CXX     ?= g++
+# or a libstdc++.a, where no g++ came with gcc
+CXXLIB  ?= -lstdc++
+ZPQ_DEF := -Dunix $(if $(filter x86_64,$(shell uname -m)),,-DNOJIT)
+ZPQ_OBJ := build/zpaq/libzpaq.o build/zpaq/kzzpaq.o
+build/zpaq/libzpaq.o: zpaq/libzpaq.cpp zpaq/libzpaq.h
+	mkdir -p $(@D)
+	$(CXX) -O3 -w $(ZPQ_DEF) -c $< -o $@
+build/zpaq/kzzpaq.o: zpaq/kzzpaq.cpp zpaq/libzpaq.h
+	mkdir -p $(@D)
+	$(CXX) -O3 -Wall -Wextra -fopenmp $(ZPQ_DEF) -Izpaq -c $< -o $@
+
 HDR := karyozip.h $(wildcard htscodecs/*.h bzip3/*.h libdeflate/*.h libdeflate/lib/*.h libdeflate/lib/*/*.h)
-build/karyozip: $(SRC) $(HDR) $(XZ_OBJ)
+build/karyozip: $(SRC) $(HDR) $(XZ_OBJ) $(ZPQ_OBJ)
 	mkdir -p build
-	$(CC) $(CFLAGS) $(ZSTD_CFLAGS) -o $@ $(SRC) $(XZ_OBJ) $(LDFLAGS) $(ZSTD_LIBS) -lm -lpthread -lz
+	$(CC) $(CFLAGS) $(ZSTD_CFLAGS) -o $@ $(SRC) $(XZ_OBJ) $(ZPQ_OBJ) $(LDFLAGS) $(ZSTD_LIBS) -lm -lpthread -lz $(CXXLIB)
 
 # the same sources, minus main: an annotator can write .kst without a BED.
 # Objects keep their paths: two vendored trees both have a utils.c.
@@ -57,18 +71,18 @@ OBJ := $(SRC:%.c=build/lib/%.o)
 build/lib/%.o: %.c $(HDR)
 	mkdir -p $(@D)
 	$(CC) $(CFLAGS) $(ZSTD_CFLAGS) -Wno-unused-function -Wno-unused-variable -DKARYOZIP_LIB -c $< -o $@
-build/libkaryozip.a: $(OBJ) $(XZ_OBJ)
-	rm -f $@ && $(AR) rcs $@ $(OBJ) $(XZ_OBJ)
+build/libkaryozip.a: $(OBJ) $(XZ_OBJ) $(ZPQ_OBJ)
+	rm -f $@ && $(AR) rcs $@ $(OBJ) $(XZ_OBJ) $(ZPQ_OBJ)
 
 build/libtest: build/libkaryozip.a ../tests/libtest.c
-	$(CC) $(CFLAGS) $(ZSTD_CFLAGS) -o $@ ../tests/libtest.c build/libkaryozip.a $(LDFLAGS) $(ZSTD_LIBS) -lm -lpthread -lz
+	$(CC) $(CFLAGS) $(ZSTD_CFLAGS) -o $@ ../tests/libtest.c build/libkaryozip.a $(LDFLAGS) $(ZSTD_LIBS) -lm -lpthread -lz $(CXXLIB)
 
 # the memory-checked twin fuzz.sh runs: one build, kept until a
 # source changes, where each script used to compile its own every run
-build/karyozip-san: $(SRC) $(HDR) $(XZ_SAN)
+build/karyozip-san: $(SRC) $(HDR) $(XZ_SAN) $(ZPQ_OBJ)
 	mkdir -p build
 	$(CC) -O1 -g -fsanitize=address,undefined -std=gnu11 -fopenmp -DVERSION='"$(BZIP3_VERSION)"' -I. \
-	  $(ZSTD_CFLAGS) -o $@ $(SRC) $(XZ_SAN) $(LDFLAGS) $(ZSTD_LIBS) -lm -lpthread -lz
+	  $(ZSTD_CFLAGS) -o $@ $(SRC) $(XZ_SAN) $(ZPQ_OBJ) $(LDFLAGS) $(ZSTD_LIBS) -lm -lpthread -lz $(CXXLIB)
 
 test: build/karyozip build/libtest build/karyozip-san
 	bash ../tests/run.sh build/karyozip build/libtest build/karyozip-san

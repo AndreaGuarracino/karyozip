@@ -496,6 +496,8 @@ static char *unz(const void *src, size_t n, size_t *len, const char *what) {
 #define CODEC_ARITH 0x10000
 #define CODEC_BZIP3 0x20000           /* 0x20000|MB: bzip3, block size in MB */
 #define CODEC_LZMA  0x40000           /* LZMA2, the settings xz/kzlzma.c pins */
+#define CODEC_ZPAQ  0x80000           /* 0x80000|MB: libzpaq level 5, pieces of MB; -e high only */
+#define ZPQMB 64                      /* -e high's zpaq piece, as zpaq -m5's block */
 #define DROPPED (1ULL << 60)          /* names deliberately not stored */
 #define ALNFLAG (1ULL << 59)          /* rows deltaed against a reference */
 #define DBFLAG  (1ULL << 58)          /* labels are featureIDs, not labels */
@@ -635,6 +637,9 @@ static size_t paycut(const uint8_t *src, size_t n, int codec, const rspec *rs, u
 static size_t paydecomp(const uint8_t *src, size_t n, int codec, uint8_t *dst, size_t raw);
 int bz3_compress_cuts(uint32_t block_size, const uint8_t *in, uint8_t *out, size_t in_size, size_t *out_size,
                       const uint32_t *cut, uint32_t ncut);
+size_t kz_zpaq_encode(const uint8_t *in, size_t n, const uint32_t *cut, uint32_t ncut, const char *method,
+                      uint8_t *out, size_t cap);
+int kz_zpaq_decode(const uint8_t *in, size_t n, uint8_t *dst, size_t raw);
 
 /* Read names split on ':' into fields that are either the same in every name
    or a plain integer. The integers go down as zigzag deltas, interleaved so a
@@ -1031,7 +1036,7 @@ static void *namespick(void *p) {
 }
 
 
-static int nosz(int c) { unsigned u = (unsigned)c; return u && !(u & CODEC_BZIP3) && (u & 0x10); }
+static int nosz(int c) { unsigned u = (unsigned)c; return u && !(u & (CODEC_BZIP3 | CODEC_ZPAQ)) && (u & 0x10); }
 
 /* a varint that may run past the end: a cut is a size, never a fault */
 static uint64_t vsoft(const uint8_t **p, const uint8_t *e) {
@@ -1072,6 +1077,20 @@ static size_t paycomp(const uint8_t *src, size_t n, int codec, uint8_t **out) { 
 
 static size_t paycut(const uint8_t *src, size_t n, int codec, const rspec *rs, uint8_t **out) {
     unsigned int ol;
+    if (codec & CODEC_ZPAQ) {   /* pieces end at read starts, as bzip3's */
+        size_t B = (size_t)(codec & 0xffff) << 20; uint32_t nc = 0, *cut;
+        if (rs && n > B) cut = bz3cuts(src, n, B, rs, &nc);
+        else {
+            nc = (uint32_t)((n + B - 1) / B); cut = xmalloc((nc ? nc : 1) * sizeof *cut);
+            for (uint32_t i = 0; i < nc; i++) cut[i] = (uint32_t)(n - (size_t)i * B < B ? n - (size_t)i * B : B);
+        }
+        size_t cap = n + n / 8 + 4096 + 1024 * (size_t)nc;
+        *out = malloc(cap);
+        size_t z = *out ? kz_zpaq_encode(src, n, cut, nc, "5", *out, cap) : 0;
+        free(cut);
+        if (!z) { free(*out); *out = NULL; }
+        return z;
+    }
     if (codec & CODEC_LZMA) {
         size_t ob = n + n / 16 + 4096, op;
         *out = malloc(ob);
@@ -1108,6 +1127,7 @@ static size_t paycut(const uint8_t *src, size_t n, int codec, const rspec *rs, u
 }
 
 static size_t paydecomp(const uint8_t *src, size_t n, int codec, uint8_t *dst, size_t raw) {
+    if (codec & CODEC_ZPAQ) return kz_zpaq_decode(src, n, dst, raw) ? 0 : raw;
     if (codec & CODEC_LZMA) {
         return kz_lzma_decode(src, n, dst, raw) ? raw : 0;
     }
@@ -2381,13 +2401,14 @@ static const char *cname(int c) {
     static __thread char b[32];
     if (!c) return "zstd";
     if (c & CODEC_LZMA) return "lzma";
-    if (c & CODEC_BZIP3) snprintf(b, sizeof b, "bzip3-%dMB", c & 0xffff);
+    if (c & CODEC_ZPAQ) snprintf(b, sizeof b, "zpaq-%dMB", c & 0xffff);
+    else if (c & CODEC_BZIP3) snprintf(b, sizeof b, "bzip3-%dMB", c & 0xffff);
     else snprintf(b, sizeof b, "%s-o%d%s%s", c & CODEC_ARITH ? "arith" : "rans", c & 1, c & 0x80 ? "+pack" : "", c & 0x40 ? "+rle" : "");
     return b;
 }
 
 static int fastenough(int codec) {
-    return (codec & (CODEC_BZIP3 | CODEC_ARITH | CODEC_LZMA)) == 0;
+    return (codec & (CODEC_BZIP3 | CODEC_ARITH | CODEC_LZMA | CODEC_ZPAQ)) == 0;
 }
 
 static void pickcodecs(int rawfd, const blkmeta *bm, size_t nraw) {
@@ -2794,6 +2815,19 @@ static void bz3rows(const uint8_t *s, size_t n, const rspec *rs, int *cd, size_t
     if (nm && bz3try(s, n, &rr, mb, nm, cd, sz)) *rows = MEDBLK;
 }
 
+/* -e high: libzpaq's level 5, context mixing, in ZPQMB pieces ended at read
+   starts: 3.93% to 11.84% under bzip3 on two assemblies, two short-read
+   tracks and an assembly holdout (job 38965676). The frame is kept, so it
+   is made once and read back once. */
+static uint8_t *ZK[2]; static size_t ZKN[2];   /* the kept lengths and labels frames */
+static void zpqtry(const uint8_t *s, size_t n, const rspec *rs, int *cd, size_t *sz, int t) {
+    int c = CODEC_ZPAQ | ZPQMB; uint8_t *o = NULL, *v = NULL;
+    size_t z = paycut(s, n, c, rs, &o);
+    int ok = z && z < *sz && (v = malloc(n ? n : 1)) && paydecomp(o, z, c, v, n) == n && !memcmp(v, s, n);
+    free(v);
+    if (ok) { *cd = c; *sz = z; free(ZK[t]); ZK[t] = o; ZKN[t] = z; } else free(o);
+}
+
 /* the checked frame is kept in *keep: the compress phase would make the same */
 static size_t lensok(ZSTD_CCtx *tc, const uint8_t *src, size_t n, const rspec *rs, uint8_t **keep) {
     uint8_t *c = NULL; size_t z = complens(tc, src, n, rs, &c, ZSTD_compressBound(n));
@@ -3012,6 +3046,9 @@ static void ktw_close(ktw *w) {
             bz3rows(src[u], m5[u], &rr, &cr, &zr, &rr.rows);
             if (rr.rows) bz3fine(src[u], m5[u], &rr, &cr, &zr);
             if (rr.rows && zr < r5[u]) { c5[u] = cr; r5[u] = zr; rs5[u] = rr; }
+            rspec rz = rs5[u]; rz.rows = 0;
+            zpqtry(src[u], m5[u], &rz, &c5[u], &r5[u], t);
+            if (c5[u] & CODEC_ZPAQ) rs5[u].rows = 0;
         }
         CUTROWS_L = rs5[L + 1].rows; CUTROWS_I = rs5[0].rows;
         /* the sample is the whole block: its winner is built, keep it */
@@ -3031,7 +3068,10 @@ static void ktw_close(ktw *w) {
         if (L == 2) GRP = 1;
         if (L == 3) ILV = 1;
         RUNHEAD = L > 0;
-        if (L && !(lkn = lensok(mc, altbuf, altlen, &rs5[L + 1], &lk))) LENCODEC = 0;  /* it does not come back: zstd does */
+        if (whole && (LENCODEC & CODEC_ZPAQ) && ZK[0]) { lk = ZK[0]; lkn = ZKN[0]; ZK[0] = NULL; }   /* made and read back */
+        else if (L && !(lkn = lensok(mc, altbuf, altlen, &rs5[L + 1], &lk))) LENCODEC = 0;  /* it does not come back: zstd does */
+        if (!whole || !(IDCODEC & CODEC_ZPAQ)) { free(ZK[1]); ZK[1] = NULL; }
+        free(ZK[0]); ZK[0] = NULL;
         static const char *LN[4] = {"plain", "headed", "grouped", "interleaved"};
         fprintf(stderr, "layout: %s, lengths %s", LN[L], cname(LENCODEC));
         fprintf(stderr, "%s%s, decided on %zu of %zu B of lengths\n", L == 3 ? "" : ", labels ", L == 3 ? "" : cname(IDCODEC), pl, nl0);
@@ -3120,7 +3160,7 @@ static void ktw_close(ktw *w) {
                 const rspec *pid = RCUT ? &rid : NULL, *pln = RCUT ? &rln : NULL;
                 int lone = !(LENCODEC & CODEC_BZIP3) || nl <= (size_t)(LENCODEC & 0xffff) << 20;   /* one thread */
                 ljob lj = { idsrc, ni, NULL, 0, LENCODEC & CODEC_LZMA ? 2 : nthr > 1 ? nthr - 1 : 1, pid }; pthread_t lth;
-                int lon = nraw == 1 && !ILV && lone && !pthread_create(&lth, NULL, labjob, &lj);
+                int lon = nraw == 1 && !ILV && lone && !ZK[1] && !pthread_create(&lth, NULL, labjob, &lj);
                 static const int ORDER[3] = { 1, 2, 0 };
                 size_t best = 0; int bv = -1;
                 for (int k = 0; k < 3; k++) {
@@ -3137,6 +3177,7 @@ static void ktw_close(ktw *w) {
                 if (failed) { free(fa); free(lj.o); break; }
                 a = best; nl = ILV ? (ownl ? ownl : altvl[bv]) : vn[bv]; nosent = (uint64_t)bv;
                 if (ILV) { b2 = 0; fb = NULL; }
+                else if (!i && ZK[1]) { fb = ZK[1]; b2 = ZKN[1]; ZK[1] = NULL; }   /* the labels frame zpqtry made */
                 else if (lon) { fb = lj.o; b2 = lj.z;
                                 if (!b2) { failed = 1; free(fa); free(fb); break; } }
                 else if (IDCODEC) { b2 = paycut(idsrc, ni, IDCODEC, pid, &fb);

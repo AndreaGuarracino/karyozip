@@ -50,6 +50,16 @@ fn main() {
         xz.include(c.join("xz/src/liblzma").join(d));
     }
     xz.opt_level(3).flag("-std=gnu11").flag("-fno-semantic-interposition").warnings(false).compile("kzxz");
+    // libzpaq 7.15 without OpenMP, its divsufsort spawns its own threads;
+    // the wrapper puts the pieces on threads. JIT on x86-64 only, as the C's.
+    let mut zp = cc::Build::new();
+    zp.cpp(true).file(c.join("zpaq/libzpaq.cpp")).define("unix", None).opt_level(3).warnings(false);
+    if std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() != Ok("x86_64") { zp.define("NOJIT", None); }
+    zp.compile("kzlibzpaq");
+    let mut zw = cc::Build::new();
+    zw.cpp(true).file(c.join("zpaq/kzzpaq.cpp")).include(c.join("zpaq")).define("unix", None).opt_level(3).flag("-fopenmp").warnings(false);
+    if std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() != Ok("x86_64") { zw.define("NOJIT", None); }
+    zw.compile("kzzpaq");
     println!("cargo:rustc-link-lib=gomp");
 }
 

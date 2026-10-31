@@ -370,6 +370,7 @@ impl Writer {
         let mut ilvcodec = p.len;
         let mut altv: [Option<(Vec<u8>, usize)>; 3] = [None, None, None];
         let (mut cutrows_l, mut cutrows_i) = (0u64, 0u64);   // -e high: the rows rule of each frame, 0 none
+        let mut zk: [Option<Vec<u8>>; 2] = [None, None];      // the kept zpaq lengths and labels frames
         let _l = crate::prof::span(9);
         if onelay {
             let (lens0, ids0) = self.read_block(0).unwrap_or_else(|_| crate::bail("cannot read back a staged block"));
@@ -418,6 +419,8 @@ impl Writer {
                 bz3_rows(src[u], &mut rr, &mut zr, slow);
                 if rr.rows != 0 { bz3_fine(src[u], Some(&rr), &mut zr); }
                 if rr.rows != 0 && zr.2 < r[u].2 { r[u] = zr; rs5[u] = rr; }
+                zpq_try(src[u], &Rspec { rows: 0, ..rs5[u] }, &mut r[u], &mut zk[usize::from(u == 0)]);
+                if r[u].0 & ffi::CODEC_ZPAQ != 0 { rs5[u].rows = 0; }
             }
             (cutrows_l, cutrows_i) = (rs5[l + 1].rows, rs5[0].rows);
             (idc, lvl_id) = (r[0].0, if r[0].1 < 0 { level } else { r[0].1 });
@@ -435,7 +438,10 @@ impl Writer {
                 _ => {}
             }
             runhead = l > 0;
-            if l > 0 { lz = lens_ok(&altbuf, ilvcodec, lvl_len, Some(&rs5[l + 1])); if lz.is_none() { ilvcodec = 0; } }   // zstd comes back
+            if whole && ilvcodec & ffi::CODEC_ZPAQ != 0 && zk[0].is_some() { lz = zk[0].take(); }   // made and read back
+            else if l > 0 { lz = lens_ok(&altbuf, ilvcodec, lvl_len, Some(&rs5[l + 1])); if lz.is_none() { ilvcodec = 0; } }   // zstd comes back
+            if !whole || idc & ffi::CODEC_ZPAQ == 0 { zk[1] = None; }
+            zk[0] = None;
             let labels = if l == 3 { String::new() } else { format!(", labels {}", cname(idc)) };
             eprintln!("layout: {}, lengths {}{labels}, decided on {pl} of {} B of lengths",
                       ["plain", "headed", "grouped", "interleaved"][l], cname(ilvcodec), lens0.len());
@@ -460,6 +466,7 @@ impl Writer {
         drop(_l);
         let lencodec = ilvcodec;
         let lz = std::sync::Mutex::new(lz);
+        let zk1 = std::sync::Mutex::new(zk[1].take());
         if runhead && !varon { self.ibx.clear(); }   // blocks past the first still spell theirs
 
         let _s = crate::prof::span(1);
@@ -521,7 +528,10 @@ impl Writer {
                 }
                 (bv, fa)
             };
-            let ids_job = || if ilv { Vec::new() } else { comp_frame(&ids, idc, lvl_id, pid).unwrap_or_else(|| crate::bail("block compression failed")) };
+            let ids_job = || if ilv { Vec::new() } else {
+                let kept = if i == 0 { zk1.lock().unwrap().take() } else { None };   // the labels frame zpq_try made
+                kept.or_else(|| comp_frame(&ids, idc, lvl_id, pid)).unwrap_or_else(|| crate::bail("block compression failed"))
+            };
             // Labels beside a lengths frame that takes one thread, as the C's:
             // the rest of the threads, or 2 beside LZMA, an hour on 3 GB, so
             // bzip3 holds 2 block states, not 8
@@ -773,6 +783,7 @@ fn bz3_dup(c: i32, m: usize, n: usize, cand: &[i32]) -> bool {
 fn cname(c: i32) -> String {
     if c == 0 { return "zstd".into(); }
     if c & ffi::CODEC_LZMA != 0 { return "lzma".into(); }
+    if c & ffi::CODEC_ZPAQ != 0 { return format!("zpaq-{}MB", c & 0xffff); }
     if c & ffi::CODEC_BZIP3 != 0 { return format!("bzip3-{}MB", c & 0xffff); }
     format!("{}-o{}{}{}", if c & ffi::CODEC_ARITH != 0 { "arith" } else { "rans" }, c & 1,
             if c & 0x80 != 0 { "+pack" } else { "" }, if c & 0x40 != 0 { "+rle" } else { "" })
@@ -792,7 +803,7 @@ pub fn candlist(slow: bool) -> Vec<i32> {
 /// pick for a file a query will seek into.
 // a query decodes a whole block: bzip3 at 8 MB/s, arith at 2.5x rANS
 fn fast_enough(codec: i32) -> bool {
-    codec & (ffi::CODEC_BZIP3 | ffi::CODEC_ARITH | ffi::CODEC_LZMA) == 0
+    codec & (ffi::CODEC_BZIP3 | ffi::CODEC_ARITH | ffi::CODEC_LZMA | ffi::CODEC_ZPAQ) == 0
 }
 
 pub struct Pick { pub id: i32, pub len: i32, pub lvl_id: i32, pub lvl_len: i32, pub level: i32 }
@@ -1123,6 +1134,18 @@ pub struct Rspec<'a> { ib: Option<&'a [u8]>, mult: usize, cs: usize, rows: u64 }
 
 /// -e medium's block: it closes at the first read start past these rows
 pub const MEDBLK: u64 = 4194304;
+/// -e high's zpaq piece, as zpaq -m5's block
+pub const ZPQMB: i32 = 64;
+
+/// -e high: libzpaq's level 5, context mixing, in ZPQMB pieces ended at read
+/// starts, as the C's zpqtry: the frame is kept, so it is made once and
+/// read back once.
+fn zpq_try(s: &[u8], rs: &Rspec, r: &mut (i32, i32, usize), keep: &mut Option<Vec<u8>>) {
+    let c = ffi::CODEC_ZPAQ | ZPQMB;
+    if let Some(v) = paycut(s, c, Some(rs)) {
+        if v.len() < r.2 && ffi::paydecomp(&v, c, s.len()).as_deref() == Some(s) { *r = (c, r.1, v.len()); *keep = Some(v); }
+    }
+}
 
 /// a varint that may run past the end, as the C's vsoft
 fn vsoft(s: &[u8], p: &mut usize) -> u64 {
@@ -1168,6 +1191,7 @@ fn bz3_cuts(s: &[u8], b: usize, rs: &Rspec) -> Vec<u32> {
 fn paycut(src: &[u8], codec: i32, rs: Option<&Rspec>) -> Option<Vec<u8>> {
     let b = ((codec & 0xffff) as usize) << 20;
     match rs {
+        Some(rs) if codec & ffi::CODEC_ZPAQ != 0 && src.len() > b => ffi::zpaq_cuts(src, &bz3_cuts(src, b, rs)),
         Some(rs) if codec & ffi::CODEC_BZIP3 != 0 && src.len() > b => ffi::bz3_cuts(src, codec, &bz3_cuts(src, b, rs)),
         _ => ffi::paycomp(src, codec),
     }

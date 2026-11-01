@@ -17,17 +17,20 @@ namespace libzpaq { void error(const char* msg) { throw std::runtime_error(msg);
 // -e high's model of an interleaved stream: each read its run count k, then
 // k pairs of label and length, LEB128. HCOMP follows the fields, so each
 // byte is predicted knowing which field it is, whether its pair is the
-// read's last and the read's earlier labels and lengths: 8.10% and 8.47%
-// under level 5 on 16 MB of two short-read tracks, 0.33% on an assembly
-// (2026-10-31).
+// read's last, the read's earlier labels and lengths, and the bytes at the
+// same offset in the reads before; match models give the last value seen
+// in each such context: 11.15% and 13.51% under level 5 on 16 MB of two
+// short-read tracks, 0.46% on an assembly (2026-10-31).
 // R0 next field (0 count, 1 label, 2 length), R1 pairs left, R2 k, R3 pair
 // index, R4 previous label, R5 label, R6 length sum, R7 previous length,
 // R8 previous k, R9 partial value, R10 its shift, R11 label before R4,
 // R12 byte, R13 value, R14 state with shift, R15 field + 4 on the last pair,
 // R16 last label of the previous read, R17 k two reads back, R18 first
-// label of the read, R19 of the previous read.
+// label of the read, R19 of the previous read, R20 label before R11,
+// R21 hash of the read so far, R22 to R25 where this read and the three
+// before start in M.
 static const char ILV[] = R"zp(
-comp 5 10 0 0 22
+comp 6 10 0 0 37
   0 icm 10
   1 isse 13 0
   2 isse 16 1
@@ -43,13 +46,28 @@ comp 5 10 0 0 22
   12 icm 16
   13 icm 16
   14 icm 16
-  15 mix 12 0 15 12 255
-  16 mix 18 0 15 12 255
-  17 mix2 0 15 16 12 0
-  18 sse 19 17 32 255
-  19 sse 20 17 32 255
-  20 mix2 0 18 19 12 0
-  21 mix2 0 17 20 12 0
+  15 icm 16
+  16 icm 18
+  17 icm 16
+  18 icm 16
+  19 icm 16
+  20 isse 18 5
+  21 isse 18 20
+  22 match 22 24
+  23 match 22 24
+  24 match 22 24
+  25 match 22 24
+  26 match 22 24
+  27 match 22 24
+  28 match 22 24
+  29 match 22 24
+  30 mix 12 0 30 12 255
+  31 mix 18 0 30 12 255
+  32 mix2 0 30 31 12 0
+  33 sse 19 32 32 255
+  34 sse 20 32 32 255
+  35 mix2 0 33 34 12 0
+  36 mix2 0 32 35 12 0
 hcomp
   c++ *c=a r=a 12
   a> 127 ifl
@@ -61,33 +79,31 @@ hcomp
     a=r 0 a== 0 ifl
       a=r 8 r=a 17 a=r 2 r=a 8
       a=r 13 r=a 2 r=a 1
-      a=0 r=a 3 r=a 6
-      a= 255 r=a 4 r=a 7 r=a 11
+      a=0 r=a 3 r=a 6 r=a 21
+      a=r 24 r=a 25 a=r 23 r=a 24 a=r 22 r=a 23 a=c r=a 22
+      a= 255 r=a 4 r=a 7 r=a 11 r=a 20
       a=r 1 a> 0 if a= 1 else a=0 endif r=a 0
     elsel
       a== 1 if
         a=r 13 r=a 5 a=r 3 a== 0 if a=r 18 r=a 19 a=r 13 r=a 18 endif a= 2 r=a 0
       else
         a=r 13 r=a 7 b=r 6 a+=b r=a 6
-        a=r 4 r=a 11 a=r 5 r=a 4
+        a=r 11 r=a 20 a=r 4 r=a 11 a=r 5 r=a 4
         a=r 3 a++ r=a 3
         a=r 1 a-- r=a 1
         a> 0 if a= 1 else a=r 5 r=a 16 a=0 endif r=a 0
       endif
     endif
   endif
+  a=r 21 b=c hash r=a 21
   a=r 1 a== 1 if a= 4 else a=0 endif b=r 0 a+=b r=a 15
   b=r 10 a+=b a+=b r=a 14
-  (0: state, pair index, k)
-  d=0 *d=0 a=r 14 hashd a=r 3 a> 15 if a= 15 endif hashd a=r 2 a> 31 if a= 31 endif hashd
-  (1-5: orders 1, 2, 3, 4, 6 with the state; 11: order 8 for the match)
-  d++ b=c a=r 14 hash *d=a
-  d++ b-- hash *d=a
-  d++ b-- hash *d=a
-  d++ b-- hash *d=a
-  d++ b-- hash b-- hash *d=a
-  d= 11 b-- hash b-- hash *d=a
-  (6: by field)
+  d= 0 *d=0 a=r 14 hashd a=r 3 a> 15 if a= 15 endif hashd a=r 2 a> 31 if a= 31 endif hashd
+  d= 1 b=c a=r 14 hash *d=a
+  d= 2 b-- hash *d=a
+  d= 3 b-- hash *d=a
+  d= 4 b-- hash *d=a
+  d= 5 b-- hash b-- hash *d=a
   d= 6 *d=0 a=r 0 hashd
   a=r 0 a== 1 ifl
     a=r 4 hashd a=r 11 hashd a=r 15 hashd a=r 3 a> 7 if a= 7 endif hashd
@@ -99,7 +115,6 @@ hcomp
     endif
   endif
   a=r 9 hashd a=r 10 hashd a=0 hashd
-  (7: by field, second)
   d= 7 *d=0 a=r 0 hashd
   a=r 0 a== 1 ifl
     a=r 4 hashd a=r 7 hashd a=r 6 hashd
@@ -111,7 +126,6 @@ hcomp
     endif
   endif
   a=r 9 hashd a=r 10 hashd a=0 hashd
-  (8: by field, third)
   d= 8 *d=0 a=r 0 hashd
   a=r 0 a== 1 ifl
     a=r 4 hashd a=r 3 hashd a=r 1 hashd
@@ -123,10 +137,9 @@ hcomp
     endif
   endif
   a=r 9 hashd a=r 10 hashd a=0 hashd
-  (9, 10: contexts 6, 7 direct)
   d= 6 a=*d d= 9 *d=a
   d= 7 a=*d d= 10 *d=a
-  (12: read level: the first labels of this read and the previous one)
+  d= 11 a=r 14 b=c hash b-- hash b-- hash b-- hash b-- hash b-- hash b-- hash b-- hash *d=a
   d= 12 *d=0 a=r 0 hashd
   a=r 0 a== 1 ifl
     a=r 3 a== 0 if
@@ -142,15 +155,37 @@ hcomp
     endif
   endif
   a=r 9 hashd a=r 10 hashd a=0 hashd
-  (13, 14: sparse, bytes 2-3 and 2, 4 back, with the state)
   d= 13 *d=0 a=r 14 hashd b=c b-- a=*b hashd b-- a=*b hashd
   d= 14 *d=0 a=r 14 hashd b=c b-- a=*b hashd b-- b-- a=*b hashd
-  (15: mixer by field, last pair, first pair; 16: by field and the last byte)
-  d= 15 a=r 3 a> 0 if a= 8 endif b=r 15 a+=b a<<= 8 *d=a
-  d= 16 a=r 0 a<<= 8 a+=*c a<<= 8 *d=a
-  (18: SSE by field, last pair and the last byte; 19: by the field context)
-  d= 18 a=r 15 a<<= 8 a+=*c a<<= 8 *d=a
-  d= 6 a=*d a>>= 20 a<<= 8 d= 19 *d=a
+  d= 15 *d=0 a=r 0 hashd
+  a=r 0 a== 1 ifl
+    a=r 4 hashd a=r 11 hashd a=r 20 hashd a=r 15 hashd
+  elsel
+    a== 2 if
+      a=r 5 hashd a=r 4 hashd a=r 11 hashd a=r 7 hashd
+    else
+      a=r 16 hashd a=r 19 hashd a=r 8 hashd a=r 17 hashd
+    endif
+  endif
+  a=r 9 hashd a=r 10 hashd a=0 hashd
+  d= 16 *d=0 a=r 21 hashd a=r 14 hashd
+  d= 17 *d=0 a=r 14 hashd a=c a++ b=r 22 a-=b b=r 23 a+=b b=a a=*b hashd a=r 3 hashd
+  d= 18 *d=0 a=r 14 hashd a=c a++ b=r 22 a-=b b=r 23 a+=b b=a a=*b hashd a=*c hashd
+  d= 19 *d=0 a=r 14 hashd a=c a++ b=r 22 a-=b b=r 23 a+=b b=a a=*b hashd a=c a++ b=r 22 a-=b b=r 24 a+=b b=a a=*b hashd
+  d= 6 a=*d d= 20 *d=a
+  d= 7 a=*d d= 21 *d=a
+  d= 22 a=r 21 *d=a
+  d= 23 *d=0 a=r 14 hashd a=c a++ b=r 22 a-=b b=r 23 a+=b b=a a=*b hashd a=r 3 hashd
+  d= 24 *d=0 a=r 14 hashd a=c a++ b=r 22 a-=b b=r 23 a+=b b=a a=*b hashd a=*c hashd
+  d= 25 a=r 14 b=c hash b-- hash b-- hash *d=a
+  d= 26 *d=0 a=r 14 hashd a=r 4 hashd a=r 11 hashd a=r 20 hashd a=r 3 hashd
+  d= 27 a=r 14 b=c hash *d=a
+  d= 28 a=r 14 b=c hash b-- hash *d=a
+  d= 7 a=*d d= 29 *d=a
+  d= 30 a=r 3 a> 0 if a= 8 endif b=r 15 a+=b a<<= 8 *d=a
+  d= 31 a=r 0 a<<= 8 a+=*c a<<= 8 *d=a
+  d= 33 a=r 15 a<<= 8 a+=*c a<<= 8 *d=a
+  d= 6 a=*d a>>= 20 a<<= 8 d= 34 *d=a
   halt
 end
 )zp";

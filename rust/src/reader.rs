@@ -83,9 +83,12 @@ pub struct Reader {
     tailpred: u64,
     tailskip: u64,
     /// every name, newline-free, back to back, and noff[i]..noff[i+1] is
-    /// name i: decoded from nz on first use
+    /// name i: decoded from the names stream on first use
     names: std::cell::OnceCell<std::sync::Arc<(Vec<u8>, Vec<u64>)>>,
-    nz: Vec<u8>,
+    /// the names stream's offset and size: read when the names are, as the
+    /// C's nz_off, not held by every reader (a smooth worker held 71 MB)
+    nz_off: u64,
+    nzl: usize,
     names_file: Option<String>,
     /// dropped, int, tok, fld
     nf: u8,
@@ -285,7 +288,7 @@ impl Reader {
         if taildec && h[13] & 0xff != 64 {
             crate::bail("corrupt file: tail skip is not the format constant");
         }
-        let nzl = nml as usize;
+        let (nzl, nz_off) = (nml as usize, rd(f.stream_position(), "seek"));
         let mut nz = vec![0u8; crate::ckalloc(nzl)];
         if nzl > 0 { rd(f.read_exact(&mut nz), "short names"); }
         let mut iz = vec![0u8; crate::ckalloc(h[2] as usize)];
@@ -311,6 +314,7 @@ impl Reader {
             mh = kst::fnv(mh, &itz);
             if mh != h[15] { crate::bail("corrupt file: the metadata does not match its hash"); }
         }
+        drop(nz);
 
         // The block table.
         let was_len = h[1] & LENFLAG != 0;
@@ -415,7 +419,7 @@ impl Reader {
             idcodec: idc, lencodec: lenc,
             taildec, tailpred: h[12], tailskip: h[13] & 0xff, iz, coff, cpend, ibx: Vec::new(), cur_chunk: u64::MAX,
             runhead, ilv, grp, rtab: Default::default(), varblk, rtab_blk: usize::MAX,
-            names: std::cell::OnceCell::new(), nz, names_file: o.names_file.clone(),
+            names: std::cell::OnceCell::new(), nz_off, nzl, names_file: o.names_file.clone(),
             nf, idx,
             mhash: h[15], cur_ri: 0, cur_q: 0, cur_pend: 0, cached: None, sc: None,
             rowhash: if h1_raw & ALNFLAG != 0 { 0 } else { h[13] >> 8 },
@@ -971,27 +975,33 @@ impl Reader {
     fn decode_names(&self) -> (Vec<u8>, Vec<u64>) {
         let (dropped, names_int) = (self.nf & 1 != 0, self.nf & 2 != 0);
         let (names_tok, names_fld) = (self.nf & 4 != 0, self.nf & 8 != 0);
-        let (nz, n) = (&self.nz, self.nreads);
+        let (n, has) = (self.nreads, self.nzl > 0);
+        let nz = || {
+            use std::os::unix::fs::FileExt;
+            let mut v = vec![0u8; self.nzl];
+            rd(self.f.read_exact_at(&mut v, self.nz_off), "short names");
+            v
+        };
         let mut names = if let Some(f) = &self.names_file {
-            if !dropped && !nz.is_empty() {
+            if !dropped && has {
                 crate::bail("this track stores its own names: --names FILE would replace them, so it is refused. Unset it to read the names in the file");
             }
             read_name_file(f, n)
-        } else if dropped && nz.is_empty() {
+        } else if dropped && !has {
             if !self.raw {
                 crate::bail("the names of this track were dropped at compress time: give them back with --names FILE");
             }
             ordinals(n)
-        } else if nz.is_empty() {
+        } else if !has {
             ordinals(n)
         } else if names_fld {
-            fld_names_d(nz, n)
+            fld_names_d(&nz(), n)
         } else if names_int {
-            int_names_d(nz, n)
+            int_names_d(&nz(), n)
         } else if names_tok {
-            tok_d(nz)
+            tok_d(&nz())
         } else {
-            zdec(nz, "names")
+            zdec(&nz(), "names")
         };
         if names.last() == Some(&b'\n') { names.pop(); }
         let mut noff: Vec<u64> = vec![0];

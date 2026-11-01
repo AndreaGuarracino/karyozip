@@ -662,6 +662,11 @@ awk 'BEGIN { srand(5); for (c = 0; c < 6; c++) { g = c % 4; nr = 20000 + int(ran
 $KT -t 4 -e high compress -i "$W/zt.bed" -o "$W/zt.kt" 2> "$W/zt.err"
 grep -q "lengths zpaq-64MB, labels zpaq-64MB" "$W/zt.err" && ok "high: zpaq on both frames of six contigs" || no "high: zpaq not picked: $(grep layout "$W/zt.err")"
 $KT -t 4 decompress -i "$W/zt.kt" 2>/dev/null | cmp -s - "$W/zt.bed" && ok "zpaq frames: round-trip" || no "zpaq frames: WRONG"
+# -e high's interleaved zpaq model: 60000 short reads of 120 bp
+awk 'BEGIN { srand(7); for (r = 0; r < 60000; r++) { k = rand() < 0.4 ? 1 : 2 + int(rand() * rand() * 12); p = 0; g = int(rand() * 4); for (j = 0; j < k; j++) { l = j == k - 1 ? 120 - p : 1 + int(rand() * (120 - p - (k - j - 1)) / (k - j)); printf "r%d\t%d\t%d\t%s\n", r, p, p + l, "chr" (1 + (g + j) % 5); p += l } } }' > "$W/zi.bed"
+$KT -t 4 -e high compress -i "$W/zi.bed" -o "$W/zi.kt" 2> "$W/zi.err"
+grep -q "lengths zpaq-64MB+ilv" "$W/zi.err" && ok "high: the interleaved zpaq model on short reads" || no "high: interleaved model not picked: $(grep layout "$W/zi.err")"
+$KT -t 4 decompress -i "$W/zi.kt" 2>/dev/null | cmp -s - "$W/zi.bed" && ok "interleaved zpaq model: round-trip" || no "interleaved zpaq model: WRONG"
 must_fail "--tmp-dir that does not exist" $KT --tmp-dir /nonexistent/dir compress < "$D/s.bed"
 $KT --tmp-dir "$W" compress < "$D/s.bed" 2>/dev/null | cmp -s - "$W/p.kt" && ok "--tmp-dir honoured: same bytes" || no "--tmp-dir honoured: WRONG"
 

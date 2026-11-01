@@ -5,8 +5,9 @@ and 9a67677ddd41c774664aaa2ade363a58. Matt Mahoney released both into the
 public domain; the libdivsufsort inside libzpaq.cpp is MIT (see its comments).
 
 kzzpaq.cpp is karyozip's: it cuts nothing itself, it compresses the pieces
-the caller gives with libzpaq::compressBlock(method "5", no SHA-1) side by
-side under OpenMP, and writes the piece count, then each piece's size and
+the caller gives with libzpaq::compressBlock(method "5", no SHA-1), or
+with its own ZPAQL model of interleaved reads (method "ilv", through
+libzpaq::Compressor), side by side under OpenMP, and writes the piece count, then each piece's size and
 its zpaq block's size (u32 little endian), then the blocks. libzpaq.cpp is
 built without OpenMP, since its divsufsort spawns its own threads, with
 -Dunix, and with -DNOJIT off x86-64; JIT and interpreter give the same bytes.

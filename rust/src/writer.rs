@@ -370,6 +370,7 @@ impl Writer {
         let mut ilvcodec = p.len;
         let mut altv: [Option<(Vec<u8>, usize)>; 3] = [None, None, None];
         let (mut cutrows_l, mut cutrows_i) = (0u64, 0u64);   // -e high: the rows rule of each frame, 0 none
+        let mut zm_l = false;                                 // -e high: the lengths' zpaq model, Rspec's zm
         let mut zk: [Option<Vec<u8>>; 2] = [None, None];      // the kept zpaq lengths and labels frames
         let _l = crate::prof::span(9);
         if onelay {
@@ -400,8 +401,8 @@ impl Writer {
             let src: Vec<&[u8]> = vec![is, ls, lay[1].as_deref().unwrap_or(&e), lay[2].as_deref().unwrap_or(&e), lay[3].as_deref().unwrap_or(&e)];
             let scale = |m: usize| if pl > 0 { (m as u128 * lens0.len() as u128 / pl as u128) as usize } else { m };
             let n5 = [ids0.len(), lens0.len(), scale(src[2].len()), scale(src[3].len()), scale(src[4].len())];
-            let mut rs5 = [Rspec { ib: Some(bs), mult: 1, cs: 0, rows: 0 }, Rspec { ib: Some(bs), mult: 1, cs: 0, rows: 0 },
-                           Rspec { ib: None, mult: 1, cs: 0, rows: 0 }, Rspec { ib: None, mult: 1, cs: 0, rows: 0 }, Rspec { ib: None, mult: 2, cs: 0, rows: 0 }];
+            let mut rs5 = [Rspec { ib: Some(bs), mult: 1, cs: 0, rows: 0, zm: false }, Rspec { ib: Some(bs), mult: 1, cs: 0, rows: 0, zm: false },
+                           Rspec { ib: None, mult: 1, cs: 0, rows: 0, zm: false }, Rspec { ib: None, mult: 1, cs: 0, rows: 0, zm: false }, Rspec { ib: None, mult: 2, cs: 0, rows: 0, zm: false }];
             let mut r = rank_all(&src, &n5, &rs5, &self.opt);
             let idok = pi == 0 || r[0].2 > 0;
             let mut sz = [0usize; 4];
@@ -419,10 +420,11 @@ impl Writer {
                 bz3_rows(src[u], &mut rr, &mut zr, slow);
                 if rr.rows != 0 { bz3_fine(src[u], Some(&rr), &mut zr); }
                 if rr.rows != 0 && zr.2 < r[u].2 { r[u] = zr; rs5[u] = rr; }
-                zpq_try(src[u], &Rspec { rows: 0, ..rs5[u] }, &mut r[u], &mut zk[usize::from(u == 0)]);
-                if r[u].0 & ffi::CODEC_ZPAQ != 0 { rs5[u].rows = 0; }
+                let mut rz = Rspec { rows: 0, ..rs5[u] };
+                zpq_try(src[u], &mut rz, &mut r[u], &mut zk[usize::from(u == 0)]);
+                if r[u].0 & ffi::CODEC_ZPAQ != 0 { rs5[u] = rz; }
             }
-            (cutrows_l, cutrows_i) = (rs5[l + 1].rows, rs5[0].rows);
+            (cutrows_l, cutrows_i, zm_l) = (rs5[l + 1].rows, rs5[0].rows, rs5[l + 1].zm);
             (idc, lvl_id) = (r[0].0, if r[0].1 < 0 { level } else { r[0].1 });
             (ilvcodec, lvl_len) = (r[l + 1].0, if r[l + 1].1 < 0 { level } else { r[l + 1].1 });
             // the sample is the whole block: its winner is built, keep it; the
@@ -443,8 +445,8 @@ impl Writer {
             if !whole || idc & ffi::CODEC_ZPAQ == 0 { zk[1] = None; }
             zk[0] = None;
             let labels = if l == 3 { String::new() } else { format!(", labels {}", cname(idc)) };
-            eprintln!("layout: {}, lengths {}{labels}, decided on {pl} of {} B of lengths",
-                      ["plain", "headed", "grouped", "interleaved"][l], cname(ilvcodec), lens0.len());
+            eprintln!("layout: {}, lengths {}{}{labels}, decided on {pl} of {} B of lengths",
+                      ["plain", "headed", "grouped", "interleaved"][l], cname(ilvcodec), if zm_l { "+ilv" } else { "" }, lens0.len());
             // --aln keeps three length spellings: respell every one the same way
             if runhead || ilv {
                 altv[0] = Some((std::mem::take(&mut altbuf), alt_lens));
@@ -514,8 +516,8 @@ impl Writer {
             // the block's reads, where its bzip3 pieces end, as the C's
             let ib0 = if varon && i > 0 { self.bm[i - 1].ibe } else { 0 };
             let ibs = (!self.ibx.is_empty()).then(|| &self.ibx[ib0..if varon { m.ibe } else { self.ibx.len() }]);
-            let rln = if runhead || ilv { Rspec { ib: None, mult: if ilv { 2 } else { 1 }, cs: 0, rows: cutrows_l } } else { Rspec { ib: ibs, mult: 1, cs: 0, rows: cutrows_l } };
-            let rid = if ibs.is_none() && vs[0].is_some() { Rspec { ib: vs[0], mult: 1, cs: 1, rows: cutrows_i } } else { Rspec { ib: ibs, mult: 1, cs: 0, rows: cutrows_i } };   // one headed block: its heads are the index
+            let rln = if runhead || ilv { Rspec { ib: None, mult: if ilv { 2 } else { 1 }, cs: 0, rows: cutrows_l, zm: zm_l } } else { Rspec { ib: ibs, mult: 1, cs: 0, rows: cutrows_l, zm: false } };
+            let rid = if ibs.is_none() && vs[0].is_some() { Rspec { ib: vs[0], mult: 1, cs: 1, rows: cutrows_i, zm: false } } else { Rspec { ib: ibs, mult: 1, cs: 0, rows: cutrows_i, zm: false } };   // one headed block: its heads are the index
             let (pid, pln) = (onelay.then_some(&rid), onelay.then_some(&rln));
             const ORDER: [usize; 3] = [1, 2, 0];
             let lens_job = || {
@@ -1128,9 +1130,10 @@ fn rank_all(src: &[&[u8]], n: &[usize], rs: &[Rspec], o: &Options) -> Vec<(i32, 
 /// read, cs varints a run after each count there (1 when ib is a headed
 /// lengths frame), or None when the stream heads each read with its own
 /// count; mult varints a run; rows, when not 0, also ends a piece at the
-/// first read start past that many rows, as medium ends a block.
+/// first read start past that many rows, as medium ends a block; zm: zpaq
+/// by the interleaved model, not level 5.
 #[derive(Clone, Copy)]
-pub struct Rspec<'a> { ib: Option<&'a [u8]>, mult: usize, cs: usize, rows: u64 }
+pub struct Rspec<'a> { ib: Option<&'a [u8]>, mult: usize, cs: usize, rows: u64, zm: bool }
 
 /// -e medium's block: it closes at the first read start past these rows
 pub const MEDBLK: u64 = 4194304;
@@ -1138,13 +1141,18 @@ pub const MEDBLK: u64 = 4194304;
 pub const ZPQMB: i32 = 64;
 
 /// -e high: libzpaq's level 5, context mixing, in ZPQMB pieces ended at read
-/// starts, as the C's zpqtry: the frame is kept, so it is made once and
-/// read back once.
-fn zpq_try(s: &[u8], rs: &Rspec, r: &mut (i32, i32, usize), keep: &mut Option<Vec<u8>>) {
-    let c = ffi::CODEC_ZPAQ | ZPQMB;
-    if let Some(v) = paycut(s, c, Some(rs)) {
-        if v.len() < r.2 && ffi::paydecomp(&v, c, s.len()).as_deref() == Some(s) { *r = (c, r.1, v.len()); *keep = Some(v); }
+/// starts, as the C's zpqtry: an interleaved stream also tries the model in
+/// kzzpaq.cpp, the smaller wins and sets rs.zm. The frame is kept, so it is
+/// made once and read back once.
+fn zpq_try(s: &[u8], rs: &mut Rspec, r: &mut (i32, i32, usize), keep: &mut Option<Vec<u8>>) {
+    let (c, mut zm) = (ffi::CODEC_ZPAQ | ZPQMB, rs.zm);
+    for m in [false, true].into_iter().take(if rs.mult == 2 { 2 } else { 1 }) {
+        rs.zm = m;
+        if let Some(v) = paycut(s, c, Some(rs)) {
+            if v.len() < r.2 && ffi::paydecomp(&v, c, s.len()).as_deref() == Some(s) { *r = (c, r.1, v.len()); *keep = Some(v); zm = m; }
+        }
     }
+    rs.zm = zm;
 }
 
 /// a varint that may run past the end, as the C's vsoft
@@ -1191,7 +1199,8 @@ fn bz3_cuts(s: &[u8], b: usize, rs: &Rspec) -> Vec<u32> {
 fn paycut(src: &[u8], codec: i32, rs: Option<&Rspec>) -> Option<Vec<u8>> {
     let b = ((codec & 0xffff) as usize) << 20;
     match rs {
-        Some(rs) if codec & ffi::CODEC_ZPAQ != 0 && src.len() > b => ffi::zpaq_cuts(src, &bz3_cuts(src, b, rs)),
+        Some(rs) if codec & ffi::CODEC_ZPAQ != 0 && src.len() > b => ffi::zpaq_cuts(src, &bz3_cuts(src, b, rs), rs.zm),
+        Some(rs) if codec & ffi::CODEC_ZPAQ != 0 => ffi::zpaq_cuts(src, &ffi::zpaq_pieces(src.len(), b), rs.zm),
         Some(rs) if codec & ffi::CODEC_BZIP3 != 0 && src.len() > b => ffi::bz3_cuts(src, codec, &bz3_cuts(src, b, rs)),
         _ => ffi::paycomp(src, codec),
     }

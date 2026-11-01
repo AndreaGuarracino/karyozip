@@ -307,6 +307,10 @@ awk 'BEGIN { srand(5); for (c = 0; c < 6; c++) { g = c % 4; nr = 20000 + int(ran
 "$C" -t 4 -e high compress -i "$W/zt.bed" > "$W/c.kst" 2>/dev/null; "$R" -t 4 -e high compress -i "$W/zt.bed" > "$W/r.kst" 2>/dev/null
 if cmp -s "$W/c.kst" "$W/r.kst" && "$R" decompress -i "$W/c.kst" 2>/dev/null | cmp -s - "$W/zt.bed" && "$C" decompress -i "$W/r.kst" 2>/dev/null | cmp -s - "$W/zt.bed"
 then echo "zpaq frames: identical, each reads the other"; else echo "zpaq frames: DIFFER"; fail=1; fi
+awk 'BEGIN { srand(7); for (r = 0; r < 60000; r++) { k = rand() < 0.4 ? 1 : 2 + int(rand() * rand() * 12); p = 0; g = int(rand() * 4); for (j = 0; j < k; j++) { l = j == k - 1 ? 120 - p : 1 + int(rand() * (120 - p - (k - j - 1)) / (k - j)); printf "r%d\t%d\t%d\t%s\n", r, p, p + l, "chr" (1 + (g + j) % 5); p += l } } }' > "$W/zi.bed"
+"$C" -t 4 -e high compress -i "$W/zi.bed" > "$W/c.kst" 2>/dev/null; "$R" -t 4 -e high compress -i "$W/zi.bed" > "$W/r.kst" 2>/dev/null
+if cmp -s "$W/c.kst" "$W/r.kst" && "$R" decompress -i "$W/c.kst" 2>/dev/null | cmp -s - "$W/zi.bed" && "$C" decompress -i "$W/r.kst" 2>/dev/null | cmp -s - "$W/zi.bed"
+then echo "interleaved zpaq model: identical, each reads the other"; else echo "interleaved zpaq model: DIFFER"; fail=1; fi
 
 # 14. damaged file: same rows before refusal
 python3 -c "

@@ -101,7 +101,7 @@ Flags work on either side of the command name. The readers are decompress and qu
 
 ## How it works
 
-**How compress chooses.** The three efforts are one rule with two settings: `low` tries 8 of the 54 codecs plus zstd at 17 on 4 MB, `medium` all 54 plus zstd at 17 and 22 on 16 MB, `high` the same on the whole file, then bzip3 at every block size from half to twice the winner's, in eighths of it, since bzip3's bytes do not follow its block size, with blocks also ending where medium ends one; then zpaq level 5 (context mixing, libzpaq), which decodes as slowly as it encodes. bzip3 and zpaq blocks end at read starts.
+**How compress chooses.** The three efforts are one rule with two settings: `low` tries 8 of the 54 codecs plus zstd at 17 on 4 MB, `medium` all 54 plus zstd at 17 and 22 on 16 MB, `high` the same on the whole file, then bzip3 at every block size from half to twice the winner's, in eighths of it, since bzip3's bytes do not follow its block size, with blocks also ending where medium ends one; then zpaq level 5 (context mixing, libzpaq), which decodes as slowly as it encodes, and on interleaved reads a zpaq model that follows each read's fields (run count, label, length). bzip3 and zpaq blocks end at read starts.
 The smallest wins, with no margin, and must read back what it was ranked on.
 A one-block file also chooses its layout on the same sample: lengths and labels apart, run counts heading each read's lengths, lengths grouped by label, or labels interleaved with lengths; every layout and codec is ranked in one parallel pool.
 Names are ranked the same way among zstd, integer deltas, field deltas and the CRAM name tokeniser.

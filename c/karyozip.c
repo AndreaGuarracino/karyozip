@@ -628,10 +628,12 @@ static size_t candlist(int *out) {
    run count of each read, cs varints a run after each count there (1 when
    ib is a headed lengths frame), or NULL when the stream heads each read
    with its own count; mult varints a run; rows, when not 0, also ends a
-   piece at the first read start past that many rows, as medium ends a block */
-typedef struct { const uint8_t *ib; size_t ibn; int mult, cs; uint64_t rows; } rspec;
+   piece at the first read start past that many rows, as medium ends a block;
+   zm 1: zpaq by the interleaved model, not level 5 */
+typedef struct { const uint8_t *ib; size_t ibn; int mult, cs; uint64_t rows; int zm; } rspec;
 static int RCUT = 0;                  /* blocks of whole reads: bzip3 cuts at read starts */
 static uint64_t CUTROWS_L = 0, CUTROWS_I = 0;   /* -e high: the rows rule of each frame, 0 none */
+static int ZPQM_L = 0;                /* -e high: the lengths' zpaq model, rspec's zm */
 static size_t paycomp(const uint8_t *src, size_t n, int codec, uint8_t **out);
 static size_t paycut(const uint8_t *src, size_t n, int codec, const rspec *rs, uint8_t **out);
 static size_t paydecomp(const uint8_t *src, size_t n, int codec, uint8_t *dst, size_t raw);
@@ -1086,7 +1088,7 @@ static size_t paycut(const uint8_t *src, size_t n, int codec, const rspec *rs, u
         }
         size_t cap = n + n / 8 + 4096 + 1024 * (size_t)nc;
         *out = malloc(cap);
-        size_t z = *out ? kz_zpaq_encode(src, n, cut, nc, "5", *out, cap) : 0;
+        size_t z = *out ? kz_zpaq_encode(src, n, cut, nc, rs && rs->zm ? "ilv" : "5", *out, cap) : 0;
         free(cut);
         if (!z) { free(*out); *out = NULL; }
         return z;
@@ -2817,15 +2819,21 @@ static void bz3rows(const uint8_t *s, size_t n, const rspec *rs, int *cd, size_t
 
 /* -e high: libzpaq's level 5, context mixing, in ZPQMB pieces ended at read
    starts: 3.93% to 11.84% under bzip3 on two assemblies, two short-read
-   tracks and an assembly holdout (job 38965676). The frame is kept, so it
-   is made once and read back once. */
+   tracks and an assembly holdout (job 38965676). An interleaved stream also
+   tries the model in kzzpaq.cpp; the smaller wins and sets rs->zm. The frame
+   is kept, so it is made once and read back once. */
 static uint8_t *ZK[2]; static size_t ZKN[2];   /* the kept lengths and labels frames */
-static void zpqtry(const uint8_t *s, size_t n, const rspec *rs, int *cd, size_t *sz, int t) {
-    int c = CODEC_ZPAQ | ZPQMB; uint8_t *o = NULL, *v = NULL;
-    size_t z = paycut(s, n, c, rs, &o);
-    int ok = z && z < *sz && (v = malloc(n ? n : 1)) && paydecomp(o, z, c, v, n) == n && !memcmp(v, s, n);
-    free(v);
-    if (ok) { *cd = c; *sz = z; free(ZK[t]); ZK[t] = o; ZKN[t] = z; } else free(o);
+static void zpqtry(const uint8_t *s, size_t n, rspec *rs, int *cd, size_t *sz, int t) {
+    int c = CODEC_ZPAQ | ZPQMB, zm = rs->zm;
+    for (int m = 0; m < (rs->mult == 2 ? 2 : 1); m++) {
+        uint8_t *o = NULL, *v = NULL;
+        rs->zm = m;
+        size_t z = paycut(s, n, c, rs, &o);
+        int ok = z && z < *sz && (v = malloc(n ? n : 1)) && paydecomp(o, z, c, v, n) == n && !memcmp(v, s, n);
+        free(v);
+        if (ok) { *cd = c; *sz = z; free(ZK[t]); ZK[t] = o; ZKN[t] = z; zm = m; } else free(o);
+    }
+    rs->zm = zm;
 }
 
 /* the checked frame is kept in *keep: the compress phase would make the same */
@@ -3026,7 +3034,7 @@ static void ktw_close(ktw *w) {
         for (int k = 2; k < 5; k++) n5[k] = pl ? (size_t)((unsigned __int128)m5[k] * nl0 / pl) : m5[k];
         int c5[5], l5[5];
         RCUT = 1;                                 /* every block holds whole reads */
-        rspec rs5[5] = { { bs, pb, 1, 0, 0 }, { bs, pb, 1, 0, 0 }, { NULL, 0, 1, 0, 0 }, { NULL, 0, 1, 0, 0 }, { NULL, 0, 2, 0, 0 } };
+        rspec rs5[5] = { { bs, pb, 1, 0, 0, 0 }, { bs, pb, 1, 0, 0, 0 }, { NULL, 0, 1, 0, 0, 0 }, { NULL, 0, 1, 0, 0, 0 }, { NULL, 0, 2, 0, 0, 0 } };
         rankall(5, src, m5, n5, rs5, c5, l5, r5);
         int idok = !pi || r5[0];
         if (r5[1] && idok) sz[0] = r5[1] + r5[0] + ic.n;      /* plain pays its index */
@@ -3048,9 +3056,9 @@ static void ktw_close(ktw *w) {
             if (rr.rows && zr < r5[u]) { c5[u] = cr; r5[u] = zr; rs5[u] = rr; }
             rspec rz = rs5[u]; rz.rows = 0;
             zpqtry(src[u], m5[u], &rz, &c5[u], &r5[u], t);
-            if (c5[u] & CODEC_ZPAQ) rs5[u].rows = 0;
+            if (c5[u] & CODEC_ZPAQ) rs5[u] = rz;
         }
-        CUTROWS_L = rs5[L + 1].rows; CUTROWS_I = rs5[0].rows;
+        CUTROWS_L = rs5[L + 1].rows; CUTROWS_I = rs5[0].rows; ZPQM_L = rs5[L + 1].zm;
         /* the sample is the whole block: its winner is built, keep it */
         int whole = nraw == 1 && pl == nl0 && pi == ni0 && pb == w->ibx.n;
         for (int k = 1; k < 4; k++) if (!whole || k != L) { free(lay[k]); lay[k] = NULL; }
@@ -3073,7 +3081,7 @@ static void ktw_close(ktw *w) {
         if (!whole || !(IDCODEC & CODEC_ZPAQ)) { free(ZK[1]); ZK[1] = NULL; }
         free(ZK[0]); ZK[0] = NULL;
         static const char *LN[4] = {"plain", "headed", "grouped", "interleaved"};
-        fprintf(stderr, "layout: %s, lengths %s", LN[L], cname(LENCODEC));
+        fprintf(stderr, "layout: %s, lengths %s%s", LN[L], cname(LENCODEC), ZPQM_L ? "+ilv" : "");
         fprintf(stderr, "%s%s, decided on %zu of %zu B of lengths\n", L == 3 ? "" : ", labels ", L == 3 ? "" : cname(IDCODEC), pl, nl0);
         /* --aln keeps three length spellings: respell every one the same way */
         if (ILV || RUNHEAD) {
@@ -3154,9 +3162,9 @@ static void ktw_close(ktw *w) {
                     }
                 /* the block's reads, where its bzip3 pieces end */
                 size_t ib0 = VARON && i ? bm[i - 1].ibe : 0;
-                rspec rid = { w->ibx.d ? w->ibx.d + ib0 : NULL, w->ibx.d ? (VARON ? bm[i].ibe : w->ibx.n) - ib0 : 0, 1, 0, CUTROWS_I };
-                const rspec rln = { RUNHEAD || ILV ? NULL : rid.ib, RUNHEAD || ILV ? 0 : rid.ibn, ILV ? 2 : 1, 0, CUTROWS_L };
-                if (!rid.ib && vs[0]) rid = (rspec){ vs[0], vn[0], 1, 1, CUTROWS_I };   /* one headed block: its heads are the index */
+                rspec rid = { w->ibx.d ? w->ibx.d + ib0 : NULL, w->ibx.d ? (VARON ? bm[i].ibe : w->ibx.n) - ib0 : 0, 1, 0, CUTROWS_I, 0 };
+                const rspec rln = { RUNHEAD || ILV ? NULL : rid.ib, RUNHEAD || ILV ? 0 : rid.ibn, ILV ? 2 : 1, 0, CUTROWS_L, ZPQM_L };
+                if (!rid.ib && vs[0]) rid = (rspec){ vs[0], vn[0], 1, 1, CUTROWS_I, 0 };   /* one headed block: its heads are the index */
                 const rspec *pid = RCUT ? &rid : NULL, *pln = RCUT ? &rln : NULL;
                 int lone = !(LENCODEC & CODEC_BZIP3) || nl <= (size_t)(LENCODEC & 0xffff) << 20;   /* one thread */
                 ljob lj = { idsrc, ni, NULL, 0, LENCODEC & CODEC_LZMA ? 2 : nthr > 1 ? nthr - 1 : 1, pid }; pthread_t lth;

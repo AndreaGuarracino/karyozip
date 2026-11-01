@@ -1,5 +1,6 @@
-// karyozip's zpaq codec: libzpaq's level 5 on pieces the caller cuts,
-// compressed and decompressed side by side under OpenMP. The frame: the
+// karyozip's zpaq codec: libzpaq's level 5, or the model below, on pieces
+// the caller cuts, compressed and decompressed side by side under OpenMP.
+// Each zpaq block carries its model, so one decoder reads both. The frame: the
 // piece count, then each piece's size and its zpaq block's size, all u32
 // little endian, then the blocks in order: the same bytes on any number
 // of threads.
@@ -12,6 +13,147 @@
 #include <omp.h>
 
 namespace libzpaq { void error(const char* msg) { throw std::runtime_error(msg); } }
+
+// -e high's model of an interleaved stream: each read its run count k, then
+// k pairs of label and length, LEB128. HCOMP follows the fields, so each
+// byte is predicted knowing which field it is, whether its pair is the
+// read's last and the read's earlier labels and lengths: 8.10% and 8.47%
+// under level 5 on 16 MB of two short-read tracks, 0.33% on an assembly
+// (2026-10-31).
+// R0 next field (0 count, 1 label, 2 length), R1 pairs left, R2 k, R3 pair
+// index, R4 previous label, R5 label, R6 length sum, R7 previous length,
+// R8 previous k, R9 partial value, R10 its shift, R11 label before R4,
+// R12 byte, R13 value, R14 state with shift, R15 field + 4 on the last pair,
+// R16 last label of the previous read, R17 k two reads back, R18 first
+// label of the read, R19 of the previous read.
+static const char ILV[] = R"zp(
+comp 5 10 0 0 22
+  0 icm 10
+  1 isse 13 0
+  2 isse 16 1
+  3 isse 18 2
+  4 isse 19 3
+  5 isse 19 4
+  6 icm 16
+  7 icm 16
+  8 icm 16
+  9 cm 22 255
+  10 cm 22 255
+  11 match 22 24
+  12 icm 16
+  13 icm 16
+  14 icm 16
+  15 mix 12 0 15 12 255
+  16 mix 18 0 15 12 255
+  17 mix2 0 15 16 12 0
+  18 sse 19 17 32 255
+  19 sse 20 17 32 255
+  20 mix2 0 18 19 12 0
+  21 mix2 0 17 20 12 0
+hcomp
+  c++ *c=a r=a 12
+  a> 127 ifl
+    a=r 12 a&= 127 b=r 10 a<<=b b=r 9 a+=b r=a 9
+    a=r 10 a+= 7 r=a 10
+  elsel
+    a=r 12 b=r 10 a<<=b b=r 9 a+=b r=a 13
+    a=0 r=a 9 r=a 10
+    a=r 0 a== 0 ifl
+      a=r 8 r=a 17 a=r 2 r=a 8
+      a=r 13 r=a 2 r=a 1
+      a=0 r=a 3 r=a 6
+      a= 255 r=a 4 r=a 7 r=a 11
+      a=r 1 a> 0 if a= 1 else a=0 endif r=a 0
+    elsel
+      a== 1 if
+        a=r 13 r=a 5 a=r 3 a== 0 if a=r 18 r=a 19 a=r 13 r=a 18 endif a= 2 r=a 0
+      else
+        a=r 13 r=a 7 b=r 6 a+=b r=a 6
+        a=r 4 r=a 11 a=r 5 r=a 4
+        a=r 3 a++ r=a 3
+        a=r 1 a-- r=a 1
+        a> 0 if a= 1 else a=r 5 r=a 16 a=0 endif r=a 0
+      endif
+    endif
+  endif
+  a=r 1 a== 1 if a= 4 else a=0 endif b=r 0 a+=b r=a 15
+  b=r 10 a+=b a+=b r=a 14
+  (0: state, pair index, k)
+  d=0 *d=0 a=r 14 hashd a=r 3 a> 15 if a= 15 endif hashd a=r 2 a> 31 if a= 31 endif hashd
+  (1-5: orders 1, 2, 3, 4, 6 with the state; 11: order 8 for the match)
+  d++ b=c a=r 14 hash *d=a
+  d++ b-- hash *d=a
+  d++ b-- hash *d=a
+  d++ b-- hash *d=a
+  d++ b-- hash b-- hash *d=a
+  d= 11 b-- hash b-- hash *d=a
+  (6: by field)
+  d= 6 *d=0 a=r 0 hashd
+  a=r 0 a== 1 ifl
+    a=r 4 hashd a=r 11 hashd a=r 15 hashd a=r 3 a> 7 if a= 7 endif hashd
+  elsel
+    a== 2 if
+      a=r 5 hashd a=r 6 hashd a=r 15 hashd
+    else
+      a=r 8 hashd
+    endif
+  endif
+  a=r 9 hashd a=r 10 hashd a=0 hashd
+  (7: by field, second)
+  d= 7 *d=0 a=r 0 hashd
+  a=r 0 a== 1 ifl
+    a=r 4 hashd a=r 7 hashd a=r 6 hashd
+  elsel
+    a== 2 if
+      a=r 5 hashd a=r 4 hashd a=r 7 hashd a=r 15 hashd
+    else
+      a=r 8 hashd a=r 16 hashd
+    endif
+  endif
+  a=r 9 hashd a=r 10 hashd a=0 hashd
+  (8: by field, third)
+  d= 8 *d=0 a=r 0 hashd
+  a=r 0 a== 1 ifl
+    a=r 4 hashd a=r 3 hashd a=r 1 hashd
+  elsel
+    a== 2 if
+      a=r 5 hashd a=r 6 hashd a=r 7 hashd a=r 4 hashd
+    else
+      a=r 8 hashd a=r 16 hashd a=r 17 hashd
+    endif
+  endif
+  a=r 9 hashd a=r 10 hashd a=0 hashd
+  (9, 10: contexts 6, 7 direct)
+  d= 6 a=*d d= 9 *d=a
+  d= 7 a=*d d= 10 *d=a
+  (12: read level: the first labels of this read and the previous one)
+  d= 12 *d=0 a=r 0 hashd
+  a=r 0 a== 1 ifl
+    a=r 3 a== 0 if
+      a=r 19 hashd a=r 16 hashd a=r 2 hashd
+    else
+      a=r 4 hashd a=r 11 hashd a=r 18 hashd
+    endif
+  elsel
+    a== 2 if
+      a=r 5 hashd a=r 7 hashd a=r 18 hashd a=r 6 a>>= 3 hashd
+    else
+      a=r 18 hashd a=r 16 hashd
+    endif
+  endif
+  a=r 9 hashd a=r 10 hashd a=0 hashd
+  (13, 14: sparse, bytes 2-3 and 2, 4 back, with the state)
+  d= 13 *d=0 a=r 14 hashd b=c b-- a=*b hashd b-- a=*b hashd
+  d= 14 *d=0 a=r 14 hashd b=c b-- a=*b hashd b-- b-- a=*b hashd
+  (15: mixer by field, last pair, first pair; 16: by field and the last byte)
+  d= 15 a=r 3 a> 0 if a= 8 endif b=r 15 a+=b a<<= 8 *d=a
+  d= 16 a=r 0 a<<= 8 a+=*c a<<= 8 *d=a
+  (18: SSE by field, last pair and the last byte; 19: by the field context)
+  d= 18 a=r 15 a<<= 8 a+=*c a<<= 8 *d=a
+  d= 6 a=*d a>>= 20 a<<= 8 d= 19 *d=a
+  halt
+end
+)zp";
 
 namespace {
 struct Out : libzpaq::Writer {   // a piece's zpaq block
@@ -36,7 +178,8 @@ uint32_t r32(const unsigned char* q) { return q[0] | q[1] << 8 | q[2] << 16 | (u
 extern "C" {
 
 // n bytes in ncut pieces of cut[i] bytes each, by libzpaq's method ("5" its
-// slowest), into out of cap bytes: the frame's size, 0 on any failure
+// slowest) or "ilv", the model above, into out of cap bytes: the frame's
+// size, 0 on any failure
 size_t kz_zpaq_encode(const unsigned char* in, size_t n, const uint32_t* cut, uint32_t ncut,
                       const char* method, unsigned char* out, size_t cap) {
   std::vector<size_t> off(ncut + 1, 0);
@@ -48,10 +191,21 @@ size_t kz_zpaq_encode(const unsigned char* in, size_t n, const uint32_t* cut, ui
   for (long i = 0; i < (long)ncut; i++) {
     try {
       if (cut[i] > 0x7fffffffu) throw 1;
-      libzpaq::StringBuffer sb(cut[i]);
-      sb.write((const char*)in + off[i], (int)cut[i]);
       Out o;
-      libzpaq::compressBlock(&sb, &o, method, 0, 0, false);
+      if (!strcmp(method, "ilv")) {
+        In r; r.p = in + off[i]; r.e = r.p + cut[i];
+        libzpaq::Compressor c;
+        c.setOutput(&o); c.setInput(&r);
+        c.startBlock(ILV, 0);
+        c.startSegment(0, 0);
+        c.compress();
+        c.endSegment(0);
+        c.endBlock();
+      } else {
+        libzpaq::StringBuffer sb(cut[i]);
+        sb.write((const char*)in + off[i], (int)cut[i]);
+        libzpaq::compressBlock(&sb, &o, method, 0, 0, false);
+      }
       blk[i].swap(o.s);
     } catch (...) {
 #pragma omp atomic write

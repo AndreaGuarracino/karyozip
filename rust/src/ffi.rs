@@ -203,14 +203,18 @@ pub fn bz3_cuts(src: &[u8], codec: i32, cut: &[u32]) -> Option<Vec<u8>> {
     }
 }
 
-/// libzpaq level 5 on pieces of the given sizes, summing to the source: the
-/// C's zpaq branch of paycut, with its output bound.
-pub fn zpaq_cuts(src: &[u8], cut: &[u32]) -> Option<Vec<u8>> {
+/// n bytes in pieces of b, the last shorter, as the C's fixed zpaq pieces
+pub fn zpaq_pieces(n: usize, b: usize) -> Vec<u32> { (0..n).step_by(b.max(1)).map(|o| (n - o).min(b) as u32).collect() }
+
+/// libzpaq level 5, or the interleaved model when ilv, on pieces of the
+/// given sizes, summing to the source: the C's zpaq branch of paycut, with
+/// its output bound.
+pub fn zpaq_cuts(src: &[u8], cut: &[u32], ilv: bool) -> Option<Vec<u8>> {
     let cap = src.len() + src.len() / 8 + 4096 + 1024 * cut.len();
     // SAFETY: out holds cap bytes, cut holds cut.len() sizes; the C checks them.
     unsafe {
         let mut out = raw_buf(cap);
-        let z = kz_zpaq_encode(src.as_ptr(), src.len(), cut.as_ptr(), cut.len() as c_uint, c"5".as_ptr(), out.as_mut_ptr(), cap);
+        let z = kz_zpaq_encode(src.as_ptr(), src.len(), cut.as_ptr(), cut.len() as c_uint, if ilv { c"ilv" } else { c"5" }.as_ptr(), out.as_mut_ptr(), cap);
         if z == 0 { return None; }
         out.set_len(z);
         Some(out)
@@ -223,9 +227,7 @@ pub fn zpaq_cuts(src: &[u8], cut: &[u32]) -> Option<Vec<u8>> {
 pub fn paycomp(src: &[u8], codec: i32) -> Option<Vec<u8>> {
     let n = src.len();
     if codec & CODEC_ZPAQ != 0 {   // pieces of MB, as the C's
-        let b = ((codec & 0xffff) as usize) << 20;
-        let cut: Vec<u32> = (0..n).step_by(b.max(1)).map(|o| (n - o).min(b) as u32).collect();
-        return zpaq_cuts(src, &cut);
+        return zpaq_cuts(src, &zpaq_pieces(n, ((codec & 0xffff) as usize) << 20), false);
     }
     if codec & CODEC_LZMA != 0 {
         let ob = n + n / 16 + 4096;

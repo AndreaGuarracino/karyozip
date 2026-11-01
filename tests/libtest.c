@@ -1,12 +1,10 @@
-/* Proves the library and the CLI produce the same file. Reads a BED and
-   feeds it row by row through kt_row, which is what an annotator would do
-   instead of writing a BED at all. */
+/* The library and the CLI write the same file: a BED fed row by row through kt_row, as an annotator would */
 #include "karyozip.h"
 #include <stdlib.h>
 #include <string.h>
 
-/* Contract violations, one per case. Each must be refused with the message
-   the CLI gives, or the header's promise is false. */
+/* Contract violations, one per case, each refused with the CLI's message
+ */
 static int abuse(int c) {
     FILE *f = fopen("/dev/null", "wb");
     kt_writer *w = kt_open(f);

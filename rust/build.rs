@@ -1,15 +1,12 @@
-// The codecs are the C ones, from ../c: htscodecs because no Rust port
-// exists, libdeflate so both inflate BGZF with one code, and bzip3 because our copy carries two fixes upstream still
-// lacks, one of which silently loses half the data on an aligned input.
-// See c/bzip3/PROVENANCE.
+// The codecs are the C ones from ../c: no Rust htscodecs, one BGZF inflate for both, and bzip3 with the fixes in c/bzip3/PROVENANCE
 fn main() {
     let c = std::path::Path::new("../c");
     println!("cargo:rerun-if-changed=../c");
-    // The two vendored versions come from the vendored trees, never a copy.
+    // The two vendored versions come from the vendored trees, never a copy
     println!("cargo:rustc-env=HTSCODECS_VERSION={}", grab(&c.join("htscodecs/version.h"), "HTSCODECS_VERSION_TEXT"));
     println!("cargo:rustc-env=LIBDEFLATE_VERSION={}", grab(&c.join("libdeflate/libdeflate.h"), "LIBDEFLATE_VERSION_STRING"));
     let bz3 = grab(&c.join("Makefile"), "BZIP3_VERSION ?=");
-    // The usage text is the C's own, so the two cannot drift apart.
+    // The usage text is the C's own, so the two cannot drift apart
     let out = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap());
     std::fs::write(out.join("usage.txt"), usage(&c.join("karyozip.c"))).unwrap();
     cc::Build::new()
@@ -35,8 +32,7 @@ fn main() {
         .flag("-fno-semantic-interposition")     // cc builds -fPIC: let calls inline, as the C's -fPIE
         .warnings(false)
         .compile("kzcodecs");
-    // liblzma 5.8.4 on its own: its config.h, common.h and version.h share
-    // names with htscodecs' and bzip3's. The file list is the C Makefile's.
+    // liblzma 5.8.4 on its own: its config.h, common.h and version.h share names with htscodecs' and bzip3's; the C Makefile's file list
     let mk = std::fs::read_to_string(c.join("Makefile")).unwrap();
     let key = "$(addprefix xz/src/liblzma/,";
     let i = mk.find(key).expect("no liblzma list in c/Makefile") + key.len();
@@ -50,8 +46,8 @@ fn main() {
         xz.include(c.join("xz/src/liblzma").join(d));
     }
     xz.opt_level(3).flag("-std=gnu11").flag("-fno-semantic-interposition").warnings(false).compile("kzxz");
-    // libzpaq 7.15 without OpenMP, its divsufsort spawns its own threads;
-    // the wrapper puts the pieces on threads. JIT on x86-64 only, as the C's.
+    // libzpaq 7.15 without OpenMP, since divsufsort spawns its own threads; JIT on x86-64 only, as the C's
+
     let mut zp = cc::Build::new();
     zp.cpp(true).file(c.join("zpaq/libzpaq.cpp")).define("unix", None).opt_level(3).warnings(false);
     if std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() != Ok("x86_64") { zp.define("NOJIT", None); }
@@ -63,7 +59,7 @@ fn main() {
     println!("cargo:rustc-link-lib=gomp");
 }
 
-/// The quoted or trailing word on the one line naming `key`.
+/// The quoted or trailing word on the one line naming `key`
 fn grab(path: &std::path::Path, key: &str) -> String {
     let t = std::fs::read_to_string(path)
         .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
@@ -75,7 +71,7 @@ fn grab(path: &std::path::Path, key: &str) -> String {
     }
 }
 
-/// The C's USAGE string literal, unescaped back into plain text.
+/// The C's USAGE string literal, unescaped back into plain text
 fn usage(path: &std::path::Path) -> String {
     let t = std::fs::read_to_string(path).unwrap();
     let i = t.find("static const char *const USAGE =").expect("no USAGE in karyozip.c");

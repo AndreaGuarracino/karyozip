@@ -1,7 +1,6 @@
-//! Format primitives shared by the writer and the reader.
-//! The format's number encoding: LEB128 unsigned, and zigzag for signed.
+//! Format primitives shared by the writer and the reader: LEB128 unsigned, zigzag for signed
 
-/// The header flags in h[1], above the 49-bit names length.
+/// The header flags in h[1], above the 49-bit names length
 pub const TOKFLAG: u64 = 1 << 63;   // names through the tokeniser
 pub const INTFLAG: u64 = 1 << 62;   // names as integer deltas
 pub const RUNFLAG: u64 = 1 << 61;   // run counts head each read's lengths
@@ -28,7 +27,7 @@ pub fn put(out: &mut Vec<u8>, mut v: u64) {
     out.push(v as u8);
 }
 
-/// LEB128 back out, with the bound the forged-file fuzzing needs.
+/// LEB128 back out, with the bound the forged-file fuzzing needs
 #[inline]
 pub fn vget(b: &[u8], i: usize) -> (u64, usize) {
     match b.get(i) {   // one byte is most values: no loop for it
@@ -55,7 +54,7 @@ pub fn zz(v: i64) -> u64 {
     ((v as u64) << 1) ^ ((v >> 63) as u64)
 }
 
-/// FNV-1a, the hash the format uses everywhere.
+/// FNV-1a, the hash the format uses everywhere
 pub const FNV0: u64 = 0xcbf2_9ce4_8422_2325;
 /// one row into the row hash: name hash, start, end, label hash, as words
 pub fn rowmix(h: u64, nh: u64, st: u64, en: u64, lh: u64) -> u64 {
@@ -71,16 +70,11 @@ pub fn fnv(mut h: u64, b: &[u8]) -> u64 {
     h
 }
 
-/// Decimal digits straight into the buffer. `to_string()` allocates a String
-/// per number, which is a quarter of decode's time on a 40M-row track.
-/// One BED row onto `buf`: one reserve, the numbers straight into it as
-/// the C's putu64, one copy for each string; a scratch for the numbers was
-/// two more memmove a row.
+/// Decimal digits straight into the buffer, as the C's putu64: to_string() allocates a String per number
 #[inline]
 pub fn put_row(buf: &mut Vec<u8>, name: &[u8], st: u64, en: u64, lab: &[u8]) {
     buf.reserve(name.len() + 44 + lab.len() + 1);
-    // SAFETY: reserved above: the name, 44 bytes for three tabs and two
-    // numbers of at most 20 digits, the label and the newline.
+    // SAFETY: reserved above, the name plus 44 bytes for three tabs and two 20-digit numbers, the label and the newline
     unsafe {
         let n0 = buf.len();
         let p = buf.as_mut_ptr().add(n0);
@@ -104,13 +98,9 @@ pub fn putu64(out: &mut Vec<u8>, v: u64) {
     out.extend_from_slice(&b[..n]);
 }
 
-/// The digits at the front of `b`, and how many: one row of a BED goes into
-/// a stack buffer and reaches the output in one call, as the C writes it
-/// through one pointer.
+/// The digits at the front of `b`, and how many: a row goes out in one call, as the C writes it
 pub fn putu64_at(b: &mut [u8], v: u64) -> usize {
-    // the digit count by compares, then one division a digit, in place:
-    // a count by division doubled the divisions and a scratch array cost
-    // a memcpy, and this is every coordinate of every row written
+    // the digit count by compares, then one division a digit, in place: this writes every coordinate
     const P: [u64; 19] = [10, 100, 1_000, 10_000, 100_000, 1_000_000, 10_000_000, 100_000_000,
         1_000_000_000, 10_000_000_000, 100_000_000_000, 1_000_000_000_000, 10_000_000_000_000,
         100_000_000_000_000, 1_000_000_000_000_000, 10_000_000_000_000_000,
@@ -120,8 +110,7 @@ pub fn putu64_at(b: &mut [u8], v: u64) -> usize {
 60616263646566676869707172737475767778798081828384858687888990919293949596979899";
     let mut n = ((63 - (v | 1).leading_zeros()) * 1233 >> 12) as usize + 1;
     if n <= 19 && v >= P[n - 1] { n += 1; }   // the estimate is off by one
-    // n <= 20 and the table index is under 200: proven here, so the digit
-    // writes need no check, and this runs twice for every row written
+    // n <= 20 and the table index is under 200, so the digit writes need no check
     assert!(b.len() >= n && n <= 20);
     let (mut i, mut t) = (n, v);
     unsafe {
@@ -138,9 +127,7 @@ pub fn putu64_at(b: &mut [u8], v: u64) -> usize {
     n
 }
 
-/// FNV-1a as a `HashMap` hasher. The default is SipHash, which on a
-/// one-byte label costs more than the lookup it protects, and these keys
-/// come from the file the caller already chose to read.
+/// FNV-1a as a `HashMap` hasher: SipHash costs more than the lookup on one-byte labels
 #[derive(Default, Clone, Copy)]
 pub struct Fnv;
 pub struct FnvHasher(u64);
@@ -155,8 +142,7 @@ impl std::hash::Hasher for FnvHasher {
     fn write_u32(&mut self, v: u32) { self.0 = (self.0 ^ v as u64).wrapping_mul(0x100_0000_01b3); }
 }
 
-/// A tuple of label ids hashed a word at a time, as the C's tuphash: a
-/// slice of u32 would hash byte by byte, four FNV rounds a word.
+/// A tuple of label ids hashed a word at a time, as the C's tuphash
 #[derive(Clone, Default, PartialEq, Eq)]
 pub struct Tup(pub Vec<u32>);
 impl std::hash::Hash for Tup {
@@ -165,9 +151,7 @@ impl std::hash::Hash for Tup {
 
 pub type FnvMap<K, V> = std::collections::HashMap<K, V, Fnv>;
 
-/// A label table: ids in first-seen order and each label's FNV. As the C's
-/// intern: the last id, then a direct-mapped cache on the length and three
-/// bytes, since labels cycle, and only then the hash map.
+/// A label table: ids in first-seen order and each label's FNV; the last id, a small cache, then the map, as the C's intern
 pub struct Intern { pub tab: Vec<Vec<u8>>, pub h: Vec<u64>, map: FnvMap<Vec<u8>, u32>, last: Option<u32>, cache: [u32; 512] }
 
 impl Default for Intern {

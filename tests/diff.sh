@@ -7,6 +7,8 @@ D=$(cd "$(dirname "$0")" && pwd)
 [ -x "$C" ] && [ -x "$R" ] || { echo "build both first: make all rust"; exit 1; }
 C=$(realpath "$C"); R=$(realpath "$R")
 W=$(mktemp -d); trap 'rm -rf "$W"' EXIT
+src=$D; D=$W/fx; mkdir -p "$D"; cp "$src"/fixtures.txt "$src"/*.py "$src"/*.sh "$D"/   # the fixtures, unpacked
+awk '/^@@ /{f=d"/"$2; next} {print > f}' d="$D" "$D/fixtures.txt"
 fail=0
 
 cv=$("$C" --version | awk '/zstd|libbz3|liblzma/{print $1"="$2}' | tr '\n' ' ')
@@ -97,7 +99,7 @@ for f in ls.bed s.bed db.rall.bed; do
     for q in "-r $seq" "-r $seq:0-100"; do both "query $f [$q]" query -i "$W/t.kst" --hier "$W/h.tsv" --smooth --set fs $q; done
   done
 done
-# --chunk on a two-level hierarchy, one long sequence
+# --chunk: two-level hierarchy, one long sequence
 python3 -c "
 import random; random.seed(5); p=0
 with open('$W/ch.bed','w') as f:

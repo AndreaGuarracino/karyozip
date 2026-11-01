@@ -29,8 +29,7 @@
 
 static uint64_t BLOCK = UINT64_MAX;      /* one block: the smallest file */
 static int BLOCKSET = 0;                 /* --block was given */
-/* -e medium: blocks close at the first read past MEDBLK rows, so every
-   block holds whole reads and takes the one-block layouts */
+/* -e medium: blocks close at the first read past MEDBLK rows, whole reads that take the one-block layouts */
 #define MEDBLK 4194304
 static int VARBLK = 0;
 static int VARON = 0;                    /* this file: more than one such block */
@@ -52,19 +51,12 @@ static inline double nowsec(void) {
     struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
     return t.tv_sec + 1e-9 * t.tv_nsec;
 }
-/* the high-water mark is read from /proc at most every 10 ms: a span per
-   sequence over 3,000,000 sequences made a 1.7 s smooth take 104 s */
+/* the high-water mark is read from /proc at most every 10 ms, so a span per sequence stays cheap */
 #define PH_ADD(i, t0) do { if (PROF) { double _n = nowsec(); PH[i] += _n - (t0); \
     if (_n - PHLAST > 0.01) { PHRSS[i] = rss_now(); PHLAST = _n; } } } while (0)
 static size_t PHRSS[10]; static double PHLAST;
 static double WALL0 = 0;
-/* --threads, else one per core capped at 8. The cap is
-   measured, not guessed: encode is about half serial, so past 8 threads the
-   extra ones only spin at barriers. On a 40M-row track, 16 cores:
-     -t 4   5.09 s wall  13.7 s cpu
-     -t 8   4.41 s wall  19.5 s cpu   <- the knee
-     -t 16  4.69 s wall  35.3 s cpu
-   No environment variable changes it. */
+/* --threads, else one per core capped at 8: encode is half serial, so more threads only spin; no environment variable changes it */
 #define THRCAP 8
 static int nthreads(void) {
     if (NTHREADS > 0) return NTHREADS;
@@ -85,8 +77,7 @@ static size_t rss_now(void) {          /* VmHWM: the true high-water mark */
 }
 
 static void profdump(void) {
-    /* WALL0 is still 0 when we die before the run starts, and the timings
-       would then be the machine uptime. */
+    /* WALL0 is still 0 when we die before the run starts, and the timings would then be the machine uptime */
     if (!PROF || WALL0 == 0) return;
     double tot = 0;
     for (int i = 0; i < 10; i++) tot += PH[i];
@@ -107,9 +98,7 @@ static void profdump(void) {
                 ru.ru_maxrss / 1048576.0);
     }
 }
-/* Workers die too, from inside parallel regions: two threads calling
-   exit() at once is undefined, so the first one through takes the lock,
-   prints and exits, and any other waits there until the process ends. */
+/* Workers die too, from parallel regions: the first through takes the lock, prints and exits, the others wait */
 static pthread_mutex_t DIELOCK = PTHREAD_MUTEX_INITIALIZER;
 /* a decode-ahead worker keeps its refusal for the block it was decoding */
 static __thread jmp_buf *DIEJMP;
@@ -205,12 +194,7 @@ static void *xcalloc(size_t n, size_t sz) {
 static void *xrealloc(void *p, size_t n) { ckalloc(n); void *q = realloc(p, n); if (!q) die("oom"); return q; }
 static char *xstrdup(const char *s) { char *p = strdup(s); if (!p) die("oom"); return p; }
 
-/* Every text input goes through one reader, a FILE* by fopencookie so
-   getline, fgets and fread are unchanged; a path of NULL means stdin. Plain
-   text passes through. BGZF, what bgzip and KaryoScope write, is many
-   independent gzip blocks: 8 MB of them at a time are inflated side by side,
-   each checked against its CRC32 and size. Any other gzip streams through
-   zlib, member after member. A cut file is refused, in every mode. */
+/* Every text input through one fopencookie FILE*, NULL for stdin: plain, BGZF inflated side by side and CRC-checked, or any gzip; a cut file is refused */
 #define ZCHUNK (8u << 20)
 typedef struct {
     int fd, mode, reof, zend;           /* mode: 0 undecided, 1 plain, 2 BGZF, 3 gzip stream */
@@ -329,9 +313,7 @@ static FILE *zfopen(const char *path) {
     return f;
 }
 
-/* the digit count by compares, then one division a digit, in place: a
-   count by division doubles the divisions and a scratch array costs a
-   memcpy, and this writes every coordinate of every row */
+/* the digit count by compares, then one division a digit, in place: this writes every coordinate */
 static inline char *putu64(char *o, uint64_t v) {
     static const uint64_t P[19] = { 10ULL, 100ULL, 1000ULL, 10000ULL, 100000ULL,
         1000000ULL, 10000000ULL, 100000000ULL, 1000000000ULL, 10000000000ULL,
@@ -418,12 +400,7 @@ static uint64_t *labh;             /* fnv of each label, for the row hash */
 static uint64_t ROWHASH;           /* the rows as words, what binds a track used as --ref */
 static int lastid = -1;
 
-/* A track has a handful of distinct labels, 31 on a real chromosome track,
-   but it cycles through them: measured on 4M real rows, the label equals the
-   previous one 0.1% of the time, so the old single-slot cache never hit and
-   every row paid a full FNV over the label plus a probe. This is a small
-   direct-mapped cache on a four-byte key, checked with one memcmp. It changes
-   no id: the table below still assigns them in first-seen order. */
+/* Labels cycle through a handful of values, so a direct-mapped cache on length and three bytes comes before the hash; it changes no id */
 #define LCACHE 512
 static int lcache[LCACHE];
 static int lcache_init = 0;
@@ -466,9 +443,7 @@ static int intern(const char *s, size_t n) {
     return lastid = nlabtab++;
 }
 
-/* ZSTD_compress builds a level-17 match table per call, about 46 MB. Do NOT
-   hold one context across calls: measured, that costs 42 MB more, because a
-   freed table can be reused by the tokeniser and a live one cannot. */
+/* ZSTD_compress builds a level-17 match table per call; a context held across calls costs memory the tokeniser could reuse */
 static size_t zcl(buf *in, uint8_t **out, int level) {
     size_t bound = ZSTD_compressBound(in->n);
     *out = xmalloc(bound);
@@ -504,18 +479,13 @@ static char *unz(const void *src, size_t n, size_t *len, const char *what) {
 #define CARTFLAG (1ULL << 52)         /* some featureIDs are 2^26 + a vocabulary rank */
 #define LENFLAG  (1ULL << 56)         /* lengths the reference implies are 0 */
 #define TAILFLAG (1ULL << 55)
-/* Every read's run count heads its own lengths, so the index blob holds
-   nothing. One frame models the count beside the lengths it counts, which
-   is smaller than a second frame of counts on its own. */
+/* Every read's run count heads its own lengths, so the index blob holds nothing and one frame models counts and lengths */
 #define RUNFLAG  (1ULL << 61)
-/* One frame, the label of a run beside its length: a repeated read pattern
-   is one string the codec can match, not two halves in two frames. */
+/* One frame, the label of a run beside its length: a repeated read pattern is one string the codec can match */
 #define ILVFLAG  (1ULL << 51)
-/* Lengths grouped by label id within a read. The labels stay in their own
-   order and are the permutation, so nothing else is stored. */
+/* Lengths grouped by label id within a read; the labels, in their own order, are the permutation */
 #define GRPFLAG  (1ULL << 49)
-/* Blocks hold whole reads, their row counts vary, and the block table
-   gives each one's read count. */
+/* Blocks hold whole reads, their row counts vary, and the block table gives each one's read count */
 #define VARFLAG  (1ULL << 57)
 static int RUNHEAD = 0;               /* the writer is using that layout */
 static int ILV = 0;                   /* and whether the two frames are one */
@@ -589,9 +559,7 @@ static char *intnamesd(const uint8_t *b, size_t n, uint64_t cnt, size_t *outn) {
     free(v); o[w] = 0; *outn = w; return o;
 }
 
-/* One list. The default tries all of it and spends whatever that costs;
-   -e low is the subset marked 1, the codecs whose encode and decode stay
-   reasonable, so it can never reach a candidate the default did not. */
+/* One list: the default tries all of it, -e low the subset marked 1, so it never reaches a candidate the default did not */
 typedef struct { int codec; int fast; } kcand;
 static const kcand KCAND[] = {
     { 0x100, 1 }, { 0x80, 0 }, { 0x40, 0 }, { 0xc0, 0 },
@@ -624,12 +592,7 @@ static size_t candlist(int *out) {
     return n;
 }
 
-/* where a stream's reads start, for bzip3 pieces that end at one: ib, the
-   run count of each read, cs varints a run after each count there (1 when
-   ib is a headed lengths frame), or NULL when the stream heads each read
-   with its own count; mult varints a run; rows, when not 0, also ends a
-   piece at the first read start past that many rows, as medium ends a block;
-   zm 1: zpaq by the interleaved model, not level 5 */
+/* where a stream's reads start, for pieces that end at one: run counts ib (cs varints a run, NULL when headed), mult, rows rule, zpaq model zm */
 typedef struct { const uint8_t *ib; size_t ibn; int mult, cs; uint64_t rows; int zm; } rspec;
 static int RCUT = 0;                  /* blocks of whole reads: bzip3 cuts at read starts */
 static uint64_t CUTROWS_L = 0, CUTROWS_I = 0;   /* -e high: the rows rule of each frame, 0 none */
@@ -643,10 +606,7 @@ size_t kz_zpaq_encode(const uint8_t *in, size_t n, const uint32_t *cut, uint32_t
                       uint8_t *out, size_t cap);
 int kz_zpaq_decode(const uint8_t *in, size_t n, uint8_t *dst, size_t raw);
 
-/* Read names split on ':' into fields that are either the same in every name
-   or a plain integer. The integers go down as zigzag deltas, interleaved so a
-   read's fields sit together, and bzip3 takes the lot: on 3444234 Illumina
-   names that is 2301419 B against the tokeniser's 2818102. */
+/* Read names split on ':' into fields, constant or integer; integers as zigzag deltas, a read's fields together, then bzip3 */
 static char FLDSEP = ':';   /* ':' or '-', whichever splits every name alike */
 #define FLDMAX 16
 static size_t fldnames1(buf *names, uint64_t n, uint8_t **out);
@@ -674,8 +634,7 @@ static size_t fldnames1(buf *names, uint64_t n, uint8_t **out) {
             q = s + 1;
         }
     }
-    /* one chunk a thread, cut at line ends: each decides its fields, then
-       each writes its deltas from the last name of the chunk before */
+    /* one chunk a thread, cut at line ends: each decides its fields, then writes its deltas from the chunk before's last name */
     int T = nthreads(); if (T > 64) T = 64;
     size_t cut[65]; cut[0] = 0;
     for (int t = 1; t < T; t++) {
@@ -921,9 +880,7 @@ static char *tokd(const uint8_t *b, size_t n, size_t *outn) {
     char *o = xmalloc(raw + 1);
     const uint8_t *p = b + hdr;
     _Atomic int failed = 0;
-    /* at most TOKDEC chunks at once: each costs 127 MB in the decoder.
-       3000000 names, 8 threads: 8 at once 1.54 s 1136 MB, 4 1.60 s 570 MB,
-       2 2.28 s 352 MB. One chunk: no pool, a query pays for it. */
+    /* at most TOKDEC chunks at once: each costs 127 MB in the decoder; one chunk needs no pool */
     int nthr = nthreads() < TOKDEC ? nthreads() : TOKDEC;
     if (nthr > (int)nchunk) nthr = nchunk ? (int)nchunk : 1;
 #ifdef _OPENMP
@@ -971,17 +928,11 @@ static size_t namesrun(int kind, buf *full, uint64_t fn, uint8_t **out) {
          : kind == 3 ? fldnames(full, fn, out) : 0;
 }
 
-/* smallest of zstd, integer deltas, tokeniser, field deltas, ranked on
-   b; losers freed. With full, the winner then runs on full, and the best
-   known runs on it early, while zstd, the slow one, still ranks. */
+/* smallest of zstd, integer deltas, tokeniser, field deltas, ranked on b, losers freed; with full, the winner then runs on full */
 static size_t bestnames(buf *b, uint64_t n, buf *full, uint64_t fn, uint8_t **out, int *kind) {
     uint8_t *a3 = NULL; size_t s3 = 0;
     double _t0 = nowsec();
-    /* A plain thread, not an OpenMP section: inside a section the
-       tokeniser's own parallel loop would be nested and run on one thread.
-       tok3 overwrites every separator with NUL and puts it back, so it
-       cannot share the buffer with a concurrent reader: zstd gets a copy,
-       and b and full, one buffer, stay on this thread. */
+    /* A plain thread, not an OpenMP section, so the tokeniser's loop is not nested; tok3 writes NUL on separators, so zstd gets a copy */
     buf zb = { xmalloc(b->n ? b->n : 1), b->n, b->n };
     memcpy(zb.d, b->d, b->n);
     zjob zj = { &zb, n, NULL, NULL, 0, 0 };
@@ -1013,8 +964,7 @@ static size_t bestnames(buf *b, uint64_t n, buf *full, uint64_t fn, uint8_t **ou
     return best;
 }
 
-/* ranked on whole names up to 4 MB -e low, DEFSAMPLE MB the default, all
-   -e high; the winner run on all. 0: zstd, by the caller */
+/* ranked on the mode's sample of whole names, the winner run on all; 0: zstd, by the caller */
 typedef struct njob { buf *names; uint64_t n; uint8_t *z; size_t zl, sn; int pick, early;
                      struct njob *ej; pthread_t eth; buf *ec; } njob;   /* ej: the early ranking, joined here */
 static void *namespick(void *p) {
@@ -1047,9 +997,7 @@ static uint64_t vsoft(const uint8_t **p, const uint8_t *e) {
     return v;
 }
 
-/* bzip3 pieces of at most B bytes, each ending at the last read start
-   within B of its own start, else at B: an assembly's contigs differ more
-   than its pieces do, 0.64% and 0.79% smaller on two (job 38947666) */
+/* bzip3 pieces of at most B bytes, each ending at the last read start within B of its own start, else at B */
 static uint32_t *bz3cuts(const uint8_t *src, size_t n, size_t B, const rspec *rs, uint32_t *np) {
     size_t cap = 2 * (n / B) + 4, k = 0, s0 = 0, last = 0;   /* two pieces span over B */
     uint64_t prow = 0;                                        /* rows since the rows rule last cut */
@@ -1201,13 +1149,8 @@ static size_t splice_heads(const uint8_t *lens, size_t nl, const uint8_t *ib,
     return (size_t)(w - *out);
 }
 
-/* One stream a read: its run count, then a label beside its own length.
-   A read that repeats another is then one string, not two halves in two
-   frames, and the count heads it so the index holds nothing. */
-/* Labels counted down from 127 so they do not share bytes with the small
-   lengths beside them: the BWT cannot see which side of a pair a byte is on,
-   and a byte that means one thing is worth more than one that means two.
-   Its own inverse, and the varint keeps its width. */
+/* One stream a read: its run count, then a label beside its own length, so a repeated read is one string */
+/* Labels counted down from 127, apart from the small lengths beside them; its own inverse, and the varint keeps its width */
 static inline uint64_t ilv_flip(uint64_t v) { return v < 128 ? 127 - v : v; }
 
 static size_t ilv_pack(const uint8_t *lens, size_t nl, const uint8_t *ids, size_t ni,
@@ -1230,8 +1173,7 @@ static size_t ilv_pack(const uint8_t *lens, size_t nl, const uint8_t *ids, size_
     return (size_t)(w - *out);
 }
 
-/* Each read's lengths in label order: all of label 0's, then label 1's. The
-   label stream stays as it was, so it says where each one goes back. */
+/* Each read's lengths in label order, label 0's first; the label stream says where each goes back */
 /* sort key: the label above, the first-seen order below */
 static int gcmp(const void *a, const void *b) {
     uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
@@ -1361,12 +1303,9 @@ static void ktw_pushread(ktw *w) {
     }
     w->nidx++;
     bput(&w->names, w->cur, w->curlen); bput(&w->names, "\n", 1);
-    /* The sample is whole names starting below the mode's cap. Once
-       complete, a copy is ranked on a thread while the rows still come,
-       when nothing at the close can change the names. */
+    /* The sample is whole names below the mode's cap, ranked on a thread while the rows still come */
     size_t ncap = (size_t)(FASTMODE ? 4 : DEFSAMPLE) << 20;
-    /* Late in the input it would only overlap the parse buffers: then the
-       close ranks them. 57 MB is zstd 17's state on a 4 MB sample. */
+    /* Late in the input it would only overlap the parse buffers: then the close ranks them */
     if (!w->eon && !INHALF && !SLOW && NAMEMODE != 1 && w->names.n >= ncap) {
         w->eon = 1;
         const char *q = (const char *)w->names.d, *e2 = q + w->names.n; uint64_t sn = 0;
@@ -1403,9 +1342,7 @@ static uint64_t refend_at(const char *nm, uint64_t pos);
 static uint32_t refrow_at(const char *nm, uint64_t st, uint64_t len);
 static __thread int LASTREV;   /* strand of the last refend answer */
 
-/* same: the caller already knows this row's name equals the previous row's,
-   which the parse threads work out in parallel. It saves one memcmp per row,
-   and the name changes only once per sequence. */
+/* same: the caller knows this row's name equals the previous one, found on the parse threads */
 static void ktw_row(ktw *w, const char *name, size_t nlen,
                     uint64_t run_len, const char *label, size_t llen, uint64_t start,
                     int same) {
@@ -1446,7 +1383,7 @@ typedef struct { char *name; seg *s; size_t n, cap; } qseg;
 typedef struct { char *name; uint64_t *st, end; uint32_t *lab, *st32; size_t n, cap; int64_t ri;
                  /* st32 holds the starts once a whole contig is in and fits 32 bits: 8 bytes a run, not 12 */
                  _Atomic int filled;              /* every run is in st and lab */
-                 uint64_t bp0, row0, *bend;       /* .kst per block: bases and row before the contig, */
+                 uint64_t bp0, row0, *bend;       /* .kst per block: bases and row before the contig */
                  uint32_t firstblk, lastblk;      /* its block range, and the position after each */
                  uint8_t *blkin; uint32_t nblkin; } rcon;
 
@@ -1597,7 +1534,7 @@ static void loadpaf(const char *path) {
         if (!rc) { noref++; continue; }               /* target absent from ref */
         uint32_t tix = (uint32_t)(rc - RC);
         qseg *Q = NULL;
-        /* A CIGAR is checked, not trusted: */
+        /* A CIGAR is checked, not trusted */
         uint64_t qcons = 0, tcons = 0;
         for (const char *c = cg; *c && *c != '\t'; ) {
             if (*c < '0' || *c > '9') die("PAF CIGAR: an operation has no length");
@@ -1611,8 +1548,7 @@ static void loadpaf(const char *path) {
             if (op == 'M' || op == '=' || op == 'X') {
                 if (rev && qp < v) die("PAF CIGAR runs before the query start");
                 if (!Q) Q = qseg_get(fl[0], 1);
-                /* one slot first: a short read carries 1.2 blocks; eight a
-                   query peaked at 972772 against 547952 KB on 2M reads */
+                /* one slot first: a short read carries 1.2 blocks */
                 if (Q->n == Q->cap) { Q->cap = Q->cap ? Q->cap * 2 : 1;
                                       Q->s = xrealloc(Q->s, Q->cap * sizeof *Q->s); }
                 Q->s[Q->n++] = (seg){ rev ? qp - v : qp, tix, (uint32_t)v, tp, rev };
@@ -1646,7 +1582,7 @@ static void loadpaf(const char *path) {
     fprintf(stderr, "alignment: %zu query contigs, %zu collinear blocks\n", nqs, nblk);
 }
 
-/* --------------------------------------------------- packed alignment Only what --aln reads: */
+/* --------------------------------------------------- packed alignment: only what --aln reads */
 #define ALNMAGIC "KSTAL1\n"   /* carries the reference contig-order hash */
 #define ALNMAGLEN 6
 #define ALNTOK 0x7fff0000   /* the name stream went through the tokeniser */
@@ -1657,8 +1593,7 @@ static uint64_t refhash(void) {   /* the reference contig names, in order */
     return h;
 }
 
-/* A gap pair as one varint: 0 none, 3k+1 an insertion of k+1, 3k+2 a
-   deletion of k+1, 3 both or a negative one, two zigzags after. */
+/* A gap pair as one varint: 0 none, 3k+1 an insertion of k+1, 3k+2 a deletion of k+1, 3 both or a negative one, two zigzags after */
 static void gapput(buf *b, int64_t dq, int64_t dt) {
     if (!dq && !dt) bvar(b, 0);
     else if (dq > 0 && !dt && dq < INT64_MAX / 3) bvar(b, 3 * (uint64_t)(dq - 1) + 1);
@@ -1676,13 +1611,7 @@ static void gapget(const uint8_t **p, const uint8_t *e, int64_t *dq, int64_t *dt
 
 static void alnpack(const char *inpaf, const char *out) {
     loadpaf(inpaf);
-    /* A block that starts a target run carries an absolute position: its
-       query offset as a varint and its target position as four byte planes,
-       since a random genome coordinate does not shrink as a varint. A block
-       within a run carries the gap since the last: the query bases skipped
-       and the target bases skipped, measured from the block's own end on the
-       minus strand, so both are the indel sizes. One varint codes them,
-       since one is nearly always 0: gapcode. */
+    /* A block starting a target run has an absolute position, query offset varint and target in four byte planes; others the gaps since the last */
     buf names = {0}, cnt = {0}, pos = {0}, len = {0}, seg_ = {0}, fq = {0}, pl[4] = {{0}, {0}, {0}, {0}};
     for (size_t i = 0; i < nqs; i++) {
         const qseg *Q = QS + i;
@@ -1921,8 +1850,7 @@ static void rcompact(rcon *rc) {   /* a whole contig under 2^32: starts to 4 byt
     for (size_t i = 0; i < rc->n; i++) w[i] = (uint32_t)rc->st[i];
     free(rc->st); rc->st = NULL; rc->st32 = w;
 }
-/* count of starts <= tpos, inside the rows [lo, hi) that are decoded and
-   whose last run ends at wend. A whole contig is lo = 0, hi = n. */
+/* count of starts <= tpos within the decoded rows [lo, hi), whose last run ends at wend; a whole contig is lo = 0, hi = n */
 static size_t runat(const rcon *rc, uint64_t tpos, size_t lo, size_t hi, uint64_t wend) {
     if (tpos >= wend) return 0;         /* past the last run: no answer, not the last run's */
     size_t a;
@@ -1975,9 +1903,7 @@ static uint64_t refend(const qseg *Q, uint64_t pos) {
 }
 
 static uint64_t refend_at(const char *nm, uint64_t pos) {
-    /* __thread like every other reader cursor: smooth refuses --aln tracks
-       today, so no threaded path reaches this, but a shared cursor here
-       would be a silent wrong-length race the day one does. */
+    /* __thread like every other reader cursor, so a future threaded path cannot race on it */
     static __thread const qseg *cq = NULL; static __thread char cn[512];
     if (strcmp(nm, cn)) { cq = qlookup(nm); snprintf(cn, sizeof cn, "%s", nm); }
     return refend(cq, pos);
@@ -2007,7 +1933,7 @@ static fent *ftab; static size_t fcap, fn;
 static char **fset;                     /* feature set names, in table order */
 static size_t nfset;
 static char ***fid2lab;                 /* featureID -> label per set */
-static uint32_t **fid2len;              /* their lengths: a strlen a row a set was 10% of a -d decode */
+static uint32_t **fid2len;              /* their lengths, not a strlen a row a set */
 static size_t nfid;
 
 static size_t fhash(const char *s) {
@@ -2039,7 +1965,7 @@ static uint32_t fget(const char *key) {
     return UINT32_MAX;
 }
 
-/* --db hot loop: */
+/* --db hot loop */
 #define DBMAXSET 32
 typedef struct { char **k; uint32_t *v; size_t cap, n; } sintern;
 static sintern SI[DBMAXSET];
@@ -2173,9 +2099,7 @@ static void loadfeatures(const char *path) {
     }
 }
 
-/* --hier: the label vocabulary of each set, features.tsv column plus the
-   hierarchy nodes of that set plus "novel", sorted. A tuple outside
-   features.tsv gets 2^26 + its mixed-radix rank, the same in every file. */
+/* --hier: per set, the features.tsv column, the hierarchy nodes and novel, sorted; an outside tuple is 2^26 + its mixed-radix rank */
 static char ***VOC; static size_t *NVOC; static uint64_t *VSTRIDE, VPROD, HIERHASH;
 static int CARTON, CARTUSED;
 #define CARTBASE (1u << 26)
@@ -2238,8 +2162,7 @@ static const char *flab(uint32_t id, size_t k) {   /* the label of set k for a f
 
 typedef struct { const char *nm; uint32_t nlen, llen; const char *lab;
                  uint64_t st, len; int same; } prow;   /* same: name equals the row before */
-/* One slab of whole lines, split into rows by T threads. The fault
-   is kept, not raised: the slab before must append first. */
+/* One slab of whole lines split into rows by T threads; the fault is kept, since the slab before must append first */
 typedef struct {
     FILE *in; char *b; size_t have, span; int eof, T;
     prow *pr[32]; size_t prn[32], prc[32];
@@ -2331,8 +2254,7 @@ static void encode(void) {
     if (T > 32) T = 32;
     FILE *IN = zfopen(NULL);            /* plain or .gz, decided by the bytes */
     if (!IN) die("read error on stdin");
-    /* Two slabs: one thread reads and splits the next while this one
-       appends the rows of the last, which must stay serial. */
+    /* Two slabs: one thread reads and splits the next while this one appends the last, which must stay serial */
     pslab sb[2];
     memset(sb, 0, sizeof sb);
     for (int k = 0; k < 2; k++) { sb[k].in = IN; sb[k].T = T; sb[k].b = xmalloc(SLAB + 1); }
@@ -2368,11 +2290,8 @@ static void encode(void) {
 }
 
 
-/* bzip3 splits the input into blocks of its MB argument, so every size at
-   or above the stream gives one block and the same bytes: the smallest
-   such size stands for all of them, and the rest are searched for nothing */
-/* hts_pack and its arith twin refuse above 16 distinct bytes and the encoder
-   then clears the PACK bit, so such a candidate is its plain sibling */
+/* every bzip3 size at or above the stream gives one block and the same bytes, so the smallest stands for them */
+/* hts_pack and its arith twin refuse above 16 distinct bytes, so such a candidate is its plain sibling */
 static int packdup(int codec, const uint8_t *p, size_t n) {
     if (!(codec & 0x80) || (codec & CODEC_BZIP3)) return 0;
     uint8_t seen[256] = {0}; int d = 0;
@@ -2380,10 +2299,7 @@ static int packdup(int codec, const uint8_t *p, size_t n) {
     return 0;
 }
 
-/* bzip3 blocks at least as big as the m bytes ranked give the same bytes
-   there, so only one of them runs: the one right for the whole n, the
-   smallest that covers it, else the largest listed. A 16 MB sample cannot
-   tell 16 MB blocks from 64 MB ones, and the tie went to 16. */
+/* bzip3 blocks at least as big as the m bytes ranked tie there, so only the one right for the whole n runs */
 static int bz3dup(int codec, size_t m, size_t n, const int *cand, size_t ncand) {
     if (!(codec & CODEC_BZIP3)) return 0;
     uint64_t mb = (uint64_t)(codec & 0xffff) << 20, keep = 0, top = 0;
@@ -2396,8 +2312,7 @@ static int bz3dup(int codec, size_t m, size_t n, const int *cand, size_t ncand) 
     return mb >= m && mb != (keep ? keep : top);
 }
 
-/* a query decodes a whole block: bzip3 at 8 MB/s, lzma at 44, arith at
-   2.5x rANS */
+/* a query decodes a whole block: bzip3 at 8 MB/s, lzma at 44, arith at 2.5x rANS */
 /* a codec id as a word, for the diagnostics */
 static const char *cname(int c) {
     static __thread char b[32];
@@ -2425,8 +2340,7 @@ static void pickcodecs(int rawfd, const blkmeta *bm, size_t nraw) {
             if (bm[i2].len - bm[i2].lens > maxstream) maxstream = bm[i2].len - bm[i2].lens; }
         int big = maxstream >= 0x7fffffffu;   /* rANS and arith decode below INT_MAX */
         int seekable = nraw > 1 || (uint64_t)rawtot > BLOCK;
-        /* one rule, three samples: -e low its codecs on 4 MB, the default all
-           of them on DEFSAMPLE MB, -e high all of them on the whole file */
+        /* one rule, three samples: -e low its codecs on 4 MB, the default all on DEFSAMPLE MB, -e high all on the whole file */
         size_t SCAP = FASTMODE ? (4u << 20) : ((size_t)DEFSAMPLE << 20);
 
         if (SLOW) {
@@ -2441,12 +2355,7 @@ static void pickcodecs(int rawfd, const blkmeta *bm, size_t nraw) {
         }
 
         size_t pick[3], np = 0;
-        /* Sampling the first, middle and last block is why compression cannot
-           start until parsing has finished: the choice needs the last block.
-           Overlapping the two phases would be worth about 26% of encode, they
-           are 2.24 s each at -t 8 and strictly sequential, but sampling the
-           first three blocks instead changes which codec wins on every encode
-           and changes what -e high means. Measured and declined. */
+        /* Sampling the first, middle and last block means compression waits for the parse: the choice needs the last block */
         if (nraw) { pick[np++] = 0;
                     if (nraw > 2) pick[np++] = nraw / 2;
                     if (nraw > 1) pick[np++] = nraw - 1; }
@@ -2464,8 +2373,7 @@ static void pickcodecs(int rawfd, const blkmeta *bm, size_t nraw) {
             const uint8_t *ids = src + nl;
             if (nl > SCAP) nl = SCAP;
             if (ni > SCAP) ni = SCAP;
-            /* The two zstd baselines are two more tasks in the same sweep,
-               so the search is parallel from its first block. */
+            /* The two zstd baselines are two more tasks in the same sweep, so the search is parallel from its first block */
             size_t zb[2][2] = {{0, 0}, {0, 0}};
             int z22 = !FASTMODE && !LEVELSET;
             int cthr = nthreads();
@@ -2484,9 +2392,7 @@ static void pickcodecs(int rawfd, const blkmeta *bm, size_t nraw) {
                     free(zo); ZSTD_freeCCtx(sc);
                     continue;
                 }
-                /* A candidate the selection below cannot take is not worth
-                   compressing. On a seekable track that is both bzip3
-                   entries, whose bz3_new alone asks for its 16 or 64 MB. */
+                /* A candidate the selection below cannot take is not worth compressing, as bzip3 on a seekable track */
                 if (bz3dup(CAND[k], ni > nl ? ni : nl, maxstream, CAND, NCAND)) { ci[k] = cl[k] = (size_t)-1 / 2; continue; }
                 if (!((!seekable || fastenough(CAND[k]))
                       && (!big || (CAND[k] & (CODEC_BZIP3 | CODEC_LZMA))))) {
@@ -2513,8 +2419,7 @@ static void pickcodecs(int rawfd, const blkmeta *bm, size_t nraw) {
         int wi = 0, wl = 0;
         {   /* every mode: the smallest that round trips on what it was ranked on */
             size_t *ti = xcalloc(NCAND + 2, sizeof *ti), *tl = xcalloc(NCAND + 2, sizeof *tl);
-            /* a candidate lives per stream: one that does not round-trip
-               the ids may still be the smallest for the lengths */
+            /* a candidate lives per stream: one that fails the ids may still win the lengths */
             int *live_i = xcalloc(NCAND + 2, sizeof *live_i), *live_l = xcalloc(NCAND + 2, sizeof *live_l);
             for (unsigned k = 0; k < NCAND; k++) {
                 int ok = !big || (CAND[k] & (CODEC_BZIP3 | CODEC_LZMA));
@@ -2522,8 +2427,7 @@ static void pickcodecs(int rawfd, const blkmeta *bm, size_t nraw) {
                 live_l[k] = cl[k] < (size_t)-1 / 4 && ok;
             }
             live_i[NCAND] = live_l[NCAND] = 1; live_i[NCAND + 1] = live_l[NCAND + 1] = !LEVELSET && !FASTMODE;
-            /* one block whose streams fit the sample: the sample already
-               compressed exactly this, so its sizes are the file's */
+            /* one block whose streams fit the sample: the sample's sizes are the file's */
             int reuse = !SLOW || (nraw == 1 && bm[0].lens <= SCAP && bm[0].len - bm[0].lens <= SCAP);
             if (reuse) {
                 for (unsigned k = 0; k < NCAND; k++) { ti[k] = ci[k]; tl[k] = cl[k]; }
@@ -2610,16 +2514,10 @@ static size_t complens(ZSTD_CCtx *tc, const uint8_t *src, size_t n, const rspec 
     return a;
 }
 
-/* A respelt block is a different stream from the one the codec was chosen
-   on, so it counts only at the size it comes back at. */
-/* Every stream by every codec of the mode in one pool, LZMA and bzip3
-   first since they take longest. Per stream the smallest that round trips
-   on its sample wins, ties to the earlier of zstd, the table, zstd-22.
-   m[s] bytes are ranked of a stream n[s] bytes whole. Out: cd[s], lv[s]
-   the zstd level or -1, sz[s] 0 if none came back. */
+/* A respelt block counts only at the size it comes back at */
+/* Every stream by every codec of the mode in one pool, slowest first; per stream the smallest that round trips wins, ties to the earlier */
 typedef struct { int s, c, lv, r, cls; size_t z, m; } rjob;
-/* the slowest first, so no long job starts last: LZMA and zstd 17 and up,
-   then bzip3, then the rest; within a class the larger stream first */
+/* the slowest first, so no long job starts last: LZMA and zstd 17 and up, then bzip3, then the rest, larger streams first */
 static int rjcmp(const void *a, const void *b) {
     const rjob *x = a, *y = b;
     return x->cls != y->cls ? x->cls - y->cls : x->m != y->m ? (x->m < y->m) - (x->m > y->m)
@@ -2643,9 +2541,7 @@ static void rankall(int ns, const uint8_t *const *src, const size_t *m, const si
     qsort(jb, nj, sizeof *jb, rjcmp);
     double *jt = xcalloc(nj, sizeof *jt), tp = nowsec();   /* per job, under --profile */
     uint8_t **bo = xcalloc((size_t)ns, sizeof *bo); long *bj = xmalloc((size_t)ns * sizeof *bj);
-    /* A stream whose jobs are all done has its best: the next free thread
-       reads it back before taking a job, not after the pool. left: jobs
-       to go, vq: the job read back, vf[j]: it came back. */
+    /* A stream whose jobs are done is read back by the next free thread before it takes a job */
     long *vq = xmalloc((size_t)ns * sizeof *vq); char *vf = xcalloc(nj, 1);
     size_t *left = xcalloc((size_t)ns, sizeof *left);
     for (int t = 0; t < ns; t++) bj[t] = vq[t] = -1;
@@ -2726,11 +2622,7 @@ static void rankall(int ns, const uint8_t *const *src, const size_t *m, const si
     free(jb); free(jt); free(bo); free(bj); free(vq); free(vf); free(left);
 }
 
-/* bzip3 at each of nm sizes over the pieces paycut makes. Every piece of
-   every size is one job, so a stream of a few pieces keeps the threads
-   busy; a frame is 13 B plus its pieces framed one by one. The smallest
-   under *sz, the smaller size on a tie, read back, takes *cd and *sz:
-   1 when one did. */
+/* bzip3 at each of nm sizes over paycut's pieces, every piece of every size one job; the smallest under *sz, read back, wins */
 static int bz3try(const uint8_t *s, size_t n, const rspec *rs, const int *mb, int nm, int *cd, size_t *sz) {
     size_t nj = 0, cap = 0, tot[16] = {0}, *jo = NULL, *jl = NULL; int *jm = NULL; char bad[16] = {0};
     for (int i = 0; i < nm; i++) {
@@ -2773,8 +2665,7 @@ static int bz3try(const uint8_t *s, size_t n, const rspec *rs, const int *mb, in
     }
 }
 
-/* the largest piece the rows rule alone makes, n without one: every block
-   size at or above it gives the same pieces */
+/* the largest piece the rows rule alone makes: every block size at or above it gives the same pieces */
 static size_t bz3cover(const uint8_t *s, size_t n, const rspec *rs) {
     if (!rs || !rs->rows || !n) return n;
     uint32_t np = 0, *c = bz3cuts(s, n, n < (512u << 20) ? n : 512u << 20, rs, &np);
@@ -2784,9 +2675,7 @@ static size_t bz3cover(const uint8_t *s, size_t n, const rspec *rs) {
     return top;
 }
 
-/* -e high: bzip3 at every MB from half to twice the winner's, in eighths
-   of it. The bytes do not follow the block size: a short-read track gave
-   184237480 B at 8 MB, 184391699 at 12, 183950371 at 14 (job 38947902). */
+/* -e high: bzip3 at every MB from half to twice the winner's, in eighths: the bytes do not follow the block size */
 static void bz3fine(const uint8_t *s, size_t n, const rspec *rs, int *cd, size_t *sz) {
     if (!(*cd & CODEC_BZIP3) || !*sz) return;
     int b = *cd & 0xffff, mb[16], nm = 0; size_t cover = bz3cover(s, n, rs);
@@ -2798,10 +2687,7 @@ static void bz3fine(const uint8_t *s, size_t n, const rspec *rs, int *cd, size_t
     if (nm) bz3try(s, n, rs, mb, nm, cd, sz);
 }
 
-/* -e high: bzip3 pieces that also end where medium ends a block, at the
-   first read start past MEDBLK rows, at every listed size: medium's own
-   pieces, which pieces counted in bytes never make; it beat them by 17301 B
-   on an assembly (job 38963751) */
+/* -e high: bzip3 pieces that also end where medium ends a block, medium's own pieces */
 static void bz3rows(const uint8_t *s, size_t n, const rspec *rs, int *cd, size_t *sz, uint64_t *rows) {
     if (!n) return;
     rspec rr = *rs; rr.rows = MEDBLK;
@@ -2817,11 +2703,7 @@ static void bz3rows(const uint8_t *s, size_t n, const rspec *rs, int *cd, size_t
     if (nm && bz3try(s, n, &rr, mb, nm, cd, sz)) *rows = MEDBLK;
 }
 
-/* -e high: libzpaq's level 5, context mixing, in ZPQMB pieces ended at read
-   starts: 3.93% to 11.84% under bzip3 on two assemblies, two short-read
-   tracks and an assembly holdout (job 38965676). An interleaved stream also
-   tries the model in kzzpaq.cpp; the smaller wins and sets rs->zm. The frame
-   is kept, so it is made once and read back once. */
+/* -e high: libzpaq level 5 in ZPQMB pieces ended at read starts; interleaved streams also try the ilv model; the frame is kept */
 static uint8_t *ZK[2]; static size_t ZKN[2];   /* the kept lengths and labels frames */
 static void zpqtry(const uint8_t *s, size_t n, rspec *rs, int *cd, size_t *sz, int t) {
     int c = CODEC_ZPAQ | ZPQMB, zm = rs->zm;
@@ -2856,9 +2738,7 @@ static size_t lensok(ZSTD_CCtx *tc, const uint8_t *src, size_t n, const rspec *r
 
 static int u64cmp(const void *a, const void *b) {
     uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b; return x < y ? -1 : x > y; }
-/* 64-bit hashes sorted in place: one pass by the top byte into 256 buckets,
-   then the buckets side by side. glibc's qsort merges through a copy of the
-   array, 590 MB on 74M short-read names, on one thread. */
+/* 64-bit hashes sorted in place, by the top byte into 256 buckets, then the buckets side by side: qsort copies the array */
 static void u64sort(uint64_t *a, size_t n) {
     size_t cnt[256] = {0}, beg[257], nx[256];
     for (size_t i = 0; i < n; i++) cnt[a[i] >> 56]++;
@@ -2930,9 +2810,7 @@ static uint64_t idxbuild(const buf *ib, buf *ichunks, buf *itab) {
     return nichunk;
 }
 
-/* Labels beside a lengths frame that takes one thread: the rest of
-   the threads, or 2 beside LZMA, an hour on 3 GB, so bzip3 holds 2
-   block states, not 8. */
+/* Labels beside a lengths frame that takes one thread: the rest of the threads, or 2 beside LZMA */
 typedef struct { const uint8_t *s; size_t n; uint8_t *o; size_t z; int t; const rspec *rs; } ljob;
 static void *labjob(void *p) {
     ljob *j = p;
@@ -2969,10 +2847,7 @@ static void ktw_close(ktw *w) {
     uint64_t nblk = w->nblk, rows = w->rows;
     FILE *tmp = w->tmp;
     const blkmeta *bm = w->bm; size_t nraw = w->nraw;
-    /* The names rank beside the searches when nothing below changes them:
-       no ordinals, none dropped, and at most 64 MB, since
-       their working memory adds to the search's. Joined before
-       namesunique, which reads the buffer tok3 rewrites in place. */
+    /* The names rank beside the searches when nothing below changes them, joined before namesunique reads the buffer tok3 rewrites */
     njob nj = { .names = &names, .n = nidx };
     if (w->eon) { nj.early = 1; nj.ej = &w->ej; nj.eth = w->eth; nj.ec = &w->ecopy; }   /* its ranking holds for these names */
     pthread_t nth;
@@ -2993,12 +2868,7 @@ static void ktw_close(ktw *w) {
             if (bm[i].alen[v] + (bm[i].len - bm[i].lens) > maxraw) maxraw = bm[i].alen[v] + (bm[i].len - bm[i].lens);
     }
 
-    /* Four spellings of one block, all measured, the smallest kept: the two
-       frames as they are; the run count heading each read's lengths, which
-       empties the index; the two frames interleaved into one, where a
-       repeated read pattern is a single string; and both. One block, or
-       blocks of whole reads, decided on the first: a split read has no
-       count to head it. */
+    /* Four spellings of one block, the smallest kept: as they are, counts heading lengths, interleaved, or grouped; decided on the first block */
     uint8_t *altbuf = NULL, *lk = NULL; size_t altlen = 0, alt_lens = 0, lkn = 0;
     uint8_t *altv[3] = {0}; size_t altvn[3] = {0}, altvl[3] = {0};
     double _tl = nowsec();
@@ -3007,10 +2877,7 @@ static void ktw_close(ktw *w) {
         uint8_t *rb0 = xmalloc(bm[0].len);
         rawget(w->rawfd, (off_t)bm[0].off, rb0, bm[0].len);
         ZSTD_CCtx *mc = ZSTD_createCCtx();
-        /* The layout is decided on the mode's sample, as the codec is: whole
-           reads up to 4 MB of lengths -e low, DEFSAMPLE MB the default, all
-           of them -e high. Each layout gets its own best codec there; only the
-           winner is built whole, compressed once and read back. */
+        /* The layout is decided on the mode's sample, as the codec is; only the winner is built whole, compressed once and read back */
         size_t cap = SLOW ? SIZE_MAX : (size_t)(FASTMODE ? 4 : DEFSAMPLE) << 20, pl = 0, pi = 0, pb = 0;
         {   const uint8_t *p = rb0, *e = rb0 + nl0, *q = rb0 + nl0, *qe = q + ni0, *r = w->ibx.d, *re = r + ibn0;
             while (r < re) {
@@ -3027,8 +2894,7 @@ static void ktw_close(ktw *w) {
         n4[1] = splice_heads(ls, pl, bs, pb, &lay[1]);
         if (!FASTMODE) n4[2] = grp_pack(ls, pl, is, pi, bs, pb, &lay[2]);   /* a sort a read back */
         n4[3] = ilv_pack(ls, pl, is, pi, bs, pb, &lay[3]);
-        /* the labels and the four length spellings, ranked in one pool; a
-           spelling's whole size is its sample's scaled by the lengths' */
+        /* the labels and the four length spellings ranked in one pool, a spelling's size scaled from its sample */
         const uint8_t *src[5] = { is, ls, lay[1], lay[2], lay[3] };
         size_t m5[5] = { pi, pl, n4[1], n4[2], n4[3] }, n5[5] = { ni0, nl0 }, r5[5];
         for (int k = 2; k < 5; k++) n5[k] = pl ? (size_t)((unsigned __int128)m5[k] * nl0 / pl) : m5[k];
@@ -3046,9 +2912,7 @@ static void ktw_close(ktw *w) {
         for (int t = 0; SLOW && t < 2; t++) {     /* -e high: the lengths, then the labels beside them */
             int u = t ? 0 : L + 1;
             if (t && L == 3) break;
-            /* two families, each refined, the smaller kept, pieces counted in
-               bytes on a tie: refining only the family the menu picked lost
-               183298 B on a short-read track (job 38965676) */
+            /* two families, each refined, the smaller kept, pieces counted in bytes on a tie */
             int cr = c5[u]; size_t zr = SIZE_MAX; rspec rr = rs5[u];
             bz3fine(src[u], m5[u], &rs5[u], &c5[u], &r5[u]);
             bz3rows(src[u], m5[u], &rr, &cr, &zr, &rr.rows);
@@ -3110,10 +2974,7 @@ static void ktw_close(ktw *w) {
     if (RUNHEAD && !VARON) { free(w->ibx.d); w->ibx.d = NULL; w->ibx.n = 0; }   /* blocks past the first still spell theirs */
 
     {
-        /* Compress apart, write in order, as the Rust's: a thread takes
-           the next block up to 4 a thread past the last written, and
-           whoever finishes the oldest writes every ready one. An ordered
-           loop held each thread until its block's turn. */
+        /* Compress apart, write in order, as the Rust's: a thread takes the next block, whoever finishes the oldest writes every ready one */
         double _tc = nowsec();
         int nthr = nthreads();
         _Atomic int failed = 0, wfail = 0;
@@ -3328,13 +3189,9 @@ static void ktw_close(ktw *w) {
 }
 
 /* ------------------------------------------------------- the library API */
-/* karyozip.h documents the contract. These are thin: the CLI and a caller
-   that skips the BED go through exactly the same writer, so a track built
-   row by row is byte-identical to one encoded from the equivalent BED. */
+/* karyozip.h documents the contract; the CLI and a library caller go through the same writer, so the bytes are the same */
 kt_writer *kt_open(FILE *out) {
-    /* the encoder keeps global state: a second writer in one process starts
-       from nothing, and the codec flags as first given. Not in ktw_open: the
-       CLI interns the reference's labels before it opens the writer. */
+    /* the encoder keeps global state: a second writer starts from nothing; the CLI interns the reference's labels before it opens the writer */
     static int idc0 = -2, lenc0, lvl0, lvlset0, blkset0; static uint64_t blk0;
     if (idc0 == -2) { idc0 = IDCODEC; lenc0 = LENCODEC; lvl0 = LEVEL; lvlset0 = LEVELSET; blk0 = BLOCK; blkset0 = BLOCKSET; }
     IDCODEC = idc0; LENCODEC = lenc0; LEVEL = lvl0; LEVELSET = lvlset0; BLOCK = blk0; BLOCKSET = blkset0;
@@ -3352,12 +3209,7 @@ void kt_level(kt_writer *w, int level) {
 }
 void kt_row(kt_writer *w, const char *name, size_t nlen,
             uint64_t run_len, const char *label, size_t llen, uint64_t start) {
-    /* The CLI gets these for free: its parser split on tabs and newlines, so
-       a name or label can never hold one, and a zero-length run cannot reach
-       the writer. A library caller can produce all of them, and a track with
-       a newline in a label does not decode: the label table is newline
-       separated, so it comes back as "the label table has more lines than
-       its count". Refusing here is what keeps encode lossless. */
+    /* A library caller can send a tab, a newline or a zero-length run, which the CLI's parser cannot: refuse them, to stay lossless */
     if (!nlen) die("empty sequence name");
     if (!run_len) die("end equals start: a run must cover at least one base");
     if (start > UINT64_MAX - run_len) die("a coordinate does not fit in 64 bits");
@@ -3384,8 +3236,7 @@ void kt_close(kt_writer *w) {
 const char *kt_version(void) { return KARYOZIP_VERSION; }
 
 /* --------------------------------------------------------------- decoding */
-/* one block: file offset, both frame sizes, both decoded sizes, rows, bp,
-   its FNV, and which of the three length spellings it used */
+/* one block: file offset, frame and decoded sizes, rows, bp, its FNV, the length spelling it used */
 typedef struct { uint64_t off, size, l, raw, lraw, rows, bp, hash; uint8_t nos; uint64_t row0, rd0, nrd; } blk;
 typedef struct {
     FILE *f; uint64_t nreads, rows, data0, block;
@@ -3622,7 +3473,7 @@ static R *ropen(const char *path) {
     r->nz_keep = nz; r->nzl_keep = (size_t)h[1]; r->names_ready = 0; r->names_tok = names_tok; r->names_int = names_int; r->names_fld = names_fld; r->dropped = dropped;
     r->name = NULL;                    /* 160 MB, allocated by ensurenames */
 
-    /* Walk varints with a cursor, allocate nothing. */
+    /* Walk varints with a cursor, allocate nothing */
 
     r->nichunk = h[10];
     r->ichunk = iz;                      /* the concatenated chunk frames */
@@ -3847,9 +3698,7 @@ static uint64_t namesrc(void) {
     struct stat st; if (stat(NAMEFILE, &st)) die("cannot stat the file given to --names");
     return stathash(&st);
 }
-/* (key, ordinal) pairs by key, then ordinal, as the Rust's sort_unstable:
-   inlined, where qsort's merge sort, its copies and a call a compare were
-   62% of index on short reads. Keys are hashes, so pivots are random. */
+/* (key, ordinal) pairs by key, then ordinal, inlined as the Rust's sort_unstable; keys are hashes, so pivots are random */
 #define KLT(a, b) ((a)[0] < (b)[0] || ((a)[0] == (b)[0] && (a)[1] < (b)[1]))
 static void ksort(uint64_t *a, uint64_t n) {
     while (n > 16) {
@@ -3872,14 +3721,7 @@ static void ksort(uint64_t *a, uint64_t n) {
 
 static void rclose(R *r);
 
-/* The name index: reads in 2^k buckets by the top k bits of a 64-bit hash of
-   the name, a byte a bucket for its count and a running total every 1024
-   buckets, then per read its low 32 hash bits and its ordinal in w bits, in
-   bucket order, bit-packed. The 32 bits are bound to the ordinal beside them,
-   so a damaged entry fails to match and the query falls back to the names.
-   32 + w + 2 bits a read where the old table spent 160: a lookup still reads
-   one bucket and decodes no name, and an absent name passes for a present
-   one 4 times in 2^32. */
+/* The name index: 2^k buckets by a 64-bit name hash, counts and running totals, then per read 32 hash bits bound to its ordinal, bit-packed */
 #define IXFP(h, o) ((uint32_t)((h) ^ (o) * 0x9e3779b97f4a7c15ULL))
 static int ixw(uint64_t n) { int w = 1; while (w < 32 && (n - 1) >> w) w++; return w; }
 static uint64_t ixget(const uint8_t *p, uint64_t bit, int nb) {
@@ -3923,8 +3765,7 @@ static void buildindex(const char *path) {
         for (uint64_t b = g * 1024; b < nb && b < (g + 1) * 1024; b++) sum += cnt[b];
     }
     free(key);
-    /* Beside the track in TRACK.kzi, as a .bai: the track never changes.
-       Written whole under a temporary name, then renamed into place. */
+    /* Beside the track in TRACK.kzi, as a .bai, written under a temporary name then renamed in */
     char *ip, *tp;
     if (asprintf(&ip, "%s.kzi", path) < 0 || asprintf(&tp, "%s.kzi.XXXXXX", path) < 0) die("oom");
     int fd = mkstemp(tp);
@@ -3942,7 +3783,7 @@ static void buildindex(const char *path) {
     rclose(r);
 }
 
-/* Returns the ordinal, or -1 when absent. */
+/* Returns the ordinal, or -1 when absent */
 static int64_t idxlookup(R *r, const char *path, const char *nm) {
     char ip[4096]; snprintf(ip, sizeof ip, "%s.kzi", path);
     int fd = open(ip, O_RDONLY);
@@ -3985,8 +3826,7 @@ static int64_t rfind(R *r, const char *nm) {
     return -1;
 }
 
-/* The run count heads every read on disk. Lift them into rtab and close the
-   gap, so every walk below sees the layout it always saw. */
+/* The run counts head every read on disk: lifted into rtab and the gap closed, so every walk sees its old layout */
 static size_t rmheads(R *r, uint8_t *b, size_t n) {
     uint8_t *w = b; const uint8_t *p = b, *e = b + n;
     uint64_t i = 0, seen = 0;
@@ -4011,16 +3851,13 @@ static size_t rmheads(R *r, uint8_t *b, size_t n) {
     return (size_t)(w - b);
 }
 
-/* One stream a read, its run count then a label beside its own length. Split
-   it back into the two regions the walks expect; the counts stay in front of
-   the lengths for rmheads to lift out. */
+/* One stream a read, its run count then a label beside its own length, split back into the two regions */
 static size_t ilv_split(R *r, uint8_t *b, size_t n, size_t nl, size_t ni) {
     uint8_t *tmp = xmalloc(ni + 16);     /* a label's varint lands whole, then the count is checked */
     const uint8_t *p = b, *e = b + n;
     uint8_t *wl = b, *wi = tmp;
     uint64_t seen = 0;
-    /* a varint at a time, a byte loop: the lengths only move back, so it
-       is safe in place, and a memmove call a value was the Rust's 3x */
+    /* a varint at a time, a byte loop: the lengths only move back, so it is safe in place */
     #define TAKE(dst, cap, base) do {                                        \
         const uint8_t *s0 = p;                                               \
         if (p >= e) die("corrupt block: the interleaved frame is short");     \
@@ -4060,8 +3897,7 @@ static size_t ilv_split(R *r, uint8_t *b, size_t n, size_t nl, size_t ni) {
     return nl;
 }
 
-/* Undo grp_pack: the labels, still in their own order, say which group each
-   length came from. Runs after rmheads, so rtab holds the run counts. */
+/* Undo grp_pack: the labels, in their own order, say which group each length came from; rtab holds the counts */
 static void grp_unpack(R *r, uint8_t *lens, size_t nl, const uint8_t *ids, size_t ni) {
     uint8_t *out = xmalloc(nl + VGUARD), *w = out;
     const uint8_t *p = lens, *e = lens + nl, *q = ids, *qe = ids + ni;
@@ -4079,8 +3915,7 @@ static void grp_unpack(R *r, uint8_t *lens, size_t nl, const uint8_t *ids, size_
             if (id >> 32) die("corrupt block: a grouped label is out of range");
             kv[j] = (id << 32) | j; if (id > top) top = id;
         }
-        /* label order, stable in j: a few runs by insertion, many by
-           counting; qsort here was 43% of an assembly decode */
+        /* label order, stable in j: a few runs by insertion, many by counting */
         if (k <= 32 || top > 4 * k + 1024) {   /* the second: ids a forged file made sparse */
             if (k <= 32) for (uint64_t a = 1; a < k; a++) { uint64_t v = kv[a], b = a; while (b && kv[b - 1] > v) { kv[b] = kv[b - 1]; b--; } kv[b] = v; }
             else qsort(kv, (size_t)k, 8, gcmp);
@@ -4104,14 +3939,11 @@ static int pftake(R *r, uint64_t b);
 static void loadblk(R *r, uint64_t b) {
 
     if (b >= r->nblk) die("corrupt index: a block number is past the end");
-    /* PAYEND and LENDEC describe the block being read, and two readers
-       interleave under --ref R.kst: re-establish them even when this
-       reader's block is already decoded. */
+    /* PAYEND and LENDEC describe the block being read, and two readers interleave under --ref R.kst: re-establish them */
     if (r->cached == b) { PAYEND = r->payend; LENDEC = r->lenfile && r->b[b].nos != 1; return; }
     if (r->pf && pftake(r, b)) return;
     r->curblk = UINT64_MAX;   /* a new block invalidates the cursor */
-    /* a buffer per block was an mmap per block: 12480 page faults on an
-       -e low assembly decode against the Rust's 2024; one block frees it */
+    /* a buffer per block was an mmap per block; one block frees it */
     uint8_t *cb;
     if (r->nblk > 1) {
         if (r->b[b].size > r->cbcap) { free(r->cbuf); r->cbcap = r->b[b].size; r->cbuf = xmalloc(r->cbcap); }
@@ -4158,10 +3990,7 @@ static void loadblk(R *r, uint64_t b) {
     r->cached = b;
 }
 
-/* Decode ahead: on a walk over every block, worker threads decode the next
-   ones, each on its own handle of the file, and loadblk takes a ready block
-   in place of decoding it. Buffers go round, as the one-thread walk's do. A
-   refusal waits for its block, so the output stops where one thread stops. */
+/* Decode ahead: worker threads decode the next blocks on their own file handles; a refusal waits for its block */
 typedef struct { uint8_t *buf; uint32_t *rt; size_t g, h2; char *err; int ok; } pfslot;
 typedef struct pf {
     pfslot *s; uint64_t nblk, win, used, next; size_t rtn;
@@ -4199,7 +4028,7 @@ static void *pfwork(void *p) {
 }
 static void pfstart(R *r, const char *path) {
     int nth = nthreads() - 1;
-    /* small blocks: the hand-off costs more than the decode (-b 4: 3.35 s against 0.73) */
+    /* small blocks: the hand-off costs more than the decode */
     if (nth < 1 || r->nblk < 2 || r->rows / r->nblk < 65536) return;
     if ((uint64_t)nth > r->nblk - 1) nth = (int)(r->nblk - 1);
     pf *q = xcalloc(1, sizeof *q);
@@ -4377,9 +4206,7 @@ static size_t maxlablen(const R *r) {   /* the longest label putlab writes */
 
 static void dump(const char *path) {
     R *r = ropen(path);
-    /* one block: decode it before the names, so the codec's working memory
-       is gone when the names arrive (74M short-read names: peak 7.16 GB was
-       the names held under a two-block bzip3 decode) */
+    /* one block: decode it before the names, so the codec's working memory is gone when the names arrive */
     if (r->nblk == 1) loadblk(r, 0);
     ensurenames(r);
     pfstart(r, path);
@@ -4454,8 +4281,7 @@ static char *putrow(char *o, const char *seq, size_t nlen, uint64_t st, uint64_t
     o = putu64(o, en); *o++ = '\t'; memcpy(o, lab, ln); o += ln; *o++ = '\n';
     return o;
 }
-/* --db: the sequence's rows over the selected sets, touching equal tuples
-   merged, so one set gives what its own track gives; needs the whole sequence */
+/* --db: the sequence's rows over the selected sets, touching equal tuples merged; needs the whole sequence */
 static void region_set(R *r, int64_t ri, const char *seq, uint64_t lo, uint64_t hi) {
     rec q = getidx(r, ri);
     loadblk(r, q.blk);
@@ -4619,10 +4445,7 @@ static void buildanc(void) {
 }
 #define ISANC(node, pa) (ANC[(size_t)(node) * NNODE + (pa)])
 
-/* Per-thread scratch, reused from sequence to sequence: short reads carry
-   two to four runs, so three malloc/free pairs a read cost more than the
-   smoothing itself. dis keeps its marks across calls: gen only rises, and
-   a wrap or a grown hierarchy clears it. */
+/* Per-thread scratch, reused from sequence to sequence: short reads have two to four runs; dis marks only rise */
 typedef struct { uint8_t *was; size_t wascap; uint32_t *dis; size_t discap;
                  int64_t *rel; size_t relcap; uint32_t gen; } smscratch;
 static __thread smscratch SM;
@@ -4704,9 +4527,7 @@ static void smooth_one(uint64_t *st, uint64_t *en, int *feat, uint64_t n) {
     S->gen = gen;
 }
 
-/* As KaryoScope 6186079 (2025-12-10): chunks of SMCHUNK runs overlapping
-   by a quarter, each smoothed alone on a copy, its first three quarters
-   kept; the rest of the sequence smoothed whole. */
+/* As KaryoScope 6186079: chunks of SMCHUNK runs overlapping by a quarter, each smoothed alone, its first three quarters kept */
 static __thread int *SMTMP; static __thread uint64_t SMTCAP;
 static void smooth_seq(uint64_t *st, uint64_t *en, int *feat, uint64_t n) {
     uint64_t s = 0;
@@ -4786,9 +4607,7 @@ static uint64_t loadseq(R *r, int64_t ri, uint64_t **st, uint64_t **en, int **fe
     return n;
 }
 
-/* --ref R.kst: the reference as a track. Its contigs are decoded when
-   first asked, so a query pays one contig, not a gigabyte of text. Its
-   labels are interned in table order, the order the text would have given. */
+/* --ref R.kst: the reference as a track, its contigs decoded when first asked, its labels interned in table order */
 static R *REFR; static uint32_t *REFLAB;
 static int ONESEQ;                   /* region: the answer needs one contig, not the reference */
 static void reffill_r(R *r, rcon *rc);
@@ -4855,8 +4674,7 @@ static void reffill_r(R *r, rcon *rc) {
         for (uint32_t k = 0; k < q.off; k++) { vget(&lp); vget(&ip); }
         span sp = { q.blk, r->b[q.blk].rows - q.off };
         size_t n = q.nruns ? q.nruns : 1;
-        /* starts into 4 bytes from the first row; a start past 32 bits, which
-           no chromosome reaches, moves what is there into 8 and goes on */
+        /* starts into 4 bytes from the first row; a start past 32 bits moves them into 8 */
         rc->st32 = xmalloc(mul(n, 4)); rc->lab = xmalloc(mul(n, 4)); rc->n = rc->cap = q.nruns;
         uint64_t s = 0;
         for (uint64_t k = 0; k < q.nruns; k++) {
@@ -4878,10 +4696,7 @@ static void reffill_r(R *r, rcon *rc) {
     }
 }
 
-/* Per block. Without a tail-encoded row every length is a plain varint, and
-   a block that opens inside a sequence records the position it opens at, so
-   the block a target position falls in can be found and decoded on its own:
-   1 of chr1's 19, not 19. */
+/* Per block: with plain varint lengths and recorded opening positions, the block a target falls in decodes on its own */
 static void refprep(R *r, rcon *rc) {
     rec q = getidx(r, (uint64_t)rc->ri);
     rc->row0 = r->b[q.blk].row0 + q.off;
@@ -4918,7 +4733,7 @@ static void refblk(R *r, rcon *rc, uint64_t b) {
         rc->filled = 1;
     }
 }
-/* One reference read, with the caller's block state put back. */
+/* One reference read, with the caller's block state put back */
 static void refload(rcon *rc, uint64_t b, int prep) {
     R *r = REFR;
     int ld = LENDEC, td = TAILDEC; uint64_t tp = TAILPRED_R, ts = TAILSKIP_R;
@@ -4928,7 +4743,7 @@ static void refload(rcon *rc, uint64_t b, int prep) {
     r->curblk = UINT64_MAX;
     LENDEC = ld; TAILDEC = td; TAILPRED_R = tp; TAILSKIP_R = ts; PAYEND = pe;
 }
-/* The decoded rows around tpos: [lo, hi) and the position after them. */
+/* The decoded rows around tpos: [lo, hi) and the position after them */
 static void refwin(rcon *rc, uint64_t tpos, size_t *lo, size_t *hi, uint64_t *wend) {
     if (rc->filled) { *lo = 0; *hi = rc->n; *wend = rc->end; return; }
     static __thread rcon *WRC; static __thread size_t WLO, WHI;
@@ -4971,10 +4786,7 @@ static void emitflush(void) {   /* runs from atexit: die would recurse */
     if (fflush(stdout)) { fprintf(stderr, "karyozip: write failed\n"); outclean(); _exit(1); }
 }
 
-/* One row emitter. With a FILE it flushes a fixed buffer and can write a
-   row larger than that buffer straight through; without one it grows the
-   caller's buffer. The run merging and the label choice are the same either
-   way, which is why they used to be written out twice. */
+/* One row emitter, to a FILE through a fixed buffer or into the caller's growing buffer, with one merging rule */
 static void emit_to(char **ob, size_t *cap, size_t *len, FILE *f,
                     const char *seq, uint64_t *st, uint64_t *en, int *feat,
                     uint8_t *novel, uint64_t n, uint64_t lo, uint64_t hi, int v1) {
@@ -5095,8 +4907,7 @@ static void smooth_mt(const char *path, R *r0, int64_t first, int64_t last,
 }
 
 /* smooth TRACK HIER FS [SEQ [START END]] */
-/* The set a one-set track holds: the one hierarchy set whose tree has
-   every label but novel. None or several is a refusal that names them. */
+/* The set a one-set track holds: the one hierarchy set whose tree has every label but novel, else a refusal */
 static const char *inferset(const char *hier, R *r) {
     FILE *f = zfopen(hier);
     if (!f) die("cannot open the hierarchy file");
@@ -5256,7 +5067,7 @@ static void encode_db(int nfiles, char **files) {
     if (HIERTAB && !DBFEATS) die("--hier does nothing without --db");
     loadfeatures(DBFEATS);
     if (HIERTAB) loadvocab(HIERTAB);
-    /* --db takes either form: */
+    /* --db takes either form */
     if ((size_t)nfiles != nfset) {
         if (nfiles != 1)
             die("--db: give one BED per feature set in features.tsv column "
@@ -5452,9 +5263,7 @@ static void smoothsets(const char *path, const char *hier, int v1, const char *d
 }
 
 static void decode_db(const char *path, const char *dir) {
-    /* --out-dir DIR: one BED per selected set, staged then swapped in together.
-       No --out-dir: the selected columns, tab-joined, merged where they all
-       agree, on stdout; one set gives that set's own track. */
+    /* --out-dir DIR: one BED a set, staged then swapped in; without, the selected columns tab-joined on stdout */
     int tostd = !dir;
     size_t nout = tostd ? 1 : NSETK;
     ow *o = xcalloc(nout, sizeof *o);
@@ -5547,8 +5356,7 @@ static void decode_db(const char *path, const char *dir) {
 }
 
 #ifndef KARYOZIP_LIB
-/* -r NAME or NAME:START-END, the range BED's: 0-based, END excluded. A
-   name may hold ':' itself, so only a digits-digits tail is a range. */
+/* -r NAME or NAME:START-END, BED's range; only a digits-digits tail is a range, a name may hold ':' */
 static const char *regparse(char *r, uint64_t *lo, uint64_t *hi) {
     *lo = *hi = 0;
     char *c = strrchr(r, ':'), *d = c ? strchr(c + 1, '-') : NULL;
@@ -5561,8 +5369,7 @@ static const char *regparse(char *r, uint64_t *lo, uint64_t *hi) {
     return r;
 }
 
-/* -o to a regular file: written under a temporary name, renamed in on
-   success, removed on failure; a device or a FIFO is written in place */
+/* -o to a regular file: written under a temporary name, renamed in on success; a device or a FIFO in place */
 static void outsig(int s) { outclean(); dbtmpclean(); (void)s; _exit(1); }
 static void outcommit(void) {
     if (!OUTTMP) return;
@@ -5594,9 +5401,7 @@ static int kzmain(int argc, char **argv);
 int main(int argc, char **argv) { int rc = kzmain(argc, argv); if (!rc) outcommit(); return rc; }
 
 static int kzmain(int argc, char **argv) {
-    /* glibc raises its mmap threshold to the first large mapped chunk it
-       frees, after which every big buffer comes from a per-thread heap and
-       stays resident: 113 MB against 57 on one -e high encode. Pin it. */
+    /* glibc raises its mmap threshold to the first large chunk it frees, after which big buffers stay resident: pin it */
     mallopt(M_MMAP_THRESHOLD, 128 << 10);
     signal(SIGXFSZ, SIG_IGN);
     for (int fd = 0; fd < 3; fd++) if (fcntl(fd, F_GETFD) < 0) die("stdin, stdout or stderr is closed");
@@ -5625,14 +5430,10 @@ static int kzmain(int argc, char **argv) {
             "  karyozip aln-pack -a P.paf --ref REF.bed|REF.kst -o OUT   cuts a PAF to what -a reads\n"
             "  -a with --aln-names F: the track names rows by ordinal, F names them\n"
             "  --smooth --max-gap N: KaryoScope's gap bound, 1000 by default"
-/* Debug and profiling flags, out of the help:
-                 -b, --block N|all   compress: rows per block by hand
-                 --read-blocks N     compress: blocks of whole reads, N rows or more; -e medium's is 4194304
-                 --raw               decompress, query: what is stored, reversing no transform
-                 --profile           any command: time and memory per phase on stderr */;
+/* Debug flags, out of the help: -b, --block N|all; --read-blocks N; --raw; --profile */;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) { puts(USAGE); return 0; }
-        /* The codec versions decide the stored bytes, so print them. */
+        /* The codec versions decide the stored bytes, so print them */
         if (!strcmp(argv[i], "--version")) {
             printf("karyozip %s, format %.8s\n", KARYOZIP_VERSION, MAGIC);
             printf("  zstd       %s\n", ZSTD_versionString());
@@ -5780,8 +5581,7 @@ static int kzmain(int argc, char **argv) {
         loadinformed("decompress ");
         if (DBFEATS) decode_db(INS[0], OUTDIR); else dump(INS[0]);
     }
-    /* one sequence: -r NAME is all of it, NAME:START-END the runs
-       overlapping it */
+    /* one sequence: -r NAME is all of it, NAME:START-END the runs overlapping it */
     else if (dec) {
         if (OUTDIR) die("-r and --out-dir: give one");
         if (RAW) die("-r and --raw: give one");

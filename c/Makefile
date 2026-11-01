@@ -1,9 +1,7 @@
-# One target, one binary. The tokeniser and the BWT codec are not optional
-# and no longer sit behind a define. Everything vendored lives beside this file.
+# one binary, every codec, vendored beside
 CC      ?= gcc
 CFLAGS  ?= -O3 -std=gnu11 -Wall -Wextra -fopenmp
-# VERSION is bzip3's, which libbz3.c needs; the KST format version is in
-# the magic. They are not the same number and never were.
+# VERSION is bzip3's, not the format's
 BZIP3_VERSION ?= 1.5.4
 CFLAGS  += -DVERSION='"$(BZIP3_VERSION)"' -I.
 ZSTD_CFLAGS := $(shell pkg-config --cflags libzstd 2>/dev/null)
@@ -21,8 +19,7 @@ SRC := karyozip.c \
        libdeflate/lib/deflate_decompress.c libdeflate/lib/crc32.c libdeflate/lib/utils.c \
        libdeflate/lib/x86/cpu_features.c libdeflate/lib/arm/cpu_features.c
 
-# liblzma 5.8.4, raw LZMA2 only, own flags: its config.h, common.h and
-# version.h share names with htscodecs' and bzip3's
+# liblzma apart: its headers clash with htscodecs'
 XZ_SRC := xz/kzlzma.c $(addprefix xz/src/liblzma/, common/common.c \
        common/filter_buffer_decoder.c common/filter_buffer_encoder.c common/filter_common.c \
        common/filter_decoder.c common/filter_encoder.c check/crc32_fast.c \
@@ -42,14 +39,12 @@ build/xz-san/%.o: %.c $(XZ_HDR)
 	mkdir -p $(@D)
 	$(CC) -O1 -g -fsanitize=address,undefined -std=gnu11 -w $(XZ_FLAGS) -c $< -o $@
 
-# libtest is in all on purpose: a stale one silently compares the wrong
-# binary and every library check "differs".
+# libtest in all: a stale one misleads
 all: build/karyozip build/libkaryozip.a build/libtest
 
-# libzpaq 7.15, C++: without OpenMP, since its divsufsort spawns its own
-# threads; the wrapper puts the pieces on threads. JIT on x86-64 only.
+# libzpaq: no OpenMP, JIT on x86-64 only
 CXX     ?= g++
-# or a libstdc++.a, where no g++ came with gcc
+# or a libstdc++.a without g++
 CXXLIB  ?= -lstdc++
 ZPQ_DEF := -Dunix $(if $(filter x86_64,$(shell uname -m)),,-DNOJIT)
 ZPQ_OBJ := build/zpaq/libzpaq.o build/zpaq/kzzpaq.o
@@ -65,8 +60,7 @@ build/karyozip: $(SRC) $(HDR) $(XZ_OBJ) $(ZPQ_OBJ)
 	mkdir -p build
 	$(CC) $(CFLAGS) $(ZSTD_CFLAGS) -o $@ $(SRC) $(XZ_OBJ) $(ZPQ_OBJ) $(LDFLAGS) $(ZSTD_LIBS) -lm -lpthread -lz $(CXXLIB)
 
-# the same sources, minus main: an annotator can write .kst without a BED.
-# Objects keep their paths: two vendored trees both have a utils.c.
+# the library: same sources, no main
 OBJ := $(SRC:%.c=build/lib/%.o)
 build/lib/%.o: %.c $(HDR)
 	mkdir -p $(@D)
@@ -77,8 +71,7 @@ build/libkaryozip.a: $(OBJ) $(XZ_OBJ) $(ZPQ_OBJ)
 build/libtest: build/libkaryozip.a ../tests/libtest.c
 	$(CC) $(CFLAGS) $(ZSTD_CFLAGS) -o $@ ../tests/libtest.c build/libkaryozip.a $(LDFLAGS) $(ZSTD_LIBS) -lm -lpthread -lz $(CXXLIB)
 
-# the memory-checked twin fuzz.sh runs: one build, kept until a
-# source changes, where each script used to compile its own every run
+# the sanitizer build fuzz.sh runs
 build/karyozip-san: $(SRC) $(HDR) $(XZ_SAN) $(ZPQ_OBJ)
 	mkdir -p build
 	$(CC) -O1 -g -fsanitize=address,undefined -std=gnu11 -fopenmp -DVERSION='"$(BZIP3_VERSION)"' -I. \

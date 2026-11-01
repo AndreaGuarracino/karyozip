@@ -11,6 +11,8 @@ set -eu
 KT=$(realpath -m "$1"); LT=$(realpath -m "$2"); SAN=$(realpath -m "${3:-$1}")
 D=$(dirname "$0")
 W=$(mktemp -d); trap 'rm -rf "$W"' EXIT
+src=$D; D=$W/fx; mkdir -p "$D"; cp "$src"/fixtures.txt "$src"/*.py "$src"/*.sh "$D"/   # the fixtures, unpacked
+awk '/^@@ /{f=d"/"$2; next} {print > f}' d="$D" "$D/fixtures.txt"
 fail=0
 ok() { echo "$1"; }
 no() { echo "$1"; fail=1; }
@@ -657,12 +659,12 @@ rc=0; (ulimit -f 1; $KT compress < "$W/pbig.bed" > "$W/lim.kt" 2> "$W/lim.err") 
 [ $rc = 1 ] && ok "file-size limit: exit 1, not a signal" || no "file-size limit: rc=$rc"
 sz=""; for e in high medium low; do sz="$sz $($KT -e $e compress < "$D/ls.bed" 2>/dev/null | wc -c)"; done
 [ "$(echo $sz | tr ' ' '\n' | sort -n | tr '\n' ' ')" = "$(echo $sz) " ] && ok "effort high <= medium <= low:$sz B" || no "effort sizes out of order:$sz B"
-# -e high's zpaq frames: six contigs where it wins both frames
+# -e high: zpaq on both frames
 awk 'BEGIN { srand(5); for (c = 0; c < 6; c++) { g = c % 4; nr = 20000 + int(rand() * 20000); p = 0; for (r = 0; r < nr; r++) { l = 1 + int(rand() * (g ? 9 * g : 37)); u = rand(); printf "ctg%d\t%d\t%d\t%s\n", c, p, p + l, u < 0.5 + g / 10 ? "chr" (1 + g) : "novel" int(rand() * 3); p += l } } }' > "$W/zt.bed"
 $KT -t 4 -e high compress -i "$W/zt.bed" -o "$W/zt.kt" 2> "$W/zt.err"
 grep -q "lengths zpaq-64MB, labels zpaq-64MB" "$W/zt.err" && ok "high: zpaq on both frames of six contigs" || no "high: zpaq not picked: $(grep layout "$W/zt.err")"
 $KT -t 4 decompress -i "$W/zt.kt" 2>/dev/null | cmp -s - "$W/zt.bed" && ok "zpaq frames: round-trip" || no "zpaq frames: WRONG"
-# -e high's interleaved zpaq model: 60000 short reads of 120 bp
+# -e high: interleaved zpaq model, short reads
 awk 'BEGIN { srand(7); for (r = 0; r < 60000; r++) { k = rand() < 0.4 ? 1 : 2 + int(rand() * rand() * 12); p = 0; g = int(rand() * 4); for (j = 0; j < k; j++) { l = j == k - 1 ? 120 - p : 1 + int(rand() * (120 - p - (k - j - 1)) / (k - j)); printf "r%d\t%d\t%d\t%s\n", r, p, p + l, "chr" (1 + (g + j) % 5); p += l } } }' > "$W/zi.bed"
 $KT -t 4 -e high compress -i "$W/zi.bed" -o "$W/zi.kt" 2> "$W/zi.err"
 grep -q "lengths zpaq-64MB+ilv" "$W/zi.err" && ok "high: the interleaved zpaq model on short reads" || no "high: interleaved model not picked: $(grep layout "$W/zi.err")"
@@ -785,7 +787,7 @@ awk 'BEGIN{p=0; for(k=0;k<400000;k++){printf "r1\t%d\t%d\tchr%d\n", p, p+20, k%2
   || echo "a full staging filesystem: refused"
 [ -z "$(ls -A "$W/tinytmp" 2>/dev/null)" ] && ok "a full staging filesystem: no temp files left" || no "a full staging filesystem: TEMP FILES LEFT"
 
-# whole-read blocks: every layout, queries, --db, --aln, --smooth
+# whole-read blocks: layouts, queries, --db, --aln, --smooth
 awk 'BEGIN { for (r = 0; r < 3000; r++) { n = 1 + r % 4; p = 0; for (i = 0; i < n; i++) { l = i + 1 == n ? 151 - p : 20 + (r * 7 + i * 13) % 40; printf "q%d\t%d\t%d\t%s\n", r, p, p + l, (r + i) % 5 ? "chr" (1 + (r + i) % 3) : "novel"; p += l } } }' > "$W/vb.bed"
 for n in 1 7 500; do
   $KT compress --read-blocks $n -i "$W/vb.bed" -o "$W/vb.kt" 2> "$W/vb.err"
@@ -807,7 +809,7 @@ $KT decompress --aln "$D/p.paf" --ref "$D/ref.bed" -i "$W/vba.kt" 2>/dev/null | 
 $KT compress -i "$W/vb.bed" -o "$W/vb1.kt" 2>/dev/null; $KT compress --read-blocks 7 -i "$W/vb.bed" -o "$W/vb.kt" 2>/dev/null
 for t in 1 4; do $KT decompress -t $t -i "$W/vb.kt" --smooth --hier "$W/vbh.tsv" 2>/dev/null | cmp -s - <($KT decompress -i "$W/vb1.kt" --smooth --hier "$W/vbh.tsv" 2>/dev/null) && ok "--read-blocks 7 --smooth -t $t: same as one block" || no "--read-blocks 7 --smooth -t $t: DIFFERS"; done
 
-# decode ahead: other threads decode the next blocks; same rows, same stop on a damaged block
+# decode ahead: same rows, same stop
 awk 'BEGIN { x = 7; for (r = 0; r < 120000; r++) { n = 1 + r % 4; p = 0; for (i = 0; i < n; i++) { x = (x * 1103515245 + 12345) % 2147483648; l = i + 1 == n ? 151 - p : 1 + x % 37; printf "q%d\t%d\t%d\t%s\n", r, p, p + l, x % 7 ? "chr" (1 + x % 3) : "novel"; p += l } } }' > "$W/pf.bed"
 for bl in "--read-blocks 70000" "--block 70000"; do
   $KT compress $bl -i "$W/pf.bed" -o "$W/pf.kt" 2>/dev/null

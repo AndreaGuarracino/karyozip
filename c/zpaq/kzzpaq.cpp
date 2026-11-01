@@ -1,9 +1,4 @@
-// karyozip's zpaq codec: libzpaq's level 5, or the model below, on pieces
-// the caller cuts, compressed and decompressed side by side under OpenMP.
-// Each zpaq block carries its model, so one decoder reads both. The frame: the
-// piece count, then each piece's size and its zpaq block's size, all u32
-// little endian, then the blocks in order: the same bytes on any number
-// of threads.
+// karyozip's zpaq codec: libzpaq level 5 or the ilv model on the caller's pieces, side by side under OpenMP; frame: count, (size, block size) u32 LE each, the blocks
 #include "libzpaq.h"
 #include <cstdint>
 #include <cstring>
@@ -14,21 +9,8 @@
 
 namespace libzpaq { void error(const char* msg) { throw std::runtime_error(msg); } }
 
-// -e high's model of an interleaved stream: each read its run count k, then
-// k pairs of label and length, LEB128. HCOMP follows the fields, so each
-// byte is predicted knowing which field it is, whether its pair is the
-// read's last, the read's earlier labels and lengths, and the bytes at the
-// same offset in the reads before; match models give the last value seen
-// in each such context: 11.15% and 13.51% under level 5 on 16 MB of two
-// short-read tracks, 0.46% on an assembly (2026-10-31).
-// R0 next field (0 count, 1 label, 2 length), R1 pairs left, R2 k, R3 pair
-// index, R4 previous label, R5 label, R6 length sum, R7 previous length,
-// R8 previous k, R9 partial value, R10 its shift, R11 label before R4,
-// R12 byte, R13 value, R14 state with shift, R15 field + 4 on the last pair,
-// R16 last label of the previous read, R17 k two reads back, R18 first
-// label of the read, R19 of the previous read, R20 label before R11,
-// R21 hash of the read so far, R22 to R25 where this read and the three
-// before start in M.
+// -e high's model of an interleaved stream (k, then k label-length pairs, LEB128): HCOMP follows the fields, the read's earlier values and the reads before
+// R0 next field, R1 pairs left, R2 k, R3 pair index, R4 previous label, R5 label, R6 length sum, R7 previous length, R8 previous k, R9-R10 partial value and shift, R11 and R20 labels before R4, R12 byte, R13 value, R14 state, R15 field + 4 on the last pair, R16 last label of the previous read, R17 k two reads back, R18-R19 first labels of this read and the previous, R21 hash of the read so far, R22-R25 where this read and the three before start in M
 static const char ILV[] = R"zp(
 comp 6 10 0 0 37
   0 icm 10
@@ -212,9 +194,7 @@ uint32_t r32(const unsigned char* q) { return q[0] | q[1] << 8 | q[2] << 16 | (u
 
 extern "C" {
 
-// n bytes in ncut pieces of cut[i] bytes each, by libzpaq's method ("5" its
-// slowest) or "ilv", the model above, into out of cap bytes: the frame's
-// size, 0 on any failure
+// n bytes in ncut pieces of cut[i] bytes, by libzpaq's method ("5") or "ilv", into out of cap bytes: the frame's size, 0 on any failure
 size_t kz_zpaq_encode(const unsigned char* in, size_t n, const uint32_t* cut, uint32_t ncut,
                       const char* method, unsigned char* out, size_t cap) {
   std::vector<size_t> off(ncut + 1, 0);
@@ -259,8 +239,8 @@ size_t kz_zpaq_encode(const unsigned char* in, size_t n, const uint32_t* cut, ui
   return z;
 }
 
-// the frame back into raw bytes at dst: 0, or -1 when it does not come back
-// to exactly raw bytes
+// the frame back into raw bytes at dst: 0, or -1 when it does not come back to exactly raw bytes
+
 int kz_zpaq_decode(const unsigned char* in, size_t n, unsigned char* dst, size_t raw) {
   if (n < 4) return -1;
   uint32_t np = r32(in);

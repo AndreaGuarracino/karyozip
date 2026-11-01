@@ -1,7 +1,4 @@
-//! The KST writer. Rows arrive grouped by sequence, gapless, each sequence
-//! starting at 0; blocks fill and are staged; the file is assembled at close.
-//! Every layout decision here is c/karyozip.c's, because the two must produce
-//! the same bytes.
+//! The KST writer: rows grouped by sequence, gapless, from 0; every layout decision is c/karyozip.c's, for the same bytes
 
 use crate::ffi;
 use crate::kst::{self, FNV0, TOKFLAG, INTFLAG, FLDFLAG, DROPPED, ALNFLAG, DBFLAG, LENFLAG,
@@ -30,11 +27,10 @@ impl Default for Options {
     }
 }
 
-/// A compressed block: lens frame, ids frame, both raw sizes, rows, bases
-/// before it, and which length spelling won.
+/// A compressed block: lens and ids frames, raw sizes, rows, bases before it, the length spelling that won
 type Done = (Vec<u8>, Vec<u8>, usize, usize, u64, u64, u64);
 
-/// One staged block, while its payload waits in the staging file.
+/// One staged block, while its payload waits in the staging file
 struct BlkMeta { off: u64, len: usize, lens: usize, rows: u64, bp: u64,
                  aoff: [usize; 2], alen: [usize; 2], ibe: usize, nrd: u64 }   // run counts and reads so far, at its close
 
@@ -65,14 +61,13 @@ pub struct Writer {
     tailsamp: Vec<u64>,
     tailpred: u64,
     tailon: Option<bool>,
-    /// The names sample, ranked during the parse: the winner, the sample's bytes.
+    /// The names sample, ranked during the parse: the winner, the sample's bytes
     early: Option<std::thread::JoinHandle<(BestNames, usize)>>,
     feathash: Option<u64>,
     /// the input rows as text, stored so the track can serve as --ref
     rowhash: u64,
     cart: bool,
-    /// --aln: the alignment, the query it is on, and the two alternate
-    /// length spellings each block also keeps.
+    /// --aln: the alignment, its query, and the two alternate length spellings each block keeps
     aln: Option<crate::aln::Aln>,
     alnq: Option<usize>,
     alnhit: u64,
@@ -86,7 +81,7 @@ pub struct Writer {
 }
 
 fn tmpfile(dir: &std::path::Path) -> std::io::Result<std::fs::File> {
-    // An unlinked file: it disappears when the handle closes, however we exit.
+    // An unlinked file: it disappears when the handle closes, however we exit
     let p = dir.join(format!("karyozip.{}.{:x}", std::process::id(),
                              std::time::SystemTime::now()
                                  .duration_since(std::time::UNIX_EPOCH).unwrap().subsec_nanos()));
@@ -96,11 +91,10 @@ fn tmpfile(dir: &std::path::Path) -> std::io::Result<std::fs::File> {
 }
 
 impl Writer {
-    /// --db binds the track to the features.tsv it came from.
+    /// --db binds the track to the features.tsv it came from
     pub fn set_feathash(&mut self, h: u64, cart: bool) { self.feathash = Some(h); self.cart = cart; }
 
-    /// The reference's labels share the track's table: loadref interns them
-    /// first, so the ids the reference answers with are the track's ids.
+    /// The reference's labels share the track's table, interned first, so the reference answers in the track's ids
     pub fn set_aln(&mut self, a: crate::aln::Aln) {
         for l in a.lt.tab.clone() { self.intern(&l); }
         self.aln = Some(a);
@@ -124,7 +118,7 @@ impl Writer {
     #[inline(always)]
     fn intern(&mut self, label: &[u8]) -> u32 { self.lt.get(label) }
 
-    /// The lengths frame, plus the two alternate spellings --aln keeps.
+    /// The lengths frame, plus the two alternate spellings --aln keeps
     #[inline(always)]
     fn lensput(&mut self, v: u64) {
         kst::put(&mut self.lens, v);
@@ -135,8 +129,7 @@ impl Writer {
         }
     }
 
-    /// The held row was the last of its sequence: its length is either stored
-    /// plainly or, once the predictor is on, as a delta from the median.
+    /// The held row was the last of its sequence: its length is plain or, with the predictor on, a delta from the median
     fn tail(&mut self) {
         if !self.phas { return; }
         if self.tailsamp.len() < TAILSKIP {
@@ -181,7 +174,7 @@ impl Writer {
                 self.nidx += 1;
                 return Ok(());
             }
-            // Not 0,1,2,... after all: write out the ordinals so far.
+            // Not 0,1,2,... after all: write out the ordinals so far
             for j in 0..self.nidx {
                 self.names.extend_from_slice(j.to_string().as_bytes());
                 self.names.push(b'\n');
@@ -191,12 +184,9 @@ impl Writer {
         self.nidx += 1;
         self.names.extend_from_slice(&self.cur);
         self.names.push(b'\n');
-        // The sample is whole names starting below the mode's cap. Once
-        // complete, a copy is ranked on a thread while the rows still come,
-        // when nothing at the close can change the names, as the C's.
+        // The sample is whole names below the mode's cap, ranked on a thread while the rows still come, as the C's
         let ncap = (if self.opt.slow { DEFSAMPLE } else { 4 }) << 20;
-        // Late in the input it would only overlap the parse buffers: then
-        // the close ranks them. 57 MB is zstd 17's state on a 4 MB sample.
+        // Late in the input it would only overlap the parse buffers: then the close ranks them
         if self.early.is_none() && !INHALF.load(std::sync::atomic::Ordering::Relaxed)
            && !self.opt.whole && !self.opt.drop_names && self.names.len() >= ncap {
             let (mut q, mut sn) = (0usize, 0u64);
@@ -237,12 +227,7 @@ impl Writer {
         Ok(())
     }
 
-    /// The CLI gets these for free: its parser split on tabs and newlines,
-    /// so a name or label can never hold one, and a zero-length run cannot
-    /// reach the writer. A library caller can produce all of them, and a
-    /// newline in a label makes a track that does not decode, because the
-    /// label table is newline separated. Refusing here keeps encode
-    /// lossless.
+    /// A library caller can send a tab, a newline or a zero-length run, which the CLI's parser cannot: refuse them, to stay lossless
     pub fn row(&mut self, name: &[u8], run_len: u64, label: &[u8], start: u64)
         -> Result<(), String> {
         let bad = name.iter().find(|&&c| matches!(c, 0 | b'\n' | b'\t'))
@@ -256,9 +241,7 @@ impl Writer {
         self.push(name, run_len, label, start, false)
     }
 
-    /// The same row without those checks, for callers whose parser already
-    /// split on tabs and newlines. This is the CLI's path, as it is the C's.
-    /// `same`: the caller knows the name equals the row before's.
+    /// The same row without those checks, the CLI's path as the C's; `same`: the name equals the row before
     #[inline(always)]
     pub fn push(&mut self, name: &[u8], run_len: u64, label: &[u8], start: u64, same: bool)
         -> Result<(), String> {
@@ -286,8 +269,7 @@ impl Writer {
         if start != self.curbp {
             return Err("gap or overlap: start is not the previous end".into());
         }
-        // The C interns first and then decides, so the label joins the table
-        // even when the reference answers for it.
+        // The C interns first and then decides, so the label joins the table even when the reference answers for it
         let mut id = self.intern(label);
         self.rowhash = kst::rowmix(self.rowhash, self.curnh, start, start + run_len, self.lt.h[id as usize]);
         if self.aln.is_some() {
@@ -325,10 +307,7 @@ impl Writer {
         self.flush().map_err(io)?;
         let level = self.opt.level;
         let mut early = self.early.take();   // joined by the names job
-        // The names rank beside the searches when nothing below changes
-        // them, as the C's: no ordinals, none dropped, at
-        // most 64 MB. Their own pool: in the global one they would queue
-        // behind the layout search's.
+        // The names rank beside the searches when nothing below changes them, as the C's, in their own pool
         let bg = (!(self.ordok && self.nidx > 0) && !self.opt.drop_names
                   && !self.names.is_empty() && self.names.len() <= 64 << 20).then(|| {
             let (mut nm, n, whole, slow, e) = (std::mem::take(&mut self.names), self.nidx, self.opt.whole, self.opt.slow, early.take());
@@ -340,8 +319,7 @@ impl Writer {
             })
         });
 
-        // The codec search samples the first, middle and last block, which is
-        // why it cannot run until every row has arrived. -e high reads them all.
+        // The codec search samples the first, middle and last block, so it waits for every row; -e high reads them all
         let rawtot: usize = self.bm.iter().map(|b| b.len).sum();
         let get = |i: usize| self.read_block(i).unwrap_or_else(|_| crate::bail("cannot read back a staged block"));
         let _s = crate::prof::span(8);
@@ -357,13 +335,7 @@ impl Writer {
                                          if p.lvl_len < 0 { level } else { p.lvl_len });
         let mut idc = p.id;
 
-        // Compress apart, write in order, a batch at a time. Holding every
-        // compressed block would cost the whole file in memory; the C stages
-        // them in a temp file for the same reason.
-        // The run count can head each read's lengths instead of living in the
-        // index. One block, or blocks of whole reads decided on the first,
-        // since a split read has no count to head it, and measured against
-        // the index it would replace.
+        // Compress apart, write in order, a batch at a time, staged as the C's; run counts may head each read's lengths
         let mut altbuf: Vec<u8> = Vec::new();
         let mut lz: Option<Vec<u8>> = None;   // the checked lengths frame
         let (mut runhead, mut ilv, mut grp, mut alt_lens) = (false, false, false, 0usize);
@@ -376,10 +348,7 @@ impl Writer {
         if onelay {
             let (lens0, ids0) = self.read_block(0).unwrap_or_else(|_| crate::bail("cannot read back a staged block"));
             let ib0 = &self.ibx[..if varon { self.bm[0].ibe } else { self.ibx.len() }];
-            // The layout is decided on the mode's sample, as the codec is: whole
-            // reads up to 4 MB of lengths -e low, DEFSAMPLE MB the default, all
-            // of them -e high. Each layout gets its own best codec there; only
-            // the winner is built whole, compressed once and read back.
+            // The layout is decided on the mode's sample, as the codec is; only the winner is built whole, compressed once and read back
             let (slow, whole) = (self.opt.slow, self.opt.whole);
             let cap = if whole { usize::MAX } else { (if slow { DEFSAMPLE } else { 4 }) << 20 };
             let (mut pl, mut pi, mut pb, mut x, mut y, mut z) = (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
@@ -395,8 +364,7 @@ impl Writer {
             let (ls, is, bs) = (&lens0[..pl], &ids0[..pi], &ib0[..pb]);
             let idx = idxsize(bs, if level < 19 { level } else { 19 });
             let mut lay = [None, splice_heads(ls, bs), if slow { grp_pack(ls, is, bs) } else { None }, ilv_pack(ls, is, bs)];
-            // the labels and the four length spellings, ranked in one pool; a
-            // spelling's whole size is its sample's scaled by the lengths'
+            // the labels and the four length spellings ranked in one pool, a spelling's size scaled from its sample
             let e: Vec<u8> = Vec::new();
             let src: Vec<&[u8]> = vec![is, ls, lay[1].as_deref().unwrap_or(&e), lay[2].as_deref().unwrap_or(&e), lay[3].as_deref().unwrap_or(&e)];
             let scale = |m: usize| if pl > 0 { (m as u128 * lens0.len() as u128 / pl as u128) as usize } else { m };
@@ -427,8 +395,7 @@ impl Writer {
             (cutrows_l, cutrows_i, zm_l) = (rs5[l + 1].rows, rs5[0].rows, rs5[l + 1].zm);
             (idc, lvl_id) = (r[0].0, if r[0].1 < 0 { level } else { r[0].1 });
             (ilvcodec, lvl_len) = (r[l + 1].0, if r[l + 1].1 < 0 { level } else { r[l + 1].1 });
-            // the sample is the whole block: its winner is built, keep it; the
-            // rest go now, as the C frees them, not after the winner's frame
+            // the sample is the whole block: keep its winner, free the rest now, as the C
             let whole = self.bm.len() == 1 && pl == lens0.len() && pi == ids0.len() && pb == self.ibx.len();
             let hlen = lay[1].as_ref().map_or(0, |h| h.len());
             for (k, v) in lay.iter_mut().enumerate() { if !whole || k != l { *v = None; } }
@@ -475,17 +442,14 @@ impl Writer {
         let mut sizes = Vec::new();
         let mut body = tmpfile(&self.tmpdir).map_err(io)?;
         let (mut byt_lens, mut byt_labs) = (0u64, 0u64);
-        // As the C's ordered loop: every pool thread takes the next block,
-        // this thread writes them in order. The window bounds what waits.
+        // As the C's ordered loop: pool threads take the next block, this thread writes them in order
         let (nb, win) = (self.bm.len(), 4 * rayon::current_num_threads());
         let next = std::sync::atomic::AtomicUsize::new(0);
         let st = (std::sync::Mutex::new((0usize, std::collections::BTreeMap::<usize, Done>::new())), std::sync::Condvar::new());
         let work = |i: usize, lens: &mut Vec<u8>, ids: &mut Vec<u8>| -> Done {
             self.read_into(i, lens, ids).unwrap_or_else(|_| crate::bail("cannot read back a staged block"));
             let (lens, ids): (&Vec<u8>, &Vec<u8>) = (lens, ids);
-            // Under --aln a block keeps the smallest of three length
-            // spellings: every sentinel, plus-strand sentinels only,
-            // or plain lengths. Zeros do not always compress better.
+            // Under --aln a block keeps the smallest of three length spellings: every sentinel, plus-strand only, or plain
             let m = &self.bm[i];
             // past the first whole-read block, this block's own spelling
             let own = ((runhead || ilv) && varon && i > 0).then(|| {
@@ -534,9 +498,7 @@ impl Writer {
                 let kept = if i == 0 { zk1.lock().unwrap().take() } else { None };   // the labels frame zpq_try made
                 kept.or_else(|| comp_frame(&ids, idc, lvl_id, pid)).unwrap_or_else(|| crate::bail("block compression failed"))
             };
-            // Labels beside a lengths frame that takes one thread, as the C's:
-            // the rest of the threads, or 2 beside LZMA, an hour on 3 GB, so
-            // bzip3 holds 2 block states, not 8
+            // Labels beside a lengths frame that takes one thread, as the C's: the rest of the threads, or 2 beside LZMA
             let nt = rayon::current_num_threads();
             let lone = lencodec & ffi::CODEC_BZIP3 == 0 || lens.len() <= ((lencodec & 0xffff) as usize) << 20;
             let lt = if lencodec & ffi::CODEC_LZMA != 0 { 2 } else { (nt - 1).max(1) };
@@ -547,8 +509,7 @@ impl Writer {
             (fa, b, nl, ids.len(), m.rows, m.bp, bv as u64)
         };
         std::thread::scope(|ts| -> Result<(), String> {
-            // a buffer pair a thread, kept, as the C's rb: fresh ones a block
-            // faulted their pages in again (asm: 465,000 faults against 387,000)
+            // a buffer pair a thread, kept, as the C's rb: fresh ones faulted their pages in again
             ts.spawn(|| rayon::broadcast(|_| { let (mut lb, mut ib) = (Vec::new(), Vec::new()); loop {
                 let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if i >= nb { break; }
@@ -588,8 +549,7 @@ impl Writer {
         let mut labs = Vec::new();
         for l in &self.lt.tab { labs.extend_from_slice(l); labs.push(b'\n'); }
 
-        // The C's decision, step for step: which of the names are stored,
-        // as text or as ordinals.
+        // The C's decision, step for step: which names are stored, as text or as ordinals
         let mut ordinal = self.ordok && self.nidx > 0;
         let mut pre = None;
         if let Some(h) = bg {   // before check_unique, as the C's join
@@ -600,8 +560,7 @@ impl Writer {
             check_unique(&self.names)?;
         }
         let mut dropnames = self.opt.drop_names;
-        // Dropping names that are not dense ordinals leaves --aln with no way
-        // back to the PAF, so they are kept as integer deltas instead.
+        // Dropping names that are not dense ordinals leaves --aln no way back to the PAF, so they are integer deltas instead
         if dropnames && aln_on && !ordinal {
             eprintln!("--names drop: the names are not dense ordinals and --aln \
                        needs them to reach the PAF, so they are stored as \
@@ -611,9 +570,7 @@ impl Writer {
         if dropnames { ordinal = true; }
         if ordinal { self.names.clear(); }
 
-        // Rank the names codecs on whole names up to 4 MB -e low, DEFSAMPLE
-        // MB the default, all -e high, then run the winner over the whole
-        // buffer: a level 17 zstd of 9.4M ONT read names is 130 s on its own.
+        // Rank the names codecs on the mode's sample, then run the winner over the whole buffer
         let (nz, tokused, intused, fldused) = if ordinal {
             (Vec::new(), false, false, false)
         } else {
@@ -628,7 +585,7 @@ impl Writer {
         };
         drop(_s);
         let _s = crate::prof::span(3);
-        // The index is chunked so a lookup decodes 65536 entries, not all.
+        // The index is chunked so a lookup decodes 65536 entries, not all
         let meta = if level < 19 { level } else { 19 };
         let (mut ichunks, mut itab, mut nichunk) = (Vec::new(), Vec::new(), 0u64);
         {   // chunk bounds first, then every chunk compressed on its own thread
@@ -720,8 +677,7 @@ impl Writer {
         self.read_into(i, &mut lens, &mut ids)?;
         Ok((lens, ids))
     }
-    /// Into two buffers the caller keeps: one read then split_off kept the
-    /// labels twice.
+    /// Into two buffers the caller keeps, not one read then split_off
     fn read_into(&self, i: usize, lens: &mut Vec<u8>, ids: &mut Vec<u8>) -> std::io::Result<()> {
         use std::os::unix::fs::FileExt;
         let m = &self.bm[i];
@@ -745,10 +701,7 @@ fn io(e: std::io::Error) -> String { e.to_string() }
 
 
 /* ------------------------------------------------- choosing a codec */
-/// One list. The default tries all of it and spends whatever that costs;
-/// -e low is the subset marked true, the codecs whose encode and decode stay
-/// reasonable, so it can never reach a candidate the default did not.
-/// Codec 0 means zstd, so bare rANS order 0 is spelled 0x100.
+/// One list: the default tries all of it, -e low the subset marked true; codec 0 is zstd, so rANS order 0 is 0x100
 pub const KCAND: [(i32, bool); 54] = [
     (0x100, true), (0x80, false), (0x40, false), (0xc0, false),
     (0x8, false), (0x88, false), (0x48, false), (0xc8, false),
@@ -771,8 +724,7 @@ pub const KCAND: [(i32, bool); 54] = [
     (ffi::CODEC_LZMA, false),
 ];
 
-/// A bzip3 block bigger than the data is the same file as the smallest that
-/// covers it, so only that one is worth a try. The mode's own list decides.
+/// A bzip3 block bigger than the data gives the same file as the smallest that covers it, so only that one is tried
 fn bz3_dup(c: i32, m: usize, n: usize, cand: &[i32]) -> bool {
     if c & ffi::CODEC_BZIP3 == 0 { return false; }
     let mb = ((c & 0xffff) as usize) << 20;
@@ -791,18 +743,16 @@ fn cname(c: i32) -> String {
             if c & 0x80 != 0 { "+pack" } else { "" }, if c & 0x40 != 0 { "+rle" } else { "" })
 }
 
-/// the mode's candidates
-/// MB the default ranks every codec on
+/// the mode's candidates MB the default ranks every codec on
 pub const DEFSAMPLE: usize = 16;
-/// stdin, a file, is read past its half: set by the reading thread.
+/// stdin, a file, is read past its half: set by the reading thread
 pub static INHALF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 pub fn candlist(slow: bool) -> Vec<i32> {
     KCAND.iter().filter(|(_, f)| slow || *f).map(|(c, _)| *c).collect()
 }
 
-/// bzip3 decodes at about 8 MB/s against zstd's ~1000, so it is the wrong
-/// pick for a file a query will seek into.
+/// bzip3 decodes at 8 MB/s against zstd's 1000, the wrong pick for a file a query seeks into
 // a query decodes a whole block: bzip3 at 8 MB/s, arith at 2.5x rANS
 fn fast_enough(codec: i32) -> bool {
     codec & (ffi::CODEC_BZIP3 | ffi::CODEC_ARITH | ffi::CODEC_LZMA | ffi::CODEC_ZPAQ) == 0
@@ -810,8 +760,7 @@ fn fast_enough(codec: i32) -> bool {
 
 pub struct Pick { pub id: i32, pub len: i32, pub lvl_id: i32, pub lvl_len: i32, pub level: i32 }
 
-/// `blocks` yields every block as (lens, ids); the default search reads three
-/// of them, -e high reads them all, twice.
+/// `blocks` yields every block as (lens, ids); the default reads three, -e high all, twice
 pub fn pick(all: &dyn Fn(usize) -> (Vec<u8>, Vec<u8>), nraw: usize, rawtot: usize,
             maxstream: usize, level: i32, o: &Options, onelay: bool) -> Pick {
     let (block, slow, whole, levelset) = (o.block, o.slow, o.whole, o.levelset);
@@ -825,22 +774,15 @@ pub fn pick(all: &dyn Fn(usize) -> (Vec<u8>, Vec<u8>), nraw: usize, rawtot: usiz
         if nraw > 2 { picks.push(nraw / 2); }
         if nraw > 1 { picks.push(nraw - 1); }
     }
-    // one rule, three samples: -e low its codecs on 4 MB, the default all of
-    // them on DEFSAMPLE MB, -e high all of them on the whole file
+    // one rule, three samples: -e low its codecs on 4 MB, the default all on DEFSAMPLE MB, -e high all on the whole file
     let mut scap = if slow { DEFSAMPLE << 20 } else { 4usize << 20 };
     if whole { scap = maxstream.clamp(4 << 20, 2048 << 20); }
     let big = maxstream >= 0x7fff_ffff;
 
-    // A candidate the selection cannot take is not worth compressing. On a
-    // seekable track that is both bzip3 entries, whose bz3_new alone asks
-    // for its 16 MB or 64 MB block.
+    // A candidate the selection cannot take is not worth compressing, as bzip3 on a seekable track
     let usable = |c: i32| (!seekable || fast_enough(c))
                        && (!big || c & (ffi::CODEC_BZIP3 | ffi::CODEC_LZMA) != 0);
-    // bzip3 splits the input into blocks of its MB argument, so every size at
-    // or above the stream gives one block and the same bytes: the smallest
-    // such size stands for all of them
-    // hts_pack and its arith twin refuse above 16 distinct bytes and the
-    // encoder then clears the PACK bit, so such a candidate is its plain sibling
+    // every bzip3 size at or above the stream gives the same bytes, so the smallest stands for them; hts_pack above 16 bytes is its plain sibling
     let bz3dup = |c: i32, n: usize| bz3_dup(c, n, maxstream, &cand);
     let (mut zi, mut zl, mut z22i, mut z22l) = (0usize, 0usize, 0usize, 0usize);
     let mut ci = vec![0usize; nc];
@@ -878,8 +820,7 @@ pub fn pick(all: &dyn Fn(usize) -> (Vec<u8>, Vec<u8>), nraw: usize, rawtot: usiz
     {   // every mode: the smallest that round trips on what it was ranked on
         let mut ti = vec![0usize; nc + 2];
         let mut tl = vec![0usize; nc + 2];
-        // a candidate lives per stream: one that does not round-trip the
-        // ids may still be the smallest for the lengths
+        // a candidate lives per stream: one that fails the ids may still win the lengths
         let ok = |k: usize| !big || cand[k] & (ffi::CODEC_BZIP3 | ffi::CODEC_LZMA) != 0;
         let mut live_i: Vec<bool> = (0..nc + 2).map(|k| if k < nc {
             ci[k] < usize::MAX / 4 && ok(k)
@@ -887,8 +828,7 @@ pub fn pick(all: &dyn Fn(usize) -> (Vec<u8>, Vec<u8>), nraw: usize, rawtot: usiz
         let mut live_l: Vec<bool> = (0..nc + 2).map(|k| if k < nc {
             cl[k] < usize::MAX / 4 && ok(k)
         } else { k == nc || (!levelset && slow) }).collect();
-        // one block whose streams fit the sample: the sample already
-        // compressed exactly this, so its sizes are the file's
+        // one block whose streams fit the sample: the sample's sizes are the file's
         let reuse = !whole || (nraw == 1 && scap >= maxstream);
         if reuse {
             for k in 0..nc { ti[k] = ci[k]; tl[k] = cl[k]; }
@@ -899,8 +839,7 @@ pub fn pick(all: &dyn Fn(usize) -> (Vec<u8>, Vec<u8>), nraw: usize, rawtot: usiz
             let (lens, ids) = all(b);
             let step: Vec<(usize, usize)> = (0..nc + 2).into_par_iter().map(|k| {
                 if !live_i[k] && !live_l[k] { return (0, 0); }
-                // An empty stream costs nothing and is not compressed, as
-                // the C's `if (ni)` and `if (nl)` guards have it.
+                // An empty stream costs nothing and is not compressed, as the C's `if (ni)` and `if (nl)`
                 let each = |s: &[u8], f: &dyn Fn(&[u8]) -> usize| {
                     if s.is_empty() { 0 } else { f(s) }
                 };
@@ -958,14 +897,10 @@ fn verifies(src: &[u8], codec: i32, rs: Option<&Rspec>) -> bool {
     }
 }
 
-/// Size alone does not qualify a codec, so the sample round trips it; under
-/// slow the whole-file pass round trips the winner and drops it on failure,
-/// so the sample only sizes.
-/// Labels counted down from 127 so they do not share bytes with the small
-/// lengths beside them. Its own inverse, and the varint keeps its width.
+/// Size alone does not qualify a codec, so the sample round trips it; under slow the whole pass round trips the winner
 pub fn ilv_flip(v: u64) -> u64 { if v < 128 { 127 - v } else { v } }
 
-/// One stream a read: its run count, then a label beside its own length.
+/// One stream a read: its run count, then a label beside its own length
 fn ilv_pack(lens: &[u8], ids: &[u8], ibx: &[u8]) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(lens.len() + ids.len() + ibx.len() + 16);
     let (mut p, mut q, mut r) = (0usize, 0usize, 0usize);
@@ -981,8 +916,7 @@ fn ilv_pack(lens: &[u8], ids: &[u8], ibx: &[u8]) -> Option<Vec<u8>> {
     if p != lens.len() || q != ids.len() { None } else { Some(out) }
 }
 
-/// Each read's lengths in label order: all of label 0's, then label 1's. The
-/// label stream stays as it was, so it says where each one goes back.
+/// Each read's lengths in label order, label 0's first; the label stream says where each goes back
 fn grp_pack(lens: &[u8], ids: &[u8], ibx: &[u8]) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(lens.len() + ibx.len() + 16);
     let (mut p, mut q, mut r) = (0usize, 0usize, 0usize);
@@ -1022,18 +956,14 @@ fn splice_heads(lens: &[u8], ibx: &[u8]) -> Option<Vec<u8>> {
     if p != lens.len() { return None; } else { Some(out) }
 }
 
-/// hts_pack and its arith twin refuse above 16 distinct bytes and the
-/// encoder then clears the PACK bit, so such a candidate is its plain sibling
+/// hts_pack and its arith twin refuse above 16 distinct bytes, so such a candidate is its plain sibling
 fn pack_dup(c: i32, p: &[u8]) -> bool {
     if c & 0x80 == 0 || c & ffi::CODEC_BZIP3 != 0 { return false; }
     let (mut seen, mut d) = ([false; 256], 0);
     p.iter().any(|&b| { if !seen[b as usize] { seen[b as usize] = true; d += 1; } d > 16 })
 }
 
-/// Every stream by every codec of the mode in one pool, LZMA and bzip3 first
-/// since they take longest. Per stream the smallest that round trips on its
-/// sample wins, ties to the earlier of zstd, the table, zstd-22. `n` is each
-/// stream's whole size; out: codec, zstd level or -1, size, 0 when none came back.
+/// Every stream by every codec of the mode in one pool, slowest first; the smallest that round trips wins, ties to the earlier
 fn rank_all(src: &[&[u8]], n: &[usize], rs: &[Rspec], o: &Options) -> Vec<(i32, i32, usize)> {
     let cand = candlist(o.slow);
     let mut jobs: Vec<(u8, usize, usize, i32, i32)> = Vec::new();   // class, stream, rank, codec, level
@@ -1048,8 +978,7 @@ fn rank_all(src: &[&[u8]], n: &[usize], rs: &[Rspec], o: &Options) -> Vec<(i32, 
         }
         if o.slow && !o.levelset { jobs.push((0, t, cand.len() + 1, 0, 22)); }
     }
-    // the slowest first, as the C: LZMA and zstd 17 and up, then bzip3, then
-    // the rest, the larger stream first; taken in that order by every thread
+    // the slowest first, as the C: LZMA and zstd 17 and up, then bzip3, then the rest, the larger stream first
     jobs.sort_unstable_by_key(|j| (j.0, std::cmp::Reverse(src[j.1].len()), j.1, j.2));
     use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
     let (next, zs): (AtomicUsize, Vec<AtomicUsize>) = (AtomicUsize::new(0), jobs.iter().map(|_| AtomicUsize::new(0)).collect());
@@ -1058,14 +987,10 @@ fn rank_all(src: &[&[u8]], n: &[usize], rs: &[Rspec], o: &Options) -> Vec<(i32, 
     let prof = crate::prof::ON.load(Relaxed);
     let jt: Vec<AtomicUsize> = jobs.iter().map(|_| AtomicUsize::new(0)).collect();   // ns, under --profile
     let tp = std::time::Instant::now();
-    // As the C, whose jobs run inside an OpenMP region: a codec's own team
-    // (bzip3's blocks) stays one thread inside the pool, or every job
-    // holds several block states at once (short reads: 10.2 GB against 8.8)
+    // As the C, whose jobs run inside an OpenMP region: a codec's own team stays one thread inside the pool
     let nt = rayon::current_num_threads();
     rayon::broadcast(|_| ffi::omp_threads(1));
-    // A stream whose jobs are all done has its best: the next free thread
-    // reads it back before taking a job, not after the pool, as the C's.
-    // left: jobs to go; vq: the job read back, plus one; vf[j]: it came back.
+    // A stream whose jobs are done is read back by the next free thread, as the C's
     let left: Vec<AtomicUsize> = src.iter().map(|_| AtomicUsize::new(0)).collect();
     for j in &jobs { left[j.1].fetch_add(1, Relaxed); }
     let vq: Vec<AtomicUsize> = src.iter().map(|_| AtomicUsize::new(0)).collect();
@@ -1126,12 +1051,7 @@ fn rank_all(src: &[&[u8]], n: &[usize], rs: &[Rspec], o: &Options) -> Vec<(i32, 
     picked
 }
 
-/// Where a stream's reads start, as the C's rspec: ib, the run count of each
-/// read, cs varints a run after each count there (1 when ib is a headed
-/// lengths frame), or None when the stream heads each read with its own
-/// count; mult varints a run; rows, when not 0, also ends a piece at the
-/// first read start past that many rows, as medium ends a block; zm: zpaq
-/// by the interleaved model, not level 5.
+/// Where a stream's reads start, as the C's rspec: run counts ib (cs varints a run, or None for headed), mult, rows rule, zpaq model zm
 #[derive(Clone, Copy)]
 pub struct Rspec<'a> { ib: Option<&'a [u8]>, mult: usize, cs: usize, rows: u64, zm: bool }
 
@@ -1140,10 +1060,7 @@ pub const MEDBLK: u64 = 4194304;
 /// -e high's zpaq piece, as zpaq -m5's block
 pub const ZPQMB: i32 = 64;
 
-/// -e high: libzpaq's level 5, context mixing, in ZPQMB pieces ended at read
-/// starts, as the C's zpqtry: an interleaved stream also tries the model in
-/// kzzpaq.cpp, the smaller wins and sets rs.zm. The frame is kept, so it is
-/// made once and read back once.
+/// -e high: libzpaq level 5 in ZPQMB pieces ended at read starts, as the C's zpqtry; interleaved streams also try the ilv model
 fn zpq_try(s: &[u8], rs: &mut Rspec, r: &mut (i32, i32, usize), keep: &mut Option<Vec<u8>>) {
     let (c, mut zm) = (ffi::CODEC_ZPAQ | ZPQMB, rs.zm);
     for m in [false, true].into_iter().take(if rs.mult == 2 { 2 } else { 1 }) {
@@ -1169,8 +1086,7 @@ fn vsoft(s: &[u8], p: &mut usize) -> u64 {
 
 fn vskip(s: &[u8], p: &mut usize) { while *p < s.len() { let b = s[*p]; *p += 1; if b & 0x80 == 0 { break; } } }
 
-/// bzip3 pieces of at most b bytes, each ending at the last read start
-/// within b of its own start, else at b, as the C's bz3cuts
+/// bzip3 pieces of at most b bytes, each ending at the last read start within b, else at b, as the C's bz3cuts
 fn bz3_cuts(s: &[u8], b: usize, rs: &Rspec) -> Vec<u32> {
     let n = s.len();
     let (mut c, mut s0, mut last, mut q, mut r) = (Vec::with_capacity(2 * (n / b) + 4), 0usize, 0usize, 0usize, 0usize);
@@ -1195,7 +1111,7 @@ fn bz3_cuts(s: &[u8], b: usize, rs: &Rspec) -> Vec<u32> {
     c
 }
 
-/// A payload frame, bzip3 cut at read starts when rs is given: the C's paycut.
+/// A payload frame, bzip3 cut at read starts when rs is given: the C's paycut
 fn paycut(src: &[u8], codec: i32, rs: Option<&Rspec>) -> Option<Vec<u8>> {
     let b = ((codec & 0xffff) as usize) << 20;
     match rs {
@@ -1206,10 +1122,7 @@ fn paycut(src: &[u8], codec: i32, rs: Option<&Rspec>) -> Option<Vec<u8>> {
     }
 }
 
-/// bzip3 at each size over the pieces paycut makes, as the C's bz3try: every
-/// piece of every size one job; a frame is 13 B plus its pieces framed one
-/// by one. The smallest under r, the smaller size on a tie, read back, takes
-/// r: true when one did.
+/// bzip3 at each size over paycut's pieces, every piece of every size one job, as the C's bz3try; true when one won
 fn bz3_try(s: &[u8], rs: Option<&Rspec>, mb: &[i32], r: &mut (i32, i32, usize)) -> bool {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
     let jobs: Vec<(usize, usize, usize)> = mb.iter().enumerate().flat_map(|(i, &m)| {
@@ -1239,8 +1152,7 @@ fn bz3_try(s: &[u8], rs: Option<&Rspec>, mb: &[i32], r: &mut (i32, i32, usize)) 
     false
 }
 
-/// the largest piece the rows rule alone makes, the length without one:
-/// every block size at or above it gives the same pieces, as the C's bz3cover
+/// the largest piece the rows rule alone makes: every block size at or above it gives the same pieces, as the C's bz3cover
 fn bz3_cover(s: &[u8], rs: Option<&Rspec>) -> usize {
     match rs {
         Some(rs) if rs.rows != 0 && !s.is_empty() => bz3_cuts(s, s.len().min(512 << 20), rs).into_iter().max().unwrap_or(0) as usize,
@@ -1248,8 +1160,7 @@ fn bz3_cover(s: &[u8], rs: Option<&Rspec>) -> usize {
     }
 }
 
-/// -e high: bzip3 at every MB from half to twice the winner's, in eighths
-/// of it, as the C's bz3fine: the bytes do not follow the block size.
+/// -e high: bzip3 at every MB from half to twice the winner's, in eighths, as the C's bz3fine
 fn bz3_fine(s: &[u8], rs: Option<&Rspec>, r: &mut (i32, i32, usize)) {
     if r.0 & ffi::CODEC_BZIP3 == 0 || r.2 == 0 { return; }
     let (b, cover) = (r.0 & 0xffff, bz3_cover(s, rs) as u64);
@@ -1259,9 +1170,7 @@ fn bz3_fine(s: &[u8], rs: Option<&Rspec>, r: &mut (i32, i32, usize)) {
     if !mb.is_empty() { bz3_try(s, rs, &mb, r); }
 }
 
-/// -e high: bzip3 pieces that also end where medium ends a block, at the
-/// first read start past MEDBLK rows, at every listed size, as the C's
-/// bz3rows: medium's own pieces, which pieces counted in bytes never make.
+/// -e high: bzip3 pieces that also end where medium ends a block, as the C's bz3rows
 fn bz3_rows(s: &[u8], rs: &mut Rspec, r: &mut (i32, i32, usize), slow: bool) {
     if s.is_empty() { return; }
     let rr = Rspec { rows: MEDBLK, ..*rs };
@@ -1275,9 +1184,7 @@ fn bz3_rows(s: &[u8], rs: &mut Rspec, r: &mut (i32, i32, usize), slow: bool) {
     if !mb.is_empty() && bz3_try(s, Some(&rr), &mb, r) { rs.rows = MEDBLK; }
 }
 
-/// A respelt block is a different stream from the one the codec was chosen
-/// on, so it counts only at the size it comes back at.
-/// The frame, if it comes back: the compress phase would make the same.
+/// A respelt block counts only at the size it comes back at; the frame is kept, since the compress phase would make the same
 fn lens_ok(src: &[u8], codec: i32, level: i32, rs: Option<&Rspec>) -> Option<Vec<u8>> {
     let c = comp_frame(src, codec, level, rs)?;
     let v = if codec != 0 { ffi::paydecomp(&c, codec, src.len())? } else { ffi::zstd_decompress(&c, src.len())? };
@@ -1300,7 +1207,7 @@ fn packsize(src: &[u8], codec: i32, bad: usize) -> usize {
     ffi::paycomp(src, codec).map_or(bad, |t| t.len())
 }
 
-/// A lengths or labels frame: the chosen codec, else zstd.
+/// A lengths or labels frame: the chosen codec, else zstd
 pub fn comp_frame(src: &[u8], codec: i32, level: i32, rs: Option<&Rspec>) -> Option<Vec<u8>> {
     if codec != 0 { paycut(src, codec, rs) } else { Some(ffi::zstd(src, level)) }
 }
@@ -1308,16 +1215,14 @@ pub fn comp_frame(src: &[u8], codec: i32, level: i32, rs: Option<&Rspec>) -> Opt
 /* ------------------------------------------------- the name stream */
 
 
-/// 0 zstd, 1 integer deltas, 2 the CRAM tokeniser.
+/// 0 zstd, 1 integer deltas, 2 the CRAM tokeniser
 pub struct BestNames {
     pub bytes: Vec<u8>,
     pub kind: u8,
     pub chunk: usize,
 }
 
-/// Names that are integers but not exact row indices become zigzag deltas.
-/// Refuses on an empty name, a leading zero, a non-digit, or a short count,
-/// which is what makes the choice safe to reverse.
+/// Integer names that are not row indices become zigzag deltas, refused on anything that would not reverse
 pub fn int_names(names: &[u8], n: u64) -> Option<Vec<u8>> {
     let mut v = Vec::new();
     let mut prev: i64 = 0;
@@ -1342,10 +1247,9 @@ pub fn int_names(names: &[u8], n: u64) -> Option<Vec<u8>> {
     Some(v)
 }
 
-/// The tokeniser, over the chunk sizes the C tries. In fast mode it tries
-/// only the ends of the list, which is what the default encode does.
+/// The tokeniser over the chunk sizes the C tries; fast mode tries only the ends of the list
 pub const TCAND: [usize; 4] = [250_000, 1_000_000, 3_000_000, 9_000_000];
-/// The smallest tokeniser blob and its chunk.
+/// The smallest tokeniser blob and its chunk
 pub fn tok_best(names: &mut [u8], slow: bool) -> Option<(Vec<u8>, usize)> {
     let mut best: Option<(Vec<u8>, usize)> = None;
     for (i, &chunk) in TCAND.iter().enumerate() {
@@ -1358,7 +1262,7 @@ pub fn tok_best(names: &mut [u8], slow: bool) -> Option<(Vec<u8>, usize)> {
     best
 }
 
-/// One tokeniser blob: a chunk table, then each chunk's output.
+/// One tokeniser blob: a chunk table, then each chunk's output
 fn tok_chunked(names: &mut [u8], chunk: usize) -> Option<Vec<u8>> {
     if names.is_empty() { return None; }
     let mut offs = vec![0usize];
@@ -1374,10 +1278,7 @@ fn tok_chunked(names: &mut [u8], chunk: usize) -> Option<Vec<u8>> {
         p = e;
     }
     let nchunk = offs.len() - 1;
-    // One chunk per thread: 9.4M ONT read names is 38 chunks, and doing them
-    // in turn was the whole of the Rust's names phase. The C threads it too.
-    // On one thread they stay on the caller's, as the C's: a pool worker
-    // would hold a second htscodecs scratch (+25.7 MB on 2M names, aln-pack).
+    // One chunk per thread, as the C; on one thread they stay on the caller's, with no second htscodecs scratch
     let mut parts: Vec<&mut [u8]> = Vec::with_capacity(nchunk);
     let mut rest = &mut names[..];
     for i in 0..nchunk {
@@ -1389,8 +1290,7 @@ fn tok_chunked(names: &mut [u8], chunk: usize) -> Option<Vec<u8>> {
     } else {
         parts.into_par_iter().map(ffi::tok_encode).collect::<Option<Vec<_>>>()?
     };
-    // chunk size, chunk count, then the raw length of each chunk and the
-    // coded length of each, then the blobs. c/karyozip.c tokc().
+    // chunk size, chunk count, each chunk's raw and coded length, then the blobs: c/karyozip.c tokc()
     let mut out = Vec::new();
     out.extend_from_slice(&(chunk as u32).to_le_bytes());
     out.extend_from_slice(&(nchunk as u32).to_le_bytes());
@@ -1404,12 +1304,7 @@ fn tok_chunked(names: &mut [u8], chunk: usize) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// Smallest of zstd, integer deltas and the tokeniser. The losers are
-/// dropped. zstd and the tokeniser are independent and neither gains from
-/// threads on a buffer this size, so they run side by side.
-/// Read names split on ':' into fields that are either the same in every name
-/// or a plain integer. The integers go down as zigzag deltas, a read's fields
-/// together, and bzip3 takes the lot.
+/// Smallest of zstd, integer deltas, the tokeniser and field deltas (':' fields, constant or zigzag integers, then bzip3)
 
 const FLDMAX: usize = 16;
 /// ':' splits an Illumina name, '-' a UUID: try both, keep the smaller
@@ -1422,8 +1317,7 @@ pub fn fld_names(names: &[u8], n: u64) -> Option<Vec<u8>> {
     }
 }
 
-/// The pieces of `s` between `c`s, as `split`, found with glibc's memchr,
-/// as the C's field scan: split's closure walks a byte at a time.
+/// The pieces of `s` between `c`s found with glibc's memchr, as the C's field scan
 fn pieces(s: &[u8], c: u8) -> impl Iterator<Item = &[u8]> {
     let mut rest = Some(s);
     std::iter::from_fn(move || {
@@ -1440,8 +1334,7 @@ fn fld_names1(names: &[u8], n: u64, sep: u8) -> Option<Vec<u8>> {
     let first: Vec<&[u8]> = pieces(pieces(names, b'\n').next()?, sep).collect();
     let nf = first.len();
     if nf == 0 || nf > FLDMAX { return None; }
-    // one chunk a thread, cut at line ends: each decides its fields, then
-    // each writes its deltas from the last name of the chunk before
+    // one chunk a thread, cut at line ends: each decides its fields, then writes its deltas from the chunk before's last name
     let nt = rayon::current_num_threads().max(1);
     let mut cut = vec![0usize];
     for t in 1..nt {
@@ -1523,8 +1416,7 @@ fn fld_names1(names: &[u8], n: u64, sep: u8) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// Ranked on whole names up to 4 MB -e low, DEFSAMPLE MB the default, all
-/// -e high; the winner run on all. Empty bytes: zstd, by the caller.
+/// Ranked on the mode's sample of whole names, the winner run on all; empty bytes: zstd, by the caller
 fn names_pick(names: &mut [u8], n: u64, level: i32, whole: bool, slow: bool,
               early: Option<std::thread::JoinHandle<(BestNames, usize)>>) -> (BestNames, usize) {
     if let Some(h) = early {   // ranked during the parse, on the sample
@@ -1545,13 +1437,10 @@ fn names_pick(names: &mut [u8], n: u64, level: i32, whole: bool, slow: bool,
     (best_names(names, q, smpn, full, level, slow), q)
 }
 
-/// Ranked on the first q bytes of w; with full (w's name count), the winner
-/// then runs on all of w.
+/// Ranked on the first q bytes of w; with full, the winner then runs on all of w
 pub fn best_names(w: &mut [u8], q: usize, n: u64, full: Option<u64>, level: i32, slow: bool) -> BestNames {
     let t0 = std::time::Instant::now();
-    // zstd, the slow one, ranks beside the rest, and the best known
-    // meanwhile runs on the whole buffer, as the C's. The tokeniser works
-    // in place, so the two beside it read a copy of the sample, as the C's.
+    // zstd ranks beside the rest while the best known runs on the whole buffer, as the C's; the tokeniser works in place on a copy
     let zb = w[..q].to_vec();
     let ((z, i), (t, f, spec)) = rayon::join(
         || (ffi::zstd(&zb, level), int_names(&zb, n).map(|v| ffi::zstd(&v, level))),
@@ -1590,7 +1479,7 @@ pub fn best_names(w: &mut [u8], q: usize, n: u64, full: Option<u64>, level: i32,
     out
 }
 
-/// The ranked winner on all the names; empty: zstd, by the caller.
+/// The ranked winner on all the names; empty: zstd, by the caller
 fn names_run(kind: u8, chunk: usize, w: &mut [u8], wn: u64, level: i32) -> Vec<u8> {
     match kind {
         1 => int_names(w, wn).map(|v| ffi::zstd(&v, level)),
@@ -1600,10 +1489,9 @@ fn names_run(kind: u8, chunk: usize, w: &mut [u8], wn: u64, level: i32) -> Vec<u
     }.unwrap_or_default()
 }
 
-/// A repeated sequence name would make the index ambiguous, so it is refused.
+/// A repeated sequence name would make the index ambiguous, so it is refused
 pub fn check_unique(names: &[u8]) -> Result<(), String> {
-    // As the C: hash every name, sort, and compare text only where two
-    // hashes collide. A set of 10,000,000 names was a sixth of an encode.
+    // As the C: hash every name, sort, and compare text only where two hashes collide
     let lines = names.split(|&c| c == b'\n').filter(|l| !l.is_empty());
     let mut hs: Vec<u64> = lines.clone().map(|l| kst::fnv(FNV0, l)).collect();
     hs.par_sort_unstable();

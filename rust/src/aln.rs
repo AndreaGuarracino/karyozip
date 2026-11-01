@@ -1,23 +1,17 @@
-//! --aln: labels and run ends the reference already implies are not stored.
-//! The alignment is read for one thing only, the collinear M/=/X segments.
+//! --aln: labels and run ends the reference implies are not stored; the PAF gives only its collinear M/=/X segments
 
 use crate::kst::{self, unzz, vget, FNV0};
 use crate::kst::FnvMap as HashMap;   // FNV, as the C's intern: SipHash was a tenth of aln-pack
 
-/// How a .kst reference is read: whole at load, per contig on demand, or one
-/// block at a time when a single sequence is asked for.
+/// How a .kst reference is read: whole, per contig on demand, or a block at a time for one sequence
 #[derive(PartialEq, Clone, Copy)]
 pub enum Lazy { No, Contig, OneSeq }
 
-/// One collinear block: where it starts on the query, which reference
-/// contig, how long, where it starts there, and the strand.
+/// One collinear block: query start, reference contig, length, reference start, strand
 #[derive(Clone, Copy)]
 pub struct Seg { pub q: u64, pub t: u32, pub n: u32, pub tp: u64, pub rev: bool }
 
-/// A reference contig: run starts, a label id per run, and its end. From a
-/// .kst reference the rows are decoded when first asked.
-/// The starts of a whole contig: 4 bytes a run when the contig fits 32
-/// bits, which every chromosome does, 8 otherwise. 12 bytes a run to 8.
+/// A reference contig: run starts (4 bytes a run when the contig fits 32 bits), a label id per run, its end; decoded when first asked
 pub enum Starts { W(Vec<u32>), L(Vec<u64>) }
 impl Starts {
     fn from(v: Vec<u64>, end: u64) -> Starts {
@@ -42,11 +36,10 @@ pub struct Aln {
     pub rc: Vec<Rcon>,
     rcix: HashMap<Vec<u8>, u32>,
     pub qs: Vec<(Box<[u8]>, Vec<Seg>)>,
-    /// open addressed by hash, as the C's qseg_get: index + 1 into qs, 0 empty;
-    /// a HashMap kept a second copy of every name, 135 B more a short read
+    /// open addressed by hash, as the C's qseg_get: index + 1 into qs, 0 empty; a HashMap copied every name
     qsix: Vec<u32>,
     pub lt: kst::Intern,
-    /// --aln-names: ordinal N is line N+1, for tracks named by ordinal.
+    /// --aln-names: ordinal N is line N+1, for tracks named by ordinal
     pub ord: Vec<Vec<u8>>,
     pub hash: u64,
     /// --ref R.kst: the track, and its label ids as this table's
@@ -99,8 +92,7 @@ impl Aln {
         self.lt.get(s)
     }
 
-    /// The reference track: one contig's rows together, sorted, gapless.
-    /// A .kst is taken as a track; `lazy` leaves its contigs until asked.
+    /// The reference track: one contig's rows together, sorted, gapless; `lazy` leaves a .kst's contigs until asked
     pub fn load_ref(&mut self, path: &str, lazy: Lazy) {
         if let Ok(mut f) = std::fs::File::open(path) {
             let mut m = [0u8; 8];
@@ -154,8 +146,7 @@ impl Aln {
         eprintln!("reference: {} contigs, {tot} runs", self.rc.len());
     }
 
-    /// The labels are interned in table order, the order the text would
-    /// have given, so the ids the reference answers with are the track's.
+    /// The labels are interned in table order, the order the text would have given, so the ids the reference answers with are the track's
     fn load_ref_kst(&mut self, path: &str, lazy: Lazy) {
         let ro = crate::reader::ReadOpts { index: true, ..Default::default() };
         let mut r = crate::reader::Reader::open_with(path, &ro);
@@ -194,7 +185,7 @@ impl Aln {
         for (t, rows) in filled { let _ = self.rc[t].rows.set(rows); }
     }
 
-    /// A contig's rows, decoded from the .kst on first use.
+    /// A contig's rows, decoded from the .kst on first use
     fn rows(&self, t: u32) -> &Rows {
         let rc = &self.rc[t as usize];
         rc.rows.get_or_init(|| {
@@ -204,7 +195,7 @@ impl Aln {
         })
     }
 
-    /// The PAF, read for its cg:Z: CIGARs. Everything else is dead weight.
+    /// The PAF, read for its cg:Z: CIGARs only
     pub fn load_paf(&mut self, path: &str) {
         let mut lines = crate::Lines::open(path, "cannot open the PAF");
         lines.err = "read error on the PAF";
@@ -229,8 +220,7 @@ impl Aln {
             if qe < qs { crate::bail("PAF query end is before its start"); }
             let mut qp = if rev { qe } else { qs };
             let tix = match self.rcix.get(fl[5]) { Some(&i) => i, None => { noref += 1; continue; } };
-            // one slot first: a short read carries 1.2 blocks, and Vec::new's
-            // four a query peaked at 961640 against 811864 KB on 2M reads
+            // one slot first: a short read carries 1.2 blocks
             let mut segs: Vec<Seg> = Vec::with_capacity(1);
             let (mut qcons, mut tcons) = (0u64, 0u64);
             let mut i = 0usize;
@@ -283,7 +273,7 @@ impl Aln {
         for (_, s) in self.qs.iter_mut() {
             s.sort_by_key(|g| (g.q, g.t, g.tp, g.rev, g.n));
         }
-        // The binding hash: this PAF and this reference, or nothing.
+        // The binding hash: this PAF and this reference, or nothing
         self.seghash();
         if badpaf > 0 || nocg > 0 || noref > 0 {
             eprintln!("alignment: skipped {badpaf} malformed PAF lines, {nocg} without a cg:Z: tag, {noref} whose target is not in the reference");
@@ -313,13 +303,12 @@ impl Aln {
         self.hash ^= sum;
     }
 
-    /// A packed alignment if the file is one, else a PAF, as the C does.
+    /// A packed alignment if the file is one, else a PAF, as the C does
     pub fn load_aln(&mut self, path: &str) {
         if !self.load_packed(path) { self.load_paf(path); }
     }
 
-    /// aln-pack's own format: five coded streams behind a magic and the
-    /// reference's contig-order hash. Returns false when it is not one.
+    /// aln-pack's own format: five coded streams behind a magic and the reference's contig-order hash; false when not one
     fn load_packed(&mut self, path: &str) -> bool {
         let Ok(d) = std::fs::read(path) else { return false };
         if d.len() < 6 || &d[..6] != b"KSTAL1" { return false; }
@@ -409,7 +398,7 @@ impl Aln {
         true
     }
 
-    /// A bare ordinal resolves through the map when one was given.
+    /// A bare ordinal resolves through the map when one was given
     pub fn find(&self, nm: &[u8]) -> Option<usize> {
         if !self.ord.is_empty() && !nm.is_empty() && nm.iter().all(|c| c.is_ascii_digit()) {
             let i: usize = std::str::from_utf8(nm).unwrap().parse().ok()?;
@@ -419,7 +408,7 @@ impl Aln {
         self.qget(nm)
     }
 
-    /// One name a line, in the order the annotator produced them.
+    /// One name a line, in the order the annotator produced them
     pub fn load_ordinals(&mut self, path: &str) {
         let data = crate::slurp(path, "cannot open the file given to --aln-names");
         let mut h = FNV0;
@@ -439,7 +428,7 @@ impl Aln {
         eprintln!("ordinal map: {} names", self.ord.len());
     }
 
-    /// The last segment whose query start is at or before `pos`.
+    /// The last segment whose query start is at or before `pos`
     fn segat(&self, qi: usize, pos: u64) -> Option<&Seg> {
         let s = &self.qs[qi].1;
         if s.is_empty() { return None; }
@@ -462,8 +451,7 @@ impl Aln {
         if pos < g.q + g.n as u64 { Some(g) } else { None }
     }
 
-    /// count of starts <= tpos, from where the last answer was, as the C's
-    /// runat: a walk in order costs a few steps, not a binary search
+    /// count of starts <= tpos from the last answer, as the C's runat: a walk in order is a few steps
     fn runat(&self, t: u32, rc: &Rows, tpos: u64) -> usize {
         if tpos >= rc.2 { return 0; }
         let st = &rc.0;
@@ -481,9 +469,7 @@ impl Aln {
         a
     }
 
-    /// The run covering `tpos` as (label, its start, its end), or None past
-    /// the contig. Under region a .kst reference fills one block, not the
-    /// contig, and the lookup happens under that contig's lock.
+    /// The run covering `tpos` as (label, start, end), or None past the contig; a .kst reference under region fills one block
     fn run(&self, t: u32, tpos: u64) -> Option<(u32, u64, u64)> {
         if !self.perblk {
             let rc = self.rows(t);
@@ -531,7 +517,7 @@ impl Aln {
         self.run(g.t, tpos).map_or(u32::MAX, |r| r.0)
     }
 
-    /// The query position where the reference run under `pos` ends.
+    /// The query position where the reference run under `pos` ends
     pub fn end(&self, qi: usize, pos: u64) -> (u64, bool) {
         let Some(g) = self.segat(qi, pos) else { return (0, false) };
         let rev = g.rev;
@@ -545,7 +531,7 @@ impl Aln {
         (g.q + (tend - g.tp), rev)
     }
 
-    /// Three probes inside the run decide its label, as the C does.
+    /// Three probes inside the run decide its label, as the C does
     pub fn row(&self, qi: usize, st: u64, len: u64) -> u32 {
         if len < 2 { return self.label(qi, st); }
         let a = self.label(qi, st + len / 4);
@@ -557,10 +543,7 @@ impl Aln {
 
 /* --------------------------------------------------------- aln-pack */
 
-/// The packed alignment: five streams, each given its own codec search.
-/// A PAF is far larger than what --aln actually reads.
-/// A gap pair as one varint, as the C's gapput: 0 none, 3k+1 an insertion
-/// of k+1, 3k+2 a deletion of k+1, 3 both or a negative one, two zigzags after.
+/// The packed alignment: five streams, each its own codec search; a gap pair is one varint, as the C's gapput
 fn gap_put(b: &mut Vec<u8>, dq: i64, dt: i64) {
     match (dq, dt) {
         (0, 0) => kst::put(b, 0),
@@ -582,9 +565,7 @@ fn gap_get(b: &[u8], i: usize) -> (i64, i64, usize) {
 
 pub fn pack(a: &Aln, out: &str, refhash: u64) {
     use crate::ffi;
-    // A block that starts a target run carries an absolute position: its
-    // query offset as a varint and its target position as four byte planes;
-    // blocks within a run carry zigzag deltas, interleaved. c/karyozip.c alnpack.
+    // A block starting a target run has an absolute position, query offset varint and target in four byte planes; others zigzag deltas
     let (mut names, mut cnt, mut pos, mut len, mut seg_, mut fq) =
         (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
     let mut pl: [Vec<u8>; 4] = Default::default();
@@ -660,7 +641,7 @@ pub fn pack(a: &Aln, out: &str, refhash: u64) {
               f.len(), if nq > 0 { f.len() as f64 / nq as f64 } else { 0.0 });
 }
 
-/// The reference contig names, in order: what binds a packed alignment.
+/// The reference contig names, in order: what binds a packed alignment
 pub fn refhash(a: &Aln) -> u64 {
     let mut h = FNV0;
     for c in &a.rc { h = kst::fnv(h, &c.name); h = kst::fnv(h, b"\n"); }

@@ -1,10 +1,9 @@
-//! The library must write the same bytes as the CLI, and refuse the same
-//! contract violations. This is the Rust half of tests/libtest.c.
+//! The library writes the same bytes as the CLI and refuses the same contract violations: the Rust half of tests/libtest.c
 use karyozip::{ffi, writer::{self, Options, Writer}};
 use std::io::Write;
 
-/// One BED through `Writer::row`, which is what an annotator would call
-/// instead of writing a BED at all.
+/// One BED through \`Writer::row\`, as an annotator would call it
+
 fn build(bed: &[u8], opt: Options) -> Vec<u8> {
     let dir = std::env::temp_dir();
     let mut w = Writer::new(opt, &dir).expect("temp file");
@@ -58,7 +57,7 @@ fn same_bytes_as_the_cli() {
     }
 }
 
-/// Every contract violation is refused, not written out.
+/// Every contract violation is refused, not written out
 #[test]
 fn refuses_what_the_header_promises() {
     let big = vec![b'x'; 4096];
@@ -84,11 +83,18 @@ fn refuses_what_the_header_promises() {
     }
 }
 
-/// Every codec candidate, and the name tokeniser, round-trips its input.
+/// One file of tests/fixtures.txt, where "@@ NAME" opens each
+fn fixfile(name: &str) -> Vec<u8> {
+    let (all, mut out, mut on) = (std::fs::read_to_string(format!("{}/../tests/fixtures.txt", env!("CARGO_MANIFEST_DIR"))).unwrap(), String::new(), false);
+    for l in all.lines() { if let Some(n) = l.strip_prefix("@@ ") { on = n == name } else if on { out += l; out.push('\n') } }
+    out.into_bytes()
+}
+
+/// Every codec candidate, and the name tokeniser, round-trips its input
 #[test]
 fn every_codec_round_trips() {
     for f in ["db.rall.bed", "db.chromosome.bed", "ls.bed"] {
-        let mut src = std::fs::read(format!("{}/../tests/{f}", env!("CARGO_MANIFEST_DIR"))).unwrap();
+        let mut src = fixfile(f);
         let mut n = 0;
         for c in writer::candlist(true) {
             if let Some(v) = ffi::paycomp(&src, c) {

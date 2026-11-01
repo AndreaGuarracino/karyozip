@@ -9,6 +9,8 @@ for t in python3 zstd; do command -v $t >/dev/null || { echo "fuzz: $t not on PA
 [ -x "$SAN" ] || { echo "fuzz: FAILED, $SAN does not run"; exit 1; }
 D=$(cd "$(dirname "$0")" && pwd)
 W=$(mktemp -d); trap 'rm -rf "$W"' EXIT
+src=$D; D=$W/fx; mkdir -p "$D"; cp "$src"/fixtures.txt "$src"/*.py "$src"/*.sh "$D"/   # the fixtures, unpacked
+awk '/^@@ /{f=d"/"$2; next} {print > f}' d="$D" "$D/fixtures.txt"
 fail=0
 
 LK=$SAN
@@ -143,7 +145,7 @@ done
 sets="acrocentric chromosome gene region repeat subtelomeric"; in=""; for f in $sets; do in="$in -i $D/db.$f.bed"; done
 $KT compress --db "$D/db.features.tsv" $in > "$W/db.kt" 2>/dev/null
 $KT compress --aln "$D/p.paf" --ref "$D/ref.bed" < "$D/s.bed" > "$W/al.kt" 2>/dev/null
-# a forged read count, before the metadata hash
+# forged read count, before the metadata hash
 cp "$W/al.kt" "$W/m.kt"; printf '\x0c' | dd of="$W/m.kt" bs=1 seek=12 conv=notrunc status=none 2>/dev/null
 ASAN_OPTIONS=detect_leaks=0 timeout 30 $SAN decompress --aln "$D/p.paf" --ref "$D/ref.bed" -i "$W/m.kt" >/dev/null 2>"$W/err"
 grep -q "does not match its hash" "$W/err" && echo "fuzz: forged read count: refused by the hash" || { echo "fuzz: forged read count: $(head -c 200 "$W/err")"; fail=1; }

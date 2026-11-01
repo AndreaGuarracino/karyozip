@@ -1,13 +1,11 @@
-//! --db: the labels are featureIDs from a database, so one merged track
-//! replaces the per-set BEDs and the mapping stays in features.tsv.
+//! --db: featureID labels, so one merged track replaces the per-set BEDs and the mapping stays in features.tsv
 
 use crate::kst::{self, FNV0, FnvMap as HashMap};
 use std::io::Write;
 
 pub struct Feats {
     pub sets: Vec<Vec<u8>>,
-    /// featureID to its label per set: a dense position table, as the C's
-    /// fid2lab, 4 bytes a slot so a sparse id costs less than the C's 8.
+    /// featureID to its label per set: a dense table, as the C's fid2lab, 4 bytes a slot
     idpos: Vec<u32>,
     labs: Vec<Vec<Vec<u8>>>,
     pub nids: usize,
@@ -17,8 +15,7 @@ pub struct Feats {
     intern: Vec<HashMap<Vec<u8>, u32>>,
     tupint: HashMap<kst::Tup, u32>,
     pub hash: u64,
-    /// --hier: per set, features.tsv column plus the hierarchy nodes plus
-    /// "novel", sorted; a tuple outside features.tsv is 2^26 + its rank
+    /// --hier: per set, the features.tsv column, the hierarchy nodes and novel, sorted; an outside tuple is 2^26 + its rank
     voc: Vec<Vec<Vec<u8>>>,
     stride: Vec<u64>,
     pub prod: u64,
@@ -83,10 +80,10 @@ impl Feats {
         f
     }
     fn has(&self, id: u32) -> bool { self.idpos.get(id as usize).is_some_and(|&p| p != u32::MAX) }
-    /// A label's interned id in set k, or MAX when no table tuple has it.
+    /// A label's interned id in set k, or MAX when no table tuple has it
     fn labid(&self, k: usize, lab: &[u8]) -> u32 { self.intern[k].get(lab).copied().unwrap_or(u32::MAX) }
 
-    /// A track label as a featureID, checked as decode checks it.
+    /// A track label as a featureID, checked as decode checks it
     pub fn featid(&self, lab: &[u8]) -> u32 {
         let id = num(lab, self.idmax(), "corrupt --db track: a label is not a featureID");
         if id != 0 && id < CARTBASE && !self.has(id) {
@@ -94,7 +91,7 @@ impl Feats {
         }
         id
     }
-    /// The largest featureID the track may hold.
+    /// The largest featureID the track may hold
     pub fn idmax(&self) -> u32 { if self.cart { CARTBASE - 1 + self.prod as u32 } else { CARTBASE - 1 } }
 
     /// The label of one set for a featureID.
@@ -104,7 +101,7 @@ impl Feats {
         else { &self.voc[k][((id - CARTBASE) as u64 / self.stride[k] % self.voc[k].len() as u64) as usize] }
     }
 
-    /// The vocabulary of every set, and the hash continued over the file.
+    /// The vocabulary of every set, and the hash continued over the file
     pub fn load_hier(&mut self, path: &str) {
         let data = crate::slurp(path, "cannot open the hierarchy file");
         let n = self.sets.len();
@@ -141,7 +138,7 @@ impl Feats {
         eprintln!("hierarchy: {} label tuples possible", self.prod);
     }
 
-    /// 2^26 + the mixed-radix rank of a tuple outside features.tsv.
+    /// 2^26 + the mixed-radix rank of a tuple outside features.tsv
     fn cart_id(&self, labs: &[&[u8]]) -> u32 {
         let mut rank = 0u64;
         for (k, l) in labs.iter().enumerate() {
@@ -152,7 +149,7 @@ impl Feats {
         CARTBASE + rank as u32
     }
 
-    /// --set A,B as columns of features.tsv; None or "all" is every set.
+    /// --set A,B as columns of features.tsv; None or all is every set
     pub fn setcols(&self, spec: Option<&str>) -> Vec<usize> {
         let Some(spec) = spec.filter(|s| *s != "all") else { return (0..self.sets.len()).collect() };
         let mut cols = Vec::new();
@@ -167,7 +164,7 @@ impl Feats {
         cols
     }
 
-    /// The labels of the picked sets for one featureID, tab-joined.
+    /// The labels of the picked sets for one featureID, tab-joined
     pub fn joined(&self, id: u32, cols: &[usize], out: &mut Vec<u8>) {
         out.clear();
         for (i, &k) in cols.iter().enumerate() {
@@ -185,7 +182,7 @@ impl Feats {
     }
 }
 
-/// Digits, in 64 bits, at most `max`: the C's num_arg, same words in the same order.
+/// Digits, in 64 bits, at most `max`: the C's num_arg, same words in the same order
 fn num(b: &[u8], max: u32, what: &str) -> u32 {
     if b.is_empty() { crate::bail(what); }
     let mut v: u64 = 0;
@@ -198,7 +195,7 @@ fn num(b: &[u8], max: u32, what: &str) -> u32 {
     v as u32
 }
 
-/// One input BED, streamed a row at a time.
+/// One input BED, streamed a row at a time
 struct Brd { lines: crate::Lines, seq: Vec<u8>, st: u64, en: u64, lab: Vec<u8>, labid: u32,
              pseq: Vec<u8>, pen: u64, had: bool, eof: bool }
 
@@ -216,8 +213,7 @@ impl Brd {
         b
     }
 
-    /// The row parsed straight from the reader's buffer, no copy of the line,
-    /// and the previous label compared, not copied: as the C's bnext.
+    /// The row parsed in the reader's buffer, the previous label compared, not copied, as the C's bnext
     fn next(&mut self) {
         let Some((line, nl)) = self.lines.next_line_nl() else { self.eof = true; return; };
         if line.is_empty() { crate::bail("bad line"); }   // as the C: a blank row is not skipped
@@ -251,8 +247,7 @@ impl Brd {
     }
 }
 
-/// One BED per feature set in header order, or one merged featureID track.
-/// True when some featureID came from the vocabulary.
+/// One BED per feature set in header order, or one merged featureID track; true when a featureID came from the vocabulary
 pub fn encode(files: &[String], feats: &Feats, w: &mut crate::writer::Writer) -> bool {
     let mut cart_used = false;
     let dbids = files.len() != feats.sets.len();
@@ -325,12 +320,9 @@ pub fn encode(files: &[String], feats: &Feats, w: &mut crate::writer::Writer) ->
     cart_used
 }
 
-/// decode --db --out-dir DIR: one BED per feature set, the featureIDs expanded.
-/// The staged BEDs of a decode in flight, removed by `die` and on the way
-/// out, so a failed run never leaves half an output behind.
+/// decode --db --out-dir DIR: staged BEDs, removed by `die` and on the way out, so a failure leaves no half output
 static TMP: std::sync::Mutex<Vec<std::path::PathBuf>> = std::sync::Mutex::new(Vec::new());
-/// DIR/<set><suffix>, from the set's bytes: a set name need not be UTF-8,
-/// and two that differ only past a lossy conversion must not share a file.
+/// DIR/<set><suffix> from the set's bytes: a set name need not be UTF-8
 fn setpath(dir: &str, s: &[u8], suffix: &str) -> std::path::PathBuf {
     use std::os::unix::ffi::OsStrExt;
     let mut f = s.to_vec(); f.extend_from_slice(suffix.as_bytes());
@@ -344,14 +336,11 @@ pub fn drop_tmp() {
     }
 }
 
-/// decode --db. With DIR: one BED per picked set, staged then swapped in
-/// together. Without: the picked columns, tab-joined, merged where they all
-/// agree, on stdout; one set gives that set's own track.
+/// decode --db: with DIR one BED a set, staged then swapped in; without, the picked columns tab-joined on stdout
 pub fn decode(r: &mut crate::reader::Reader, feats: &Feats, dir: Option<&str>, cols: &[usize]) {
     let sets: Vec<&[u8]> = cols.iter().map(|&k| feats.sets[k].as_slice()).collect();
     let mut tmps: Vec<std::path::PathBuf> = Vec::new();
-    // each output its own 1 MB row buffer, written whole, as the C's ow:
-    // a row through a BufWriter was a third copy and a virtual call a row
+    // each output its own 1 MB row buffer, written whole, as the C's ow
     let mut out: Vec<(Box<dyn Write>, Vec<u8>)> = Vec::new();
     if let Some(dir) = dir {
         tmps = stage_open(dir, &sets);
@@ -360,12 +349,10 @@ pub fn decode(r: &mut crate::reader::Reader, feats: &Feats, dir: Option<&str>, c
     } else {
         out.push((Box::new(std::io::stdout()), Vec::with_capacity(OCAP)));
     }
-    // One open run per output, extended while its label does not change.
+    // One open run per output, extended while its label does not change
     let n = out.len();
     let mut joined = Vec::new();
-    // (open, start, end, label) per output: the label is the table's own
-    // bytes, as the C's pointer, so a run start copies nothing; on stdout
-    // the joined label of the open run is kept in cj
+    // (open, start, end, label) per output: the label borrows the table, as the C's pointer; cj holds the joined label on stdout
     let mut cur: Vec<(bool, u64, u64, &[u8])> = vec![(false, 0, 0, &[][..]); n];
     let mut cj: Vec<u8> = Vec::new();
     let mut cseq: Vec<u8> = Vec::new();
@@ -416,7 +403,7 @@ pub fn decode(r: &mut crate::reader::Reader, feats: &Feats, dir: Option<&str>, c
 }
 
 const OCAP: usize = 1 << 20;
-/// One row into its output's buffer; the buffer goes out when the row would not fit, as the C's owput.
+/// One row into its output's buffer, flushed when the row would not fit, as the C's owput
 fn wr(o: &mut (Box<dyn Write>, Vec<u8>), seq: &[u8], st: u64, en: u64, lab: &[u8]) {
     let (f, v) = o;
     if v.len() + seq.len() + lab.len() + 48 > OCAP.max(v.capacity()) {
@@ -426,7 +413,7 @@ fn wr(o: &mut (Box<dyn Write>, Vec<u8>), seq: &[u8], st: u64, en: u64, lab: &[u8
     crate::kst::put_row(v, seq, st, en, lab);
 }
 
-/// --out-dir DIR: one staged BED a set, beside the old ones, as the C's stage_open.
+/// --out-dir DIR: one staged BED a set, beside the old ones, as the C's stage_open
 pub fn stage_open(dir: &str, sets: &[&[u8]]) -> Vec<std::path::PathBuf> {
     std::fs::create_dir_all(dir).unwrap_or_else(|_| crate::bail("cannot create the output directory"));
     for s in sets {
@@ -443,7 +430,7 @@ pub fn stage_open(dir: &str, sets: &[&[u8]]) -> Vec<std::path::PathBuf> {
     tmps
 }
 
-/// The staged BEDs swapped in together, as the C's stage_swap.
+/// The staged BEDs swapped in together, as the C's stage_swap
 pub fn stage_done(dir: &str, sets: &[&[u8]], tmps: &[std::path::PathBuf]) {
     let owned: Vec<Vec<u8>> = sets.iter().map(|s| s.to_vec()).collect();
     swap_in(dir, &owned, tmps);
@@ -451,7 +438,7 @@ pub fn stage_done(dir: &str, sets: &[&[u8]], tmps: &[std::path::PathBuf]) {
     TMP.lock().unwrap().clear();
 }
 
-/// Move every staged BED into place, or put back what was there.
+/// Move every staged BED into place, or put back what was there
 fn swap_in(dir: &str, sets: &[Vec<u8>], tmps: &[std::path::PathBuf]) {
     let pid = std::process::id();
     let live = |s: &[u8]| setpath(dir, s, ".bed");

@@ -2,8 +2,7 @@ use karyozip::{aln, bail as die, bedcoord_r, db, ffi, prof, reader, smooth, writ
 
 use std::io::{BufWriter, Read, Write};
 
-/// The C's wording for a number that is not one.
-/// A count: digits only, at most 18 of them, in range, as the C's int_arg.
+/// The C's wording for a number that is not one: digits only, at most 18, in range, as the C's int_arg
 fn count(s: &str, lo: u64, hi: u64, what: &'static str) -> u64 {
     if s.len() > 18 { die(what); }
     let n = karyozip::bedcoord(s.as_bytes(), what);
@@ -20,8 +19,7 @@ fn main() {
     ffi::panic_clean();
     if !ffi::STDFDS_OPEN.load(std::sync::atomic::Ordering::Relaxed) { die("stdin, stdout or stderr is closed"); }
     let c = Cli::get();
-    // --threads, else one per core capped at 8, as the C. The pool is
-    // explicit, so no environment variable reaches it.
+    // --threads, else one per core capped at 8, as the C; the pool is explicit, so no environment variable reaches it
     const THRCAP: usize = 8;
     let n = match cnt(&c.threads, 1, 1024, "--threads is a number of 1 to 1024") {
         Some(t) => t as usize,
@@ -49,8 +47,7 @@ fn main() {
     let Some(cmd) = c.cmd.as_ref() else { die(USAGE) };
     prof::start(c.profile, n);
     let mut ro = reader::ReadOpts { raw: c.raw, db: c.db.is_some(), ..Default::default() };
-    // The C keeps a mode and a file separately, so a repeat of one does not
-    // clear the other.
+    // The C keeps a mode and a file separately, so a repeat of one does not clear the other
     for n in &c.names {
         if n == "drop" { opt.drop_names = true } else { ro.names_file = Some(n.clone()) }
     }
@@ -145,8 +142,7 @@ fn main() {
             let smchunk = cnt(&c.chunk, 1, 1000000000, "--chunk is a number of runs, 1 to 1000000000").unwrap_or(0) as usize;
             let (seq, lo, hi) = c.region.as_deref().map_or(("", 0, 0), regparse);
             let feats = informed(&c, &mut ro, if c.query { "query " } else { "decompress " }, Some(hier), aln::Lazy::Contig);
-            // not stdout().lock(): a lock guard cannot cross to the smooth
-            // workers, and they are serialized by turn anyway
+            // not stdout().lock(): a lock guard cannot cross to the smooth workers
             let mut o = BufWriter::new(std::io::stdout());
             smooth::run(track, hier, fs.map(str::as_bytes), c.region.as_ref().map(|_| seq.as_bytes()),
                         lo, hi, c.v1, maxgap, smchunk, &ro, feats.as_ref(), &mut o);
@@ -171,7 +167,7 @@ fn main() {
     prof::dump();
 }
 
-/// Writes the file and reports, for both encode paths.
+/// Writes the file and reports, for both encode paths
 fn finish(w: writer::Writer, aln_on: bool) {
     let so = std::io::stdout();
     let mut o = BufWriter::new(so.lock());
@@ -185,8 +181,7 @@ fn finish(w: writer::Writer, aln_on: bool) {
 }
 
 
-/// -r NAME or NAME:START-END, the range BED's: 0-based, END excluded. A
-/// name may hold ':' itself, so only a digits-digits tail is a range.
+/// -r NAME or NAME:START-END, BED's range; only a digits-digits tail is a range, a name may hold ':'
 fn regparse(r: &str) -> (&str, u64, u64) {
     let digits = |x: &str| !x.is_empty() && x.bytes().all(|b| b.is_ascii_digit());
     let Some((nm, tail)) = r.rsplit_once(':') else { return (r, 0, 0) };
@@ -199,9 +194,7 @@ fn regparse(r: &str) -> (&str, u64, u64) {
     (nm, lo, hi)
 }
 
-/// --aln needs --ref, and the two are read once, before any row.
-/// --db and --aln companions for a reader, in the C's order: features first.
-/// smooth's positional hierarchy stands in for --hier under --db.
+/// --aln needs --ref, both read once before any row; reader companions in the C's order, features first
 fn informed(c: &Cli, ro: &mut reader::ReadOpts, who: &str, hier: Option<&str>,
             lazy: aln::Lazy) -> Option<db::Feats> {
     if c.set.is_some() && c.db.is_none() { die("--set needs --db"); }
@@ -227,8 +220,7 @@ fn load_aln(paf: &Option<String>, refbed: &Option<String>,
         (None, None) if ordfile.is_some() => die("--aln-names does nothing without --aln"),
         (None, None) => None,
         (Some(p), Some(r)) => {
-            // The C loads the ordinal map first, and the diagnostics are
-            // compared line for line.
+            // The C loads the ordinal map first, and the diagnostics are compared line for line
             let mut a = aln::Aln::default();
             if let Some(o) = ordfile { a.load_ordinals(o); }
             a.load_ref(r, lazy);
@@ -238,7 +230,7 @@ fn load_aln(paf: &Option<String>, refbed: &Option<String>,
     }
 }
 
-/// The staging file goes under tmpdir; the C's words if it cannot.
+/// The staging file goes under tmpdir; the C's words if it cannot
 fn new_writer(opt: writer::Options, tmpdir: &std::path::Path) -> writer::Writer {
     writer::Writer::new(opt, tmpdir).unwrap_or_else(|_| die(&format!(
         "cannot create a temp file under {} (see --tmp-dir)", tmpdir.display())))
@@ -248,10 +240,7 @@ fn encode(opt: writer::Options, tmpdir: &std::path::Path, a: Option<aln::Aln>) {
     let mut w = new_writer(opt, tmpdir);
     let aln_on = a.is_some();
     if let Some(x) = a { w.set_aln(x); }
-    // A slab at a time, like the C. Reading the whole input first would cost
-    // the input's size in memory, 2.3 GB on the benchmark track. Two slabs:
-    // one thread reads and splits the next while this one appends the rows
-    // of the last, which must stay serial.
+    // A slab at a time, like the C, so memory does not grow with the input; one thread reads the next while this one appends
     let nthr = rayon::current_num_threads().min(32);
     let mut stdin = karyozip::unzip(std::io::stdin());   // plain or .gz
     let new = || Slab { b: vec![0u8; SLAB], have: 0, span: 0, eof: false, rows: (0..nthr).map(|_| Vec::new()).collect(), err: None };
@@ -294,15 +283,11 @@ fn report(st: &writer::Stats) {
               st.index, st.offs, st.lens, st.labs, st.raw);
 }
 
-/// One parsed row: byte ranges into the slab, and the coordinates.
-/// Offsets into the slab, which is 16 MB, so u32 is enough and the row is
-/// 32 bytes instead of 48.
-/// `same`: the name equals the row before's, found on the split threads.
+/// One parsed row: u32 offsets into the 16 MB slab and the coordinates; `same`: the name equals the one before
 struct Row { nm: (u32, u32), lab: (u32, u32), st: u64, en: u64, same: bool }
 
 const SLAB: usize = 1 << 24;
-/// One slab of whole lines and its rows. The fault is kept, not raised:
-/// the slab before must append first.
+/// One slab of whole lines and its rows; the fault is kept, since the slab before must append first
 struct Slab { b: Vec<u8>, have: usize, span: usize, eof: bool, rows: Vec<Vec<Row>>, err: Option<&'static str> }
 impl Slab {
     fn fill(&mut self, r: &mut impl Read) {
@@ -328,9 +313,7 @@ impl Slab {
     }
 }
 
-/// Splits `s` at line boundaries into one chunk per buffer, parses each on
-/// its own thread into its buffer, in order. A worker records the first
-/// thing it refuses; the earliest chunk's is returned.
+/// Splits `s` at line boundaries, one chunk a buffer parsed on its own thread; the earliest chunk's refusal wins
 fn parse_slab(s: &[u8], bufs: &mut [Vec<Row>]) -> Result<(), &'static str> {
     use rayon::prelude::*;
     let t = bufs.len();
@@ -348,7 +331,7 @@ fn parse_slab(s: &[u8], bufs: &mut [Vec<Row>]) -> Result<(), &'static str> {
     errs.into_iter().collect()
 }
 
-/// Digits then a tab, from `p`: the tab's index and the value.
+/// Digits then a tab, from `p`: the tab's index and the value
 #[inline(always)]
 fn dig_tab(l: &[u8], mut p: usize) -> Option<(usize, u64)> {
     let (s, mut x) = (p, 0u64);
@@ -370,8 +353,7 @@ fn dig_tab(l: &[u8], mut p: usize) -> Option<(usize, u64)> {
 
 #[inline(never)]
 fn parse_chunk(s: &[u8], from: usize, to: usize, buf: &mut Vec<Row>) -> Result<(), &'static str> {
-    // Moved out while it fills: the per-thread vectors sit side by side,
-    // and a push to one header stalled the other threads on its cache line
+    // Moved out while it fills: per-thread vectors side by side stalled on one cache line
     let mut out = std::mem::take(buf);
     let r = fill_rows(s, from, to, &mut out);
     *buf = out;
@@ -379,12 +361,10 @@ fn parse_chunk(s: &[u8], from: usize, to: usize, buf: &mut Vec<Row>) -> Result<(
 }
 
 fn fill_rows(s: &[u8], from: usize, to: usize, out: &mut Vec<Row>) -> Result<(), &'static str> {
-    // a row is at least 8 bytes: sized once and reused, so no doubling copy
-    // and no fresh pages each slab, as the C's per-thread arrays
+    // a row is at least 8 bytes: sized once and reused, as the C's per-thread arrays
     out.clear();
     out.reserve((to - from) / 8 + 1);
-    // the name before, in registers: reading it back from the row just
-    // pushed stalled each row on a store-to-load forward
+    // the name before, in registers: reading it back stalled each row on a store-to-load forward
     let (mut p, mut prev) = (from, 0..0);
     while p < to {
         // the newline and a NUL in one pass; a chunk ends in a newline
@@ -416,11 +396,9 @@ fn fill_rows(s: &[u8], from: usize, to: usize, out: &mut Vec<Row>) -> Result<(),
     Ok(())
 }
 
-// The command line, parsed as the C parses it: the same flag table, flags
-// on either side of the command, short forms rewritten to long ones, and
-// the C's own refusal for each mistake, in the same order.
+// The command line, parsed as the C parses it: the same flags, either side of the command, the same refusals in order
 
-/// The C's own usage text, lifted from karyozip.c by build.rs.
+/// The C's own usage text, lifted from karyozip.c by build.rs
 pub const USAGE: &str = include_str!(concat!(env!("OUT_DIR"), "/usage.txt"));
 
 pub enum Cmd { Encode, Decode, Smooth, Index, AlnPack }

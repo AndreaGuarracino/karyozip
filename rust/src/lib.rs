@@ -1,6 +1,4 @@
-//! The KaryoScope Track (KST) format: a lossless, seekable container for
-//! k-mer annotation tracks. `writer::Writer` writes one, `reader::Reader`
-//! reads one, and both produce the same bytes as the C in `../c`.
+//! The KaryoScope Track (KST) format: writer and reader, the same bytes as the C in `../c`
 
 pub mod aln;
 pub mod db;
@@ -14,10 +12,10 @@ thread_local! {
     /// set on a decode-ahead thread: a refusal is kept for its block
     pub static DEFER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
-/// A decode-ahead thread's refusal, carried to the walk.
+/// A decode-ahead thread's refusal, carried to the walk
 pub struct Deferred(pub String);
 
-/// Every refusal is the C's own wording, and exits 1 as the C does.
+/// Every refusal is the C's own wording, and exits 1 as the C does
 pub fn bail(msg: &str) -> ! {
     if DEFER.with(|d| d.get()) { std::panic::panic_any(Deferred(msg.to_string())); }
     eprintln!("karyozip: {msg}");
@@ -27,14 +25,13 @@ pub fn bail(msg: &str) -> ! {
     std::process::exit(1);
 }
 
-/// The C's ALLOCMAX. A length read out of a file can say anything, and the
-/// answer to a forged one is a refusal, not an allocator panic.
+/// The C's ALLOCMAX: a forged length is a refusal, not an allocator panic
 pub fn ckalloc(n: usize) -> usize {
     if n > 1 << 38 { bail("corrupt file: an impossible allocation size"); }
     n
 }
 
-/// A BED coordinate: digits only, and it must fit in 64 bits.
+/// A BED coordinate: digits only, and it must fit in 64 bits
 pub fn bedcoord_r(b: &[u8], what: &'static str) -> Result<u64, &'static str> {
     if b.is_empty() { return Err("empty start or end column"); }
     let mut v: u64 = 0;
@@ -52,7 +49,7 @@ pub fn bedcoord(b: &[u8], what: &'static str) -> u64 {
     bedcoord_r(b, what).unwrap_or_else(|e| bail(e))
 }
 
-/// A whole text input, plain or gzipped, through the same reader as a stream.
+/// A whole text input, plain or gzipped, through the same reader as a stream
 pub fn slurp(path: &str, what: &'static str) -> Vec<u8> {
     let f = std::fs::File::open(path).unwrap_or_else(|_| bail(what));
     let mut v = Vec::new();
@@ -60,10 +57,7 @@ pub fn slurp(path: &str, what: &'static str) -> Vec<u8> {
     v
 }
 
-/// Every text input, as the C's zfopen: plain text passes through; BGZF,
-/// what bgzip and KaryoScope write, is inflated 8 MB of blocks at a time
-/// side by side, each block checked against its CRC32 and size; any other
-/// gzip streams, member after member. A cut file is an error in every mode.
+/// Every text input, as the C's zfopen: plain, BGZF blocks inflated side by side and CRC-checked, or any gzip
 pub fn unzip(r: impl std::io::Read + Send + 'static) -> Box<dyn std::io::Read + Send> {
     Box::new(Zr { r: Box::new(r), mode: 0, reof: false, raw: Vec::new(), rp: 0, out: Vec::new(), op: 0, gz: None })
 }
@@ -72,7 +66,7 @@ const ZCHUNK: usize = 8 << 20;
 type Gz = flate2::read::MultiGzDecoder<std::io::Chain<std::io::Cursor<Vec<u8>>, Box<dyn std::io::Read + Send>>>;
 struct Zr { r: Box<dyn std::io::Read + Send>, mode: u8, reof: bool, raw: Vec<u8>, rp: usize, out: Vec<u8>, op: usize, gz: Option<Gz> }
 
-/// One BGZF block's size, 0 if it is not one.
+/// One BGZF block's size, 0 if it is not one
 fn bgzf_size(p: &[u8]) -> usize {
     if p.len() < 18 || p[0] != 0x1f || p[1] != 0x8b || p[2] != 8 || p[3] & 4 == 0 { return 0; }
     let xl = p[10] as usize | (p[11] as usize) << 8;
@@ -88,7 +82,7 @@ fn le32(p: &[u8]) -> usize { u32::from_le_bytes([p[0], p[1], p[2], p[3]]) as usi
 fn zbad() -> std::io::Error { std::io::Error::other("bad or cut gzip input") }
 
 impl Zr {
-    /// At least `want` unused bytes in raw, or the end.
+    /// At least `want` unused bytes in raw, or the end
     fn fill(&mut self, want: usize) -> std::io::Result<()> {
         self.raw.drain(..self.rp); self.rp = 0;
         let mut b = vec![0u8; 1 << 20];
@@ -102,8 +96,7 @@ impl Zr {
         }
         Ok(())
     }
-    /// The next run of whole blocks into out: 1, or 0 at the end, or 2 when
-    /// what follows is not a whole BGZF block.
+    /// The next run of whole blocks into out: 1, 0 at the end, or 2 when what follows is not a whole BGZF block
     fn bgzf(&mut self) -> std::io::Result<u8> {
         use rayon::prelude::*;
         self.fill(ZCHUNK)?;
@@ -172,8 +165,7 @@ impl std::io::Read for Zr {
     }
 }
 
-/// A text input one line at a time, plain or gzipped, without holding the
-/// file: a reference track is a gigabyte of text for 24 million runs.
+/// A text input one line at a time, plain or gzipped, without holding the file
 pub struct Lines { r: std::io::BufReader<Box<dyn std::io::Read + Send>>, buf: Vec<u8>, pend: usize, pub nl: bool, pub err: &'static str }
 impl Lines {
     pub fn open(path: &str, what: &'static str) -> Lines {
@@ -183,12 +175,9 @@ impl Lines {
     pub fn new(r: impl std::io::Read + Send + 'static) -> Lines {
         Lines { r: std::io::BufReader::with_capacity(1 << 20, unzip(r)), buf: Vec::new(), pend: 0, nl: true, err: "read error" }
     }
-    /// The next line without its newline, or None at the end; `nl` says
-    /// whether the line had one.
+    /// The next line without its newline, or None at the end; `nl` says whether the line had one
     pub fn next_line(&mut self) -> Option<&[u8]> { self.next_line_nl().map(|(l, _)| l) }
-    /// The line and whether a newline ended it, for a caller that keeps the line borrowed.
-    /// A line inside the reader's buffer is returned in place, consumed on
-    /// the next call; only one across the buffer's end is copied.
+    /// The line and whether a newline ended it, in place when it lies inside the buffer
     pub fn next_line_nl(&mut self) -> Option<(&[u8], bool)> {
         use std::io::BufRead;
         self.r.consume(std::mem::take(&mut self.pend));
@@ -207,9 +196,7 @@ impl Lines {
 }
 
 pub mod prof {
-    // --profile: the same phases, and the same closing line, as the C prints.
-    // Times and memory are the machine's, so they are never compared byte for
-    // byte with the C; only the shape of the output is the same.
+    // --profile: the C's phases and closing line; times are the machine's, never compared
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
     use std::sync::OnceLock;
     use std::time::Instant;
@@ -228,7 +215,7 @@ pub mod prof {
         let _ = T0.set(Instant::now());
     }
 
-    /// Charges its phase for as long as it lives.
+    /// Charges its phase for as long as it lives
     pub struct Span(usize, Instant);
     pub fn span(i: usize) -> Option<Span> {
         (ON.load(Relaxed) && i < NAME.len()).then(|| Span(i, Instant::now()))   // 10 is "not this phase"
@@ -246,7 +233,7 @@ pub mod prof {
         }
     }
 
-    /// One kB number from a "Key: N kB" line, or 0 when /proc is not there.
+    /// One kB number from a "Key: N kB" line, or 0 when /proc is not there
     fn field(path: &str, key: &str) -> u64 {
         std::fs::read_to_string(path).ok()
             .and_then(|t| t.lines().find(|l| l.starts_with(key))
@@ -254,8 +241,7 @@ pub mod prof {
             .unwrap_or(0)
     }
 
-    /// utime plus stime, in seconds. /proc/self/stat counts in 100 Hz ticks,
-    /// and the comm field can hold spaces, so the split starts after its ')'.
+    /// utime plus stime in seconds, from /proc/self/stat in 100 Hz ticks, split after the comm field's ')'
     fn cpu() -> f64 {
         let Ok(t) = std::fs::read_to_string("/proc/self/stat") else { return 0.0 };
         let Some(i) = t.rfind(')') else { return 0.0 };

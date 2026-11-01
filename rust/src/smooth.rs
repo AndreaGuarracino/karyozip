@@ -1,5 +1,4 @@
-//! Reproducing KaryoScope's smoothing from an unsmoothed track, so the
-//! smoothed variant never has to be stored. Every rule is c/karyozip.c's.
+//! KaryoScope's smoothing from an unsmoothed track, so the smoothed one need not be stored; every rule is c/karyozip.c's
 
 use crate::reader::Reader;
 use std::io::Write;
@@ -22,7 +21,7 @@ impl Hier {
         (self.node.len() - 1) as i32
     }
 
-    /// feature_set, child, parent; one feature set at a time.
+    /// feature_set, child, parent; one feature set at a time
     pub fn load(path: &str, fs: &[u8]) -> Hier {
         let data = crate::slurp(path, "cannot open the hierarchy file");
         let mut h = Hier { node: Vec::new(), par: Vec::new(), anc: Vec::new(),
@@ -56,8 +55,7 @@ impl Hier {
         h
     }
 
-    /// Ancestor and lowest-common-ancestor tables, rebuilt after the track's
-    /// own labels are added as nodes.
+    /// Ancestor and lowest-common-ancestor tables, rebuilt after the track's own labels are added as nodes
     pub fn build(&mut self) {
         let n = self.node.len();
         self.nlen1 = (0..n).map(|a| {
@@ -85,16 +83,11 @@ impl Hier {
 
 }
 
-/// Buffers one worker reuses from sequence to sequence: short reads carry two
-/// to four runs, so three allocations a read cost more than the smoothing.
-/// `dis` keeps its marks across calls: `mark` only rises, and a wrap or a
-/// grown hierarchy clears it.
+/// Buffers one worker reuses from sequence to sequence: short reads have two to four runs; `dis` marks only rise
 #[derive(Default)]
 pub struct Scratch { was: Vec<u8>, dis: Vec<u32>, rel: Vec<usize>, mark: u32, tmp: Vec<i32> }
 
-/// As KaryoScope 6186079 (2025-12-10), as the C's smooth_seq: chunks of
-/// `chunk` runs overlapping by a quarter, each smoothed alone on a copy,
-/// its first three quarters kept; the rest smoothed whole. 0 is no chunks.
+/// As KaryoScope 6186079 and the C's smooth_seq: chunks of `chunk` runs overlapping by a quarter, 0 for none
 fn smooth_seq(h: &Hier, st: &[u64], en: &[u64], feat: &mut [i32], maxgap: u64,
               chunk: usize, sc: &mut Scratch) {
     let (n, mut s) = (feat.len(), 0);
@@ -111,16 +104,13 @@ fn smooth_seq(h: &Hier, st: &[u64], en: &[u64], feat: &mut [i32], maxgap: u64,
     smooth_one(h, &st[s..], &en[s..], &mut feat[s..], maxgap, sc);
 }
 
-/// One sequence, in place. Promotes a run to the lowest common ancestor of
-/// its neighbours when the noise between them is below it.
+/// One sequence, in place: a run becomes the lowest common ancestor of its neighbours when the noise between them is below it
 fn smooth_one(h: &Hier, st: &[u64], en: &[u64], feat: &mut [i32], maxgap: u64,
               sc: &mut Scratch) {
     let n = feat.len();
     if n < 3 { return; }   // only runs strictly inside a window change
     let nn = h.node.len();
-    // every index below is proven once here: st, en, was are n long, every
-    // feature id is a node, dis and par are nn long, anc and lca nn*nn;
-    // the loops then read unchecked, as the C's ISANC macro does
+    // every index below is proven once here, so the loops read unchecked, as the C's ISANC macro
     assert!(st.len() == n && en.len() == n && h.par.len() == nn
             && h.anc.len() == nn * nn && h.lca.len() == nn * nn
             && feat.iter().all(|&f| (f as usize) < nn)
@@ -198,8 +188,7 @@ fn smooth_one(h: &Hier, st: &[u64], en: &[u64], feat: &mut [i32], maxgap: u64,
     sc.mark = mark;
 }
 
-/// Merges equal neighbours and prints, dropping the v1 `_specific` suffix
-/// when asked.
+/// Merges equal neighbours and prints, dropping the v1 `_specific` suffix when asked
 #[allow(clippy::too_many_arguments)]
 fn emit(h: &Hier, out: &mut Vec<u8>, seq: &[u8], st: &[u64], en: &[u64],
         feat: &[i32], novel: &[u8], lo: u64, hi: u64, v1: bool) {
@@ -238,8 +227,7 @@ fn emit(h: &Hier, out: &mut Vec<u8>, seq: &[u8], st: &[u64], en: &[u64],
     }
 }
 
-/// The set a one-set track holds, as the C's inferset: the one hierarchy
-/// set whose tree has every label but novel; none or several is a refusal.
+/// The set a one-set track holds, as the C's inferset: the one set whose tree has every label but novel
 fn infer_set(hier: &str, r: &Reader) -> Vec<u8> {
     let data = crate::slurp(hier, "cannot open the hierarchy file");
     let (mut set, mut node): (Vec<Vec<u8>>, Vec<(Vec<u8>, usize)>) = (Vec::new(), Vec::new());
@@ -286,8 +274,7 @@ pub fn run(path: &str, hier: &str, fs: Option<&[u8]>, seq: Option<&[u8]>,
     if let Some(f) = feats { f.check_hash(&r); }
     let setk = feats.map(|f| f.sets.iter().position(|s| s == fs)
         .unwrap_or_else(|| crate::bail("--smooth: the set is not in features.tsv")));
-    // The track's own labels join the hierarchy, so the tables are rebuilt.
-    // Under --aln "=" and under --db a non-featureID are resolved per row.
+    // The track's labels join the hierarchy, so the tables are rebuilt; --aln "=" and --db labels resolve per row
     let (mut labmap, mut novelid, known) = (Vec::new(), Vec::new(), h.node.len());
     for i in 0..r.nlabels() {
         let mut l = r.label_at(i).to_vec();
@@ -311,8 +298,7 @@ pub fn run(path: &str, hier: &str, fs: Option<&[u8]>, seq: Option<&[u8]>,
                      (i as u64, i as u64 + 1) }
         None => (0, r.nreads),
     };
-    // One sequence: smoothed whole, printed where it overlaps the range.
-    // The phases are the C's serial ones; its threaded path records none.
+    // One sequence: smoothed whole, printed where it overlaps the range
     let one = |r: &mut Reader, ri: u64, sr: &mut crate::reader::SeqRows,
                sc: &mut Scratch, buf: &mut Vec<u8>, prof: bool| {
         let s = crate::prof::span(if prof { 6 } else { 10 });
@@ -329,10 +315,7 @@ pub fn run(path: &str, hier: &str, fs: Option<&[u8]>, seq: Option<&[u8]>,
     let wr = |out: &mut dyn Write, b: &[u8]| out.write_all(b).unwrap_or_else(|_| crate::bail("write failed"));
     let (nthr, chunk) = (rayon::current_num_threads() as u64, 4096u64);
     if nthr > 1 && last - first >= 64 {
-        // As the C's smooth_mt: chunks of sequences on worker threads, each
-        // with its own reader (sharing a one-block track's block) and one buffer it reuses, taken in order and
-        // written in turn, so nothing is held but a buffer per thread. A
-        // window of eight chunks per thread held 2 GB against the C's 0.45 GB.
+        // As the C's smooth_mt: chunks of sequences on worker threads, each with its own reader and buffer, written in turn
         use std::sync::atomic::{AtomicU64, Ordering};
         let blk = r.share_block();   // one block: decoded once, for every thread, before the names
         let names = r.names_shared();

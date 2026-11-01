@@ -1,0 +1,1215 @@
+@@ aln.expected
+q1	0	50	=
+q1	50	100	B
+q2	0	50	=
+q2	50	100	=
+q3	0	50	=
+q3	50	100	B
+q4	0	50	=
+q4	50	70	Z
+q4	70	120	B
+q5	0	100	A
+@@ db2.acrocentric.bed
+chrA	0	100	acro
+chrA	100	150	nonacro
+chrLONGNAME_XYZ	0	50	acro
+chrLONGNAME_XYZ	50	150	nonacro
+c	0	100	nonacro
+c	100	150	acro
+chrMEDIUM	0	50	acro
+chrMEDIUM	50	100	nonacro
+chrMEDIUM	100	150	acro
+@@ db2.chromosome.bed
+chrA	0	50	chr2
+chrA	50	150	chr1
+chrLONGNAME_XYZ	0	50	chr1
+chrLONGNAME_XYZ	50	150	chr2
+c	0	150	chr2
+chrMEDIUM	0	50	chr1
+chrMEDIUM	50	100	chr2
+chrMEDIUM	100	150	chr1
+@@ db2.features.tsv
+featureID	acrocentric	chromosome	gene	region	repeat	subtelomeric
+1	acro	chr1	CDS	arm	LINE	ITS
+2	acro	chr1	CDS	arm	LINE	nonsub
+3	acro	chr1	CDS	arm	SINE	ITS
+4	acro	chr1	CDS	arm	SINE	nonsub
+5	acro	chr1	CDS	parm	LINE	ITS
+6	acro	chr1	CDS	parm	LINE	nonsub
+7	acro	chr1	CDS	parm	SINE	ITS
+8	acro	chr1	CDS	parm	SINE	nonsub
+9	acro	chr1	inter	arm	LINE	ITS
+10	acro	chr1	inter	arm	LINE	nonsub
+11	acro	chr1	inter	arm	SINE	ITS
+12	acro	chr1	inter	arm	SINE	nonsub
+13	acro	chr1	inter	parm	LINE	ITS
+14	acro	chr1	inter	parm	LINE	nonsub
+15	acro	chr1	inter	parm	SINE	ITS
+16	acro	chr1	inter	parm	SINE	nonsub
+17	acro	chr2	CDS	arm	LINE	ITS
+18	acro	chr2	CDS	arm	LINE	nonsub
+19	acro	chr2	CDS	arm	SINE	ITS
+20	acro	chr2	CDS	arm	SINE	nonsub
+21	acro	chr2	CDS	parm	LINE	ITS
+22	acro	chr2	CDS	parm	LINE	nonsub
+23	acro	chr2	CDS	parm	SINE	ITS
+24	acro	chr2	CDS	parm	SINE	nonsub
+25	acro	chr2	inter	arm	LINE	ITS
+26	acro	chr2	inter	arm	LINE	nonsub
+27	acro	chr2	inter	arm	SINE	ITS
+28	acro	chr2	inter	arm	SINE	nonsub
+29	acro	chr2	inter	parm	LINE	ITS
+30	acro	chr2	inter	parm	LINE	nonsub
+31	acro	chr2	inter	parm	SINE	ITS
+32	acro	chr2	inter	parm	SINE	nonsub
+33	nonacro	chr1	CDS	arm	LINE	ITS
+34	nonacro	chr1	CDS	arm	LINE	nonsub
+35	nonacro	chr1	CDS	arm	SINE	ITS
+36	nonacro	chr1	CDS	arm	SINE	nonsub
+37	nonacro	chr1	CDS	parm	LINE	ITS
+38	nonacro	chr1	CDS	parm	LINE	nonsub
+39	nonacro	chr1	CDS	parm	SINE	ITS
+40	nonacro	chr1	CDS	parm	SINE	nonsub
+41	nonacro	chr1	inter	arm	LINE	ITS
+42	nonacro	chr1	inter	arm	LINE	nonsub
+43	nonacro	chr1	inter	arm	SINE	ITS
+44	nonacro	chr1	inter	arm	SINE	nonsub
+45	nonacro	chr1	inter	parm	LINE	ITS
+46	nonacro	chr1	inter	parm	LINE	nonsub
+47	nonacro	chr1	inter	parm	SINE	ITS
+48	nonacro	chr1	inter	parm	SINE	nonsub
+49	nonacro	chr2	CDS	arm	LINE	ITS
+50	nonacro	chr2	CDS	arm	LINE	nonsub
+51	nonacro	chr2	CDS	arm	SINE	ITS
+52	nonacro	chr2	CDS	arm	SINE	nonsub
+53	nonacro	chr2	CDS	parm	LINE	ITS
+54	nonacro	chr2	CDS	parm	LINE	nonsub
+55	nonacro	chr2	CDS	parm	SINE	ITS
+56	nonacro	chr2	CDS	parm	SINE	nonsub
+57	nonacro	chr2	inter	arm	LINE	ITS
+58	nonacro	chr2	inter	arm	LINE	nonsub
+59	nonacro	chr2	inter	arm	SINE	ITS
+60	nonacro	chr2	inter	arm	SINE	nonsub
+61	nonacro	chr2	inter	parm	LINE	ITS
+62	nonacro	chr2	inter	parm	LINE	nonsub
+63	nonacro	chr2	inter	parm	SINE	ITS
+64	nonacro	chr2	inter	parm	SINE	nonsub
+@@ db2.gene.bed
+chrA	0	50	CDS
+chrA	50	100	inter
+chrA	100	150	CDS
+chrLONGNAME_XYZ	0	150	inter
+c	0	50	inter
+c	50	100	CDS
+c	100	150	inter
+chrMEDIUM	0	100	inter
+chrMEDIUM	100	150	CDS
+@@ db2.region.bed
+chrA	0	150	arm
+chrLONGNAME_XYZ	0	100	parm
+chrLONGNAME_XYZ	100	150	arm
+c	0	50	parm
+c	50	150	arm
+chrMEDIUM	0	100	parm
+chrMEDIUM	100	150	arm
+@@ db2.repeat.bed
+chrA	0	150	LINE
+chrLONGNAME_XYZ	0	100	SINE
+chrLONGNAME_XYZ	100	150	LINE
+c	0	100	LINE
+c	100	150	SINE
+chrMEDIUM	0	50	LINE
+chrMEDIUM	50	150	SINE
+@@ db2.subtelomeric.bed
+chrA	0	50	nonsub
+chrA	50	150	ITS
+chrLONGNAME_XYZ	0	150	nonsub
+c	0	150	ITS
+chrMEDIUM	0	100	ITS
+chrMEDIUM	100	150	nonsub
+@@ db.acrocentric.bed
+seq0000	0	85	acro
+seq0000	85	190	nonacrocentric
+seq0000	190	233	acro
+seq0001	0	79	nonacrocentric
+seq0001	79	139	acro
+seq0001	139	255	nonacrocentric
+seq0001	255	270	acro
+seq0001	270	373	nonacrocentric
+seq0002	0	139	acro
+seq0002	139	212	nonacrocentric
+seq0002	212	277	acro
+seq0002	277	423	nonacrocentric
+seq0002	423	485	acro
+seq0003	0	45	nonacrocentric
+seq0004	0	170	nonacrocentric
+seq0005	0	46	nonacrocentric
+seq0005	46	179	acro
+seq0005	179	226	nonacrocentric
+seq0005	226	251	novel
+seq0006	0	58	acro
+seq0007	0	74	acro
+seq0007	74	123	novel
+seq0007	123	181	acro
+seq0007	181	269	nonacrocentric
+seq0008	0	53	acro
+seq0009	0	325	nonacrocentric
+seq0009	325	378	novel
+seq0010	0	84	nonacrocentric
+seq0010	84	258	acro
+seq0010	258	345	nonacrocentric
+seq0010	345	417	novel
+seq0010	417	434	acro
+seq0011	0	183	acro
+seq0011	183	269	nonacrocentric
+seq0011	269	374	acro
+seq0012	0	74	acro
+seq0012	74	114	nonacrocentric
+seq0012	114	240	acro
+seq0013	0	135	acro
+seq0014	0	14	acro
+seq0014	14	64	nonacrocentric
+seq0015	0	45	nonacrocentric
+seq0015	45	150	acro
+seq0016	0	116	nonacrocentric
+seq0016	116	130	acro
+seq0016	130	165	novel
+seq0016	165	254	nonacrocentric
+seq0017	0	90	nonacrocentric
+seq0017	90	228	acro
+seq0018	0	15	novel
+seq0018	15	90	nonacrocentric
+seq0018	90	173	novel
+seq0018	173	244	acro
+seq0019	0	118	nonacrocentric
+seq0019	118	276	acro
+seq0020	0	57	acro
+seq0021	0	90	nonacrocentric
+seq0021	90	106	acro
+seq0021	106	150	nonacrocentric
+seq0021	150	239	acro
+seq0021	239	331	nonacrocentric
+seq0022	0	30	acro
+seq0022	30	89	nonacrocentric
+seq0022	89	189	acro
+seq0022	189	270	novel
+seq0022	270	328	nonacrocentric
+seq0023	0	15	nonacrocentric
+seq0023	15	183	acro
+seq0024	0	140	nonacrocentric
+seq0024	140	203	acro
+seq0024	203	325	nonacrocentric
+seq0024	325	363	acro
+seq0025	0	303	nonacrocentric
+seq0026	0	70	nonacrocentric
+seq0027	0	77	acro
+seq0028	0	32	acro
+seq0028	32	57	novel
+seq0028	57	81	nonacrocentric
+seq0028	81	127	acro
+seq0028	127	141	nonacrocentric
+seq0028	141	239	acro
+seq0029	0	80	nonacrocentric
+seq0030	0	19	acro
+seq0030	19	120	nonacrocentric
+seq0031	0	54	acro
+seq0031	54	397	nonacrocentric
+seq0032	0	140	acro
+seq0032	140	312	nonacrocentric
+seq0032	312	356	acro
+seq0032	356	368	nonacrocentric
+seq0033	0	83	acro
+seq0033	83	232	nonacrocentric
+seq0034	0	71	acro
+seq0035	0	15	acro
+seq0035	15	55	nonacrocentric
+seq0035	55	113	acro
+seq0035	113	140	nonacrocentric
+seq0035	140	185	acro
+seq0036	0	89	acro
+seq0036	89	103	nonacrocentric
+seq0037	0	10	novel
+seq0037	10	153	nonacrocentric
+seq0037	153	222	acro
+seq0038	0	409	acro
+seq0038	409	489	nonacrocentric
+seq0039	0	128	nonacrocentric
+@@ db.chromosome.bed
+seq0000	0	85	autosome
+seq0000	85	172	chr2
+seq0000	172	190	chr1
+seq0000	190	233	chr2
+seq0001	0	79	chr1
+seq0001	79	178	chr2
+seq0001	178	237	autosome
+seq0001	237	255	chr2
+seq0001	255	270	chr1
+seq0001	270	314	autosome
+seq0001	314	373	chr1
+seq0002	0	139	chr2
+seq0002	139	277	autosome
+seq0002	277	340	chr1
+seq0002	340	423	chr2
+seq0002	423	485	autosome
+seq0003	0	45	autosome
+seq0004	0	51	chr2
+seq0004	51	133	autosome
+seq0004	133	170	chr2
+seq0005	0	226	chr1
+seq0005	226	251	novel
+seq0006	0	58	autosome
+seq0007	0	74	chr1
+seq0007	74	123	novel
+seq0007	123	146	chr1
+seq0007	146	269	autosome
+seq0008	0	53	chr2
+seq0009	0	198	chr2
+seq0009	198	242	autosome
+seq0009	242	282	chr1
+seq0009	282	325	chr2
+seq0009	325	378	novel
+seq0010	0	84	chr1
+seq0010	84	172	chr2
+seq0010	172	345	autosome
+seq0010	345	417	novel
+seq0010	417	434	chr1
+seq0011	0	42	autosome
+seq0011	42	127	chr2
+seq0011	127	183	autosome
+seq0011	183	292	chr1
+seq0011	292	374	chr2
+seq0012	0	114	autosome
+seq0012	114	179	chr1
+seq0012	179	202	autosome
+seq0012	202	240	chr2
+seq0013	0	135	chr2
+seq0014	0	64	chr2
+seq0015	0	150	autosome
+seq0016	0	116	chr1
+seq0016	116	130	chr2
+seq0016	130	165	novel
+seq0016	165	254	chr1
+seq0017	0	14	autosome
+seq0017	14	90	chr2
+seq0017	90	228	chr1
+seq0018	0	15	novel
+seq0018	15	90	chr1
+seq0018	90	173	novel
+seq0018	173	244	chr2
+seq0019	0	118	chr2
+seq0019	118	142	autosome
+seq0019	142	276	chr1
+seq0020	0	31	autosome
+seq0020	31	57	chr1
+seq0021	0	90	chr1
+seq0021	90	150	chr2
+seq0021	150	214	autosome
+seq0021	214	224	chr2
+seq0021	224	239	chr1
+seq0021	239	310	autosome
+seq0021	310	331	chr1
+seq0022	0	30	autosome
+seq0022	30	189	chr2
+seq0022	189	270	novel
+seq0022	270	328	chr2
+seq0023	0	15	chr2
+seq0023	15	183	chr1
+seq0024	0	140	autosome
+seq0024	140	203	chr2
+seq0024	203	240	autosome
+seq0024	240	363	chr1
+seq0025	0	57	chr2
+seq0025	57	202	autosome
+seq0025	202	303	chr2
+seq0026	0	70	chr1
+seq0027	0	77	chr1
+seq0028	0	32	autosome
+seq0028	32	57	novel
+seq0028	57	81	autosome
+seq0028	81	127	chr1
+seq0028	127	216	chr2
+seq0028	216	239	chr1
+seq0029	0	80	chr2
+seq0030	0	19	chr2
+seq0030	19	60	autosome
+seq0030	60	120	chr2
+seq0031	0	112	chr1
+seq0031	112	226	chr2
+seq0031	226	326	chr1
+seq0031	326	397	chr2
+seq0032	0	112	chr2
+seq0032	112	140	autosome
+seq0032	140	179	chr2
+seq0032	179	226	chr1
+seq0032	226	312	chr2
+seq0032	312	356	autosome
+seq0032	356	368	chr1
+seq0033	0	83	chr2
+seq0033	83	146	chr1
+seq0033	146	232	chr2
+seq0034	0	71	chr1
+seq0035	0	15	chr2
+seq0035	15	185	autosome
+seq0036	0	64	chr1
+seq0036	64	89	autosome
+seq0036	89	103	chr2
+seq0037	0	10	novel
+seq0037	10	62	chr1
+seq0037	62	153	chr2
+seq0037	153	203	autosome
+seq0037	203	222	chr1
+seq0038	0	77	chr1
+seq0038	77	254	autosome
+seq0038	254	409	chr1
+seq0038	409	456	chr2
+seq0038	456	489	autosome
+seq0039	0	32	autosome
+seq0039	32	100	chr2
+seq0039	100	128	autosome
+@@ db.features.tsv
+featureID	acrocentric	chromosome	gene	region	repeat	subtelomeric
+1	acro	chr1	intergenic	arm	LINE	nonsubtelomeric
+2	acro	chr1	intergenic	arm	LINE	ITS
+3	acro	chr1	intergenic	arm	SINE	nonsubtelomeric
+4	acro	chr1	intergenic	arm	SINE	ITS
+5	acro	chr1	intergenic	p_arm	LINE	nonsubtelomeric
+6	acro	chr1	intergenic	p_arm	LINE	ITS
+7	acro	chr1	intergenic	p_arm	SINE	nonsubtelomeric
+8	acro	chr1	intergenic	p_arm	SINE	ITS
+9	acro	chr1	CDS	arm	LINE	nonsubtelomeric
+10	acro	chr1	CDS	arm	LINE	ITS
+11	acro	chr1	CDS	arm	SINE	nonsubtelomeric
+12	acro	chr1	CDS	arm	SINE	ITS
+13	acro	chr1	CDS	p_arm	LINE	nonsubtelomeric
+14	acro	chr1	CDS	p_arm	LINE	ITS
+15	acro	chr1	CDS	p_arm	SINE	nonsubtelomeric
+16	acro	chr1	CDS	p_arm	SINE	ITS
+17	acro	chr2	intergenic	arm	LINE	nonsubtelomeric
+18	acro	chr2	intergenic	arm	LINE	ITS
+19	acro	chr2	intergenic	arm	SINE	nonsubtelomeric
+20	acro	chr2	intergenic	arm	SINE	ITS
+21	acro	chr2	intergenic	p_arm	LINE	nonsubtelomeric
+22	acro	chr2	intergenic	p_arm	LINE	ITS
+23	acro	chr2	intergenic	p_arm	SINE	nonsubtelomeric
+24	acro	chr2	intergenic	p_arm	SINE	ITS
+25	acro	chr2	CDS	arm	LINE	nonsubtelomeric
+26	acro	chr2	CDS	arm	LINE	ITS
+27	acro	chr2	CDS	arm	SINE	nonsubtelomeric
+28	acro	chr2	CDS	arm	SINE	ITS
+29	acro	chr2	CDS	p_arm	LINE	nonsubtelomeric
+30	acro	chr2	CDS	p_arm	LINE	ITS
+31	acro	chr2	CDS	p_arm	SINE	nonsubtelomeric
+32	acro	chr2	CDS	p_arm	SINE	ITS
+33	acro	autosome	intergenic	arm	LINE	nonsubtelomeric
+34	acro	autosome	intergenic	arm	LINE	ITS
+35	acro	autosome	intergenic	arm	SINE	nonsubtelomeric
+36	acro	autosome	intergenic	arm	SINE	ITS
+37	acro	autosome	intergenic	p_arm	LINE	nonsubtelomeric
+38	acro	autosome	intergenic	p_arm	LINE	ITS
+39	acro	autosome	intergenic	p_arm	SINE	nonsubtelomeric
+40	acro	autosome	intergenic	p_arm	SINE	ITS
+41	acro	autosome	CDS	arm	LINE	nonsubtelomeric
+42	acro	autosome	CDS	arm	LINE	ITS
+43	acro	autosome	CDS	arm	SINE	nonsubtelomeric
+44	acro	autosome	CDS	arm	SINE	ITS
+45	acro	autosome	CDS	p_arm	LINE	nonsubtelomeric
+46	acro	autosome	CDS	p_arm	LINE	ITS
+47	acro	autosome	CDS	p_arm	SINE	nonsubtelomeric
+48	acro	autosome	CDS	p_arm	SINE	ITS
+49	nonacrocentric	chr1	intergenic	arm	LINE	nonsubtelomeric
+50	nonacrocentric	chr1	intergenic	arm	LINE	ITS
+51	nonacrocentric	chr1	intergenic	arm	SINE	nonsubtelomeric
+52	nonacrocentric	chr1	intergenic	arm	SINE	ITS
+53	nonacrocentric	chr1	intergenic	p_arm	LINE	nonsubtelomeric
+54	nonacrocentric	chr1	intergenic	p_arm	LINE	ITS
+55	nonacrocentric	chr1	intergenic	p_arm	SINE	nonsubtelomeric
+56	nonacrocentric	chr1	intergenic	p_arm	SINE	ITS
+57	nonacrocentric	chr1	CDS	arm	LINE	nonsubtelomeric
+58	nonacrocentric	chr1	CDS	arm	LINE	ITS
+59	nonacrocentric	chr1	CDS	arm	SINE	nonsubtelomeric
+60	nonacrocentric	chr1	CDS	arm	SINE	ITS
+61	nonacrocentric	chr1	CDS	p_arm	LINE	nonsubtelomeric
+62	nonacrocentric	chr1	CDS	p_arm	LINE	ITS
+63	nonacrocentric	chr1	CDS	p_arm	SINE	nonsubtelomeric
+64	nonacrocentric	chr1	CDS	p_arm	SINE	ITS
+65	nonacrocentric	chr2	intergenic	arm	LINE	nonsubtelomeric
+66	nonacrocentric	chr2	intergenic	arm	LINE	ITS
+67	nonacrocentric	chr2	intergenic	arm	SINE	nonsubtelomeric
+68	nonacrocentric	chr2	intergenic	arm	SINE	ITS
+69	nonacrocentric	chr2	intergenic	p_arm	LINE	nonsubtelomeric
+70	nonacrocentric	chr2	intergenic	p_arm	LINE	ITS
+71	nonacrocentric	chr2	intergenic	p_arm	SINE	nonsubtelomeric
+72	nonacrocentric	chr2	intergenic	p_arm	SINE	ITS
+73	nonacrocentric	chr2	CDS	arm	LINE	nonsubtelomeric
+74	nonacrocentric	chr2	CDS	arm	LINE	ITS
+75	nonacrocentric	chr2	CDS	arm	SINE	nonsubtelomeric
+76	nonacrocentric	chr2	CDS	arm	SINE	ITS
+77	nonacrocentric	chr2	CDS	p_arm	LINE	nonsubtelomeric
+78	nonacrocentric	chr2	CDS	p_arm	LINE	ITS
+79	nonacrocentric	chr2	CDS	p_arm	SINE	nonsubtelomeric
+80	nonacrocentric	chr2	CDS	p_arm	SINE	ITS
+81	nonacrocentric	autosome	intergenic	arm	LINE	nonsubtelomeric
+82	nonacrocentric	autosome	intergenic	arm	LINE	ITS
+83	nonacrocentric	autosome	intergenic	arm	SINE	nonsubtelomeric
+84	nonacrocentric	autosome	intergenic	arm	SINE	ITS
+85	nonacrocentric	autosome	intergenic	p_arm	LINE	nonsubtelomeric
+86	nonacrocentric	autosome	intergenic	p_arm	LINE	ITS
+87	nonacrocentric	autosome	intergenic	p_arm	SINE	nonsubtelomeric
+88	nonacrocentric	autosome	intergenic	p_arm	SINE	ITS
+89	nonacrocentric	autosome	CDS	arm	LINE	nonsubtelomeric
+90	nonacrocentric	autosome	CDS	arm	LINE	ITS
+91	nonacrocentric	autosome	CDS	arm	SINE	nonsubtelomeric
+92	nonacrocentric	autosome	CDS	arm	SINE	ITS
+93	nonacrocentric	autosome	CDS	p_arm	LINE	nonsubtelomeric
+94	nonacrocentric	autosome	CDS	p_arm	LINE	ITS
+95	nonacrocentric	autosome	CDS	p_arm	SINE	nonsubtelomeric
+96	nonacrocentric	autosome	CDS	p_arm	SINE	ITS
+@@ db.gene.bed
+seq0000	0	233	CDS
+seq0001	0	79	CDS
+seq0001	79	237	intergenic
+seq0001	237	255	CDS
+seq0001	255	270	intergenic
+seq0001	270	314	CDS
+seq0001	314	373	intergenic
+seq0002	0	340	intergenic
+seq0002	340	485	CDS
+seq0003	0	45	intergenic
+seq0004	0	51	CDS
+seq0004	51	133	intergenic
+seq0004	133	170	CDS
+seq0005	0	117	CDS
+seq0005	117	226	intergenic
+seq0005	226	251	novel
+seq0006	0	58	CDS
+seq0007	0	74	intergenic
+seq0007	74	123	novel
+seq0007	123	181	intergenic
+seq0007	181	269	CDS
+seq0008	0	53	intergenic
+seq0009	0	58	intergenic
+seq0009	58	117	CDS
+seq0009	117	198	intergenic
+seq0009	198	242	CDS
+seq0009	242	325	intergenic
+seq0009	325	378	novel
+seq0010	0	172	intergenic
+seq0010	172	345	CDS
+seq0010	345	417	novel
+seq0010	417	434	intergenic
+seq0011	0	127	intergenic
+seq0011	127	183	CDS
+seq0011	183	374	intergenic
+seq0012	0	114	intergenic
+seq0012	114	202	CDS
+seq0012	202	240	intergenic
+seq0013	0	135	CDS
+seq0014	0	64	CDS
+seq0015	0	45	intergenic
+seq0015	45	65	CDS
+seq0015	65	150	intergenic
+seq0016	0	130	intergenic
+seq0016	130	165	novel
+seq0016	165	254	intergenic
+seq0017	0	90	intergenic
+seq0017	90	228	CDS
+seq0018	0	15	novel
+seq0018	15	90	intergenic
+seq0018	90	173	novel
+seq0018	173	244	intergenic
+seq0019	0	40	intergenic
+seq0019	40	118	CDS
+seq0019	118	221	intergenic
+seq0019	221	276	CDS
+seq0020	0	57	intergenic
+seq0021	0	90	intergenic
+seq0021	90	106	CDS
+seq0021	106	150	intergenic
+seq0021	150	214	CDS
+seq0021	214	224	intergenic
+seq0021	224	331	CDS
+seq0022	0	137	CDS
+seq0022	137	189	intergenic
+seq0022	189	270	novel
+seq0022	270	328	CDS
+seq0023	0	15	CDS
+seq0023	15	183	intergenic
+seq0024	0	240	CDS
+seq0024	240	363	intergenic
+seq0025	0	57	intergenic
+seq0025	57	125	CDS
+seq0025	125	202	intergenic
+seq0025	202	303	CDS
+seq0026	0	70	intergenic
+seq0027	0	77	CDS
+seq0028	0	32	CDS
+seq0028	32	57	novel
+seq0028	57	239	CDS
+seq0029	0	80	CDS
+seq0030	0	19	intergenic
+seq0030	19	120	CDS
+seq0031	0	54	CDS
+seq0031	54	112	intergenic
+seq0031	112	142	CDS
+seq0031	142	297	intergenic
+seq0031	297	326	CDS
+seq0031	326	397	intergenic
+seq0032	0	85	intergenic
+seq0032	85	140	CDS
+seq0032	140	226	intergenic
+seq0032	226	312	CDS
+seq0032	312	368	intergenic
+seq0033	0	32	CDS
+seq0033	32	83	intergenic
+seq0033	83	232	CDS
+seq0034	0	71	CDS
+seq0035	0	15	CDS
+seq0035	15	113	intergenic
+seq0035	113	140	CDS
+seq0035	140	154	intergenic
+seq0035	154	185	CDS
+seq0036	0	64	CDS
+seq0036	64	89	intergenic
+seq0036	89	103	CDS
+seq0037	0	10	novel
+seq0037	10	81	CDS
+seq0037	81	203	intergenic
+seq0037	203	222	CDS
+seq0038	0	154	CDS
+seq0038	154	211	intergenic
+seq0038	211	336	CDS
+seq0038	336	409	intergenic
+seq0038	409	489	CDS
+seq0039	0	128	intergenic
+@@ db.rall.bed
+seq0000	0	85	48
+seq0000	85	172	75
+seq0000	172	190	61
+seq0000	190	233	25
+seq0001	0	79	61
+seq0001	79	139	20
+seq0001	139	178	67
+seq0001	178	237	86
+seq0001	237	255	76
+seq0001	255	270	4
+seq0001	270	314	93
+seq0001	314	373	55
+seq0002	0	139	18
+seq0002	139	212	87
+seq0002	212	277	39
+seq0002	277	340	50
+seq0002	340	423	75
+seq0002	423	485	44
+seq0003	0	45	86
+seq0004	0	51	74
+seq0004	51	133	84
+seq0004	133	170	74
+seq0005	0	46	62
+seq0005	46	117	9
+seq0005	117	179	3
+seq0005	179	226	54
+seq0005	226	251	0
+seq0006	0	58	43
+seq0007	0	74	5
+seq0007	74	123	0
+seq0007	123	146	5
+seq0007	146	181	38
+seq0007	181	269	89
+seq0008	0	53	18
+seq0009	0	58	67
+seq0009	58	117	77
+seq0009	117	198	65
+seq0009	198	242	93
+seq0009	242	282	56
+seq0009	282	325	71
+seq0009	325	378	0
+seq0010	0	84	49
+seq0010	84	172	18
+seq0010	172	189	43
+seq0010	189	258	46
+seq0010	258	345	95
+seq0010	345	417	0
+seq0010	417	434	3
+seq0011	0	42	39
+seq0011	42	127	23
+seq0011	127	183	48
+seq0011	183	269	49
+seq0011	269	292	4
+seq0011	292	374	17
+seq0012	0	74	35
+seq0012	74	114	87
+seq0012	114	179	13
+seq0012	179	202	43
+seq0012	202	240	22
+seq0013	0	53	28
+seq0013	53	135	29
+seq0014	0	14	25
+seq0014	14	64	74
+seq0015	0	45	83
+seq0015	45	65	45
+seq0015	65	150	38
+seq0016	0	69	54
+seq0016	69	116	53
+seq0016	116	130	20
+seq0016	130	165	0
+seq0016	165	254	56
+seq0017	0	14	85
+seq0017	14	90	70
+seq0017	90	143	9
+seq0017	143	228	16
+seq0018	0	15	0
+seq0018	15	90	56
+seq0018	90	173	0
+seq0018	173	244	22
+seq0019	0	40	68
+seq0019	40	118	79
+seq0019	118	142	33
+seq0019	142	221	8
+seq0019	221	276	16
+seq0020	0	31	36
+seq0020	31	57	1
+seq0021	0	90	52
+seq0021	90	106	32
+seq0021	106	150	67
+seq0021	150	214	42
+seq0021	214	224	17
+seq0021	224	239	9
+seq0021	239	310	92
+seq0021	310	331	63
+seq0022	0	30	45
+seq0022	30	89	76
+seq0022	89	137	25
+seq0022	137	189	17
+seq0022	189	270	0
+seq0022	270	328	73
+seq0023	0	15	78
+seq0023	15	94	6
+seq0023	94	183	7
+seq0024	0	90	90
+seq0024	90	140	89
+seq0024	140	203	32
+seq0024	203	240	89
+seq0024	240	325	55
+seq0024	325	363	4
+seq0025	0	57	72
+seq0025	57	100	89
+seq0025	100	125	94
+seq0025	125	202	86
+seq0025	202	225	73
+seq0025	225	303	76
+seq0026	0	70	50
+seq0027	0	77	13
+seq0028	0	32	44
+seq0028	32	57	0
+seq0028	57	81	90
+seq0028	81	127	12
+seq0028	127	141	73
+seq0028	141	216	31
+seq0028	216	239	13
+seq0029	0	80	73
+seq0030	0	19	24
+seq0030	19	60	90
+seq0030	60	120	77
+seq0031	0	54	11
+seq0031	54	112	53
+seq0031	112	142	73
+seq0031	142	226	67
+seq0031	226	297	52
+seq0031	297	326	64
+seq0031	326	397	67
+seq0032	0	85	24
+seq0032	85	112	26
+seq0032	112	140	41
+seq0032	140	179	69
+seq0032	179	226	53
+seq0032	226	312	75
+seq0032	312	356	40
+seq0032	356	368	49
+seq0033	0	32	31
+seq0033	32	83	19
+seq0033	83	146	62
+seq0033	146	232	75
+seq0034	0	71	10
+seq0035	0	15	30
+seq0035	15	55	87
+seq0035	55	73	33
+seq0035	73	113	34
+seq0035	113	140	91
+seq0035	140	154	33
+seq0035	154	185	41
+seq0036	0	64	11
+seq0036	64	89	38
+seq0036	89	103	75
+seq0037	0	10	0
+seq0037	10	62	63
+seq0037	62	81	75
+seq0037	81	153	70
+seq0037	153	203	36
+seq0037	203	222	15
+seq0038	0	77	13
+seq0038	77	154	48
+seq0038	154	211	38
+seq0038	211	254	44
+seq0038	254	336	15
+seq0038	336	409	8
+seq0038	409	456	73
+seq0038	456	489	94
+seq0039	0	32	84
+seq0039	32	100	72
+seq0039	100	128	83
+@@ db.region.bed
+seq0000	0	85	p_arm
+seq0000	85	172	arm
+seq0000	172	190	p_arm
+seq0000	190	233	arm
+seq0001	0	79	p_arm
+seq0001	79	178	arm
+seq0001	178	237	p_arm
+seq0001	237	270	arm
+seq0001	270	373	p_arm
+seq0002	0	139	arm
+seq0002	139	277	p_arm
+seq0002	277	485	arm
+seq0003	0	45	p_arm
+seq0004	0	170	arm
+seq0005	0	46	p_arm
+seq0005	46	179	arm
+seq0005	179	226	p_arm
+seq0005	226	251	novel
+seq0006	0	58	arm
+seq0007	0	74	p_arm
+seq0007	74	123	novel
+seq0007	123	181	p_arm
+seq0007	181	269	arm
+seq0008	0	53	arm
+seq0009	0	58	arm
+seq0009	58	117	p_arm
+seq0009	117	198	arm
+seq0009	198	325	p_arm
+seq0009	325	378	novel
+seq0010	0	189	arm
+seq0010	189	345	p_arm
+seq0010	345	417	novel
+seq0010	417	434	arm
+seq0011	0	183	p_arm
+seq0011	183	374	arm
+seq0012	0	74	arm
+seq0012	74	179	p_arm
+seq0012	179	202	arm
+seq0012	202	240	p_arm
+seq0013	0	53	arm
+seq0013	53	135	p_arm
+seq0014	0	64	arm
+seq0015	0	45	arm
+seq0015	45	150	p_arm
+seq0016	0	116	p_arm
+seq0016	116	130	arm
+seq0016	130	165	novel
+seq0016	165	254	p_arm
+seq0017	0	90	p_arm
+seq0017	90	143	arm
+seq0017	143	228	p_arm
+seq0018	0	15	novel
+seq0018	15	90	p_arm
+seq0018	90	173	novel
+seq0018	173	244	p_arm
+seq0019	0	40	arm
+seq0019	40	118	p_arm
+seq0019	118	142	arm
+seq0019	142	276	p_arm
+seq0020	0	57	arm
+seq0021	0	90	arm
+seq0021	90	106	p_arm
+seq0021	106	310	arm
+seq0021	310	331	p_arm
+seq0022	0	30	p_arm
+seq0022	30	189	arm
+seq0022	189	270	novel
+seq0022	270	328	arm
+seq0023	0	183	p_arm
+seq0024	0	140	arm
+seq0024	140	203	p_arm
+seq0024	203	240	arm
+seq0024	240	325	p_arm
+seq0024	325	363	arm
+seq0025	0	57	p_arm
+seq0025	57	100	arm
+seq0025	100	202	p_arm
+seq0025	202	303	arm
+seq0026	0	70	arm
+seq0027	0	77	p_arm
+seq0028	0	32	arm
+seq0028	32	57	novel
+seq0028	57	141	arm
+seq0028	141	239	p_arm
+seq0029	0	80	arm
+seq0030	0	19	p_arm
+seq0030	19	60	arm
+seq0030	60	120	p_arm
+seq0031	0	54	arm
+seq0031	54	112	p_arm
+seq0031	112	297	arm
+seq0031	297	326	p_arm
+seq0031	326	397	arm
+seq0032	0	85	p_arm
+seq0032	85	140	arm
+seq0032	140	226	p_arm
+seq0032	226	312	arm
+seq0032	312	356	p_arm
+seq0032	356	368	arm
+seq0033	0	32	p_arm
+seq0033	32	83	arm
+seq0033	83	146	p_arm
+seq0033	146	232	arm
+seq0034	0	71	arm
+seq0035	0	55	p_arm
+seq0035	55	185	arm
+seq0036	0	64	arm
+seq0036	64	89	p_arm
+seq0036	89	103	arm
+seq0037	0	10	novel
+seq0037	10	62	p_arm
+seq0037	62	81	arm
+seq0037	81	153	p_arm
+seq0037	153	203	arm
+seq0037	203	222	p_arm
+seq0038	0	211	p_arm
+seq0038	211	254	arm
+seq0038	254	409	p_arm
+seq0038	409	456	arm
+seq0038	456	489	p_arm
+seq0039	0	32	arm
+seq0039	32	100	p_arm
+seq0039	100	128	arm
+@@ db.repeat.bed
+seq0000	0	172	SINE
+seq0000	172	233	LINE
+seq0001	0	79	LINE
+seq0001	79	178	SINE
+seq0001	178	237	LINE
+seq0001	237	270	SINE
+seq0001	270	314	LINE
+seq0001	314	373	SINE
+seq0002	0	139	LINE
+seq0002	139	277	SINE
+seq0002	277	340	LINE
+seq0002	340	485	SINE
+seq0003	0	45	LINE
+seq0004	0	51	LINE
+seq0004	51	133	SINE
+seq0004	133	170	LINE
+seq0005	0	117	LINE
+seq0005	117	179	SINE
+seq0005	179	226	LINE
+seq0005	226	251	novel
+seq0006	0	58	SINE
+seq0007	0	74	LINE
+seq0007	74	123	novel
+seq0007	123	269	LINE
+seq0008	0	53	LINE
+seq0009	0	58	SINE
+seq0009	58	242	LINE
+seq0009	242	325	SINE
+seq0009	325	378	novel
+seq0010	0	172	LINE
+seq0010	172	189	SINE
+seq0010	189	258	LINE
+seq0010	258	345	SINE
+seq0010	345	417	novel
+seq0010	417	434	SINE
+seq0011	0	183	SINE
+seq0011	183	269	LINE
+seq0011	269	292	SINE
+seq0011	292	374	LINE
+seq0012	0	114	SINE
+seq0012	114	179	LINE
+seq0012	179	202	SINE
+seq0012	202	240	LINE
+seq0013	0	53	SINE
+seq0013	53	135	LINE
+seq0014	0	64	LINE
+seq0015	0	45	SINE
+seq0015	45	150	LINE
+seq0016	0	116	LINE
+seq0016	116	130	SINE
+seq0016	130	165	novel
+seq0016	165	254	SINE
+seq0017	0	143	LINE
+seq0017	143	228	SINE
+seq0018	0	15	novel
+seq0018	15	90	SINE
+seq0018	90	173	novel
+seq0018	173	244	LINE
+seq0019	0	118	SINE
+seq0019	118	142	LINE
+seq0019	142	276	SINE
+seq0020	0	31	SINE
+seq0020	31	57	LINE
+seq0021	0	150	SINE
+seq0021	150	239	LINE
+seq0021	239	331	SINE
+seq0022	0	30	LINE
+seq0022	30	89	SINE
+seq0022	89	189	LINE
+seq0022	189	270	novel
+seq0022	270	328	LINE
+seq0023	0	94	LINE
+seq0023	94	183	SINE
+seq0024	0	140	LINE
+seq0024	140	203	SINE
+seq0024	203	240	LINE
+seq0024	240	363	SINE
+seq0025	0	57	SINE
+seq0025	57	225	LINE
+seq0025	225	303	SINE
+seq0026	0	70	LINE
+seq0027	0	77	LINE
+seq0028	0	32	SINE
+seq0028	32	57	novel
+seq0028	57	81	LINE
+seq0028	81	127	SINE
+seq0028	127	141	LINE
+seq0028	141	216	SINE
+seq0028	216	239	LINE
+seq0029	0	80	LINE
+seq0030	0	19	SINE
+seq0030	19	120	LINE
+seq0031	0	54	SINE
+seq0031	54	142	LINE
+seq0031	142	397	SINE
+seq0032	0	85	SINE
+seq0032	85	226	LINE
+seq0032	226	356	SINE
+seq0032	356	368	LINE
+seq0033	0	83	SINE
+seq0033	83	146	LINE
+seq0033	146	232	SINE
+seq0034	0	71	LINE
+seq0035	0	15	LINE
+seq0035	15	55	SINE
+seq0035	55	113	LINE
+seq0035	113	140	SINE
+seq0035	140	185	LINE
+seq0036	0	64	SINE
+seq0036	64	89	LINE
+seq0036	89	103	SINE
+seq0037	0	10	novel
+seq0037	10	81	SINE
+seq0037	81	153	LINE
+seq0037	153	222	SINE
+seq0038	0	77	LINE
+seq0038	77	154	SINE
+seq0038	154	211	LINE
+seq0038	211	409	SINE
+seq0038	409	489	LINE
+seq0039	0	128	SINE
+@@ db.self.paf
+seq0000	233	0	233	+	seq0000	233	0	233	233	233	60	cg:Z:233M
+seq0001	373	0	373	+	seq0001	373	0	373	373	373	60	cg:Z:373M
+seq0002	485	0	485	+	seq0002	485	0	485	485	485	60	cg:Z:485M
+@@ db.subtelomeric.bed
+seq0000	0	85	ITS
+seq0000	85	233	nonsubtelomeric
+seq0001	0	79	nonsubtelomeric
+seq0001	79	139	ITS
+seq0001	139	178	nonsubtelomeric
+seq0001	178	270	ITS
+seq0001	270	373	nonsubtelomeric
+seq0002	0	139	ITS
+seq0002	139	277	nonsubtelomeric
+seq0002	277	340	ITS
+seq0002	340	423	nonsubtelomeric
+seq0002	423	485	ITS
+seq0003	0	45	ITS
+seq0004	0	170	ITS
+seq0005	0	46	ITS
+seq0005	46	179	nonsubtelomeric
+seq0005	179	226	ITS
+seq0005	226	251	novel
+seq0006	0	58	nonsubtelomeric
+seq0007	0	74	nonsubtelomeric
+seq0007	74	123	novel
+seq0007	123	146	nonsubtelomeric
+seq0007	146	181	ITS
+seq0007	181	269	nonsubtelomeric
+seq0008	0	53	ITS
+seq0009	0	242	nonsubtelomeric
+seq0009	242	282	ITS
+seq0009	282	325	nonsubtelomeric
+seq0009	325	378	novel
+seq0010	0	84	nonsubtelomeric
+seq0010	84	172	ITS
+seq0010	172	189	nonsubtelomeric
+seq0010	189	258	ITS
+seq0010	258	345	nonsubtelomeric
+seq0010	345	417	novel
+seq0010	417	434	nonsubtelomeric
+seq0011	0	127	nonsubtelomeric
+seq0011	127	183	ITS
+seq0011	183	269	nonsubtelomeric
+seq0011	269	292	ITS
+seq0011	292	374	nonsubtelomeric
+seq0012	0	202	nonsubtelomeric
+seq0012	202	240	ITS
+seq0013	0	53	ITS
+seq0013	53	135	nonsubtelomeric
+seq0014	0	14	nonsubtelomeric
+seq0014	14	64	ITS
+seq0015	0	65	nonsubtelomeric
+seq0015	65	150	ITS
+seq0016	0	69	ITS
+seq0016	69	116	nonsubtelomeric
+seq0016	116	130	ITS
+seq0016	130	165	novel
+seq0016	165	254	ITS
+seq0017	0	14	nonsubtelomeric
+seq0017	14	90	ITS
+seq0017	90	143	nonsubtelomeric
+seq0017	143	228	ITS
+seq0018	0	15	novel
+seq0018	15	90	ITS
+seq0018	90	173	novel
+seq0018	173	244	ITS
+seq0019	0	40	ITS
+seq0019	40	142	nonsubtelomeric
+seq0019	142	276	ITS
+seq0020	0	31	ITS
+seq0020	31	57	nonsubtelomeric
+seq0021	0	106	ITS
+seq0021	106	150	nonsubtelomeric
+seq0021	150	214	ITS
+seq0021	214	239	nonsubtelomeric
+seq0021	239	310	ITS
+seq0021	310	331	nonsubtelomeric
+seq0022	0	30	nonsubtelomeric
+seq0022	30	89	ITS
+seq0022	89	189	nonsubtelomeric
+seq0022	189	270	novel
+seq0022	270	328	nonsubtelomeric
+seq0023	0	94	ITS
+seq0023	94	183	nonsubtelomeric
+seq0024	0	90	ITS
+seq0024	90	140	nonsubtelomeric
+seq0024	140	203	ITS
+seq0024	203	325	nonsubtelomeric
+seq0024	325	363	ITS
+seq0025	0	57	ITS
+seq0025	57	100	nonsubtelomeric
+seq0025	100	202	ITS
+seq0025	202	225	nonsubtelomeric
+seq0025	225	303	ITS
+seq0026	0	70	ITS
+seq0027	0	77	nonsubtelomeric
+seq0028	0	32	ITS
+seq0028	32	57	novel
+seq0028	57	127	ITS
+seq0028	127	239	nonsubtelomeric
+seq0029	0	80	nonsubtelomeric
+seq0030	0	60	ITS
+seq0030	60	120	nonsubtelomeric
+seq0031	0	226	nonsubtelomeric
+seq0031	226	326	ITS
+seq0031	326	397	nonsubtelomeric
+seq0032	0	112	ITS
+seq0032	112	312	nonsubtelomeric
+seq0032	312	356	ITS
+seq0032	356	368	nonsubtelomeric
+seq0033	0	83	nonsubtelomeric
+seq0033	83	146	ITS
+seq0033	146	232	nonsubtelomeric
+seq0034	0	71	ITS
+seq0035	0	15	ITS
+seq0035	15	73	nonsubtelomeric
+seq0035	73	113	ITS
+seq0035	113	185	nonsubtelomeric
+seq0036	0	64	nonsubtelomeric
+seq0036	64	89	ITS
+seq0036	89	103	nonsubtelomeric
+seq0037	0	10	novel
+seq0037	10	81	nonsubtelomeric
+seq0037	81	203	ITS
+seq0037	203	222	nonsubtelomeric
+seq0038	0	77	nonsubtelomeric
+seq0038	77	254	ITS
+seq0038	254	336	nonsubtelomeric
+seq0038	336	409	ITS
+seq0038	409	456	nonsubtelomeric
+seq0038	456	489	ITS
+seq0039	0	100	ITS
+seq0039	100	128	nonsubtelomeric
+@@ lp.paf
+r1	400	0	400	+	chr1	400	0	400	400	400	60	cg:Z:400M
+r2	400	0	400	+	chr1	400	0	400	400	400	60	cg:Z:400M
+@@ lref.bed
+chr1	0	100	A
+chr1	100	200	B
+chr1	200	300	C
+chr1	300	400	D
+@@ ls.bed
+r1	0	100	A
+r1	100	200	B
+r1	200	300	C
+r1	300	400	D
+r2	0	100	A
+r2	100	200	X
+r2	200	300	C
+r2	300	400	D
+@@ ord2.bed
+0	0	50	A
+0	50	100	B
+1	0	50	C
+1	50	100	C
+2	0	50	A
+2	50	100	B
+7	0	50	A
+7	50	70	Z
+7	70	120	B
+8	0	100	A
+@@ ord2.names.txt
+q1
+q2
+q3
+d1
+d2
+d3
+d4
+q4
+q5
+@@ ord.bed
+0	0	50	A
+0	50	100	B
+1	0	50	C
+1	50	100	C
+2	0	50	A
+2	50	100	B
+3	0	50	A
+3	50	70	Z
+3	70	120	B
+4	0	100	A
+@@ ord.names.txt
+q1
+q2
+q3
+q4
+q5
+@@ p.paf
+q1	1000	0	100	+	chr1	400	0	100	100	100	60	cg:Z:100M
+q2	100	0	100	-	chr1	400	200	300	100	100	60	cg:Z:100M
+q3	100	0	100	+	chr1	400	0	120	100	100	60	cg:Z:50M20D50M
+q4	120	0	120	+	chr1	400	0	100	120	120	60	cg:Z:50M20I50M
+@@ ref.bed
+chr1	0	100	A
+chr1	100	200	B
+chr1	200	300	C
+chr1	300	400	D
+@@ s.bed
+q1	0	50	A
+q1	50	100	B
+q2	0	50	C
+q2	50	100	C
+q3	0	50	A
+q3	50	100	B
+q4	0	50	A
+q4	50	70	Z
+q4	70	120	B
+q5	0	100	A

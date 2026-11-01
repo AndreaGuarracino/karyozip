@@ -1,5 +1,4 @@
-//! Reading a KST track. Every refusal message is the C's, because the two
-//! are meant to be interchangeable.
+//! Reading a KST track; every refusal is the C's, so the two are interchangeable
 
 use crate::ffi;
 use crate::kst::{self, FNV0, TOKFLAG, INTFLAG, FLDFLAG, DROPPED, ALNFLAG, DBFLAG, LENFLAG,
@@ -8,7 +7,7 @@ use std::io::{Read, Seek, SeekFrom};
 
 const IDXMAGIC: u64 = 0x3130_5844_4954_534b;   // "KSTIDX01"
 
-/// A decoded block: its number, bytes, where the labels start, rows.
+/// A decoded block: its number, bytes, where the labels start, rows
 type Cached = (usize, std::sync::Arc<Vec<u8>>, usize, u64);
 pub type Shared = (Cached, std::sync::Arc<Vec<u32>>);
 
@@ -18,14 +17,13 @@ fn ordinals(n: u64) -> Vec<u8> {
     v
 }
 
-/// --names FILE: a FASTA, a FASTQ, or one name per line. Rank N is record N.
+/// --names FILE: a FASTA, a FASTQ, or one name per line; rank N is record N
 fn read_name_file(path: &str, nreads: u64) -> Vec<u8> {
     let data = crate::slurp(path, "cannot open the file given to --names");
-    // getline gives no line after a final newline, and the split does, which
-    // made an @-line index land on the empty tail.
+    // getline gives no line after a final newline, and the split does
     let mut lines: Vec<&[u8]> = data.split(|&c| c == b'\n').collect();
     if data.last() == Some(&b'\n') { lines.pop(); }
-    // 1 fastq, 0 fasta, 2 a plain list.
+    // 1 fastq, 0 fasta, 2 a plain list
     let fq = if lines.len() >= 3 && lines[0].first() == Some(&b'@') && lines[2].first() == Some(&b'+') { 1 }
              else if lines.len() >= 2 && lines[0].first() == Some(&b'>') && lines[1].first() != Some(&b'>') { 0 }
              else { 2 };
@@ -50,12 +48,10 @@ fn read_name_file(path: &str, nreads: u64) -> Vec<u8> {
     out
 }
 
-/// One block: where it is, both frame sizes, both decoded sizes, its rows,
-/// the bases before it, and its own hash.
+/// One block: where it is, both frame and decoded sizes, its rows, the bases before it, its own hash
 #[derive(Clone, Copy)]
 struct Blk { off: u64, size: u64, l: u64, raw: u64, lraw: u64, rows: u64, bp: u64, hash: u64, row0: u64, rd0: u64, nrd: u64 }
 
-/// seq, start, end, label, as decode hands each row out.
 /// name, start, end, label, and the label's table index when the label is that entry's own text
 pub type RowFn<'a> = dyn FnMut(&[u8], u64, u64, &[u8], Option<usize>) + 'a;
 
@@ -82,11 +78,9 @@ pub struct Reader {
     taildec: bool,
     tailpred: u64,
     tailskip: u64,
-    /// every name, newline-free, back to back, and noff[i]..noff[i+1] is
-    /// name i: decoded from the names stream on first use
+    /// every name back to back, noff[i]..noff[i+1] is name i, decoded from the names stream on first use
     names: std::cell::OnceCell<std::sync::Arc<(Vec<u8>, Vec<u64>)>>,
-    /// the names stream's offset and size: read when the names are, as the
-    /// C's nz_off, not held by every reader (a smooth worker held 71 MB)
+    /// the names stream's offset and size: read when the names are, as the C's nz_off, not held by every reader
     nz_off: u64,
     nzl: usize,
     names_file: Option<String>,
@@ -94,13 +88,9 @@ pub struct Reader {
     nf: u8,
     /// the appended index: offset of its key table, and its trailer's binding word
     idx: Option<(u64, u64, u64, u64, std::fs::File)>,   // index base, binding, bucket bits, payload, TRACK.kzi
-    /// name -> rank, built on the first lookup, which is also where the C
-    /// notices that two sequences share a name.
-    /// as the C's buildhash: a power-of-two table of ordinals over the
-    /// decoded names, open addressed, no key copied
+    /// name -> rank on the first lookup, where the C notices two sequences sharing a name; open addressed, as the C's buildhash
     nameix: std::cell::OnceCell<(Vec<u32>, u64)>,
-    /// the sequence index: chunk frames, their offsets, the run count each
-    /// starts at, and the one chunk decoded now, as the C's loadichunk
+    /// the sequence index: chunk frames, offsets, each chunk's first run count, the chunk decoded now, as the C's loadichunk
     iz: Vec<u8>, coff: Vec<u64>, cpend: Vec<u64>, ibx: Vec<u8>, cur_chunk: u64,
     runhead: bool, ilv: bool, grp: bool, rtab: std::sync::Arc<Vec<u32>>,   // run-count prefix sums, lifted out of the lengths; 32 bits, as the C's offsets
     varblk: bool, rtab_blk: usize,   // blocks of whole reads; the block rtab counts
@@ -113,14 +103,13 @@ pub struct Reader {
     pub rowhash: u64,
     /// not --aln, --db, --names drop, names in the file: fit for --ref
     pub plainref: bool,
-    /// where the last seq_rows stopped: (block, rows into it, cursor), so a
-    /// walk in order continues instead of re-skipping the block's rows
+    /// where the last seq_rows stopped, so a walk in order continues instead of re-skipping rows
     sc: Option<(usize, u64, Cursor)>,
     feathash: u64,
     cart: bool,
     aln: Option<std::sync::Arc<crate::aln::Aln>>,
     lenfile: bool,
-    /// --raw shows what is stored, so a zero length is the answer, not a fault.
+    /// --raw shows what is stored, so a zero length is the answer, not a fault
     raw: bool,
     alnq: Option<usize>,
     blk_nos: Vec<u8>,
@@ -128,12 +117,11 @@ pub struct Reader {
     pf: Option<Pf>,   // the blocks ahead, decoding on other threads
 }
 
-/// What decoding one block needs, copied for each decode-ahead thread.
+/// What decoding one block needs, copied for each decode-ahead thread
 #[derive(Clone)]
 struct Dec { b: Vec<Blk>, data0: u64, rows: u64, lencodec: i32, idcodec: i32, ilv: bool, runhead: bool, grp: bool }
 
-/// One block's frames, its two regions back to back, the split, its rows,
-/// and its run-count prefix sums when the counts head the lengths.
+/// One block's frames, its two regions back to back, the split, its rows, and its run-count prefix sums when counts head the lengths
 fn block_dec(f: &mut std::fs::File, d: &Dec, b: usize) -> (Vec<u8>, usize, u64, Option<Vec<u32>>) {
     if b >= d.b.len() { crate::bail("corrupt index: a block number is past the end"); }
     let m = d.b[b];
@@ -150,8 +138,7 @@ fn block_dec(f: &mut std::fs::File, d: &Dec, b: usize) -> (Vec<u8>, usize, u64, 
     let mut data = ffi::raw_buf(crate::ckalloc(lraw + raw));
     frame(&cb[..la], d.lencodec, &mut data, if d.ilv { lraw + raw } else { lraw });
     if !d.ilv { frame(&cb[la..la + lb], d.idcodec, &mut data, raw); }
-    // as the C frees it: not needed past its frames; kept for the next
-    // block only when there is one, or a one-block decode holds it to the end
+    // as the C frees it: kept for the next block only when there is one
     if d.b.len() > 1 { ffi::recycle(cb); } else { drop(cb); }
     let mut data = if d.ilv { ilv_split(data, lraw, raw, m.rows) } else { data };
     let (mut split, mut tab) = (lraw, None);
@@ -171,10 +158,7 @@ fn block_dec(f: &mut std::fs::File, d: &Dec, b: usize) -> (Vec<u8>, usize, u64, 
 
 type Got = Result<(Vec<u8>, usize, u64, Option<Vec<u32>>), String>;
 struct PfSt { used: usize, next: usize, stop: bool, got: std::collections::HashMap<usize, Got>, spare: Vec<Vec<u8>> }
-/// Decode ahead, as the C's: on a walk over every block, threads decode the
-/// next ones, each on its own handle of the file, and load takes a ready
-/// block in place of decoding it. A refusal waits for its block, so the
-/// output stops where one thread stops.
+/// Decode ahead, as the C's: threads decode the next blocks on their own file handles; a refusal waits for its block
 struct Pf { st: std::sync::Arc<(std::sync::Mutex<PfSt>, std::sync::Condvar)>, th: Vec<std::thread::JoinHandle<()>> }
 impl Drop for Pf {
     fn drop(&mut self) {
@@ -298,8 +282,7 @@ impl Reader {
         let mut itz = vec![0u8; crate::ckalloc(h[11] as usize)];
         rd(f.read_exact(&mut itz), "short index table");
 
-        // The metadata hash covers the header with h[15] zeroed, then every
-        // stream.
+        // The metadata hash covers the header with h[15] zeroed, then every stream
         {
             let mut hz = h;
             hz[15] = 0;
@@ -316,7 +299,7 @@ impl Reader {
         }
         drop(nz);
 
-        // The block table.
+        // The block table
         let was_len = h[1] & LENFLAG != 0;
         let varblk = h[1] & VARFLAG != 0;
         let mut blk_nos: Vec<u8> = Vec::new();
@@ -375,7 +358,7 @@ impl Reader {
             crate::ckalloc(n.checked_mul(4).unwrap_or_else(|| crate::bail("allocation size overflows")) as usize);
         }
 
-        // The index: chunk table, then the concatenated chunk frames.
+        // The index: chunk table, then the concatenated chunk frames
         let tbuf = zdec(&itz, "index table");
         let mut coff = vec![0u64];
         let mut cpend = vec![];
@@ -399,8 +382,7 @@ impl Reader {
             crate::bail("corrupt file: index chunk starts are not in order");
         }
 
-        // The names are decoded on first use: a query through the index
-        // never needs them, and a short-read track has 20 million.
+        // The names are decoded on first use: a query through the index never needs them
         let mut nf = 0u8;
         for (bit, on) in [(1, dropped), (2, names_int), (4, names_tok), (8, names_fld)] {
             if on { nf |= bit; }
@@ -431,7 +413,7 @@ impl Reader {
         }
     }
 
-    /// Every row, in order, to a callback. decode and --db share it.
+    /// Every row, in order, to a callback; decode and --db share it
     pub fn for_each_row(&mut self, f: &mut RowFn) {
         let mut c = Cursor { blk: usize::MAX, data: std::sync::Arc::new(Vec::new()),
                              lp: 0, ip: 0, left: 0 };
@@ -459,7 +441,7 @@ impl Reader {
         }
     }
 
-    /// Every sequence, in order. One forward pass over the blocks.
+    /// Every sequence, in order, in one forward pass over the blocks
     pub fn decode(&mut self, out: &mut impl std::io::Write) {
         let mut ocap = 1usize << 22;
         let mut buf: Vec<u8> = Vec::with_capacity(ocap);
@@ -479,8 +461,7 @@ impl Reader {
                 let en = st + len;
                 if self.aln.is_some() && self.lab.get(f as usize).is_some_and(|l| l == b"=") { restored += 1; }
                 let lab = self.label_at2(f, st, len);
-                // the C's flush point, before a row that would not fit: a
-                // damaged file then stops at the same byte in both
+                // the C's flush point, before a row that would not fit, so a damaged file stops at the same byte in both
                 let need = name.len() + lab.map_or(20, |l| l.len()) + 48;
                 if buf.len() + need > ocap {
                     if !buf.is_empty() { rd(out.write_all(&buf), "write failed"); buf.clear(); }
@@ -507,10 +488,7 @@ impl Reader {
         }
     }
 
-    /// One block's two frames back to back, the split, its rows. The last
-    /// block stays decoded: without that, a track whose sequences share a
-    /// block is decompressed once per sequence.
-    /// A one-block track's decoded block, for another reader of the same file.
+    /// One block's two frames back to back, the split, its rows; the last block stays decoded for the next sequence
     pub fn share_block(&mut self) -> Option<Shared> {
         if self.b.len() != 1 { return None; }
         self.load(0);
@@ -541,7 +519,7 @@ impl Reader {
               ilv: self.ilv, runhead: self.runhead, grp: self.grp }
     }
 
-    /// Start the decode-ahead threads, as the C's pfstart.
+    /// Start the decode-ahead threads, as the C's pfstart
     fn prefetch(&mut self) {
         let nth = rayon::current_num_threads().saturating_sub(1).min(self.b.len().saturating_sub(1));
         // small blocks: the hand-off costs more than the decode, as the C's
@@ -575,7 +553,7 @@ impl Reader {
         if !th.is_empty() { self.pf = Some(Pf { st, th }); }
     }
 
-    /// The walk's next block, decoded ahead.
+    /// The walk's next block, decoded ahead
     fn pf_take(&mut self, b: usize) -> Option<(Vec<u8>, usize, u64, Option<Vec<u32>>)> {
         let pf = self.pf.as_ref()?;
         let (m, cv) = &*pf.st;
@@ -591,9 +569,7 @@ impl Reader {
     }
 }
 
-/// One stream a read, its run count then a label beside its own length.
-/// Split it back into the two regions the walks expect; the counts stay
-/// in front of the lengths for rmheads to lift out.
+/// One stream a read, its run count then a label beside its own length, split back into the two regions
 fn ilv_split(v: Vec<u8>, nl: usize, ni: usize, rows: u64) -> Vec<u8> {
     let (mut lens, mut ids) = (Vec::with_capacity(nl + ni), Vec::with_capacity(ni));   // the ids join lens: no regrowth
     let (mut i, mut seen) = (0usize, 0u64);
@@ -618,13 +594,10 @@ fn ilv_split(v: Vec<u8>, nl: usize, ni: usize, rows: u64) -> Vec<u8> {
     lens
 }
 
-/// The run count heads every read on disk. Lift them into rtab and close
-/// the gap, so every walk below sees the layout it always saw.
-/// In place, as the C's memmove: a second copy of the lengths was the
-/// largest buffer of an assembly decode.
+/// The run counts head every read on disk: lifted into rtab in place, as the C's memmove, so every walk sees its old layout
 fn rmheads(lens: &mut [u8], total: u64, rows: u64, nrd: u64) -> (usize, Vec<u32>) {
     let (mut w, mut i, mut seen) = (0usize, 0usize, 0u64);
-    // 4 B a read, as the C's counts: 8 B was 295 MB more on 73.7M reads
+    // 4 B a read, as the C's counts
     if total > u32::MAX as u64 { crate::bail("corrupt index: a sequence offset past 32 bits"); }
     let mut tab: Vec<u32> = Vec::with_capacity(nrd as usize + 1);
     tab.push(0);
@@ -647,12 +620,11 @@ fn rmheads(lens: &mut [u8], total: u64, rows: u64, nrd: u64) -> (usize, Vec<u32>
     (w, tab)
 }
 
-/// Undo grp_pack: the labels, still in their own order, say which group
-/// each length came from. Runs after rmheads, so rtab holds the counts.
+/// Undo grp_pack: the labels, in their own order, say which group each length came from; rtab holds the counts
 fn grp_unpack(lens: &[u8], ids: &[u8], rtab: &[u32]) -> Vec<u8> {
     let mut out = Vec::with_capacity(lens.len() + ids.len());   // the ids join it next: no regrowth
     let (mut p, mut q) = (0usize, 0usize);
-    // 8 B a run in each, as the C's: positions as pairs were 16 B in two
+    // 8 B a run in each, as the C's
     let (mut kv, mut gv, mut lv, mut cnt): (Vec<u64>, Vec<u64>, Vec<u64>, Vec<u64>) = Default::default();
     for w in rtab.windows(2) {
         let k = (w[1] - w[0]) as u64;
@@ -700,7 +672,7 @@ fn zdec(src: &[u8], what: &str) -> Vec<u8> {
         .unwrap_or_else(|| crate::bail(&format!("{what} decompress failed")))
 }
 
-/// The field-delta names, as the C's fldnamesd rebuilds them.
+/// The field-delta names, as the C's fldnamesd rebuilds them
 fn fld_names_d(b: &[u8], cnt: u64) -> Vec<u8> {
     let (raw, hp) = vget(b, 0);
     if raw == 0 || raw > 1 << 40 { crate::bail("corrupt names: a bad field blob size"); }
@@ -787,15 +759,13 @@ pub fn tok_d(b: &[u8]) -> Vec<u8> {
     if coff[nchunk] > b.len() - hdr {
         crate::bail("corrupt tokenised names: chunks overrun the stream");
     }
-    // One chunk per thread into one preallocated buffer, so the peak is the
-    // names once, not twice. The tokeniser separates with NUL; the format
-    // stores newlines.
+    // One chunk per thread into one preallocated buffer, so the peak is the names once; NUL separators become newlines
     use rayon::prelude::*;
     let mut out = vec![0u8; crate::ckalloc(woff[nchunk])];
     let mut slots: Vec<&mut [u8]> = Vec::with_capacity(nchunk);
     let mut rest = out.as_mut_slice();
     for i in 0..nchunk { let (a, r) = rest.split_at_mut(woff[i + 1] - woff[i]); slots.push(a); rest = r; }
-    // At most TOKDEC chunks at once, as the C: each costs 127 MB in the decoder.
+    // At most TOKDEC chunks at once, as the C: each costs 127 MB in the decoder
     let pool = rayon::ThreadPoolBuilder::new().num_threads(rayon::current_num_threads().min(TOKDEC)).build()
         .unwrap_or_else(|_| crate::bail("cannot start the name decode threads"));
     let ok = pool.install(|| slots.into_par_iter().enumerate().all(|(i, slot)| {
@@ -813,20 +783,16 @@ pub fn tok_d(b: &[u8]) -> Vec<u8> {
 
 pub use crate::kst::{unzz, vget};
 
-/// Tokenised name chunks decoded at once; 2026-10-02, 3000000 names, 8 threads:
-/// 8 at once 1.54 s 1136 MB, 4 1.60 s 570 MB, 2 2.28 s 352 MB.
+/// Tokenised name chunks decoded at once
 const TOKDEC: usize = 4;
 
 /* ------------------------------------------------ one sequence at a time */
 
-/// A position in the row stream: the block, its bytes, a cursor per frame,
-/// and how many of its rows are left.
+/// A position in the row stream: the block, its bytes, a cursor per frame, and its rows left
 struct Cursor { blk: usize, data: std::sync::Arc<Vec<u8>>, lp: usize, ip: usize, left: u64 }
 
 impl Reader {
-    /// (block, offset in it, run count) for sequence `ri`. A forward cursor,
-    /// so walking every sequence is linear and not quadratic.
-    /// One index chunk decoded and checked, the cursor at its first sequence.
+    /// (block, offset in it, run count) for sequence `ri`, by a forward cursor, so a full walk is linear
     fn load_ichunk(&mut self, c: u64) {
         if c >= self.coff.len() as u64 - 1 { crate::bail("index chunk out of range"); }
         let d = zdec(&self.iz[self.coff[c as usize] as usize..self.coff[c as usize + 1] as usize], "index chunk");
@@ -882,12 +848,12 @@ impl Reader {
         (b, start - self.b[b].row0, nruns)
     }
 
-    /// The block holding row i, or read i when rd: a search under whole-read blocks.
+    /// The block holding row i, or read i when rd: a search under whole-read blocks
     pub fn blk_at(&self, i: u64, rd: bool) -> usize {
         if !self.varblk { return if rd { 0 } else { (i / self.block) as usize }; }
         self.b.partition_point(|x| (if rd { x.rd0 } else { x.row0 }) <= i) - 1
     }
-    /// The first row of block b.
+    /// The first row of block b
     pub fn blk_row0(&self, b: usize) -> u64 { self.b[b].row0 }
 
     fn at(&mut self, blk: usize, off: u64) -> Cursor {
@@ -898,10 +864,8 @@ impl Reader {
         c
     }
 
-    /// Next row: (length, label id). Steps to the next block when this one
-    /// ends. Under --aln a zero length means "ask the reference".
-    // inline, its rare branches cold: a call a row cost the Rust decode
-    // more than the C's, whose loop has them in line
+    /// Next row: (length, label id), stepping blocks; under --aln a zero length asks the reference
+    // inline, its rare branches cold, as the C's loop has them in line
     #[inline]
     fn step(&mut self, c: &mut Cursor, st: u64, last: bool) -> (u64, u64) {
         if c.left == 0 { self.next_block(c); }
@@ -930,7 +894,7 @@ impl Reader {
         *c = Cursor { blk: b, data, lp: 0, ip: split, left: rows };
     }
 
-    /// A zero length: --raw keeps it, a sentinel block asks the reference.
+    /// A zero length: --raw keeps it, a sentinel block asks the reference
     #[cold]
     fn zero_len(&self, c: &Cursor, st: u64) -> u64 {
         if self.raw { return 0; }
@@ -942,7 +906,7 @@ impl Reader {
         e - st
     }
 
-    /// The label bytes, or None when the table is empty and the id is the label.
+    /// The label bytes, or None when the table is empty and the id is the label
     #[inline]
     fn label_at2(&self, f: u64, st: u64, len: u64) -> Option<&[u8]> {
         let l: &[u8] = match self.lab.get(f as usize) {
@@ -970,8 +934,7 @@ impl Reader {
         }
     }
 
-    /// What the C's ensurenames does: the names, by whichever codec stored
-    /// them, or from --names FILE, or the ordinals.
+    /// What the C's ensurenames does: the names by their codec, from --names FILE, or the ordinals
     fn decode_names(&self) -> (Vec<u8>, Vec<u64>) {
         let (dropped, names_int) = (self.nf & 1 != 0, self.nf & 2 != 0);
         let (names_tok, names_fld) = (self.nf & 4 != 0, self.nf & 8 != 0);
@@ -1016,8 +979,7 @@ impl Reader {
         (names, noff)
     }
 
-    /// The C's namesrc: an index is bound to the --names FILE it was built
-    /// under, by path and stat; a pipe binds nothing.
+    /// The C's namesrc: an index is bound to the --names FILE it was built under, by path and stat
     fn namesrc(&self) -> u64 {
         use std::os::linux::fs::MetadataExt;
         let Some(f) = self.names_file.as_ref() else { return 0 };
@@ -1031,8 +993,7 @@ impl Reader {
         h
     }
 
-    /// The appended index, as the C reads it: the name's bucket, its
-    /// fingerprints, and a name decoded only when one fingerprint is not enough.
+    /// The appended index, as the C reads it: the bucket, its fingerprints, a name decoded only when needed
     fn idxlookup(&self, nm: &[u8]) -> i64 {
         use std::os::unix::fs::FileExt;
         let Some((base, bind, k, pay, xf)) = &self.idx else { return -1 };
@@ -1041,8 +1002,7 @@ impl Reader {
         let (nb, w) = (1u64 << k, ixw(n.max(1)));
         let ns = nb.div_ceil(1024);
         if bind != self.mhash ^ self.namesrc() || pay != nb + ns * 8 + (n * (32 + w)).div_ceil(8) + 8 { return -1; }
-        // only the name's bucket is read, as the C's mmap touches only it:
-        // reading the whole index was 481 MB a query on 64M short reads
+        // only the name's bucket is read, as the C's mmap touches only it
         let h = h64b(nm);
         let b = if k > 0 { h >> (64 - k) } else { 0 };
         let get = |off: u64, len: u64| { let mut v = vec![0u8; len as usize]; rd(xf.read_exact_at(&mut v, base + off), "index read"); v };
@@ -1062,8 +1022,7 @@ impl Reader {
         hits.into_iter().find(|&o| self.name_at(o) == nm).map_or(-1, |o| o as i64)
     }
 
-    /// As find, but a one-block track decodes its block before the names, as
-    /// the C: the codec's working memory is gone when the names arrive.
+    /// As find, but a one-block track decodes its block before the names, as the C, so the codec's memory is gone first
     pub fn find_seq(&mut self, seq: &[u8]) -> i64 {
         let hit = self.idxlookup(seq);
         if hit >= 0 { return hit; }
@@ -1097,9 +1056,7 @@ impl Reader {
         -1
     }
 
-    /// region F SEQ | SEQ POS | SEQ START END [HALO].
-    /// --db: the sequence's rows over the picked sets, touching equal tuples
-    /// merged, so one set gives what its own track gives. Needs the whole sequence.
+    /// region F SEQ | SEQ POS | SEQ START END [HALO]; under --db, touching equal tuples merged over the picked sets
     #[allow(clippy::too_many_arguments)]
     fn region_set(&mut self, ri: u64, seq: &[u8], lo: u64, hi: u64,
                   fe: &crate::db::Feats, cols: &[usize], out: &mut impl std::io::Write) {
@@ -1146,9 +1103,7 @@ impl Reader {
         let (blk, off, nruns) = self.locate(ri);
         let tskip = self.tailskip;
         let last_of = |k: u64| k + 1 == nruns && ri >= tskip;
-        // As the C: a block that opens inside this sequence records where,
-        // so with a START the walk begins at the last block opening at or
-        // before it, not at the sequence's first run.
+        // As the C: with a START the walk begins at the last block opening at or before it
         let start = self.b[blk].row0 + off;
         let (mut jump, mut kskip, mut st0) = (blk, 0u64, 0u64);
         if lo > 0 {
@@ -1205,8 +1160,7 @@ fn h64b(s: &[u8]) -> u64 {
 }
 
 impl Reader {
-    /// Appends a name index to the track, magic last so a torn write is
-    /// simply not seen. One file, not two.
+    /// Appends a name index to the track, magic last so a torn write is simply not seen
     pub fn build_index(&mut self, path: &str) {
         if self.nreads > u32::MAX as u64 {
             crate::bail("more than 2^32 sequences: the index stores the ordinal in 32 bits");
@@ -1273,8 +1227,7 @@ impl Reader {
         let (names, noff) = &**self.names.get_or_init(|| std::sync::Arc::new(self.decode_names()));
         let i = i as usize; &names[noff[i] as usize..noff[i + 1] as usize - 1]
     }
-    /// The decoded names, to hand to a worker's reader of the same track so
-    /// the table is decoded once, as the C's smooth_mt borrows it.
+    /// The decoded names for a worker's reader of the same track, decoded once, as the C's smooth_mt borrows them
     pub fn names_shared(&self) -> std::sync::Arc<(Vec<u8>, Vec<u64>)> {
         self.names.get_or_init(|| std::sync::Arc::new(self.decode_names())).clone()
     }
@@ -1295,9 +1248,7 @@ impl Reader {
         let (blk, off, n) = self.locate(ri);
         (blk, self.b[blk].row0 + off, n)
     }
-    /// The rows of sequence `ri` that lie in block `b`, as (start, label id),
-    /// and the position after the last of them. The sequence's own
-    /// coordinates: block `b` opens at blk_bp(b) unless it is the first.
+    /// The rows of sequence `ri` in block `b` as (start, label id), and the position after them
     pub fn blk_runs(&mut self, ri: u64, b: usize) -> (Vec<(u64, u32)>, u64) {
         let (fb, row0, n) = self.seq_span(ri);
         let (mut row, mut pos) = if b == fb { (row0, 0) } else { (self.b[b].row0, self.b[b].bp) };
@@ -1315,14 +1266,12 @@ impl Reader {
         (out, pos)
     }
 
-    /// One sequence of a plain track as run starts, label ids and its end:
-    /// what a --ref contig is, decoded when first asked.
+    /// One sequence of a plain track as run starts, label ids and its end: a --ref contig
     pub fn seq_runs(&mut self, ri: u64) -> (crate::aln::Starts, Vec<u32>, u64) {
         use crate::aln::Starts;
         let (blk, off, nruns) = self.locate(ri);
         let mut c = self.at(blk, off);
-        // starts into 4 bytes from the first row; a start past 32 bits, which
-        // no chromosome reaches, moves what is there into 8 and goes on
+        // starts into 4 bytes from the first row; a start past 32 bits moves them into 8
         let (mut st, mut lab) = (Starts::W(Vec::with_capacity(nruns as usize)), Vec::with_capacity(nruns as usize));
         let mut s = 0u64;
         for k in 0..nruns {
@@ -1337,10 +1286,7 @@ impl Reader {
         (st, lab, s)
     }
 
-    /// One sequence as arrays: starts, ends, hierarchy node per run, and
-    /// whether the label was "novel". What smoothing works on.
-    /// The four arrays are the caller's and are cleared here, so a walk over
-    /// many sequences allocates once, as the C's r->sst and friends do.
+    /// One sequence as arrays: starts, ends, hierarchy node, novel; the caller's, cleared here, as the C's r->sst
     pub fn seq_rows(&mut self, ri: u64, labmap: &[i32], isnovel: &[u8], root: i32,
                     out: &mut SeqRows) {
         let (blk, off, nruns) = self.locate(ri);
@@ -1385,6 +1331,6 @@ impl Reader {
     }
 }
 
-/// One sequence as arrays, reused across sequences.
+/// One sequence as arrays, reused across sequences
 #[derive(Default)]
 pub struct SeqRows { pub st: Vec<u64>, pub en: Vec<u64>, pub feat: Vec<i32>, pub nov: Vec<u8> }

@@ -36,20 +36,21 @@ A name may contain `:`; only a final `:START-END` of digits is read as a range.
 `index` never changes the track; `query` uses `F.kzi` when it is there and matches the track, and never builds it.
 The index costs 7.5 B a read: on short reads it can be larger than the track, on long reads and assemblies it is 2% of it or less.
 
-## Size or speed
+## Compression modes
 
-| you want | use |
-|---|---|
-| a small file and a `query` that decodes one block, the usual choice | `compress`, or `-e medium`, then `index` for many reads |
-| the smallest file; a `query` decodes the whole file | `compress -e high` |
-| the quickest compress and `query`, a larger file | `compress -e low`, then `index` for many reads |
+| mode | input | flags, on compress and on every read |
+|---|---|---|
+| standard, the default | one BED, or stdin | none |
+| db-informed | one BED per feature set of a sample, in `features.tsv` column order | `-d features.tsv` |
+| alignment-informed | one BED, with its reads aligned to a reference | `-a P.paf --ref ref.bed` |
+| db + alignment | as db-informed | `-d features.tsv -a P.paf --ref ref.ids.bed` |
 
-## Smoothing, feature sets and alignments
+Use db-informed when you have every feature set of a sample: one file replaces the per-set files and is smaller than their sum.
+Standard stays the default because db-informed cannot take one BED or stdin, and its file reads back only with the same `features.tsv`.
 
-A KaryoScope run writes one BED per feature set, presmoothed and smoothed.
-
-- **Smoothed tracks need not be stored.** `--smooth --hier hierarchy.tsv` on decompress or query rebuilds the smoothed track from the presmoothed one, row for row as KaryoScope writes it. The set is the one whose tree in hierarchy.tsv holds every label of the track; when two do, or for a `-d` track, `--set SET` names it. Tracks of KaryoScope 1.x need `--v1`, and those smoothed before 2026-01-08 also `--chunk 20000`.
-- **All feature sets in one file.** `-d features.tsv` merges one sample's per-set BEDs into a single, smaller track. Smoothed sets merged this way also need `--hier hierarchy.tsv`, on compress and on every read.
+An alignment-informed file stores only what differs from the reference. The PAF and the reference stay outside the file, and on short reads they cost more than one file saves.
+`ref.bed` is the reference's track of the same feature set. `ref.ids.bed` is the reference's db-informed track, written by `karyozip decompress --raw -i ref.all.kst -o ref.ids.bed`.
+For queries, give `--ref` as a plain `.kst` track (`compress -e low`): it is read one contig at a time, not whole.
 
 ```
 karyozip compress   -d features.tsv -i s.acrocentric.bed.gz -i s.chromosome.bed.gz ... -o s.all.kst
@@ -58,7 +59,19 @@ karyozip decompress -d features.tsv -i s.all.kst --set gene         # one set
 karyozip decompress -d features.tsv -i s.all.kst --smooth --hier hierarchy.tsv --out-dir DIR   # every set smoothed, one BED each
 ```
 
-- **Against a reference.** With the reads aligned to a reference (a PAF) and the reference's own track, `-a P.paf --ref ref.bed` stores only what differs from the reference. Every read of such a file takes the same `-a` and `--ref`. For queries, give `--ref` as a `.kst` track (`compress -e low`): it is read one contig at a time, not whole.
+Smoothed sets under `-d` also need `--hier hierarchy.tsv`, on compress and on every read.
+
+## Size or speed
+
+| you want | use |
+|---|---|
+| a small file and a `query` that decodes one block, the usual choice | `compress`, or `-e medium`, then `index` for many reads |
+| the smallest file; a `query` decodes the whole file | `compress -e high` |
+| the quickest compress and `query`, a larger file | `compress -e low`, then `index` for many reads |
+
+## Smoothed tracks
+
+Smoothed tracks need not be stored. `--smooth --hier hierarchy.tsv` on decompress or query rebuilds the smoothed track from the presmoothed one, row for row as KaryoScope writes it. The set is the one whose tree in hierarchy.tsv holds every label of the track; when two do, or for a `-d` track, `--set SET` names it. Tracks of KaryoScope 1.x need `--v1`, and those smoothed before 2026-01-08 also `--chunk 20000`.
 
 ## Read names
 
@@ -81,10 +94,10 @@ Read names are stored in the file by default.
 | `--v1`, `--chunk N` | `--smooth` | KaryoScope 1.x output; its chunked smoothing before 2026-01-08 |
 | `-e`, `--effort low\|medium\|high` | compress | see Size or speed; default medium |
 | `-n`, `--names ...` | compress, readers | see Read names |
-| `-d`, `--db features.tsv` | compress, readers | see Smoothing, feature sets and alignments |
+| `-d`, `--db features.tsv` | compress, readers | see Compression modes |
 | `--set A,B` | decompress, query | the sets of a `-d` track to print, default all; with `--smooth`, the one set smoothed |
 | `--out-dir DIR` | decompress | one BED per set under `-d` |
-| `-a`, `--aln P.paf`, `--ref R` | compress, readers, aln-pack | see Smoothing, feature sets and alignments |
+| `-a`, `--aln P.paf`, `--ref R` | compress, readers, aln-pack | see Compression modes |
 | `-t`, `--threads N` | all | default the cores, up to 8 |
 | `--tmp-dir DIR` | all | where temporary files go, default /tmp |
 | `-h`, `--help`, `--version` | all | usage; library versions |

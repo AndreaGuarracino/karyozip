@@ -2,7 +2,7 @@
 use karyozip::{ffi, writer::{self, Options, Writer}};
 use std::io::Write;
 
-/// One BED through \`Writer::row\`, as an annotator would call it
+/// One BED through `Writer::row`, as an annotator would call it
 
 fn build(bed: &[u8], opt: Options) -> Vec<u8> {
     let dir = std::env::temp_dir();

@@ -82,7 +82,8 @@ pub struct Writer {
 
 fn tmpfile(dir: &std::path::Path) -> std::io::Result<std::fs::File> {
     // An unlinked file: it disappears when the handle closes, however we exit
-    let p = dir.join(format!("karyozip.{}.{:x}", std::process::id(),
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);   // two writers in one process never share a name
+    let p = dir.join(format!("karyozip.{}.{}.{:x}", std::process::id(), N.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
                              std::time::SystemTime::now()
                                  .duration_since(std::time::UNIX_EPOCH).unwrap().subsec_nanos()));
     let f = std::fs::OpenOptions::new().read(true).write(true).create_new(true).open(&p)?;

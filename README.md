@@ -34,7 +34,7 @@ karyozip index      -i F                       writes F.kzi beside the track: qu
 `START-END` is BED: 0-based, END excluded, so `-r chr1:150-151` is the run covering position 150.
 A name may contain `:`; only a final `:START-END` of digits is read as a range.
 `index` never changes the track; `query` uses `F.kzi` when it is there and matches the track, and never builds it.
-The index costs 7.5 B a read: on short reads it is larger than the track (223334174 B track, 481554594 B index), on long reads and assemblies 0 to 2% of it.
+The index costs 7.5 B a read: on short reads it can be larger than the track, on long reads and assemblies it is 2% of it or less.
 
 ## Size or speed
 
@@ -48,7 +48,7 @@ The index costs 7.5 B a read: on short reads it is larger than the track (223334
 
 A KaryoScope run writes one BED per feature set, presmoothed and smoothed.
 
-- **Smoothed tracks need not be stored.** `--smooth --hier hierarchy.tsv` on decompress or query rebuilds the smoothed track from the presmoothed one, row for row as KaryoScope writes it. The set is the one whose tree in hierarchy.tsv holds every label of the track; when two do, or for a `-d` track, `--set SET` names it. Tracks written by KaryoScope 1.x, whose smoothed labels carry no `_specific` suffix, need `--v1`; those its first release (2025-12-10) smoothed also need `--chunk 20000`, its chunks of 20000 runs per sequence.
+- **Smoothed tracks need not be stored.** `--smooth --hier hierarchy.tsv` on decompress or query rebuilds the smoothed track from the presmoothed one, row for row as KaryoScope writes it. The set is the one whose tree in hierarchy.tsv holds every label of the track; when two do, or for a `-d` track, `--set SET` names it. Tracks of KaryoScope 1.x need `--v1`, and those smoothed before 2026-01-08 also `--chunk 20000`.
 - **All feature sets in one file.** `-d features.tsv` merges one sample's per-set BEDs into a single, smaller track. Smoothed sets merged this way also need `--hier hierarchy.tsv`, on compress and on every read.
 
 ```
@@ -58,7 +58,7 @@ karyozip decompress -d features.tsv -i s.all.kst --set gene         # one set
 karyozip decompress -d features.tsv -i s.all.kst --smooth --hier hierarchy.tsv --out-dir DIR   # every set smoothed, one BED each
 ```
 
-- **Against a reference.** With the reads aligned to a reference (a PAF) and the reference's own track, `-a P.paf --ref ref.bed` stores only what differs from the reference. Every read of such a file takes the same `-a` and `--ref`. Give `--ref` as a `.kst` track (`compress -e low`) for queries: a point query on the whole CHM13 reference takes 0.10 s against 13.0 s from the BED.
+- **Against a reference.** With the reads aligned to a reference (a PAF) and the reference's own track, `-a P.paf --ref ref.bed` stores only what differs from the reference. Every read of such a file takes the same `-a` and `--ref`. For queries, give `--ref` as a `.kst` track (`compress -e low`): it is read one contig at a time, not whole.
 
 ## Read names
 
@@ -101,16 +101,9 @@ Flags work on either side of the command name. The readers are decompress and qu
 
 ## How it works
 
-**How compress chooses.** The three efforts are one rule with two settings: `low` tries 8 of the 54 codecs plus zstd at 17 on 4 MB, `medium` all 54 plus zstd at 17 and 22 on 16 MB, `high` the same on the whole file, then bzip3 at every block size from half to twice the winner's, in eighths of it, since bzip3's bytes do not follow its block size, with blocks also ending where medium ends one; then zpaq level 5 (context mixing, libzpaq), which decodes as slowly as it encodes, and on interleaved reads a zpaq model that follows each read's fields (run count, label, length). bzip3 and zpaq blocks end at read starts.
-The smallest wins, with no margin, and must read back what it was ranked on.
-A one-block file also chooses its layout on the same sample: lengths and labels apart, run counts heading each read's lengths, lengths grouped by label, or labels interleaved with lengths; every layout and codec is ranked in one parallel pool.
-Names are ranked the same way among zstd, integer deltas, field deltas and the CRAM name tokeniser.
-Compress prints what it chose on stderr, on its `layout:` and `names:` lines.
-`-e low` also writes 262144-row blocks and a block index, which a query decodes one at a time, and so drops the codecs slow to decode, bzip3, arith and LZMA, on a track of more than one block.
-`-e medium` writes blocks of whole reads, each closed at the first read that starts past 4194304 rows; every block takes the layout the first block chose, so a query decodes one block. `-e high` writes one block.
-Decompress decodes the next blocks on the other threads while it writes the rows of one, when the blocks hold 65536 rows or more on average.
-
-**Name index.** `karyozip index` writes to `F.kzi` a 32-bit fingerprint and a bit-packed ordinal per name, 2,044,644 B for 300,000 reads; one fingerprint match is answered without decoding the names, so a name absent from the track passes for a present one about 4 times in 2^32 lookups; two or more matches are confirmed against the decoded names.
+Compress tries its codecs on a sample, and under `medium` and `high` four layouts of lengths and labels too, keeps the smallest that reads back, and prints its choice on stderr (`layout:` and `names:` lines): `low` tries the fast codecs on 4 MB, `medium` all of them on 16 MB, `high` all of them on the whole file, plus bzip3 at many block sizes and zpaq.
+`-e low` writes blocks of 262144 rows with a block index, `-e medium` blocks of whole reads from 4194304 rows, `-e high` one block; a query decodes one block, so under `high` the whole file.
+`index` stores a 32-bit fingerprint and an ordinal per name: one matching fingerprint is answered without decoding the names, so a name absent from the track passes for a present one about 4 times in 2^32 lookups.
 
 ## C and Rust
 

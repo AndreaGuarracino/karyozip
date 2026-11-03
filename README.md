@@ -2,6 +2,8 @@
 
 Compresses KaryoScope annotation tracks losslessly, and reads them back without decompressing the whole file.
 
+[KaryoScope](https://github.com/barthel-lab/KaryoScope) annotates assemblies and sequencing reads without alignment. It gives every base of every read or contig a label drawn from one or more hierarchical feature sets (chromosome of origin, satellite, repeat class, and so on), and writes one BED track per feature set. Those tracks are what karyozip stores.
+
 ## Install
 
 ```
@@ -11,6 +13,23 @@ cargo install --path rust       # puts karyozip in ~/.cargo/bin
 
 It needs cargo, a C and a C++ compiler and libgomp: the codecs under `c/` are compiled into the binary.
 It builds on Linux with glibc and GCC (or a compiler with `-fopenmp` and libgomp), and from a clone only: `rust/build.rs` reads `c/`, so the crate is not published.
+
+## Input
+
+A track is a 4-column BED: sequence name, start, end, label.
+
+```
+m84039_230928_213653_s3/1000/ccs	0	18701	chr1
+m84039_230928_213653_s3/1000/ccs	18701	27109	chr13
+m84039_230928_213653_s3/1007/ccs	0	14778	chrX
+```
+
+Every row must meet these rules, and compress refuses the input with a message otherwise:
+- Each sequence's rows come together, and a sequence never comes back once left.
+- Each sequence starts at 0 and is gapless: every row starts where the one before ended.
+- Every run has a positive length.
+- Names are unique, under 512 bytes, and contain no tab, newline or NUL. Labels contain no newline or NUL.
+- Under `-d`, two touching runs of one sequence must not carry the same label (featureID): merge them first.
 
 ## Quick start
 
@@ -112,6 +131,10 @@ Flags work on either side of the command name. The readers are decompress and qu
 | `aln-pack -a P.paf --ref R -o OUT` | | cuts a PAF to what `-a` reads, for many tracks against one alignment |
 | `--aln-names F` | compress, readers | with `-a`: read N is line N+1 of `F` |
 | `--max-gap N` | `--smooth` | KaryoScope's gap bound, 1000 by default |
+| `--raw` | decompress | prints what is stored, without the companion files: featureIDs of a `-d` track, `=` labels and 0 lengths of an `-a` track, ordinals for dropped names |
+| `-b`, `--block N\|all` | compress | blocks of exactly N rows (a block may split a sequence); `all` is one block. Overrides the block size `-e` picks |
+| `--read-blocks N` | compress | blocks of whole sequences, each closing at the first sequence start at or past N rows. The later of `-b` and `--read-blocks` wins |
+| `--profile` | all | a debug flag: per-phase times and peak memory on stderr |
 
 ## How it works
 
@@ -122,3 +145,8 @@ Compress tries its codecs on a sample, and under `medium` and `high` four layout
 ## C and Rust
 
 A C implementation in `c/` writes the same bytes. How to build it, its library, and how the two are kept equal: [C-and-Rust.md](C-and-Rust.md).
+The C library `libkaryozip.a` prints a message and exits the process on any error, and it is not thread-safe.
+
+## File format
+
+[FORMAT.md](FORMAT.md) specifies the `.kst` track, the `.kzi` index and the `aln-pack` file. The magic `KST00001` has not changed while flags and codecs were added, and no release is tagged yet. A file is only guaranteed to be read by the karyozip that wrote it.

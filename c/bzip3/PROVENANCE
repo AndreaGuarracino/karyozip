@@ -1,4 +1,5 @@
-kspalaiologos/bzip3, release 1.5.4, plus one local change.
+kspalaiologos/bzip3, release 1.5.4, plus three local changes: two in
+libbz3.c and one in libsais.h. lastblock_check.c is karyozip's own test.
 Upstream: https://github.com/kspalaiologos/bzip3
 
 libbz3.h and common.h are byte-identical to 1.5.4.
@@ -9,7 +10,8 @@ each with its own state, and written in order, so the bytes are the
 same. Second, bz3_compress is bz3_compress_cuts with no cut list:
 bz3_compress_cuts takes each block's size, none above the block size,
 which the frame already records, so bz3_decompress reads it unchanged.
-Diffed against 1.5.4 on 2026-10-19: no other line differs.
+Diffed against 1.5.4 on 2026-10-19 and again on 2026-11-02: no other
+line differs.
 libsais.h is 1.5.4 with one change at its 48 flag shifts:
   ((sa_sint_t)(x) << (SAINT_BIT - 1))  became
   (sa_sint_t)((sa_uint_t)(x) << (SAINT_BIT - 1)).

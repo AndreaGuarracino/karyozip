@@ -15,15 +15,18 @@ The C needs zstd, zlib, an OpenMP compiler and a C++ compiler for libzpaq. liblz
 ## C and Rust
 
 `c/` and `rust/` write the same bytes, print the same `--help` and refuse the same inputs with the same words; the usage text is `c/usage.txt`, which the C embeds and the Rust includes, and the liblzma file list is `c/xz/sources.txt`, which `c/Makefile` and `rust/build.rs` both read.
-`make test` (65 s) runs the shared suite in `tests/`, sanitizers and fuzzing on both and compares them compress by compress.
+`make test` runs the shared suite in `tests/` on both, fuzzes both, and compares them compress by compress. It takes a few minutes, depending on the machine.
+The C half fuzzes an ASan/UBSan build. The Rust half checks for leaks under valgrind, not a sanitizer, so `make test` needs valgrind installed.
 The C finds zstd, zlib and libgomp at the path in its rpath; the Rust bundles zstd. Both compile the same liblzma from `c/xz`.
-The Rust compiles the C codecs too, through `rust/src/ffi.rs`: there is no Rust htscodecs, and the `bzip3` crate lacks the two fixes in `c/bzip3/PROVENANCE`. `zstd-sys` is pinned to `=2.0.16`, the zstd 1.5.7 the C links, because zstd does not promise the same bytes across releases.
+The Rust compiles the C codecs too, through `rust/src/ffi.rs`: there is no Rust htscodecs, and the `bzip3` crate lacks the local changes in `c/bzip3/PROVENANCE` (`bz3_compress_cuts` among them). `zstd-sys` is pinned to `=2.1.2`, which bundles the zstd 1.5.7 the C links, because zstd does not promise the same bytes across releases.
 Outside `ffi.rs`, four hot loops write unchecked, each behind an assertion: the digit writer in `kst.rs`, the row writers in `reader.rs` and `smooth.rs`, and `smooth_one`.
 
 ## The C library
 
 `make` also builds `c/build/libkaryozip.a`, six calls in `c/karyozip.h` (`kt_open`, `kt_block`, `kt_level`, `kt_row`, `kt_close`, `kt_version`), for an annotator that writes `.kst` directly.
 Rows must arrive grouped by sequence, each sequence once, starting at 0, gapless; anything else is refused with the CLI's message.
+By default a writer makes one block, with no random access: `kt_block(w, rows)` before the first row sets fixed blocks of that many rows, as `-e low` does with 262144. The default zstd level is 17.
+The library is not thread-safe: it keeps global state, so use one writer at a time, from one thread. On any error it prints the message and calls `exit(1)`; it never returns an error code.
 
 ```c
 kt_writer *w = kt_open(f);

@@ -345,7 +345,7 @@ impl Aln {
             if (cd == 1 || cd >= 3) && rl > 1 << 38 { return Err(Error::input("corrupt file: an impossible allocation size")); }
             sec.push(match cd {
                 0 => Vec::new(),
-                2 => crate::reader::tok_d(src),
+                2 => crate::reader::tok_d_r(src)?,
                 1 => crate::ffi::zstd_decompress(src, rl as usize)
                         .ok_or_else(|| Error::input("corrupt packed alignment: a stream does not decompress"))?,
                 _ => crate::ffi::paydecomp(src, (cd - 3) as i32, rl as usize)

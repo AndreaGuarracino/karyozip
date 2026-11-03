@@ -530,12 +530,18 @@ hd, sec = secs(W + "/fg.pk"); open(W + "/big.pk", "wb").write(pack(hd, [(1, 1 <<
 hd, sec = secs(W + "/fg2.pk"); k = [j for j, x in enumerate(sec) if x[0] == 0]
 if k: sec[k[0]] = (0, 0, b"junk")   # bytes behind an empty stream
 open(W + "/skip.pk", "wb").write(pack(hd, sec))
+# a tokenised names section: empty, a chunk table cut short, chunks past the stream, a chunk that does not decode
+hd, sec = secs(W + "/fg.pk")
+for nm, x in (("e", b""), ("h", b"\0\0\0\0\5\0\0\0"), ("o", b"\0\0\0\0\1\0\0\0\4\0\0\0\x64\0\0\0"),
+              ("d", b"\0\0\0\0\1\0\0\0\4\0\0\0\3\0\0\0\1\2\3")):
+    open(W + "/tk%s.pk" % nm, "wb").write(pack(hd, [(2, 0, x)] + sec[1:]))
 PY
 "$C" compress --aln "$D/p.paf" --ref "$D/ref.bed" < "$D/s.bed" > "$W/fa.kst" 2>/dev/null
 "$C" compress --aln "$W/fg2.pk" --ref "$D/ref.bed" < "$D/s.bed" > "$W/fa2.kst" 2>/dev/null
 EXPECT=fail
 for bit in 53 54; do both "header flag bit $bit" decompress -i "$W/fl$bit.kst"; done
 both "a packed alignment claiming a 1 TB stream" decompress --aln "$W/big.pk" --ref "$D/ref.bed" -i "$W/fa.kst"
+for t in e h o d; do both "a packed alignment, tokenised names [$t]" decompress --aln "$W/tk$t.pk" --ref "$D/ref.bed" -i "$W/fa.kst"; done
 EXPECT=ok
 both "a packed alignment with bytes behind an empty stream" decompress --aln "$W/skip.pk" --ref "$D/ref.bed" -i "$W/fa2.kst"
 python3 - "$W" <<'PY'

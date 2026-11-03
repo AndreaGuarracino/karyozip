@@ -1,6 +1,7 @@
 //! Reading a KST track; every refusal is the C's, so the two are interchangeable
 
 use crate::ffi;
+use crate::{Error, KzResult};
 use crate::kst::{self, FNV0, TOKFLAG, INTFLAG, FLDFLAG, DROPPED, ALNFLAG, DBFLAG, LENFLAG,
                  TAILFLAG, RUNFLAG, ILVFLAG, GRPFLAG, CARTFLAG, VARFLAG, ICHUNK, FLAGS};
 use std::io::{Read, Seek, SeekFrom};
@@ -777,12 +778,17 @@ fn int_names_d(b: &[u8], cnt: u64) -> Vec<u8> {
     o
 }
 
-pub fn tok_d(b: &[u8]) -> Vec<u8> {
-    if b.len() < 8 { crate::bail("truncated tokenised names"); }
+/// Tokenised names, the reader path's form: a refusal exits, as the C's tokd
+pub fn tok_d(b: &[u8]) -> Vec<u8> { tok_d_r(b).unwrap_or_else(|e| crate::die(&e)) }
+
+/// Tokenised names decoded, a refusal returned in the C's words: the packed-alignment loader's form
+pub fn tok_d_r(b: &[u8]) -> KzResult<Vec<u8>> {
+    let bad = |m: &str| Err(Error::input(m));
+    if b.len() < 8 { return bad("truncated tokenised names"); }
     let nchunk = u32::from_le_bytes(b[4..8].try_into().unwrap()) as usize;
     let hdr = 8 + 8 * nchunk;
     if nchunk > (b.len() - 8) / 8 || hdr > b.len() {
-        crate::bail("corrupt tokenised names header");
+        return bad("corrupt tokenised names header");
     }
     // raw and coded length per chunk, as the C's tokd
     let (mut woff, mut coff) = (vec![0usize], vec![0usize]);
@@ -792,17 +798,21 @@ pub fn tok_d(b: &[u8]) -> Vec<u8> {
         coff.push(coff[i] + at(8 + 4 * (nchunk + i)));
     }
     if coff[nchunk] > b.len() - hdr {
-        crate::bail("corrupt tokenised names: chunks overrun the stream");
+        return bad("corrupt tokenised names: chunks overrun the stream");
     }
     // One chunk per thread into one preallocated buffer, so the peak is the names once; NUL separators become newlines
     use rayon::prelude::*;
-    let mut out = vec![0u8; crate::ckalloc(woff[nchunk])];
+    // the cap ckalloc would refuse, and an allocation that fails, returned
+    if woff[nchunk] > 1 << 38 && crate::readcap_on() { return bad("corrupt file: an impossible allocation size"); }
+    let mut out: Vec<u8> = Vec::new();
+    out.try_reserve_exact(woff[nchunk]).map_err(|_| Error::internal("oom"))?;
+    out.resize(woff[nchunk], 0);
     let mut slots: Vec<&mut [u8]> = Vec::with_capacity(nchunk);
     let mut rest = out.as_mut_slice();
     for i in 0..nchunk { let (a, r) = rest.split_at_mut(woff[i + 1] - woff[i]); slots.push(a); rest = r; }
     // At most TOKDEC chunks at once, as the C: each costs 127 MB in the decoder
     let pool = rayon::ThreadPoolBuilder::new().num_threads(rayon::current_num_threads().min(TOKDEC)).build()
-        .unwrap_or_else(|_| crate::bail("cannot start the name decode threads"));
+        .map_err(|_| Error::internal("cannot start the name decode threads"))?;
     let ok = pool.install(|| slots.into_par_iter().enumerate().all(|(i, slot)| {
         match ffi::tok_decode(&b[hdr + coff[i]..hdr + coff[i + 1]]) {
             Some(d) if d.len() == slot.len() => {
@@ -812,8 +822,8 @@ pub fn tok_d(b: &[u8]) -> Vec<u8> {
             _ => false,
         }
     }));
-    if !ok { crate::bail("name tokeniser decode failed"); }
-    out
+    if !ok { return bad("name tokeniser decode failed"); }
+    Ok(out)
 }
 
 pub use crate::kst::{unzz, vget};

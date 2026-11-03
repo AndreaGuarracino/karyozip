@@ -294,6 +294,36 @@ fn db_encode_from_per_set_kst() {
     let _ = std::fs::remove_dir_all(&d);
 }
 
+/// A packed alignment whose tokenised names section is malformed: an Err in the CLI's words from the loader, and the
+/// caller goes on (the sentinel after each call), where the token decoder once exited the process
+#[test]
+fn a_bad_packed_names_section_is_an_error() {
+    use karyozip::aln;
+    let d = scratch("pkname");
+    let vput = |o: &mut Vec<u8>, mut v: u64| { while v >= 0x80 { o.push(v as u8 | 0x80); v >>= 7; } o.push(v as u8); };
+    let mut alive = 0;
+    let cases: [(&[u8], &str); 4] = [
+        (b"", "truncated tokenised names"),                                     // codec 2, raw 0, coded 0
+        (b"\0\0\0\0\x05\0\0\0", "corrupt tokenised names header"),           // five chunks, no chunk table
+        (b"\0\0\0\0\x01\0\0\0\x04\0\0\0\x64\0\0\0", "corrupt tokenised names: chunks overrun the stream"),
+        (b"\0\0\0\0\x01\0\0\0\x04\0\0\0\x03\0\0\0\x01\x02\x03", "name tokeniser decode failed"),
+    ];
+    for (i, (names, want)) in cases.iter().enumerate() {
+        let mut a = aln::Aln::default();
+        let mut f = b"KSTAL1".to_vec();
+        f.extend_from_slice(&aln::refhash(&a).to_le_bytes());
+        vput(&mut f, 2); vput(&mut f, 0); vput(&mut f, names.len() as u64); f.extend_from_slice(names);
+        for _ in 1..10 { vput(&mut f, 0); vput(&mut f, 0); vput(&mut f, 0); }   // the other nine streams empty
+        let p = d.join(format!("t{i}.pk"));
+        std::fs::write(&p, &f).unwrap();
+        let e = a.load_aln(&p.display().to_string()).expect_err(&format!("case {i} was accepted"));
+        assert_eq!((e.message(), e.kind()), (*want, ErrorKind::Input), "case {i}");
+        alive += 1;
+    }
+    assert_eq!(alive, cases.len(), "the caller is still running");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
 /// A features table with its header alone: a novel row encodes as the CLI's bytes, any other label is the CLI's
 /// refusal, returned; neither panics
 #[test]

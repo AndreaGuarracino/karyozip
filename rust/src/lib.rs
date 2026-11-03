@@ -85,9 +85,11 @@ pub fn readcap() { READCAP.store(true, std::sync::atomic::Ordering::Relaxed); }
 
 /// A forged length is a refusal, not an allocator panic
 pub fn ckalloc(n: usize) -> usize {
-    if n > 1 << 38 && READCAP.load(std::sync::atomic::Ordering::Relaxed) { bail("corrupt file: an impossible allocation size"); }
+    if n > 1 << 38 && readcap_on() { bail("corrupt file: an impossible allocation size"); }
     n
 }
+/// Whether `ckalloc` refuses a forged length: `readcap` was called
+pub fn readcap_on() -> bool { READCAP.load(std::sync::atomic::Ordering::Relaxed) }
 
 /// A BED coordinate: digits only, and it must fit in 64 bits
 pub fn bedcoord_r(b: &[u8], what: &'static str) -> Result<u64, &'static str> {

@@ -821,6 +821,34 @@ for bl in "--read-blocks 70000" "--block 70000"; do
 done
 if [ "$SAN" != "$KT" ]; then ASAN_OPTIONS=detect_leaks=1 $SAN decompress -t 4 -i "$W/pf.kt" 2> "$W/pfs.err" | cmp -s - "$W/pf.bed" && ! grep -qE "Sanitizer|runtime error" "$W/pfs.err" && ok "decode ahead: sanitizer clean" || no "decode ahead: SANITIZER REPORT"; fi
 
+# forged BGZF, under the sanitizer binary: ISIZE bounds, BC after another subfield, cuts inside the extra field
+X=$W/bx; mkdir -p "$X"; python3 "$D/kt.py" bgzfx "$X"
+bx_ok() {  # DESC GZ BED: file and pipe give the plain BED's bytes, sanitizer clean
+  $KT compress -i "$3" > "$W/bx.want" 2>/dev/null
+  ASAN_OPTIONS=detect_leaks=1 $SAN compress -i "$2" > "$W/bx.f" 2> "$W/bx.err"; ASAN_OPTIONS=detect_leaks=1 $SAN compress < "$2" > "$W/bx.p" 2>> "$W/bx.err"
+  cmp -s "$W/bx.f" "$W/bx.want" && cmp -s "$W/bx.p" "$W/bx.want" && ! grep -qE "Sanitizer|runtime error" "$W/bx.err" && ok "$1: same bytes" || no "$1: WRONG"
+}
+bx_no() {  # DESC GZ: refused from file and pipe, sanitizer clean
+  local rc=0 rp=0
+  local A=detect_leaks=0   # a refusal exits through die, leaks are not the point here
+  ASAN_OPTIONS=$A $SAN compress -i "$2" > /dev/null 2> "$W/bx.err" || rc=$?; ASAN_OPTIONS=$A $SAN compress < "$2" > /dev/null 2>> "$W/bx.err" || rp=$?
+  [ $rc = 1 ] && [ $rp = 1 ] && [ "$(grep -c '^karyozip: ' "$W/bx.err")" = 2 ] && ! grep -qE "Sanitizer|runtime error" "$W/bx.err" \
+    && echo "$1: refused ($(grep -m1 '^karyozip: ' "$W/bx.err" | cut -c11-90))" || { echo "$1: WRONG, exit $rc/$rp: $(head -c 300 "$W/bx.err")"; fail=1; }
+}
+bx_ok "BGZF ISIZE 65535" "$X/isz65535.gz" "$X/isz65535.bed"
+bx_ok "BGZF ISIZE 65536" "$X/isz65536.gz" "$X/isz65536.bed"
+bx_no "BGZF ISIZE 65537" "$X/isz65537.gz"
+bx_no "BGZF BSIZE ending inside its header" "$X/bsize.gz"
+bx_ok "BGZF BC after another subfield" "$X/bcafter.gz" "$X/bc.bed"
+bx_no "BGZF BC payload past the end" "$X/bcend1.gz"; bx_no "BGZF BC payload past the end, second block" "$X/bcend2.gz"
+cb=0; for f in "$X"/cut[12].*.gz; do bx_no "cut" "$f" > "$W/bx.one" || true; grep -q WRONG "$W/bx.one" && { cat "$W/bx.one"; cb=1; }; done
+[ $cb = 0 ] && ok "BGZF cut at every byte of the extra field, one block and two: refused, sanitizer clean" || no "BGZF cut inside the extra field: WRONG"
+bx_no "BGZF blocks claiming 4 GiB each" "$X/huge.gz"; bx_no "BGZF 300000 blocks claiming 64 KiB each" "$X/many.gz"
+for f in huge many; do   # refused before allocating what the trailers claim
+  rc=0; ( ulimit -v 1500000; exec timeout 30 $KT compress -t 2 -i "$X/$f.gz" ) > /dev/null 2> "$W/bx.err" || rc=$?
+  [ $rc = 1 ] && grep -q '^karyozip: ' "$W/bx.err" && ok "BGZF $f.gz under a 1.5 GB address limit: refused" || no "BGZF $f.gz under a 1.5 GB address limit: WRONG, exit $rc: $(head -c 200 "$W/bx.err")"
+done
+
 # pin the stored bytes to codec versions
 want=55b6e9eadfe851a4374e094e045ee8ecb4ffac9a2fdd83de126ff076724e700b
 got=$($KT --block 4 compress < "$D/db.rall.bed" 2>/dev/null | sha256sum | cut -d' ' -f1)

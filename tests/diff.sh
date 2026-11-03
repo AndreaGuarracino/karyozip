@@ -249,6 +249,16 @@ for f in bzcut bzflip; do
   "$R" compress -i "$W/$f.bgz" 2> "$W/re" >/dev/null; r1=$?; rm2=$(tail -1 "$W/re")
   [ "$cm" = "$rm2" ] && [ "$c1" = 1 ] && [ "$r1" = 1 ] && gok=$((gok+1)) || { gbad=$((gbad+1)); echo "  $f refusal differs: c=[$cm] rc $c1, rust=[$rm2] rc $r1"; }
 done
+# forged BGZF: ISIZE bounds, BC after another subfield, cuts inside the extra field; same bytes or same refusal
+mkdir -p "$W/bx"; python3 "$D/kt.py" bgzfx "$W/bx"
+for f in "$W"/bx/*.gz; do
+  for how in file pipe; do
+    if [ $how = file ]; then "$C" compress -i "$f" > "$W/bxc" 2> "$W/ce"; c1=$?; "$R" compress -i "$f" > "$W/bxr" 2> "$W/re"; r1=$?
+    else "$C" compress < "$f" > "$W/bxc" 2> "$W/ce"; c1=$?; "$R" compress < "$f" > "$W/bxr" 2> "$W/re"; r1=$?; fi
+    cmp -s "$W/bxc" "$W/bxr" && cmp -s "$W/ce" "$W/re" && [ $c1 = $r1 ] && gok=$((gok+1)) \
+      || { gbad=$((gbad+1)); echo "  forged bgzf differs: $(basename "$f") $how, c=[$(tail -1 "$W/ce")] rc $c1, rust=[$(tail -1 "$W/re")] rc $r1"; }
+  done
+done
 [ $gbad = 0 ] && echo "gzip input: $gok forms match the plain track" \
   || { echo "gzip input: $gbad DIFFER"; fail=1; }
 

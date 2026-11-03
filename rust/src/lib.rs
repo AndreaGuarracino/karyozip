@@ -59,20 +59,22 @@ pub fn slurp(path: &str, what: &'static str) -> Vec<u8> {
 
 /// Every text input, as the C's zfopen: plain, BGZF blocks inflated side by side and CRC-checked, or any gzip
 pub fn unzip(r: impl std::io::Read + Send + 'static) -> Box<dyn std::io::Read + Send> {
-    Box::new(Zr { r: Box::new(r), mode: 0, reof: false, raw: Vec::new(), rp: 0, out: Vec::new(), op: 0, gz: None })
+    Box::new(Zr { r: Box::new(r), mode: 0, reof: false, raw: Vec::new(), rb: Vec::new(), rp: 0, out: Vec::new(), op: 0, gz: None })
 }
 
 const ZCHUNK: usize = 8 << 20;
+const BGZFOUT: usize = 64 << 20;   // most inflated bytes one batch of BGZF blocks holds
 type Gz = flate2::read::MultiGzDecoder<std::io::Chain<std::io::Cursor<Vec<u8>>, Box<dyn std::io::Read + Send>>>;
-struct Zr { r: Box<dyn std::io::Read + Send>, mode: u8, reof: bool, raw: Vec<u8>, rp: usize, out: Vec<u8>, op: usize, gz: Option<Gz> }
+struct Zr { r: Box<dyn std::io::Read + Send>, mode: u8, reof: bool, raw: Vec<u8>, rb: Vec<u8>, rp: usize, out: Vec<u8>, op: usize, gz: Option<Gz> }
 
 /// One BGZF block's size, 0 if it is not one
 fn bgzf_size(p: &[u8]) -> usize {
     if p.len() < 18 || p[0] != 0x1f || p[1] != 0x8b || p[2] != 8 || p[3] & 4 == 0 { return 0; }
     let xl = p[10] as usize | (p[11] as usize) << 8;
-    let mut i = 12;
-    while i + 4 <= 12 + xl && i + 4 <= p.len() {
+    let (mut i, e) = (12, (12 + xl).min(p.len()));   // each subfield whole, inside XLEN and p
+    while i + 4 <= e {
         let sl = p[i + 2] as usize | (p[i + 3] as usize) << 8;
+        if i + 4 + sl > e { break; }
         if p[i] == b'B' && p[i + 1] == b'C' && sl == 2 { return (p[i + 4] as usize | (p[i + 5] as usize) << 8) + 1; }
         i += 4 + sl;
     }
@@ -85,11 +87,11 @@ impl Zr {
     /// At least `want` unused bytes in raw, or the end
     fn fill(&mut self, want: usize) -> std::io::Result<()> {
         self.raw.drain(..self.rp); self.rp = 0;
-        let mut b = vec![0u8; 1 << 20];
+        if self.rb.is_empty() { self.rb = vec![0u8; 1 << 20]; }
         while self.raw.len() < want && !self.reof {
-            match self.r.read(&mut b) {
+            match self.r.read(&mut self.rb) {
                 Ok(0) => self.reof = true,
-                Ok(k) => self.raw.extend_from_slice(&b[..k]),
+                Ok(k) => self.raw.extend_from_slice(&self.rb[..k]),
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
                 Err(e) => return Err(e),
             }
@@ -100,16 +102,19 @@ impl Zr {
     fn bgzf(&mut self) -> std::io::Result<u8> {
         use rayon::prelude::*;
         self.fill(ZCHUNK)?;
-        let (mut bo, mut q) = (Vec::new(), self.rp);
+        let (mut bo, mut oo, mut q) = (Vec::new(), vec![0usize], self.rp);
         while q < self.raw.len() {
             let bs = bgzf_size(&self.raw[q..]);
             if bs < 26 || q + bs > self.raw.len() { break; }
-            bo.push(q); q += bs;
+            // checked before anything is summed or allocated
+            let (b, tot) = (&self.raw[q..q + bs], *oo.last().unwrap());
+            let isz = le32(&b[bs - 4..]);
+            if isz > 65536 || 12 + (b[10] as usize | (b[11] as usize) << 8) + 8 > bs { return Err(zbad()); }
+            if tot + isz > BGZFOUT { break; }   // a batch's output is capped
+            bo.push(q); oo.push(tot + isz); q += bs;
         }
         bo.push(q);
         if bo.len() == 1 { return Ok(if self.rp < self.raw.len() { 2 } else { 0 }); }
-        let mut oo = vec![0usize];
-        for w in bo.windows(2) { oo.push(oo.last().unwrap() + le32(&self.raw[w[1] - 4..])); }
         self.out = vec![0u8; *oo.last().unwrap()]; self.op = 0;
         let mut slots: Vec<&mut [u8]> = Vec::with_capacity(bo.len() - 1);
         let mut rest = self.out.as_mut_slice();
@@ -119,7 +124,6 @@ impl Zr {
         let ok = slots.into_par_iter().enumerate().with_min_len(16).map_init(ffi::Inflater::new, |d, (i, o)| {
             let b = &raw[bo[i]..bo[i + 1]];
             let xl = b[10] as usize | (b[11] as usize) << 8;
-            if o.len() > 65536 || 12 + xl + 8 > b.len() { return false; }
             d.inflate(&b[12 + xl..b.len() - 8], o) && ffi::crc32(o) as usize == le32(&b[b.len() - 8..])
         }).all(|x| x);
         self.rp = q;
@@ -137,6 +141,8 @@ impl std::io::Read for Zr {
     fn read(&mut self, b: &mut [u8]) -> std::io::Result<usize> {
         if self.mode == 0 {
             self.fill(18)?;
+            let p = &self.raw[self.rp..];   // the whole extra field, to find BC
+            if p.len() >= 18 && p[0] == 0x1f && p[1] == 0x8b && p[3] & 4 != 0 { let x = 12 + (p[10] as usize | (p[11] as usize) << 8); self.fill(x)?; }
             let p = &self.raw[self.rp..];
             self.mode = if p.len() < 2 || p[0] != 0x1f || p[1] != 0x8b { 1 } else if bgzf_size(p) > 0 { 2 } else { 3 };
             if self.mode == 3 { self.to_stream(); }

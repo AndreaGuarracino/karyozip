@@ -129,7 +129,7 @@ impl Zr {
         self.rp = q;
         if ok { Ok(1) } else { Err(zbad()) }
     }
-    fn to_stream(&mut self) {
+    fn switch_to_stream(&mut self) {
         let rest = std::io::Cursor::new(self.raw.split_off(self.rp));
         let r = std::mem::replace(&mut self.r, Box::new(std::io::empty()));
         self.gz = Some(flate2::read::MultiGzDecoder::new(std::io::Read::chain(rest, r)));
@@ -145,7 +145,7 @@ impl std::io::Read for Zr {
             if p.len() >= 18 && p[0] == 0x1f && p[1] == 0x8b && p[3] & 4 != 0 { let x = 12 + (p[10] as usize | (p[11] as usize) << 8); self.fill(x)?; }
             let p = &self.raw[self.rp..];
             self.mode = if p.len() < 2 || p[0] != 0x1f || p[1] != 0x8b { 1 } else if bgzf_size(p) > 0 { 2 } else { 3 };
-            if self.mode == 3 { self.to_stream(); }
+            if self.mode == 3 { self.switch_to_stream(); }
         }
         if self.mode == 1 {                        // plain: what was peeked, then the reader
             if self.rp < self.raw.len() {
@@ -158,7 +158,7 @@ impl std::io::Read for Zr {
         while self.mode == 2 && self.op == self.out.len() {
             match self.bgzf()? {
                 0 => return Ok(0),
-                2 => { if self.reof && self.raw.len() - self.rp < 18 { return Err(zbad()); } self.to_stream(); }
+                2 => { if self.reof && self.raw.len() - self.rp < 18 { return Err(zbad()); } self.switch_to_stream(); }
                 _ => {}
             }
         }

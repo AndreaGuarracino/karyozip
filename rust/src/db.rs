@@ -208,24 +208,43 @@ struct Brd { src: Src, seq: Vec<u8>, st: u64, en: u64, lab: Vec<u8>, labid: u32,
              /// BED lines read
              lines: u64 }
 
-/// A .kst by its magic, read at offset 0 from the file the BED reader would take, so nothing is consumed. Only a
-/// regular file (a symlink followed) is probed, since a .kst is read with random access: a FIFO, a /dev/fd pipe or a
-/// device goes to the BED reader unprobed, opened once, and a .kst through one is refused by `kst_pipe`, as the C's iskst
+/// A set's .kst in place of its BED, known by its first line, as `kst_pipe` knows one (kst_head): the magic, and no
+/// BED row, so a BED whose first name begins with the magic is a BED here too. Read at offset 0 from the file the BED
+/// reader would take, so nothing is consumed, and at most KSTPROBE bytes: a .kst's header has a NUL within its first
+/// words, and a BED row its three tabs within its name's 511 bytes and two coordinates; a first line longer than that
+/// is judged by what was read. Only a regular file (a symlink followed) is probed, since a .kst is read with random
+/// access: a FIFO, a /dev/fd pipe or a device goes to the BED reader unprobed, opened once, and a .kst through one is
+/// refused by `kst_pipe`, as the C's iskst
+const KSTPROBE: usize = 4096;
 fn is_kst(f: &std::fs::File) -> bool {
     use std::os::unix::fs::FileExt;
-    let mut m = [0u8; 8];
-    f.metadata().is_ok_and(|md| md.is_file()) && f.read_exact_at(&mut m, 0).is_ok() && &m == crate::writer::MAGIC
+    if !f.metadata().is_ok_and(|md| md.is_file()) { return false; }
+    let mut m = [0u8; KSTPROBE];
+    let mut got = 0;
+    while got < KSTPROBE {
+        match f.read_at(&mut m[got..], got as u64) {
+            Ok(0) => break,
+            Ok(k) => got += k,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => break,
+        }
+    }
+    let nl = crate::ffi::find(b'\n', &m[..got]);
+    kst_head(&m[..nl.unwrap_or(got)], nl.is_some() || got == KSTPROBE)
 }
 
 const KSTPIPE: &str = "--db: a .kst input must be a regular file: it is read with random access, not through a pipe or stdin";
-/// A BED input's first line that is a .kst's start: the magic, then what no BED row has, a NUL, fewer than three
-/// tabs or no newline at all. The byte after the magic may be a newline (a sequence count of 10, 266, ...), so a
-/// NUL alone is not enough; a BED row whose name begins with the magic has its three tabs and no NUL, and is read
+/// An input's first line (its newline dropped) that is a .kst's start: the magic, then what no BED row has, a NUL,
+/// fewer than three tabs or no newline at all (`nl` false). The byte after the magic may be a newline (a sequence
+/// count of 10, 266, ...), so a NUL alone is not enough; a BED row whose name begins with the magic has its three tabs
+/// and no NUL, and is read. The one rule for a regular file (is_kst) and for a pipe (kst_pipe). As the C's ksthead
+fn kst_head(line: &[u8], nl: bool) -> bool {
+    line.starts_with(crate::writer::MAGIC)
+        && (!nl || crate::ffi::find(0, line).is_some() || line.iter().filter(|&&c| c == b'\t').take(3).count() < 3)
+}
+/// A BED reader's first line that is a .kst's start: refused, since a .kst through a pipe cannot be read
 fn kst_pipe(line: &[u8], nl: bool) -> KzResult<()> {
-    if line.starts_with(crate::writer::MAGIC)
-        && (!nl || crate::ffi::find(0, line).is_some() || line.iter().filter(|&&c| c == b'\t').take(3).count() < 3) {
-        return Err(Error::input(KSTPIPE));
-    }
+    if kst_head(line, nl) { return Err(Error::input(KSTPIPE)); }
     Ok(())
 }
 

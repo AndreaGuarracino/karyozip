@@ -5100,15 +5100,18 @@ static void sset(char **d, size_t *cap, const char *s, size_t n) {   /* a string
 }
 
 #define KSTPIPE "--db: a .kst input must be a regular file: it is read with random access, not through a pipe or stdin"
-/* A BED input's first line that is a .kst's start: the magic, then what no BED row has, a NUL, fewer than three
-   tabs or no newline at all. The byte after the magic may be a newline (a sequence count of 10, 266, ...), so a
-   NUL alone is not enough; a BED row whose name begins with the magic has its three tabs and no NUL, and is read */
-static void kstpipe(const char *ln, size_t n, int nonl) {
-    if (n < 8 || memcmp(ln, MAGIC, 8)) return;
+/* An input's first line (its newline dropped) that is a .kst's start: the magic, then what no BED row has, a NUL,
+   fewer than three tabs or no newline at all. The byte after the magic may be a newline (a sequence count of 10,
+   266, ...), so a NUL alone is not enough; a BED row whose name begins with the magic has its three tabs and no NUL,
+   and is read. The one rule for a regular file (iskst) and for a pipe (kstpipe). As the Rust's kst_head */
+static int ksthead(const char *ln, size_t n, int nonl) {
+    if (n < 8 || memcmp(ln, MAGIC, 8)) return 0;
     size_t tabs = 0;
     for (size_t i = 0; i < n && tabs < 3; i++) tabs += ln[i] == '\t';
-    if (nonl || memchr(ln, 0, n) || tabs < 3) die(KSTPIPE);
+    return nonl || memchr(ln, 0, n) || tabs < 3;
 }
+/* A BED reader's first line that is a .kst's start: refused, since a .kst through a pipe cannot be read */
+static void kstpipe(const char *ln, size_t n, int nonl) { if (ksthead(ln, n, nonl)) die(KSTPIPE); }
 
 #define BRDBUF (8u << 20)
 static ssize_t brd_line(brd *b, char **lnp) {
@@ -5172,13 +5175,25 @@ static void bnext(brd *b) {
 }
 
 /* A per-set .kst in place of its BED: a plain track, as --ref takes one, opened as no companion.
-   Known by its magic, read with pread from the descriptor the BED reader would take, so nothing is consumed;
-   only a regular file (a symlink followed) is probed, since a .kst is read with random access: a FIFO, a
-   /dev/fd pipe or a device goes to the BED reader unprobed, opened once, and a .kst through one is refused
-   by kstpipe. 1: fd is a .kst; 0: a BED */
+   Known by its first line, as kstpipe knows one (ksthead): the magic, and no BED row, so a BED whose first name
+   begins with the magic is a BED here too. Read with pread from the descriptor the BED reader would take, so nothing
+   is consumed, and at most KSTPROBE bytes: a .kst's header has a NUL within its first words, and a BED row its three
+   tabs within its name's 511 bytes and two coordinates; a first line longer than that is judged by what was read.
+   Only a regular file (a symlink followed) is probed, since a .kst is read with random access: a FIFO, a /dev/fd
+   pipe or a device goes to the BED reader unprobed, opened once, and a .kst through one is refused by kstpipe.
+   1: fd is a .kst; 0: a BED. As the Rust's is_kst */
+#define KSTPROBE 4096
 static int iskst(int fd) {
-    struct stat st; char m[8];
-    return !fstat(fd, &st) && S_ISREG(st.st_mode) && pread(fd, m, 8, 0) == 8 && !memcmp(m, MAGIC, 8);
+    struct stat st; char m[KSTPROBE]; size_t got = 0;
+    if (fstat(fd, &st) || !S_ISREG(st.st_mode)) return 0;
+    while (got < sizeof m) {
+        ssize_t k = pread(fd, m + got, sizeof m - got, (off_t)got);
+        if (k < 0 && errno == EINTR) continue;
+        if (k <= 0) break;
+        got += (size_t)k;
+    }
+    const char *nl = memchr(m, '\n', got);
+    return ksthead(m, nl ? (size_t)(nl - m) : got, !nl && got < sizeof m);
 }
 static void kopen(brd *b, const char *path) {
     uint64_t hh[16]; uint8_t hb[128];

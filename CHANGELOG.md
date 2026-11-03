@@ -21,7 +21,7 @@ The first tagged release. File format `KST00001` ([FORMAT.md](FORMAT.md)); files
 
 ### Added
 - The Rust library's write path (`Writer`, `db::encode`, the `features.tsv` and alignment loaders, including a packed alignment's tokenised names) returns `Result<_, karyozip::Error>` instead of exiting.
-- `compress -d` takes each feature set as its BED or its plain `.kst`, mixed as you like, for the same bytes. BED inputs may also come through a pipe, a FIFO or `<(...)`; a `.kst` input must be a regular file.
+- `compress -d` takes each feature set as its BED or its plain `.kst`, mixed as you like, for the same bytes. BED inputs may also come through a pipe, a FIFO or `<(...)`; a `.kst` input must be a regular file. A `.kst` is known by its magic and a first line no BED row could be, so a BED whose first sequence name begins with `KST00001` is a BED whatever its form.
 - FORMAT.md: a specification of `KST00001`, the `.kzi` index and `KSTAL1`.
 - Tests: a shared harness with pass/fail counts, `CASE`, a total `TEST_JOBS` budget, `TEST_LIGHT=1` for small machines, seeded fuzzing, Rust unit tests, run by `make test`, and a CI workflow template in `ci/`.
 

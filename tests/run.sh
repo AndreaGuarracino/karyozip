@@ -263,6 +263,30 @@ for form in fifo psub; do
   [ $rc = 0 ] && $KT --db "$W/po.tsv" decompress -i "$W/pm.kt" 2>/dev/null | cmp -s - "$W/pm.bed" \
     && ok "-d, a BED row named KST00001x through a $form: read as a BED, decoded back" || no "-d, a BED row named KST00001x through a $form: rc $rc [$(tail -1 "$W/pm.kt.err")]"
 done
+# and from a regular file too: a .kst is known by the magic and a first line no BED row has, the one rule for a pipe
+# and a file, so a first name KST00001x, or exactly KST00001, is a BED from a regular file, a symlink, stdin, a FIFO
+# and <(...), the same bytes from each, decoded back; a file of the magic and a few bytes is still a cut .kst
+printf 'KST00001\t0\t5\tx\n' > "$W/pe.bed"
+for b in pm pe; do
+  nm=$([ $b = pm ] && echo KST00001x || echo KST00001); ln -sf "$W/$b.bed" "$W/$b.lnk"
+  rc=0; dbform file "$W/$b.kt" "$W/po.tsv" "$W/$b.bed" || rc=$?
+  [ $rc = 0 ] && $KT --db "$W/po.tsv" decompress -i "$W/$b.kt" 2>/dev/null | cmp -s - "$W/$b.bed" \
+    && ok "-d, a BED row named $nm from a regular file: read as a BED, decoded back" || no "-d, a BED row named $nm from a regular file: rc $rc [$(tail -1 "$W/$b.kt.err")]"
+  for form in symlink stdin fifo psub; do
+    rc=0
+    case $form in
+      symlink) dbform file "$W/pg.kt" "$W/po.tsv" "$W/$b.lnk" || rc=$? ;;
+      stdin) timeout "$(tmo 30)" $KT compress --db "$W/po.tsv" -i - < "$W/$b.bed" > "$W/pg.kt" 2>"$W/pg.kt.err" || rc=$? ;;
+      *) dbform $form "$W/pg.kt" "$W/po.tsv" "$W/$b.bed" || rc=$? ;;
+    esac
+    [ $rc = 0 ] && cmp -s "$W/pg.kt" "$W/$b.kt" && ok "-d, a BED row named $nm through a $form: the regular file's bytes" \
+      || no "-d, a BED row named $nm through a $form: rc $rc [$(tail -1 "$W/pg.kt.err")]"
+  done
+done
+printf 'KST00001\001\002' > "$W/pt.kst"
+rc=0; dbform file "$W/pg.kt" "$W/po.tsv" "$W/pt.kst" || rc=$?
+[ $rc = 1 ] && [ "$(tail -1 "$W/pg.kt.err")" = "karyozip: --db: cannot read a .kst input" ] && ok "-d, the magic and two bytes in a regular file: refused as a cut .kst" \
+  || no "-d, the magic and two bytes in a regular file: rc $rc [$(tail -1 "$W/pg.kt.err")]"
 # a features table with its header alone: a novel row is featureID 0, any other label is refused (finding 4)
 printf 'featureID\tsetA\n' > "$W/ho.tsv"; printf 'chr1\t0\t5\tnovel\n' > "$W/hn.bed"; printf 'chr1\t0\t5\tx\n' > "$W/hx.bed"
 rc=0; $KT compress --db "$W/ho.tsv" -i "$W/hn.bed" > "$W/ho.kt" 2>"$W/ho.err" || rc=$?

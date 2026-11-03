@@ -715,6 +715,29 @@ done
 for x in C R; do rc=0; timeout "$(tmo 30)" "${!x}" compress --db "$W/k10.tsv" -i - < "$W/k10.kst" > /dev/null 2>"$W/k$x.err" || rc=$?; eval "rc$x=$rc"; done
 [ $rcC = 1 ] && [ $rcR = 1 ] && [ "$(tail -1 "$W/kC.err")" = "$kp" ] && cmp -s "$W/kC.err" "$W/kR.err" && { ok=$((ok+1)); tpass; } \
   || { bad=$((bad+1)); tfail "a .kst with a newline after its magic on stdin: rc $rcC/$rcR"; }
+# a BED row named KST00001x, or exactly KST00001, from a regular file, a symlink and stdin too: a BED in both, the
+# bytes of the pipe's; a genuine .kst from a regular file read, and the magic and two bytes refused as a cut .kst,
+# the same bytes and words from both
+printf 'KST00001\t0\t5\tx\n' > "$W/ke.bed"; ln -sf "$W/km.bed" "$W/km.lnk"; ln -sf "$W/ke.bed" "$W/ke.lnk"
+printf 'KST00001\001\002' > "$W/kt.kst"
+for c in "km.bed|file" "km.lnk|file" "km.bed|stdin" "km.bed|fifo" "ke.bed|file" "ke.lnk|file" "ke.bed|stdin" "ke.bed|fifo" "ke.bed|psub" \
+         "k10.kst|file" "kt.kst|file"; do
+  IFS='|' read -r f form <<< "$c"
+  for x in C R; do
+    rc=0
+    case $form in
+      file) timeout "$(tmo 30)" "${!x}" compress --db "$W/k10.tsv" -i "$W/$f" > "$W/k$x" 2>"$W/k$x.err" || rc=$? ;;
+      stdin) timeout "$(tmo 30)" "${!x}" compress --db "$W/k10.tsv" -i - < "$W/$f" > "$W/k$x" 2>"$W/k$x.err" || rc=$? ;;
+      *) kpr "${!x}" $form "$W/$f" "$W/k$x" || rc=$? ;;
+    esac
+    eval "rc$x=$rc"
+  done
+  case $f in kt.kst) want=1 ;; *) want=0 ;; esac
+  if [ $rcC = $want ] && [ $rcR = $want ] && cmp -s "$W/kC" "$W/kR" && cmp -s "$W/kC.err" "$W/kR.err" \
+     && { [ $want = 1 ] && [ "$(tail -1 "$W/kC.err")" = "karyozip: --db: cannot read a .kst input" ] \
+          || { [ -s "$W/kC" ] && "$C" --db "$W/k10.tsv" decompress -i "$W/kC" 2>/dev/null | cmp -s - "$W/${f%.*}.bed"; }; }; then ok=$((ok+1)); tpass
+  else bad=$((bad+1)); tfail "--db input $f through a $form: rc $rcC/$rcR [$(tail -1 "$W/kC.err")] [$(tail -1 "$W/kR.err")]"; fi
+done
 tally "piped .kst inputs"
 fi
 

@@ -66,7 +66,7 @@ The index costs 7.5 B a read: on short reads it can be larger than the track, on
 | db + alignment | as db-informed | `-d features.tsv -a P.paf --ref ref.ids.bed` |
 
 Use db-informed when you have every feature set of a sample: one file replaces the per-set files and is smaller than their sum.
-Each set may come as its BED or as its plain `.kst` (what `compress` wrote from that BED, in any mode), known by its magic `KST00001`, and the two may be mixed: the `.kst` inputs are decoded in step, one row at a time, and the merged file is byte-identical to the one their BEDs give.
+Each set may come as its BED or as its plain `.kst` (what `compress` wrote from that BED, in any mode), known by its magic `KST00001` and a first line no BED row could be (a BED whose first name begins with `KST00001` is still a BED), and the two may be mixed: the `.kst` inputs are decoded in step, one row at a time, and the merged file is byte-identical to the one their BEDs give.
 A `.kst` input must be plain: not written with `-d`, `-a` or `-n drop`. A missing set, a wrong order or a refused input is refused in the same words as for BEDs.
 Standard stays the default because db-informed cannot take one BED or stdin, and its file reads back only with the same `features.tsv`.
 

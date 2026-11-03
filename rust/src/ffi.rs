@@ -341,6 +341,7 @@ unsafe extern "C" {
     fn unlink(p: *const c_char) -> i32;
     fn _exit(c: i32) -> !;
     fn signal(sig: c_int, handler: usize) -> usize;
+    fn sigaction(sig: c_int, act: *const SigAction, old: *mut SigAction) -> c_int;
     fn fdatasync(fd: i32) -> i32;
     fn raise(sig: c_int) -> c_int;
     fn sigemptyset(set: *mut SigSet) -> c_int;
@@ -351,6 +352,19 @@ unsafe extern "C" {
 #[repr(C)] struct TimeSpec { s: i64, ns: i64 }
 /// glibc's sigset_t: 1024 bits
 #[repr(C)] pub struct SigSet([u64; 16]);
+/// glibc's struct sigaction on Linux x86-64 and aarch64 (the generic <bits/sigaction.h>): the handler (a union with
+/// sa_sigaction, one pointer), sa_mask, sa_flags, then sa_restorer after 4 bytes of padding; 152 bytes. glibc's
+/// sigaction wrapper takes this, not the kernel's struct, and fills in the restorer itself
+#[repr(C)] struct SigAction { handler: usize, mask: SigSet, flags: c_int, restorer: usize }
+#[cfg(all(target_os = "linux", not(any(target_arch = "x86_64", target_arch = "aarch64"))))]
+compile_error!("ffi::SigAction is laid out for glibc on x86-64 and aarch64: check it against <bits/sigaction.h>");
+const _: () = {
+    use std::mem::{offset_of, size_of};
+    assert!(size_of::<SigSet>() == 128 && size_of::<SigAction>() == 152);
+    assert!(offset_of!(SigAction, mask) == 8 && offset_of!(SigAction, flags) == 136 && offset_of!(SigAction, restorer) == 144);
+};
+/// what glibc's signal() sets: an interrupted read or write restarts
+const SA_RESTART: c_int = 0x1000_0000;
 const SIG_BLOCK: c_int = 0;
 const SIG_SETMASK: c_int = 2;
 
@@ -388,7 +402,9 @@ fn await_exit() -> ! {
 }
 /// The commit window opens: SIGINT, SIGTERM and SIGHUP blocked in this thread, then IDLE to COMMITTING, after which
 /// a handler on any other thread (a rayon worker has them unblocked) only records the signal. When a handler has
-/// already claimed EXITING, no rename starts: this waits for that handler to end the process. Returns the mask to put
+/// already claimed EXITING, no rename starts: this waits for that handler to end the process. That handler is on
+/// another thread: this one has the three blocked and is in no handler (one that claims EXITING never returns), and
+/// catch_signals' mask keeps any of them from nesting under it there, so it reaches _exit. Returns the mask to put
 /// back, as the C's stage_swap
 pub fn commit_begin() -> SigSet {
     use std::sync::atomic::Ordering::SeqCst;
@@ -464,10 +480,19 @@ extern "C" fn outsig(sig: c_int) {
     }
 }
 
-/// SIGINT, SIGTERM and SIGHUP remove -o's and --out-dir's temporaries, as the C.
+/// SIGINT, SIGTERM and SIGHUP remove -o's and --out-dir's temporaries, as the C. Installed by sigaction with all
+/// three in sa_mask, so while any one's handler runs on a thread, none of them can interrupt it there: one that
+/// claimed EXITING is never suspended under a nested handler, which would see EXITING and wait for it forever
+/// (await_exit). A second signal to that thread stays pending until _exit; one to another thread runs its handler
+/// there. SA_RESTART, as signal() gave. As the C's catchsig
 fn catch_signals() {
-    // SAFETY: outsig only unlinks and exits
-    unsafe { for s in [1, 2, 15] { signal(s, outsig as extern "C" fn(c_int) as usize); } }
+    // SAFETY: the action and its set are owned and laid out as glibc's (SigAction); outsig only unlinks and exits
+    unsafe {
+        let mut a = SigAction { handler: outsig as extern "C" fn(c_int) as usize, mask: SigSet([0; 16]), flags: SA_RESTART, restorer: 0 };
+        sigemptyset(&mut a.mask);
+        for s in [1, 2, 15] { sigaddset(&mut a.mask, s); }
+        for s in [1, 2, 15] { sigaction(s, &a, std::ptr::null_mut()); }
+    }
 }
 
 /// The staged BEDs a signal removes; empty once they are swapped in. The old list is retired, not freed (OUTSIG)

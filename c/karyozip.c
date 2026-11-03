@@ -5378,6 +5378,15 @@ static void dbtmpsig(int s) {   /* atexit does not run on a signal */
     sig_pause();
     dbtmpclean(); outclean(); _exit(1);
 }
+/* SIGINT, SIGTERM and SIGHUP to h, with all three in sa_mask, so while any one's handler runs on a thread, none of
+   them can interrupt it there: one that claimed EXITING is never suspended under a nested handler, which would see
+   EXITING and wait for it forever (await_exit). A second signal to that thread stays pending until _exit; one to
+   another thread runs its handler there. SA_RESTART, as glibc's signal() gave. As the Rust's catch_signals */
+static void catchsig(void (*h)(int)) {
+    struct sigaction a = { .sa_handler = h, .sa_flags = SA_RESTART };
+    sigemptyset(&a.sa_mask); sigaddset(&a.sa_mask, SIGINT); sigaddset(&a.sa_mask, SIGTERM); sigaddset(&a.sa_mask, SIGHUP);
+    sigaction(SIGINT, &a, NULL); sigaction(SIGTERM, &a, NULL); sigaction(SIGHUP, &a, NULL);
+}
 
 /* SET.bed.old.* in DIR for a set about to be written: what an uncatchable end inside an earlier commit left (stage_swap).
    Counted, said once, never touched; a name counts once however many sets it could belong to. As the Rust's
@@ -5410,7 +5419,7 @@ static int *stage_open(const char *dir) {
     }
     stale_warn(dir);
     DBTMP = xcalloc(NSETK, sizeof *DBTMP); ndbtmp = NSETK; atexit(dbtmpclean);
-    signal(SIGINT, dbtmpsig); signal(SIGTERM, dbtmpsig); signal(SIGHUP, dbtmpsig);
+    catchsig(dbtmpsig);
     int *fd = xmalloc(NSETK * sizeof *fd);
     mode_t um = umask(0); umask(um);
     for (size_t i = 0; i < NSETK; i++) {
@@ -5433,7 +5442,9 @@ static void swap_pause(void) {
 }
 /* The commit window opens: SIGINT, SIGTERM and SIGHUP blocked in this thread, then IDLE to COMMITTING, after which a
    handler on any other thread only records the signal. When a handler has already claimed EXITING, no rename starts:
-   this waits for that handler to end the process. As the Rust's commit_begin */
+   this waits for that handler to end the process. That handler is on another thread: this one has the three blocked
+   and is in no handler (one that claims EXITING never returns), and catchsig's mask keeps any of them from nesting
+   under it there, so it reaches _exit. As the Rust's commit_begin */
 static void win_open(sigset_t *was) {
     sigset_t hs; sigemptyset(&hs); sigaddset(&hs, SIGINT); sigaddset(&hs, SIGTERM); sigaddset(&hs, SIGHUP);
     pthread_sigmask(SIG_BLOCK, &hs, was);
@@ -5666,7 +5677,7 @@ static void redirect(const char *path, int fd) {
             fprintf(stderr, "karyozip: cannot create a temporary file beside %s\n", path); exit(1); }
         (void)!fchmod(f, ex ? st.st_mode & 07777 : 0644 & ~um);   /* as a plain create, or the old file's */
         OUTFIN = path; OUTDST = dst; atexit(outclean);
-        signal(SIGINT, outsig); signal(SIGTERM, outsig); signal(SIGHUP, outsig);
+        catchsig(outsig);
     } else f = open(dst, fd ? O_WRONLY : O_RDONLY);
     if (f < 0 || dup2(f, fd) < 0) { fprintf(stderr, "karyozip: cannot open %s\n", path); exit(1); }
     close(f);

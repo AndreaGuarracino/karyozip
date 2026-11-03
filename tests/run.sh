@@ -1093,6 +1093,13 @@ $KT compress -i "$D/s.bed" -o "$W/ff/o.kt" 2>/dev/null && rc2=0 || rc2=$?; wait 
 # sigwait DIR GLOB PID: up to 30 s (scaled) for GLOB to show in DIR while PID lives
 sigwait() { local n=0 lim; lim=$(awk -v t="$(tmo 30)" 'BEGIN { print int(t * 20) }')
   while [ $n -lt $lim ] && kill -0 "$3" 2>/dev/null; do compgen -G "$1/$2" >/dev/null && return 0; sleep 0.05; n=$((n+1)); done; return 1; }
+# tgk PID TID SIG: SIG to that one thread of PID (tgkill), never to another thread of it
+tgk() { python3 -c 'import ctypes, sys; sys.exit(ctypes.CDLL(None).tgkill(*map(int, sys.argv[1:])) != 0)' "$@"; }
+# dwait PID SECS: waits for the child PID, up to SECS (scaled); its exit status in rc, or 124 if it was still running
+# then, when it is killed and reaped. Polls /proc's state, since kill -0 also succeeds on an unreaped zombie
+dwait() { local n=0 lim; lim=$(awk -v t="$(tmo "$2")" 'BEGIN { print int(t * 20) }')
+  while [ $n -lt $lim ]; do case $(cut -d' ' -f3 "/proc/$1/stat" 2>/dev/null) in Z|'') break ;; esac; sleep 0.05; n=$((n+1)); done
+  if [ $n -ge $lim ]; then kill -KILL "$1" 2>/dev/null || :; wait "$1" 2>/dev/null || :; rc=124; else wait "$1" && rc=0 || rc=$?; fi; }
 mkdir -p "$W/sg"; $KT compress --names drop < "$W/ch.bed" > "$W/sg.kt" 2>/dev/null; mkfifo "$W/sg.names"
 $KT --names "$W/sg.names" decompress -i "$W/sg.kt" -o "$W/sg/out.bed" 2>/dev/null & pid=$!
 if sigwait "$W/sg" 'out.bed.tmp.*' $pid; then kill -TERM $pid 2>/dev/null || :; wait $pid && rc=0 || rc=$?
@@ -1185,7 +1192,7 @@ else kill -KILL $pid 2>/dev/null || :; wait $pid 2>/dev/null || :; no "a failed 
 # holds the main thread just before the window, then lets it go on into the commit. --smooth --out-dir over 100
 # contigs, so the C too keeps a team of workers. Signalled once both BEDs are staged and closed, before the window:
 # the handler exits and the commit must not start, all old (all new only if the window opened first). Signalled
-# inside the window: the handler defers, all new, exit 1
+# inside the window: the handler defers, all new, exit 1.
 mkdir -p "$W/rc"; printf 'featureID\tgene\trepeat\n1\tCDS\tLINE\n2\tCDS\tSINE\n3\tintergenic\tLINE\n4\tintergenic\tSINE\n' > "$W/rc/f.tsv"
 printf 'feature_set\tchild\tparent\ngene\tCDS\tcategorized\ngene\tintergenic\tcategorized\nrepeat\tLINE\tcategorized\nrepeat\tSINE\tcategorized\n' > "$W/rc/h.tsv"
 awk -v d="$W/rc" 'BEGIN { for (c = 0; c < 100; c++) for (j = 0; j < 4; j++) {
@@ -1228,6 +1235,28 @@ for at in before inside; do
       || no "SIGTERM on a worker, its handler held, $at -o's commit window: rc=$rc, $g, left: $(ls -A "$W/or" | tr '\n' ' ')"
   else kill -KILL $pid 2>/dev/null || :; wait $pid 2>/dev/null || :; no "SIGTERM on a worker $at -o's commit window: no window, or no worker thread"; fi
 done
+
+# a second handled signal while the first's handler, which has claimed the exit, is held (KZ_TEST_SIG_PAUSE_MS), to
+# that same thread (tgkill): the handlers block all three of SIGINT, SIGTERM and SIGHUP, so the second waits, pending,
+# and the first ends the process: exit 1, no temporaries. Were it to nest, it would see EXITING and wait for the
+# handler it interrupted, forever. Bounded: still running after 30 s (scaled), it is killed and the case fails.
+# On the main thread, blocked on a names FIFO nobody writes, at the suite's -t; then on a worker of the race above,
+# before the commit window, a stress case
+nhold=$(awk -v s="${TIMEOUT_SCALE:-1}" 'BEGIN { print int(1200 * s) }')
+rm -rf "$W/sg"; mkdir -p "$W/sg"
+KZ_TEST_SIG_PAUSE_MS=$nhold $KT --names "$W/sg.names" decompress -i "$W/sg.kt" -o "$W/sg/out.bed" 2>/dev/null & pid=$!
+if sigwait "$W/sg" 'out.bed.tmp.*' $pid && tgk $pid $pid 15; then sleep "$(tmo 0.2)"; tgk $pid $pid 2 || :; dwait $pid 30
+  [ $rc = 1 ] && [ -z "$(ls -A "$W/sg")" ] && ok "SIGINT on the main thread inside its held SIGTERM handler: exit 1, no temporary" \
+    || no "SIGINT on the main thread inside its held SIGTERM handler: rc=$rc (124: hung, killed), left: $(ls -A "$W/sg" | tr '\n' ' ')"
+else kill -KILL $pid 2>/dev/null || :; wait $pid 2>/dev/null || :; no "SIGINT on the main thread inside its held SIGTERM handler: no temporary appeared"; fi
+if stress "SIGINT on a worker inside its held SIGTERM handler, before the commit window"; then
+  swdir "$W/sw"; ( rcrace "$W/sw" ) & pid=$!; tid=
+  swwait "$W/sw" "$staged" $pid && tid=$(ls /proc/$pid/task 2>/dev/null | grep -vx "$pid" | head -n1) || :
+  if [ -n "$tid" ] && tgk $pid "$tid" 15; then sleep "$(tmo 0.2)"; tgk $pid "$tid" 2 || :; dwait $pid 30; g=$(rcgen "$W/sw")
+    [ $rc = 1 ] && [ $g != mixed ] && swclean "$W/sw" && ok "SIGINT on a worker inside its held SIGTERM handler, before the commit window: exit 1, all $g, no leftovers" \
+      || no "SIGINT on a worker inside its held SIGTERM handler, before the commit window: rc=$rc (124: hung, killed), $g, left: $(ls -A "$W/sw" | tr '\n' ' ')"
+  else kill -KILL $pid 2>/dev/null || :; wait $pid 2>/dev/null || :; no "SIGINT on a worker inside its held SIGTERM handler: no window, or no worker thread"; fi
+fi
 
 # stale backups of the sets about to be written, left by an uncatchable end mid-commit: one warning with their count,
 # before any work, and every one left as it was; another set's, or another name, not counted

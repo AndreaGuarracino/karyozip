@@ -3,13 +3,12 @@
 This document specifies the `.kst` track that karyozip 0.3.0 writes, plus its two companion files: the `.kzi` name index and the `KSTAL1` packed alignment.
 It was derived from the code, mainly `rust/src/writer.rs` (`Writer::close`), `rust/src/reader.rs` (`Reader::open_with`, `block_dec`, `rmheads`, `ilv_split`, `grp_unpack`, the name decoders, `build_index`, `idxlookup`), `rust/src/kst.rs`, `rust/src/aln.rs` and `c/karyozip.c`.
 Where the code and this document disagree, the code is what existing files contain. Please report the disagreement.
-Statements marked **(uncertain)** could not be settled from the code with certainty.
 
 Read the [Compatibility](#compatibility) section before you rely on the magic as a version number.
 
 ## Conventions
 
-- **u64** is an unsigned 64-bit integer, little-endian. The Rust writes every fixed-width integer with `to_le_bytes`. The C `fwrite`s some of them in host byte order (the header, the tokeniser chunk header, the index trailer and the `KSTAL1` reference hash). So the C writes conforming files only on little-endian hosts. Every supported platform is little-endian.
+- **u64** is an unsigned 64-bit integer, little-endian, and **u32** the same in 32 bits. Every fixed-width integer in the three files is little-endian on any host: the Rust writes them with `to_le_bytes`, and the C stores them byte by byte through `st64`, `st32` and `stwords` and loads them through `ld64`, `ld32` and `ldwords` (the header, the tokeniser chunk header, the `.kzi` super table and trailer, and the `KSTAL1` reference hash).
 - **varint** is unsigned LEB128. Each byte carries 7 bits, least significant group first, and the high bit (0x80) means another byte follows. Writers emit the shortest encoding. Readers accept up to 10 bytes, the tenth only as 0 or 1 with no continuation bit (it holds bit 63 alone), and refuse anything past 64 bits or a varint that runs off the end of its buffer with `corrupt varint`. A longer encoding than the shortest is read when it fits.
 - **zigzag** maps a signed value to an unsigned one: `zz(v) = (v << 1) ^ (v >> 63)` (arithmetic shift), and the inverse is `unzz(u) = (u >> 1) ^ -(u & 1)`.
 - **FNV-1a 64**: start at `h = 0xcbf29ce484222325`. For each byte `c`, do `h = (h ^ c) * 0x100000001b3 mod 2^64`. `fnv(h, bytes)` continues a hash, so `fnv(fnv(h0, a), b) == fnv(h0, a ‖ b)`.
@@ -79,8 +78,8 @@ The streams follow each other with no padding and no alignment. Writers write no
 | 50 | `FLDFLAG` | names stream is the field-delta encoding |
 | 49 | `GRPFLAG` | each sequence's lengths are grouped by label |
 
-`NAMEMASK` is every bit not in the table above, which is bits 0 to 48 plus the free bits 53 and 54.
-Both readers compute the names length as `h[1] & ~FLAGS`, where `FLAGS` is the 13 named bits. A set bit 53 or 54 therefore becomes part of the names length (see [Compatibility](#compatibility)).
+`NAMEMASK` is bits 0 to 48 (`NMLBITS = 49`): the names length.
+Both readers first refuse a header with any bit from 49 up that the table does not name (today bits 53 and 54) as `this track was written by a newer karyozip: unknown header flags`, before any other header check. The names length is then `h[1] & ~FLAGS`, where `FLAGS` is the 13 named bits, which equals `h[1] & NAMEMASK`.
 At most one of `TOKFLAG`, `INTFLAG` and `FLDFLAG` is set. If none is set and the names stream is non-empty, the names stream is zstd text.
 
 ### The metadata hash
@@ -96,11 +95,12 @@ Under `ALNFLAG`, `h[13] >> 8` is the low 56 bits of the **alignment hash**, the 
 - the reference's row hash (computed over the reference BED, or taken from a `.kst` reference's `h[13] >> 8`)
 - with `--aln-names`, the FNV-1a over each line followed by a 0 byte
 
-The segment hash is the wrapping sum over query names of `fnv(name ‖ 0x00 ‖ for each segment: q u64, t u32, n u32, tp u64, rev i32)`, with segments sorted by `(q, t, tp, rev, n)`. The Rust hashes these as little-endian integers. The C hashes the raw struct bytes **(uncertain: whether struct padding can differ between the two was not checked; the test suite shows the two agree on x86-64)**.
+The segment hash is the wrapping sum, over the query names that have segments, of `fnv(name ‖ 0x00 ‖ for each segment: q u64, t u32, n u32, tp u64, rev u32)`, with segments sorted by `(q, t, tp, rev, n)`. Each field is hashed as a little-endian integer of that width, `rev` as 0 or 1: the Rust with `to_le_bytes`, the C with `fnv64` and `fnv32`. No struct bytes or padding are hashed.
 
 ### The features hash (under DBFLAG)
 
 The features hash is FNV-1a 64 over the raw bytes of `features.tsv`. Under `CARTFLAG` the hash is continued over the raw bytes of `hierarchy.tsv`. A reader given `-d` refuses a track whose stored hash differs.
+`compress -d` takes each feature set as its BED or as a plain `.kst` of that set (no `ALNFLAG`, `DBFLAG` or `DROPPED`; known by its magic, and read only from a regular file). Its rows are taken as the BED's would be, so the output is the same bytes either way, and nothing in the file records which was given.
 
 ## The streams
 
@@ -242,7 +242,7 @@ Each block stores its lengths in one of three **spellings**, chosen per block as
 | 1 | plain lengths, no zero allowed |
 | 2 | sentinels only where the segment under the row is on the forward strand |
 
-Value 3 is never written, and readers do not refuse it **(uncertain whether that is intended)**.
+Readers tell only value 1 (no zero allowed) from the others: under 0, 2 and 3 a zero length is a sentinel. Value 2 differs from 0 only in where the writer put zeros. Value 3 is never written, and readers do not refuse it (open decision 3).
 Exact segment semantics, including how the PAF is parsed, are in `rust/src/aln.rs` (`load_paf`, `segat`, `end`, `row`). Reimplementers should treat that file as normative.
 
 ## Validation a reader must perform
@@ -250,6 +250,7 @@ Exact segment semantics, including how the PAF is parsed, are in `rust/src/aln.r
 Both readers refuse a file, with a message, on each of the following. A reimplementation should do the same.
 
 - The magic is not `KST00001`, or the file is shorter than 136 bytes.
+- A bit of `h[1]` from 49 up that no flag names (`this track was written by a newer karyozip: unknown header flags`).
 - Any stream length (`h[1] & ~FLAGS`, `h[2]`, `h[3]`, `h[6]`, `h[11]`) exceeds the file size, or `136 +` their sum does.
 - The metadata hash does not match.
 - A labels stream with `h[7] = 0`, a label count without a stream, more labels than lines, or more lines than `h[7]`.
@@ -275,7 +276,8 @@ Both readers refuse a file, with a message, on each of the following. A reimplem
 - Companions: reading an `ALNFLAG`, `DBFLAG` or `LENFLAG` track without its companion, or with a companion whose hash differs, unless `--raw`.
 - After decoding, the rows emitted differ from `h[4]`.
 
-Several 32-bit limits are part of the current readers: a sequence's run count and its offset within its first block, the block number of a fixed-size block, the run-count prefix sums under `RUNFLAG`, and at most `2^32` sequences for name lookup and the `.kzi`. The writer refuses a sequence whose first block, offset or run count does not fit 32 bits. It does not check the others **(uncertain whether every reader limit is matched by a writer check)**.
+Several 32-bit limits are part of the current readers: a sequence's run count and its offset within its first block, the block number of a fixed-size block, and the run-count prefix sums under `RUNFLAG` (an offset within a block). The readers refuse a value past 32 bits as `corrupt index: ...`. The writer refuses a sequence whose first block, offset within it or run count does not fit 32 bits (`sequence index does not fit 32 bits`), which covers each of these.
+Name lookup and the `.kzi` store an ordinal in 32 bits, so they need fewer than `2^32` sequences. `index` refuses more in both, and so does the Rust's name table (a lookup by name, as `query -r` does without a usable index); the C's name table does not check. The writer does not limit the sequence count.
 
 ## The .kzi name index
 
@@ -294,10 +296,11 @@ trailer     5 x u64: n, k, bind, pay, "KSTIDX01" (0x313058444954534b)
 - A name's bucket is the top `k` bits of `h64b` (bucket 0 when `k = 0`). Its 32-bit fingerprint is `(h64b ^ ordinal * 0x9e3779b97f4a7c15) & 0xffffffff`. Binding the fingerprint to the ordinal makes a damaged entry fail to match.
 - Each entry is `32 + w` bits, least significant bit first: the fingerprint, then the ordinal. Entries are sorted by `(bucket, fingerprint, ordinal)`.
 - `k` starts at the smallest value with `2^(k+2) >= n` (at most 30) and grows until no bucket holds more than 255 entries.
-- `bind = h[15] XOR namesrc`. `namesrc` is 0, unless the index was built under `--names FILE`. Then it is FNV-1a 64 over the file's path, continued over its `st_size`, `st_ino`, `st_dev`, `st_mtime`, `st_mtime_nsec`, `st_ctime` and `st_ctime_nsec`, each as u64.
+- `bind = h[15] XOR namesrc`. `namesrc` is 0, unless the index was built under `--names FILE` with `FILE` a regular file (a pipe binds nothing). Then it is FNV-1a 64 over the file's path, continued over its `st_size`, `st_ino`, `st_dev`, `st_mtime`, `st_mtime_nsec`, `st_ctime` and `st_ctime_nsec`, each as a u64.
+- `n` must be below `2^32`: `index` refuses a track of more sequences.
 
-A reader uses the index only when all of these hold: the magic matches, `n == h[0]`, `k < 40`, `pay` fits the file, `bind` matches the track and names source, and `pay` matches the formula. Otherwise it silently falls back to decoding the names.
-A lookup reads the name's bucket and keeps the entries whose fingerprint matches its ordinal.
+A reader uses the index only when all of these hold: the file is at least 40 bytes, the magic matches, `n == h[0]`, `k < 40`, `pay` fits the file, `bind` matches the track and names source, and `pay` matches the formula. Otherwise it silently falls back to decoding the names.
+A lookup reads the name's bucket and keeps the entries whose ordinal is below `n` and whose fingerprint matches that ordinal.
 **Lookup is probabilistic**: with exactly one match and the names not yet decoded, the ordinal is returned without comparing the name. So a name absent from the track can be answered as a present one, about 4 times in 2^32 lookups.
 With several matches, the names are decoded and compared.
 
@@ -315,9 +318,10 @@ Stream codec values:
 - `0`: the stream is empty.
 - `1`: zstd (level 19).
 - `2`: the tokeniser blob of the Names section.
-- `c + 3`: payload codec id `c` from the Codecs table. aln-pack tries only the rANS and arith candidates of `-e low`.
+- `c + 3`: payload codec id `c` from the Codecs table.
 
-The decoded stream must be `rawlen` bytes. The ten streams are:
+aln-pack codes the names stream with the tokeniser whenever it succeeds (each of the four chunk sizes is tried and the smallest blob kept). Any other non-empty stream gets zstd level 19, replaced by the smallest of rANS `0x100`, `1`, `65`, `521` and arith `0x10000`, `0x10001` when one is smaller.
+The decoded stream must be `rawlen` bytes. For codec 2 `rawlen` is written as the names' decoded length but not checked: the tokeniser blob carries its own chunk lengths, which are. The ten streams are:
 
 | # | stream | content |
 |---|---|---|
@@ -327,7 +331,7 @@ The decoded stream must be `rawlen` bytes. The ten streams are:
 | 3 | lengths | varint `n` per segment (1 to `2^32 - 1`) |
 | 4 | targets | per target run: varint `t*2 + rev` (contig index into the reference, strand), varint run length in segments |
 | 5 | qstarts | varint `q` of each target run's first segment |
-| 6 to 9 | tpos0..3 | byte planes, least significant first, of the 32-bit `tp` of each target run's first segment |
+| 6 to 9 | tpos0..3 | byte planes, least significant first, of the 32-bit `tp` of each target run's first segment. aln-pack refuses a target position past 32 bits |
 
 A **target run** is a maximal stretch of a query's segments, in sorted order, with the same `t` and strand.
 A segment that is not first in its run follows the segment before it (`pq`, `pt` that segment's end on the query and target, `ps` its `tp`). It is coded by a gap pair `(dq, dt)`:
@@ -346,24 +350,32 @@ A reader refuses the following:
 - a reference hash that differs from the given reference
 - a stream that overruns the file
 - a repeated query name
+- a name with no newline
+- a segment count of 0, or one past what the lengths stream can hold
+- a segment length of 0 or past `2^32 - 1`
 - a target index past the reference
-- an empty target run
+- an empty target run, more target runs than positions, or a target run that outlives its query
+- a bad gap code
 - planes of unequal length
-- any byte left over in any stream
+- any byte left over in any stream, or after the tenth
 
 ## Compatibility
 
 Plainly stated:
 
-- **The magic is not a version.** `KST00001` has not changed while the format gained `VARFLAG` (whole-sequence blocks, an 8th block table varint), `GRPFLAG`, `ILVFLAG`, `FLDFLAG`, `CARTFLAG`, the zpaq and LZMA codecs and bzip3 cut lists. A file from an older karyozip may therefore carry the same magic as one this version cannot write, and the reverse holds too. No release has been tagged, so no file is guaranteed to be readable by a later karyozip.
-- **Unknown flags are not detected.** Bits 53 and 54 are free. Both readers compute the names length as `h[1]` minus the known flags, so a file with bit 53 or 54 set (say, from a newer writer) is refused as `corrupt header: the stream sizes do not fit the file`, not as "written by a newer karyozip". A new codec id fails later, as a frame decode error.
+- **The magic is not a version.** `KST00001` has not changed while the format gained `VARFLAG` (whole-sequence blocks, an 8th block table varint), `GRPFLAG`, `ILVFLAG`, `FLDFLAG`, `CARTFLAG`, the zpaq and LZMA codecs and bzip3 cut lists. 0.3.0 is the first tagged release, and this document is its format. A file from an untagged commit before it may carry the same magic and still not read, or read as something else. Whether later releases keep reading 0.3.0 files is open decision 2.
+- **Unknown flags are refused by name.** Both readers refuse a header with a bit of `h[1]` from 49 up that no flag names (today bits 53 and 54) as `this track was written by a newer karyozip: unknown header flags`, before any other header check. A later writer can therefore spend bit 53 or 54 on a feature that 0.3.0 readers must not misread. A new codec id is not detected that way: it fails later, as a frame decode error.
 - **`h[14]` is unused** and is the only spare header word. It is covered by the metadata hash but not checked.
 - C and Rust agreement is tested byte for byte. That cannot catch a mistake both share, and there are no golden files from earlier versions in `tests/`.
 
+Decided in 0.3.0:
+
+- **Byte order.** The C writes and reads every fixed-width integer little-endian explicitly (`st64`, `st32`, `stwords`, and `ld64`, `ld32`, `ldwords`), as the Rust does, so the bytes do not depend on the host. The segment hash is defined field by field, not over struct bytes.
+- **The names length is narrowed** to bits 0 to 48: a set bit from 49 up that no flag names is refused, not folded into the names length.
+- **Ten-byte varints**: a tenth byte other than 0 or 1 (a value past 64 bits) is refused as `corrupt varint`, not truncated.
+
 Open decisions for the maintainer:
 
-1. **Bump the magic or add a version field.** One option is to bump the magic (`KST00002`) whenever the layout changes, and keep readers for older magics or refuse them by name. The other is to reserve a field now, for example `h[14]` as a format minor version or a "required features" bit mask, or bits 53 and 54. Readers would then refuse unknown bits and versions explicitly.
-2. **Freeze at the first tag.** Decide whether the format is frozen as of 0.3.0, the first tagged release, or at 1.0. If so, add golden `.kst`, `.kzi` and `KSTAL1` files from that tag to `tests/` and decode them in CI.
-3. **Narrow the names length.** Decide whether readers should refuse any set bit outside the known flags and bits 0 to 48, instead of folding it into the names length.
-4. **Byte order.** Decide whether to make the C write little-endian explicitly, so that the format does not depend on the host.
-5. **Undefined values.** Decide what a reader does with spelling value 3, with `ILVFLAG` without `RUNFLAG` (the writer never produces it, and readers do not refuse it), and with trailing bytes after the last block.
+1. **Bump the magic or add a version field.** One option is to bump the magic (`KST00002`) whenever the layout changes, and keep readers for older magics or refuse them by name. The other is to reserve a field now, for example `h[14]` as a format minor version or a "required features" bit mask, or to spend bits 53 and 54, which 0.3.0 readers already refuse by name.
+2. **Freeze at the first tag.** Decide whether the format is frozen as of 0.3.0, the first tagged release, or at 1.0. Either way, add golden `.kst`, `.kzi` and `KSTAL1` files from the 0.3.0 tag to `tests/` and decode them in CI.
+3. **Undefined values.** Decide what a reader does with spelling value 3, with `ILVFLAG` without `RUNFLAG` (the writer never produces it, and readers do not refuse it), and with trailing bytes after the last block.

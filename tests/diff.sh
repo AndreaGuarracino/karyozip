@@ -4,7 +4,7 @@
 # Every compared form counts once; failures are prefixed "FAIL: "; the last lines are
 # "diff.sh: N passed, M failed" and DIFF_PASS or DIFF_FAIL.
 # CASE=REGEX runs only the sections whose name matches: versions compress decompress cross region index
-#   reader-flags smooth db aln refusals awkward gzip cli tail zpaq damaged forged edge bodytmp forged2
+#   reader-flags smooth db aln refusals awkward gzip cli tail zpaq damaged forged edge bodytmp forged2 varint
 set -u
 . "$(dirname "$0")/lib.sh"
 need python3 zstd gzip awk realpath mktemp cmp diff dd stat cut sort uniq sed tr head tail
@@ -501,6 +501,23 @@ PY
 in65=""; for k in $(seq 0 64); do in65="$in65 -i $W/f65.$k.bed"; done
 both "--db with 65 -i" --db "$W/f65.tsv" compress $in65
 tally "forged headers, packed alignments, 65 inputs"
+fi
+
+# 19. a ten-byte varint past 64 bits in the index table, re-signed: once read as its low 64 bits, now refused alike
+if sec varint; then
+"$C" --block 4 compress < "$D/s.bed" > "$W/v10.kst" 2>/dev/null
+for t in 0x00 0x01 0x02 0x40 0x7f 0x80 0x81 0xff; do python3 "$D/kt.py" varint10 "$W/v10.kst" "$W/v10.$t.kst" $t "$W"; done
+EXPECT=fail
+for t in 0x02 0x40 0x7f 0x80 0x81 0xff; do
+  both "a ten-byte varint ending $t, decompress" decompress -i "$W/v10.$t.kst"
+  if grep -qx 'karyozip: corrupt varint' "$W/c.err"; then tpass; else tfail "a ten-byte varint ending $t: C says $(head -c 200 "$W/c.err")"; fi
+  both "a ten-byte varint ending $t, query" query -i "$W/v10.$t.kst" -r q1
+done
+both "a ten-byte varint of 2^63 where 0 belongs" decompress -i "$W/v10.0x01.kst"   # it fits, and a later check refuses it
+EXPECT=ok
+both "a ten-byte varint of 0, not the shortest but it fits" decompress -i "$W/v10.0x00.kst"
+if cmp -s "$W/c.out" "$D/s.bed"; then tpass; else tfail "a ten-byte varint of 0: rows WRONG"; fi
+tally "ten-byte varints"
 fi
 
 summary diff.sh

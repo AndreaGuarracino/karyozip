@@ -86,8 +86,17 @@ def bgzfx(dst):   # forged BGZF: ISIZE bounds, subfields before BC, cuts inside 
     tail = b"\x1f\x8b\x08\x04" + bytes(6) + struct.pack("<H", 12) + b"XY\x02\x00ab" + b"BC\x02\x00"   # BC payload past the end
     w("bcend1.gz", tail); w("bcend2.gz", blk(s) + tail)
 
+def varint10(src, dst, top, W):   # chunk 0's row start in the index table (always 0): nine 0x80, then byte top
+    d, h = load(src); off = 136 + h[6] + (h[1] & ~FLAGS) + h[2] + h[3]
+    tab = unzst(d[off:off + h[11]]); cl, p = vget(tab, 0); sp, q = vget(tab, p)
+    assert sp == 0, "chunk 0 starts at row 0"
+    z = zst(W, tab[:p] + b"\x80" * 9 + bytes([top]) + tab[q:])
+    d[off:off + h[11]] = z; h[11] = len(z); sign(d, h); open(dst, "wb").write(d)
+
 if __name__ == "__main__":   # kt.py IN OUT IDX VALUE ...   (IDX "lo9" keeps the high 32 bits)
     if sys.argv[1] == "gen": gen(sys.argv[2], int(sys.argv[3])); sys.exit(0)
+    if sys.argv[1] == "varint10":   # kt.py varint10 IN OUT TOPBYTE WORKDIR
+        varint10(sys.argv[2], sys.argv[3], int(sys.argv[4], 0), sys.argv[5]); sys.exit(0)
     if sys.argv[1] == "bgzf": bgzf(sys.argv[2], sys.argv[3]); sys.exit(0)
     if sys.argv[1] == "bgzfx": bgzfx(sys.argv[2]); sys.exit(0)
     d, h = load(sys.argv[1])

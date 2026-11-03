@@ -439,6 +439,15 @@ $KT compress --aln "$W/huge.paf" --ref "$W/huge.ref" < "$W/huge.q" > "$W/huge.kt
 # codec id with bit 31 set: refused
 python3 "$D/kt.py" "$W/p.kt" "$W/neg.kt" lo9 0x80010010
 must_fail "a codec id with bit 31 set" $KT decompress -i "$W/neg.kt"
+# a ten-byte varint past 64 bits in the index table, re-signed: once read as 0, now refused; one that fits still reads
+$KT --block 4 compress < "$D/s.bed" > "$W/v10.kt" 2>/dev/null
+for t in 0x02 0x40 0x7f 0x81; do
+  python3 "$D/kt.py" varint10 "$W/v10.kt" "$W/v10.$t.kt" $t "$W"
+  must_fail "a ten-byte varint ending $t in the index table" $SAN decompress -i "$W/v10.$t.kt"
+  grep -qx 'karyozip: corrupt varint' "$W/mf.err" && ok "a ten-byte varint ending $t: says corrupt varint" || no "a ten-byte varint ending $t: WRONG words: $(head -c 200 "$W/mf.err")"
+done
+python3 "$D/kt.py" varint10 "$W/v10.kt" "$W/v10.0.kt" 0x00 "$W"
+$SAN decompress -i "$W/v10.0.kt" 2>/dev/null | cmp -s - "$D/s.bed" && ok "a ten-byte varint of 0 in the index table: still read" || no "a ten-byte varint of 0 in the index table: WRONG"
 
 # a packed alignment needs the same reference
 { cat "$D/ref.bed"; printf 'chr2\t0\t50\tB\n'; } > "$W/ref2.bed"; { printf 'chr2\t0\t50\tB\n'; cat "$D/ref.bed"; } > "$W/ref.rev"

@@ -277,7 +277,7 @@ Both readers refuse a file, with a message, on each of the following. A reimplem
 - After decoding, the rows emitted differ from `h[4]`.
 
 Several 32-bit limits are part of the current readers: a sequence's run count and its offset within its first block, the block number of a fixed-size block, and the run-count prefix sums under `RUNFLAG` (an offset within a block). The readers refuse a value past 32 bits as `corrupt index: ...`. The writer refuses a sequence whose first block, offset within it or run count does not fit 32 bits (`sequence index does not fit 32 bits`), which covers each of these.
-Name lookup and the `.kzi` store an ordinal in 32 bits, so they need fewer than `2^32` sequences. `index` refuses more in both, and so does the Rust's name table (a lookup by name, as `query -r` does without a usable index); the C's name table does not check. The writer does not limit the sequence count.
+Name lookup and the `.kzi` store an ordinal in 32 bits, so they need fewer than `2^32` sequences. `index` refuses more in both, and so does each one's name table (a lookup by name, as `query -r` does without a usable index). The writer does not limit the sequence count.
 
 ## The .kzi name index
 

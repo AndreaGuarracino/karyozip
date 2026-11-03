@@ -2,21 +2,23 @@
 # Sanitizer and leak checks, then generative tests
 #   fuzz.sh BINARY [SANITIZER_BINARY] [N]
 # N: cases per generator (default 60)
-# Failures are prefixed "FAIL: "; the last line is "fuzz.sh: N passed, M failed".
+# Failures are prefixed "FAIL: "; the last line is "fuzz.sh: N passed, M failed, K skipped".
 # FUZZ_SEED=N repeats a run's mutation offsets and bytes (the seed is printed first); the generated
 #   corpora keep their fixed seeds. CASE=REGEX runs only the stages whose name matches: leaks malformed
 #   valid damaged packed forged-header forged-sizes forged-index. REQUIRE_VALGRIND=1 fails, rather than
-#   skips, the leak stage when it needs valgrind and there is none. TEST_JOBS, TIMEOUT_SCALE: see lib.sh.
+#   skips, the leak stage when it needs valgrind and there is none. TEST_JOBS, KZ_TEST_THREADS, TIMEOUT_SCALE:
+#   see lib.sh. Every run gets -t KZ_TEST_THREADS, and each of the J files xargs runs at once -t KZ_TEST_THREADS / J.
 set -u
 . "$(dirname "$0")/lib.sh"
 need python3 zstd awk realpath timeout xargs dd stat cmp cut head mktemp seq
 need_gnu
-KT=$(realpath -m "$1"); SAN=$(realpath -m "${2:-$1}"); N=${3:-60}; J=$TEST_JOBS   # forged files run J at a time
+KZ=$(realpath -m "$1"); KZSAN=$(realpath -m "${2:-$1}"); N=${3:-60}; J=$TEST_JOBS   # forged files run J at a time
+KT="$KZ -t $KZ_TEST_THREADS"; SAN="$KZSAN -t $KZ_TEST_THREADS"; export SANX="$KZSAN -t $(share "$J")"   # SANX: xargs workers
 SCASE=${CASE:-}; CASE=   # stages, not lines, are filtered here
 stage() { [ -z "$SCASE" ] || [[ $1 =~ $SCASE ]]; }
-tscale "$SAN"; T30=$(tmo 30); T60=$(tmo 60); export T30 T60
+tscale "$KZSAN"; T30=$(tmo 30); T60=$(tmo 60); export T30 T60
 FUZZ_SEED=${FUZZ_SEED:-$(python3 -c 'import random; print(random.SystemRandom().randrange(1 << 32))')}
-echo "fuzz: FUZZ_SEED=$FUZZ_SEED, timeouts x$TIMEOUT_SCALE, $J jobs${SCASE:+, stages matching $SCASE}"
+echo "fuzz: FUZZ_SEED=$FUZZ_SEED, timeouts x$TIMEOUT_SCALE, $J jobs, $KZ_TEST_THREADS threads${SCASE:+, stages matching $SCASE}"
 # muts TAG SIZE COUNT: COUNT "offset byte" lines below SIZE, from FUZZ_SEED and TAG
 muts() {
   python3 -c 'import random, sys; r = random.Random("%s/%s" % (sys.argv[1], sys.argv[2])); n = int(sys.argv[3])
@@ -24,24 +26,24 @@ for _ in range(int(sys.argv[4])): print(r.randrange(n), r.randrange(256))' "$FUZ
 }
 # flip FILE OFFSET BYTE
 flip() { printf "\\x$(printf %02x "$3")" | dd of="$1" bs=1 seek="$2" conv=notrunc status=none 2>/dev/null; }
-"$KT" --help >/dev/null 2>&1 || { echo "FAIL: fuzz: $KT does not run"; exit 1; }   # a binary that cannot run refuses everything
-[ -x "$SAN" ] || { echo "FAIL: fuzz: FAILED, $SAN does not run"; exit 1; }
+$KT --help >/dev/null 2>&1 || { echo "FAIL: fuzz: $KZ does not run"; exit 1; }   # a binary that cannot run refuses everything
+[ -x "$KZSAN" ] || { echo "FAIL: fuzz: FAILED, $KZSAN does not run"; exit 1; }
 D=$(cd "$(dirname "$0")" && pwd)
 W=$(mktemp -d); trap 'rm -rf "$W"' EXIT
 src=$D; D=$W/fx; mkdir -p "$D"; cp "$src"/fixtures.txt "$src"/*.py "$src"/*.sh "$D"/   # the fixtures, unpacked
 awk '/^@@ /{f=d"/"$2; next} {print > f}' d="$D" "$D/fixtures.txt"
 
 # 0. leaks: under the sanitizer binary, or valgrind when none was given
-LK=$SAN; LEAKS=1
+LK=$SAN; LEAKS=1   # word-split, as $KT: the binary and its -t
 if ! stage leaks; then LEAKS=0
-elif [ "$SAN" = "$KT" ] && ! command -v valgrind >/dev/null; then
+elif [ "$KZSAN" = "$KZ" ] && ! command -v valgrind >/dev/null; then
   LEAKS=0
-  if [ "${REQUIRE_VALGRIND:-0}" = 1 ]; then tfail "leaks: FAILED, no valgrind for $KT"
+  if [ "${REQUIRE_VALGRIND:-0}" = 1 ]; then tfail "leaks: FAILED, no valgrind for $KZ"
   else echo "leaks: skipped: valgrind not installed (no sanitizer binary given; see C-and-Rust.md)"; fi
-elif [ "$SAN" = "$KT" ]; then
+elif [ "$KZSAN" = "$KZ" ]; then
   # suppress glibc TLS of live threads
   printf '{\n  tls\n  Memcheck:Leak\n  match-leak-kinds: definite\n  fun:calloc\n  fun:allocate_dtv\n}\n' > "$W/supp"
-  printf '#!/bin/bash\nulimit -n 4096 2>/dev/null\nexec valgrind -q --leak-check=full --errors-for-leak-kinds=definite --error-exitcode=99 --suppressions="%s" "%s" "$@"\n' "$W/supp" "$KT" > "$W/lk"; chmod +x "$W/lk"; LK=$W/lk
+  printf '#!/bin/bash\nulimit -n 4096 2>/dev/null\nexec valgrind -q --leak-check=full --errors-for-leak-kinds=definite --error-exitcode=99 --suppressions="%s" "%s" "$@"\n' "$W/supp" "$KZ" > "$W/lk"; chmod +x "$W/lk"; LK="$W/lk -t $KZ_TEST_THREADS"
 fi
 lk() {   # fails on refusal unless "(refused)" in DESC
   local what=$1; shift
@@ -56,32 +58,32 @@ lk() {   # fails on refusal unless "(refused)" in DESC
 if [ $LEAKS = 1 ]; then
 s0=$NFAIL; L=$W/lk.d; mkdir -p "$L/out"
 printf 'feature_set\tchild\tparent\nfs\tA\tcategorized\nfs\tB\tcategorized\nfs\tC\tcategorized\nfs\tD\tcategorized\nfs\tX\tcategorized\nfs\tZ\tcategorized\n' > "$L/h.tsv"
-"$LK" compress < "$D/ls.bed" > "$L/p.kt" 2>/dev/null
-"$LK" compress --names drop < "$D/ls.bed" > "$L/s.kt" 2>/dev/null; cut -f1 "$D/ls.bed" | uniq > "$L/s.names"
-"$LK" compress --aln "$D/lp.paf" --ref "$D/lref.bed" < "$D/ls.bed" > "$L/a.kt" 2>/dev/null
+$LK compress < "$D/ls.bed" > "$L/p.kt" 2>/dev/null
+$LK compress --names drop < "$D/ls.bed" > "$L/s.kt" 2>/dev/null; cut -f1 "$D/ls.bed" | uniq > "$L/s.names"
+$LK compress --aln "$D/lp.paf" --ref "$D/lref.bed" < "$D/ls.bed" > "$L/a.kt" 2>/dev/null
 DB="-i $D/db.acrocentric.bed -i $D/db.chromosome.bed -i $D/db.gene.bed -i $D/db.region.bed -i $D/db.repeat.bed -i $D/db.subtelomeric.bed"
-"$LK" compress --db "$D/db.features.tsv" $DB > "$L/f.kt" 2>/dev/null
-lk "compress"                       "$LK" compress < "$D/ls.bed"
-lk "compress --effort low"          "$LK" --effort low compress < "$D/ls.bed"
-lk "compress --block 262144"        "$LK" --block 262144 compress < "$D/ls.bed"
-lk "compress --names drop"          "$LK" compress --names drop < "$D/ls.bed"
-lk "compress --aln --ref"           "$LK" compress --aln "$D/lp.paf" --ref "$D/lref.bed" < "$D/ls.bed"
-lk "compress --db"                  "$LK" compress --db "$D/db.features.tsv" $DB
-lk "decompress"                       "$LK" decompress -i "$L/p.kt"
-lk "decompress --raw"                 "$LK" decompress --raw -i "$L/p.kt"
-lk "decompress --names F"             "$LK" --names "$L/s.names" decompress -i "$L/s.kt"
-lk "decompress --aln --ref"           "$LK" decompress --aln "$D/lp.paf" --ref "$D/lref.bed" -i "$L/a.kt"
-lk "decompress --db --out"            "$LK" decompress --db "$D/db.features.tsv" --out-dir "$L/out" -i "$L/f.kt"
-lk "region, a name that is there" "$LK" query -i "$L/p.kt" -r r1
-lk "region, a name that is not (refused)" "$LK" query -i "$L/p.kt" -r nosuchname
-lk "region SEQ POS"               "$LK" query -i "$L/p.kt" -r r1:150-151
-lk "index"                        "$LK" index -i "$L/p.kt"
-lk "region, after index"          "$LK" query -i "$L/p.kt" -r r1:150-151
-lk "decompress"                       "$LK" decompress -i "$L/p.kt" --hier "$L/h.tsv" --smooth --set fs
-lk "query, one sequence"         "$LK" query -i "$L/p.kt" --hier "$L/h.tsv" --smooth --set fs -r r1
-lk "aln-pack"                     "$LK" aln-pack -a "$D/lp.paf" --ref "$D/lref.bed" -o "$L/pk"
-lk "--help"                       "$LK" --help
-lk "--version"                    "$LK" --version
+$LK compress --db "$D/db.features.tsv" $DB > "$L/f.kt" 2>/dev/null
+lk "compress"                       $LK compress < "$D/ls.bed"
+lk "compress --effort low"          $LK --effort low compress < "$D/ls.bed"
+lk "compress --block 262144"        $LK --block 262144 compress < "$D/ls.bed"
+lk "compress --names drop"          $LK compress --names drop < "$D/ls.bed"
+lk "compress --aln --ref"           $LK compress --aln "$D/lp.paf" --ref "$D/lref.bed" < "$D/ls.bed"
+lk "compress --db"                  $LK compress --db "$D/db.features.tsv" $DB
+lk "decompress"                       $LK decompress -i "$L/p.kt"
+lk "decompress --raw"                 $LK decompress --raw -i "$L/p.kt"
+lk "decompress --names F"             $LK --names "$L/s.names" decompress -i "$L/s.kt"
+lk "decompress --aln --ref"           $LK decompress --aln "$D/lp.paf" --ref "$D/lref.bed" -i "$L/a.kt"
+lk "decompress --db --out"            $LK decompress --db "$D/db.features.tsv" --out-dir "$L/out" -i "$L/f.kt"
+lk "region, a name that is there" $LK query -i "$L/p.kt" -r r1
+lk "region, a name that is not (refused)" $LK query -i "$L/p.kt" -r nosuchname
+lk "region SEQ POS"               $LK query -i "$L/p.kt" -r r1:150-151
+lk "index"                        $LK index -i "$L/p.kt"
+lk "region, after index"          $LK query -i "$L/p.kt" -r r1:150-151
+lk "decompress"                       $LK decompress -i "$L/p.kt" --hier "$L/h.tsv" --smooth --set fs
+lk "query, one sequence"         $LK query -i "$L/p.kt" --hier "$L/h.tsv" --smooth --set fs -r r1
+lk "aln-pack"                     $LK aln-pack -a "$D/lp.paf" --ref "$D/lref.bed" -o "$L/pk"
+lk "--help"                       $LK --help
+lk "--version"                    $LK --version
 [ $NFAIL = $s0 ] && echo "leaks: clean" || echo "leaks: FOUND SOMETHING"
 rm -rf "$L"
 fi
@@ -241,13 +243,13 @@ one_forged() {   # three commands on one file
   local m=$1 e="$1.err"
   for c in "decompress --raw" "query --raw -r read1" "decompress --smooth --set fs"; do
     case $c in *smooth*) args="-i $m --hier $W/hier.tsv";; *) args="-i $m";; esac
-    ASAN_OPTIONS=detect_leaks=0 timeout "$T30" $SAN $c $args > /dev/null 2>"$e"; rc=$?
+    ASAN_OPTIONS=detect_leaks=0 timeout "$T30" $SANX $c $args > /dev/null 2>"$e"; rc=$?
     [ $rc -gt 1 ] && { echo "FAIL: fuzz: forged $(basename $m) $c crashed rc=$rc"; return 1; }
     grep -qE "AddressSanitizer|runtime error" "$e" && { echo "FAIL: fuzz: forged $(basename $m) $c sanitizer report"; return 1; }
   done
   return 0
 }
-export -f one_forged; export W KT SAN T30 T60
+export -f one_forged; export W KT SAN SANX T30 T60
 nf=$(ls "$W"/forged*.kt | wc -l); f=$((nf * 3))
 ls "$W"/forged*.kt | xargs -P "$J" -I{} bash -c 'one_forged "$@"' _ {} > "$W/forged.out" 2>&1
 tally "$nf" "$W/forged.out"
@@ -289,7 +291,7 @@ for bi in sorted(set([0, len(rows) // 2, len(rows) - 1])):
 PY
 one_fsz() {
   local m=$1 e="$1.err" out rc
-  out=$(ASAN_OPTIONS=detect_leaks=0 timeout "$T30" $SAN decompress --raw -i "$m" 2>"$e"); rc=$?
+  out=$(ASAN_OPTIONS=detect_leaks=0 timeout "$T30" $SANX decompress --raw -i "$m" 2>"$e"); rc=$?
   [ $rc -gt 1 ] && { echo "FAIL: fuzz: forged sizes $(basename $m) crashed rc=$rc"; return 1; }
   grep -qE "AddressSanitizer|runtime error" "$e" && { echo "FAIL: fuzz: forged sizes $(basename $m) sanitizer report"; return 1; }
   [ $rc -eq 0 ] && { printf '%s\n' "$out" | cut -f2,3,4 | cmp -s - "$W/want4" || { echo "FAIL: fuzz: forged sizes $(basename $m) decoded WRONG rows with exit 0"; return 1; }; }
@@ -351,11 +353,11 @@ printf 'feature_set\tchild\tparent\nfs\tA\tcategorized\nfs\tB\tcategorized\n' > 
 $KT decompress -i "$W/t5.kt" --hier "$W/hier.tsv" --smooth --set fs 2>/dev/null > "$W/want5s"
 one_fidx() {
   local m=$1 e="$1.err" out rc
-  out=$(ASAN_OPTIONS=detect_leaks=0 timeout "$T30" $SAN query -i "$m" -r s69999 2>"$e"); rc=$?
+  out=$(ASAN_OPTIONS=detect_leaks=0 timeout "$T30" $SANX query -i "$m" -r s69999 2>"$e"); rc=$?
   [ $rc -gt 1 ] && { echo "FAIL: fuzz: forged index $(basename $m) crashed rc=$rc"; return 1; }
   grep -qE "AddressSanitizer|runtime error" "$e" && { echo "FAIL: fuzz: forged index $(basename $m) sanitizer report"; return 1; }
   [ $rc -eq 0 ] && { printf '%s\n' "$out" | cmp -s - "$W/want5" || { echo "FAIL: fuzz: forged index $(basename $m) WRONG rows with exit 0"; return 1; }; }
-  out=$(ASAN_OPTIONS=detect_leaks=0 timeout "$T60" $SAN decompress -i "$m" --hier "$W/hier.tsv" --smooth --set fs 2>"$e"); rc=$?
+  out=$(ASAN_OPTIONS=detect_leaks=0 timeout "$T60" $SANX decompress -i "$m" --hier "$W/hier.tsv" --smooth --set fs 2>"$e"); rc=$?
   [ $rc -gt 1 ] && { echo "FAIL: fuzz: forged index $(basename $m) decompress crashed rc=$rc"; return 1; }
   [ $rc -eq 0 ] && { printf '%s\n' "$out" | cmp -s - "$W/want5s" || { echo "FAIL: fuzz: forged index $(basename $m) decompress WRONG rows with exit 0"; return 1; }; }
   return 0

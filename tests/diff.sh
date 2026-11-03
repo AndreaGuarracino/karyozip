@@ -2,7 +2,9 @@
 # C and Rust: same bytes, same words
 #   diff.sh [C_BINARY] [RUST_BINARY]
 # Every compared form counts once; failures are prefixed "FAIL: "; the last lines are
-# "diff.sh: N passed, M failed" and DIFF_PASS or DIFF_FAIL.
+# "diff.sh: N passed, M failed, K skipped" and DIFF_PASS or DIFF_FAIL.
+# KZ_TEST_THREADS, TEST_LIGHT: see lib.sh. "$C" and "$R" are wrappers that add
+#   -t $KZ_TEST_THREADS; $CB and $RB are the bare binaries, for the cli section's exact argument lists.
 # CASE=REGEX runs only the sections whose name matches: versions compress decompress cross region index
 #   reader-flags smooth db aln refusals awkward gzip cli tail zpaq damaged forged edge bodytmp forged2 varint finalize
 set -u
@@ -16,6 +18,9 @@ D=$(cd "$(dirname "$0")" && pwd)
 [ -x "$C" ] && [ -x "$R" ] || { echo "build both first: make all rust"; exit 1; }
 C=$(realpath "$C"); R=$(realpath "$R")
 W=$(mktemp -d); trap 'rm -rf "$W"' EXIT
+CB=$C; RB=$R; mkdir -p "$W/bin"
+for x in C R; do printf '#!/bin/sh\nexec "%s" -t %s "$@"\n' "${!x}" "$KZ_TEST_THREADS" > "$W/bin/$x"; chmod +x "$W/bin/$x"; done
+C=$W/bin/C; R=$W/bin/R   # a later -t wins, in the C and the Rust
 src=$D; D=$W/fx; mkdir -p "$D"; cp "$src"/fixtures.txt "$src"/*.py "$src"/*.sh "$D"/   # the fixtures, unpacked
 awk '/^@@ /{f=d"/"$2; next} {print > f}' d="$D" "$D/fixtures.txt"
 
@@ -309,8 +314,8 @@ fi
 if sec cli; then
 cok=0; cbad=0
 cli() {
-  (cd "$W" && "$C" "$@" </dev/null > cliout.c 2>&1); local cr=$?   # in $W, since forms may write files
-  (cd "$W" && "$R" "$@" </dev/null > cliout.r 2>&1); local rr=$?
+  (cd "$W" && "$CB" "$@" </dev/null > cliout.c 2>&1); local cr=$?   # in $W, since forms may write files
+  (cd "$W" && "$RB" "$@" </dev/null > cliout.r 2>&1); local rr=$?
   if cmp -s "$W/cliout.c" "$W/cliout.r" && [ "$cr" = "$rr" ]; then cok=$((cok+1)); tpass; return; fi
   cbad=$((cbad+1)); tfail "cli differs: [$*] rc $cr/$rr"; echo "    c=[$(head -c 200 "$W/cliout.c" | tr -d '\0' | head -1)]"
   echo "    rust=[$(head -c 200 "$W/cliout.r" | tr -d '\0' | head -1)]"
@@ -367,11 +372,11 @@ fi
 # 13b. -e high's zpaq frames, both ways
 if sec zpaq; then
 awk 'BEGIN { srand(5); for (c = 0; c < 6; c++) { g = c % 4; nr = 20000 + int(rand() * 20000); p = 0; for (r = 0; r < nr; r++) { l = 1 + int(rand() * (g ? 9 * g : 37)); u = rand(); printf "ctg%d\t%d\t%d\t%s\n", c, p, p + l, u < 0.5 + g / 10 ? "chr" (1 + g) : "novel" int(rand() * 3); p += l } } }' > "$W/zt.bed"
-"$C" -t 4 -e high compress -i "$W/zt.bed" > "$W/c.kst" 2>/dev/null; "$R" -t 4 -e high compress -i "$W/zt.bed" > "$W/r.kst" 2>/dev/null
+"$C" -e high compress -i "$W/zt.bed" > "$W/c.kst" 2>/dev/null; "$R" -e high compress -i "$W/zt.bed" > "$W/r.kst" 2>/dev/null
 if cmp -s "$W/c.kst" "$W/r.kst" && "$R" decompress -i "$W/c.kst" 2>/dev/null | cmp -s - "$W/zt.bed" && "$C" decompress -i "$W/r.kst" 2>/dev/null | cmp -s - "$W/zt.bed"
 then tpass "zpaq frames: identical, each reads the other"; else tfail "zpaq frames: DIFFER"; fi
 awk 'BEGIN { srand(7); for (r = 0; r < 60000; r++) { k = rand() < 0.4 ? 1 : 2 + int(rand() * rand() * 12); p = 0; g = int(rand() * 4); for (j = 0; j < k; j++) { l = j == k - 1 ? 120 - p : 1 + int(rand() * (120 - p - (k - j - 1)) / (k - j)); printf "r%d\t%d\t%d\t%s\n", r, p, p + l, "chr" (1 + (g + j) % 5); p += l } } }' > "$W/zi.bed"
-"$C" -t 4 -e high compress -i "$W/zi.bed" > "$W/c.kst" 2>/dev/null; "$R" -t 4 -e high compress -i "$W/zi.bed" > "$W/r.kst" 2>/dev/null
+"$C" -e high compress -i "$W/zi.bed" > "$W/c.kst" 2>/dev/null; "$R" -e high compress -i "$W/zi.bed" > "$W/r.kst" 2>/dev/null
 if cmp -s "$W/c.kst" "$W/r.kst" && "$R" decompress -i "$W/c.kst" 2>/dev/null | cmp -s - "$W/zi.bed" && "$C" decompress -i "$W/r.kst" 2>/dev/null | cmp -s - "$W/zi.bed"
 then tpass "interleaved zpaq model: identical, each reads the other"; else tfail "interleaved zpaq model: DIFFER"; fi
 fi
@@ -449,7 +454,7 @@ fi
 
 
 # 17. a body temp file that fills: the staging fits, the one-row blocks' frames do not; the Rust used to hang here
-if sec bodytmp; then
+if sec bodytmp && stress "full body temp file at 2 threads: both refuse alike"; then
 awk 'BEGIN{p=0; for(k=0;k<20000;k++){printf "r1\t%d\t%d\tchr%d\n", p, p+20, k%22; p+=20}}' > "$W/body.bed"
 mkdir -p "$W/btmp"
 for x in C R; do

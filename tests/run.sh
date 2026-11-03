@@ -1127,6 +1127,35 @@ if swwait "$W/sw" '[ ! -e gene.bed ]' $pid; then mkdir -p "$W/sw/gene.bed/x"; wa
     && ok "a failed --out-dir rollback: refused, the old BED kept as $kept" || no "a failed --out-dir rollback: rc=$rc, $(grep -m1 '^karyozip: ' "$W/sw.err" | head -c 200), left: $(ls -A "$W/sw" | tr '\n' ' ')"
 else kill -KILL $pid 2>/dev/null; wait $pid 2>/dev/null; no "a failed --out-dir rollback: the window never showed"; fi
 
+# a handler that has decided to exit races the commit's start: KZ_TEST_SIG_PAUSE_MS holds the handler right after its
+# decision, on a worker thread (signalled by its thread id, the thread Linux then prefers), while KZ_TEST_SWAP_PAUSE_MS
+# holds the main thread just before the window, then lets it go on into the commit. --smooth --out-dir over 100
+# contigs, so the C too keeps a team of workers. Signalled once both BEDs are staged and closed, before the window:
+# the handler exits and the commit must not start, all old (all new only if the window opened first). Signalled
+# inside the window: the handler defers, all new, exit 1
+mkdir -p "$W/rc"; printf 'featureID\tgene\trepeat\n1\tCDS\tLINE\n2\tCDS\tSINE\n3\tintergenic\tLINE\n4\tintergenic\tSINE\n' > "$W/rc/f.tsv"
+printf 'feature_set\tchild\tparent\ngene\tCDS\tcategorized\ngene\tintergenic\tcategorized\nrepeat\tLINE\tcategorized\nrepeat\tSINE\tcategorized\n' > "$W/rc/h.tsv"
+awk -v d="$W/rc" 'BEGIN { for (c = 0; c < 100; c++) for (j = 0; j < 4; j++) {
+  printf "c%03d\t%d\t%d\t%s\n", c, 10 * j, 10 * j + 10, (c + j) % 2 ? "CDS" : "intergenic" > (d "/gene.bed")
+  printf "c%03d\t%d\t%d\t%s\n", c, 10 * j, 10 * j + 10, j % 2 ? "LINE" : "SINE" > (d "/repeat.bed") } }'
+$KT compress --db "$W/rc/f.tsv" -i "$W/rc/gene.bed" -i "$W/rc/repeat.bed" > "$W/rc/r.kt" 2>/dev/null
+rcgo() { exec $KZ -t 4 --db "$W/rc/f.tsv" decompress -i "$W/rc/r.kt" --hier "$W/rc/h.tsv" --smooth --out-dir "$1" >/dev/null 2>"$W/sw.err"; }
+rcrace() { KZ_TEST_SWAP_PAUSE_MS=$PAUSE KZ_TEST_SIG_PAUSE_MS=$((2 * PAUSE)) rcgo "$1"; }
+rcgen() { if [ "$(cat "$1/gene.bed" "$1/repeat.bed" 2>/dev/null | tr '\n' ' ')" = "OLD_gene OLD_repeat " ]; then echo old
+  elif cmp -s "$1/gene.bed" "$W/rc/new/gene.bed" && cmp -s "$1/repeat.bed" "$W/rc/new/repeat.bed"; then echo new; else echo mixed; fi; }
+staged='[ $(ls | grep -c "\.bed\.tmp\.") = 2 ] && ! ls -l /proc/$pid/fd 2>/dev/null | grep -q "\.bed\.tmp\."'
+( rcgo "$W/rc/new" ) || :
+for at in before inside; do
+  swdir "$W/sw"; ( rcrace "$W/sw" ) & pid=$!; [ $at = before ] && cond=$staged || cond=$nold; tid=
+  swwait "$W/sw" "$cond" $pid && tid=$(ls /proc/$pid/task 2>/dev/null | grep -vx "$pid" | head -n1) || :
+  if [ -n "$tid" ]; then
+    kill -TERM "$tid" 2>/dev/null || :; wait $pid && rc=0 || rc=$?; g=$(rcgen "$W/sw")
+    [ $rc = 1 ] && { [ $g = new ] || { [ $at = before ] && [ $g = old ]; }; } && swclean "$W/sw" \
+      && ok "SIGTERM on a worker, its handler held, $at the commit window: exit 1, all $g, no leftovers" \
+      || no "SIGTERM on a worker, its handler held, $at the commit window: rc=$rc, $g, left: $(ls -A "$W/sw" | tr '\n' ' ')"
+  else kill -KILL $pid 2>/dev/null || :; wait $pid 2>/dev/null || :; no "SIGTERM on a worker $at the commit window: no window, or no worker thread"; fi
+done
+
 # pin the stored bytes to codec versions: `karyozip --block 4 compress` of the fixture db.rall.bed
 # (tests/fixtures.txt), default effort (medium), no other flag but $KT's -t (threads never change the bytes).
 # It moves when a vendored codec, zstd or the format changes; then check diff.sh still passes and update the pin on purpose.

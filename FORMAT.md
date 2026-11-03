@@ -1,6 +1,6 @@
 # The KST00001 file format
 
-This document specifies the `.kst` track that karyozip 0.2.0 writes, plus its two companion files: the `.kzi` name index and the `KSTAL1` packed alignment.
+This document specifies the `.kst` track that karyozip 0.3.0 writes, plus its two companion files: the `.kzi` name index and the `KSTAL1` packed alignment.
 It was derived from the code, mainly `rust/src/writer.rs` (`Writer::close`), `rust/src/reader.rs` (`Reader::open_with`, `block_dec`, `rmheads`, `ilv_split`, `grp_unpack`, the name decoders, `build_index`, `idxlookup`), `rust/src/kst.rs`, `rust/src/aln.rs` and `c/karyozip.c`.
 Where the code and this document disagree, the code is what existing files contain. Please report the disagreement.
 Statements marked **(uncertain)** could not be settled from the code with certainty.
@@ -363,7 +363,7 @@ Plainly stated:
 Open decisions for the maintainer:
 
 1. **Bump the magic or add a version field.** One option is to bump the magic (`KST00002`) whenever the layout changes, and keep readers for older magics or refuse them by name. The other is to reserve a field now, for example `h[14]` as a format minor version or a "required features" bit mask, or bits 53 and 54. Readers would then refuse unknown bits and versions explicitly.
-2. **Freeze at the first tag.** Decide whether the format is frozen when 0.2.0 (or 1.0) is tagged. If so, add golden `.kst`, `.kzi` and `KSTAL1` files from that tag to `tests/` and decode them in CI.
+2. **Freeze at the first tag.** Decide whether the format is frozen as of 0.3.0, the first tagged release, or at 1.0. If so, add golden `.kst`, `.kzi` and `KSTAL1` files from that tag to `tests/` and decode them in CI.
 3. **Narrow the names length.** Decide whether readers should refuse any set bit outside the known flags and bits 0 to 48, instead of folding it into the names length.
 4. **Byte order.** Decide whether to make the C write little-endian explicitly, so that the format does not depend on the host.
 5. **Undefined values.** Decide what a reader does with spelling value 3, with `ILVFLAG` without `RUNFLAG` (the writer never produces it, and readers do not refuse it), and with trailing bytes after the last block.

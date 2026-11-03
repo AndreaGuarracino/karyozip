@@ -43,7 +43,7 @@ static int LEVEL_L = -1, LEVEL_I = -1;   /* per stream, chosen by the search */
 
 static const char MAGIC[8] = "KST00001";   /* KaryoScope Track, format version 1 */
 #define IDXMAGIC 0x313058444954534bULL   /* "KSTIDX01", the index trailer */
-#define KARYOZIP_VERSION "0.2.0"
+#define KARYOZIP_VERSION "0.3.0"
 
 static int PROF = 0;
 static double PH[10];

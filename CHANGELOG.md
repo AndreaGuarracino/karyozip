@@ -1,15 +1,33 @@
 # Changelog
 
-No release has been tagged yet: the version `0.2.0` in `rust/Cargo.toml` and `c/karyozip.c` points at no tag.
+## 0.3.0 (2026-11-03)
 
-## Unreleased
+The first tagged release. File format `KST00001` ([FORMAT.md](FORMAT.md)); files written by 0.3.0 read with this release, and readers now refuse header flags they do not know instead of misreading them.
 
-The current state is version 0.2.0, file format `KST00001` ([FORMAT.md](FORMAT.md)).
+### Fixed
+- `-o`, `aln-pack`, `--out-dir` and the `.kzi` index never truncate or replace a good output on failure: outputs are staged under exclusive random names, synced and closed with checks, then renamed in.
+- `--out-dir` replaces its set of BEDs all or nothing with respect to SIGINT/SIGTERM/SIGHUP and failed renames; backups have unique names, and a run warns about `*.bed.old.*` leftovers of an earlier crash.
+- BGZF input: the extra field and each block's ISIZE are validated before any allocation (a forged header could read past the input, or ask for many GB).
+- A ten-byte varint that overflows 64 bits is refused (it was silently truncated).
+- The Rust compressor no longer hangs when writing its temporary body fails.
+- The C library resets all encoder state in `kt_open`; `karyozip.h` documents the real contract (one block by default, not thread-safe, exits on error).
+- C: the lazy `.kst` reference fill is race-free; host byte order no longer reaches the file; 32-bit counters on very large inputs; the allocation cap applies on every thread; the default thread count follows the CPU affinity mask (Slurm allocations).
+- Rust: `query --smooth` without `-r` is refused, as in the C; a packed alignment's magic is read before the whole file; a closed stdout pipe ends quietly, as the C.
+
+### Added
+- The Rust library's write path (`Writer`, `db::encode`, the `features.tsv` and alignment loaders) returns `Result<_, karyozip::Error>` instead of exiting.
+- `compress -d` takes each feature set as its BED or its plain `.kst`, mixed as you like, for the same bytes.
+- FORMAT.md: a specification of `KST00001`, the `.kzi` index and `KSTAL1`.
+- Tests: a shared harness with pass/fail counts, `CASE`, a total `TEST_JOBS` budget, `TEST_LIGHT=1` for small machines, seeded fuzzing, Rust unit tests, and a CI workflow template in `ci/`.
+
+### Changed
+- The C builds inside an activated conda environment; the usage text and the liblzma source list are shared files, no longer scraped from the C; the build checks for zstd 1.5.7.
+- `-o` together with `--out-dir`, and an empty `--out-dir`, are refused.
+
+## 0.2.0 (untagged)
 
 - Commands `compress`, `decompress`, `query`, `index` (the `.kzi` name index) and `aln-pack` (the `KSTAL1` packed alignment).
 - Compression modes: standard, db-informed (`-d`), alignment-informed (`-a`/`--ref`), and the two combined. `--smooth` rebuilds KaryoScope's smoothed track from the presmoothed one.
 - Effort levels `low`, `medium` and `high`. The codecs are zstd, htscodecs rANS and arith, bzip3, LZMA2 and zpaq. Names are stored as zstd text, integer deltas, CRAM-tokenised or field deltas.
 - A C implementation in `c/` and a Rust one in `rust/` write the same bytes. The C also builds the library `libkaryozip.a`.
-- `compress -d` takes each feature set as its BED or its plain `.kst`, mixed as you like, for the same bytes.
-- The Rust library's write path (`Writer`, `db::encode`, the `features.tsv` and alignment loaders) returns `Result<_, karyozip::Error>` instead of exiting; the CLI's messages are unchanged. The Rust CLI ends quietly on a closed stdout pipe, as the C does.
 - Format: the magic `KST00001` stayed the same while flags and codecs were added, so a file from an earlier commit is not guaranteed to read. See the Compatibility section of FORMAT.md.

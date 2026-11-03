@@ -13,6 +13,9 @@ The first tagged release. File format `KST00001` ([FORMAT.md](FORMAT.md)); files
 - The C library resets all encoder state in `kt_open`; `karyozip.h` documents the real contract (one block by default, not thread-safe, exits on error).
 - C: the lazy `.kst` reference fill is race-free; host byte order no longer reaches the file; 32-bit counters on very large inputs; the allocation cap applies on every thread; the default thread count follows the CPU affinity mask (Slurm allocations).
 - Rust: `query --smooth` without `-r` is refused, as in the C; a packed alignment's magic is read before the whole file; a closed stdout pipe ends quietly, as the C.
+- PAF and packed-alignment coordinates that leave 64 bits are refused (`PAF coordinates overflow 64 bits`, `corrupt packed alignment: a coordinate overflows`); they used to wrap or, in a Rust debug build, panic.
+- A signal while `--out-dir` creates its staged BEDs no longer leaves one behind.
+- A `.kst` given to `-d` through a pipe is refused with the regular-file message whatever its ninth byte; the C name table refuses 2^32 or more sequences, as the Rust's does.
 - A second SIGINT, SIGTERM or SIGHUP arriving while the first one's handler runs no longer hangs the process: the handlers are installed with `sigaction`, each masking the other two.
 - Rust: a header-only `features.tsv` no longer panics (a row labelled `novel` is accepted, as in the C).
 

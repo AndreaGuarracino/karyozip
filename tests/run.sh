@@ -1047,12 +1047,12 @@ mkdir -p "$W/sg"; $KT compress --names drop < "$W/ch.bed" > "$W/sg.kt" 2>/dev/nu
 $KT --names "$W/sg.names" decompress -i "$W/sg.kt" -o "$W/sg/out.bed" 2>/dev/null & pid=$!
 if sigwait "$W/sg" 'out.bed.tmp.*' $pid; then kill -TERM $pid 2>/dev/null || :; wait $pid && rc=0 || rc=$?
   [ $rc = 1 ] && [ -z "$(ls -A "$W/sg")" ] && ok "SIGTERM during decompress -o: exit 1, no temporary, no output" || no "SIGTERM during decompress -o: rc=$rc, left: $(ls "$W/sg")"
-else kill -KILL $pid 2>/dev/null; wait $pid 2>/dev/null; no "SIGTERM during decompress -o: no temporary appeared"; fi
+else kill -KILL $pid 2>/dev/null || :; wait $pid 2>/dev/null || :; no "SIGTERM during decompress -o: no temporary appeared"; fi
 $KT compress --db "$D/db.features.tsv" --names drop $in > "$W/sgd.kt" 2>/dev/null
 $KT --db "$D/db.features.tsv" --hier "$W/full.tsv" --names "$W/sg.names" decompress -i "$W/sgd.kt" --smooth --out-dir "$W/sgd" 2>/dev/null & pid=$!
 if sigwait "$W/sgd" '*.bed.tmp.*' $pid; then kill -TERM $pid 2>/dev/null || :; wait $pid && rc=0 || rc=$?
   [ $rc = 1 ] && [ -z "$(ls -A "$W/sgd")" ] && ok "SIGTERM during decompress --out-dir: exit 1, no temporaries, no BEDs" || no "SIGTERM during decompress --out-dir: rc=$rc, left: $(ls "$W/sgd")"
-else kill -KILL $pid 2>/dev/null; wait $pid 2>/dev/null; no "SIGTERM during decompress --out-dir: no temporary appeared"; fi
+else kill -KILL $pid 2>/dev/null || :; wait $pid 2>/dev/null || :; no "SIGTERM during decompress --out-dir: no temporary appeared"; fi
 
 # delayed write errors (tests/failclose.c, LD_PRELOAD): a staged output whose fsync or close fails is refused, every
 # old output kept byte for byte, no temporaries left; -o, --out-dir, --smooth --out-dir, index and aln-pack
@@ -1108,7 +1108,7 @@ for at in backup install; do
     kill -TERM $pid 2>/dev/null || :; wait $pid && rc=0 || rc=$?; g=$(swgen "$W/sw")
     { [ $rc = 0 ] || [ $rc = 1 ]; } && [ $g != mixed ] && swclean "$W/sw" && ok "SIGTERM in --out-dir's $at renames: exit $rc, all $g, no leftovers" \
       || no "SIGTERM in --out-dir's $at renames: rc=$rc, $g, left: $(ls -A "$W/sw" | tr '\n' ' ')"
-  else kill -KILL $pid 2>/dev/null; wait $pid 2>/dev/null; no "SIGTERM in --out-dir's $at renames: the window never showed"; fi
+  else kill -KILL $pid 2>/dev/null || :; wait $pid 2>/dev/null || :; no "SIGTERM in --out-dir's $at renames: the window never showed"; fi
 done
 # a rename fails: a directory takes gene.bed's place inside the window; with no old gene.bed the rollback succeeds
 swdir "$W/sw"; rm "$W/sw/gene.bed"; ( swgo "$W/sw" ) & pid=$!
@@ -1116,7 +1116,7 @@ if swwait "$W/sw" '[ ! -e repeat.bed ]' $pid; then mkdir -p "$W/sw/gene.bed/x"; 
   [ $rc = 1 ] && [ "$(grep '^karyozip: ' "$W/sw.err")" = "karyozip: cannot rename a derived BED into place" ] && [ "$(cat "$W/sw/repeat.bed")" = OLD_repeat ] \
     && rmdir "$W/sw/gene.bed/x" "$W/sw/gene.bed" && echo OLD_gene > "$W/sw/gene.bed" && swclean "$W/sw" \
     && ok "a failed --out-dir rename: rolled back, all old, no leftovers" || no "a failed --out-dir rename: rc=$rc, $(grep -m1 '^karyozip: ' "$W/sw.err" | head -c 200), left: $(ls -A "$W/sw" | tr '\n' ' ')"
-else kill -KILL $pid 2>/dev/null; wait $pid 2>/dev/null; no "a failed --out-dir rename: the window never showed"; fi
+else kill -KILL $pid 2>/dev/null || :; wait $pid 2>/dev/null || :; no "a failed --out-dir rename: the window never showed"; fi
 # the rollback fails too: gene.bed's old file cannot go back over the directory, and the refusal says so
 swdir "$W/sw"; ( swgo "$W/sw" ) & pid=$!
 if swwait "$W/sw" '[ ! -e gene.bed ]' $pid; then mkdir -p "$W/sw/gene.bed/x"; wait $pid && rc=0 || rc=$?
@@ -1125,7 +1125,7 @@ if swwait "$W/sw" '[ ! -e gene.bed ]' $pid; then mkdir -p "$W/sw/gene.bed/x"; wa
     && [ -n "$kept" ] && [ "$(cat "$W/sw/$kept")" = OLD_gene ] && [ "$(cat "$W/sw/repeat.bed")" = OLD_repeat ] \
     && rmdir "$W/sw/gene.bed/x" "$W/sw/gene.bed" && mv "$W/sw/$kept" "$W/sw/gene.bed" && swclean "$W/sw" \
     && ok "a failed --out-dir rollback: refused, the old BED kept as $kept" || no "a failed --out-dir rollback: rc=$rc, $(grep -m1 '^karyozip: ' "$W/sw.err" | head -c 200), left: $(ls -A "$W/sw" | tr '\n' ' ')"
-else kill -KILL $pid 2>/dev/null; wait $pid 2>/dev/null; no "a failed --out-dir rollback: the window never showed"; fi
+else kill -KILL $pid 2>/dev/null || :; wait $pid 2>/dev/null || :; no "a failed --out-dir rollback: the window never showed"; fi
 
 # a handler that has decided to exit races the commit's start: KZ_TEST_SIG_PAUSE_MS holds the handler right after its
 # decision, on a worker thread (signalled by its thread id, the thread Linux then prefers), while KZ_TEST_SWAP_PAUSE_MS

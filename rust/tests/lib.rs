@@ -19,9 +19,18 @@ fn build(bed: &[u8], opt: Options) -> Vec<u8> {
     out
 }
 
+/// The -t of every CLI child: KZ_TEST_THREADS (the Makefile passes each test's share), else 1; the bytes never depend on it
+fn test_threads() -> String {
+    match std::env::var("KZ_TEST_THREADS").ok().and_then(|v| v.parse::<u32>().ok()) {
+        Some(n) if (1..=1024).contains(&n) => n.to_string(),
+        _ => "1".into(),
+    }
+}
+
 fn cli(args: &[&str], bed: &[u8]) -> Vec<u8> {
     let exe = env!("CARGO_BIN_EXE_karyozip");
     let mut c = std::process::Command::new(exe)
+        .arg("-t").arg(test_threads())
         .args(args).arg("compress")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())

@@ -10,8 +10,9 @@ all:
 TEST_JOBS ?= $(or $(SLURM_CPUS_PER_TASK),$(shell nproc 2>/dev/null || echo 1))
 SUITE_JOBS := $(shell n=$(TEST_JOBS); [ "$$n" -ge 1 ] 2>/dev/null || n=1; [ "$$n" -gt 3 ] && n=3; echo $$n)
 SUITE_TJ := $(shell n=$(TEST_JOBS); [ "$$n" -ge 1 ] 2>/dev/null || n=1; echo $$((n / $(SUITE_JOBS))))
-# rayon N: the Rust's own tests run N at once (--test-threads), so each Writer's rayon pool gets
-# KZ_TEST_THREADS (default N) / N threads, at least 1
+# rayon N: the Rust's own tests run N at once (--test-threads), so each Writer's rayon pool, and each karyozip
+# CLI the tests spawn (as -t, from KZ_TEST_THREADS, see rust/tests/lib.rs), gets KZ_TEST_THREADS (default N) / N
+# threads, at least 1
 rayon = $(shell t=$${KZ_TEST_THREADS:-$(1)}; t=$$((t / $(1))); [ $$t -ge 1 ] || t=1; echo $$t)
 export TEST_JOBS
 
@@ -28,13 +29,13 @@ test: all rust san
 test-c:
 	@env TEST_JOBS=$(SUITE_TJ) bash tests/run.sh c/build/karyozip c/build/libtest c/build/karyozip-san
 test-rust:
-	@cd rust && env TEST_JOBS=$(SUITE_TJ) RAYON_NUM_THREADS=$(call rayon,$(SUITE_TJ)) cargo test --release -q -j $(SUITE_TJ) --test lib -- --test-threads=$(SUITE_TJ)
+	@cd rust && env TEST_JOBS=$(SUITE_TJ) RAYON_NUM_THREADS=$(call rayon,$(SUITE_TJ)) KZ_TEST_THREADS=$(call rayon,$(SUITE_TJ)) cargo test --release -q -j $(SUITE_TJ) --test lib -- --test-threads=$(SUITE_TJ)
 	@env TEST_JOBS=$(SUITE_TJ) bash tests/run.sh rust/target/release/karyozip c/build/libtest
 test-diff:
 	@env TEST_JOBS=$(SUITE_TJ) bash tests/diff.sh
 # the Rust unit and integration tests in a debug build: overflow checks and debug assertions on
 test-rust-debug:
-	@cd rust && env RAYON_NUM_THREADS=$(call rayon,$(TEST_JOBS)) cargo test -q -j $(TEST_JOBS) -- --test-threads=$(TEST_JOBS)
+	@cd rust && env RAYON_NUM_THREADS=$(call rayon,$(TEST_JOBS)) KZ_TEST_THREADS=$(call rayon,$(TEST_JOBS)) cargo test -q -j $(TEST_JOBS) -- --test-threads=$(TEST_JOBS)
 
 clean:
 	$(MAKE) -C c clean

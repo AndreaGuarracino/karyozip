@@ -14,7 +14,7 @@ The C needs zstd, zlib, an OpenMP compiler and a C++ compiler for libzpaq. liblz
 
 ## C and Rust
 
-`c/` and `rust/` write the same bytes, print the same `--help` and refuse the same inputs with the same words; the usage text is `c/usage.txt`, which the C embeds and the Rust includes, and the liblzma file list is `c/xz/sources.txt`, which `c/Makefile` and `rust/build.rs` both read.
+`c/` and `rust/` write the same bytes, print the same `--help` and refuse the same inputs with the same words, `compress -d` from per-set `.kst` inputs included (the C walks each input as `dump` does, setting and restoring the reader's per-track globals around every row, as `reffill_r` does for `--ref`; the Rust pulls rows through `Reader::next_row`); the usage text is `c/usage.txt`, which the C embeds and the Rust includes, and the liblzma file list is `c/xz/sources.txt`, which `c/Makefile` and `rust/build.rs` both read.
 `make test` runs the shared suite in `tests/` on both, fuzzes both, and compares them compress by compress. It takes a few minutes, depending on the machine.
 The C half fuzzes an ASan/UBSan build. The Rust half checks for leaks under valgrind, not a sanitizer, so `make test` needs valgrind installed.
 The C finds zstd, zlib and libgomp at the path in its rpath; the Rust bundles zstd. Both compile the same liblzma from `c/xz`.
@@ -44,6 +44,29 @@ kt_writer *w = kt_open(f);
 kt_row(w, name, nlen, run_len, label, llen, start);   /* once per run */
 kt_close(w);
 ```
+
+## The Rust library
+
+`rust/` is also a library crate, `karyozip`, for a program that writes `.kst` itself (a Cargo git dependency on the `rust/` subdirectory). The write path returns errors; it never exits the process or panics on anything a caller can cause:
+
+```rust
+use karyozip::{writer::{Options, Writer, Stats}, Error, ErrorKind, KzResult};
+pub fn Writer::new(opt: Options, tmpdir: &Path) -> KzResult<Writer>;
+pub fn Writer::row(&mut self, name: &[u8], run_len: u64, label: &[u8], start: u64) -> KzResult<()>;
+pub fn Writer::push(&mut self, name: &[u8], run_len: u64, label: &[u8], start: u64, same: bool) -> KzResult<()>;  // row without its byte checks
+pub fn Writer::close(self, out: &mut impl Write) -> KzResult<Stats>;
+pub fn Writer::set_aln(&mut self, a: aln::Aln);  pub fn Writer::set_feathash(&mut self, h: u64, cart: bool);
+pub fn db::Feats::load(path: &str) -> KzResult<Feats>;   pub fn db::Feats::load_hier(&mut self, path: &str) -> KzResult<()>;
+pub fn db::encode(files: &[String], feats: &Feats, w: &mut Writer) -> KzResult<bool>;
+pub fn aln::Aln::{load_ref, load_paf, load_aln, load_ordinals}(&mut self, ...) -> KzResult<()>;
+```
+
+`KzResult<T>` is `Result<T, karyozip::Error>`; an `Error` has `message()` (the C's words, which the CLI prints after `karyozip: `, then exits 1), `kind()` (`Input`, `Io` or `Internal`) and implements `std::error::Error`.
+A failing `out` is `write failed`, a temp directory that cannot take the staging files `cannot create a temp file under DIR (see --tmp-dir)`, at `new` or at `close`. The staging files are unlinked when made, so neither a failed close nor a dropped `Writer` leaves a `karyozip.*` file, and the names threads are joined before either returns.
+Writers may run one after another or at once on several threads; they share rayon's global pool. Process-wide state left: the OpenMP team size, which a close sets and restores (the speed of a writer beside it changes, never its bytes), and the allocation cap, which turns on once any file is read, as in the C. The writer prints its decisions (`codec:`, `layout:`, `names:`) on stderr.
+The reader path still exits on a refused or corrupt file, as the CLI does: `reader::Reader`, smoothing, query, index, `decompress --db`, `aln-pack`, and a `.kst` read as `--ref` or as a `-d` input. `rust/tests/lib.rs` checks the refusals' words, a missing, read-only or vanished temp directory, an output that fails after N bytes, writers in sequence and on two threads, and `db::encode` over per-set `.kst` files.
+
+The Rust CLI restores SIGPIPE's default, as the C runs: `karyozip ... | head` ends quietly (killed by SIGPIPE, 141 in the shell, or 0 when its last write landed first), never with a panic or `write failed`.
 
 ## Vendored code
 

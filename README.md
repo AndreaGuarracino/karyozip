@@ -61,11 +61,13 @@ The index costs 7.5 B a read: on short reads it can be larger than the track, on
 | mode | input | flags, on compress and on every read |
 |---|---|---|
 | standard, the default | one BED, or stdin | none |
-| db-informed | one BED per feature set of a sample, in `features.tsv` column order | `-d features.tsv` |
+| db-informed | one BED or plain `.kst` per feature set of a sample, in `features.tsv` column order | `-d features.tsv` |
 | alignment-informed | one BED, with its reads aligned to a reference | `-a P.paf --ref ref.bed` |
 | db + alignment | as db-informed | `-d features.tsv -a P.paf --ref ref.ids.bed` |
 
 Use db-informed when you have every feature set of a sample: one file replaces the per-set files and is smaller than their sum.
+Each set may come as its BED or as its plain `.kst` (what `compress` wrote from that BED, in any mode), known by its magic `KST00001`, and the two may be mixed: the `.kst` inputs are decoded in step, one row at a time, and the merged file is byte-identical to the one their BEDs give.
+A `.kst` input must be plain: not written with `-d`, `-a` or `-n drop`. A missing set, a wrong order or a refused input is refused in the same words as for BEDs.
 Standard stays the default because db-informed cannot take one BED or stdin, and its file reads back only with the same `features.tsv`.
 
 An alignment-informed file stores only what differs from the reference. The PAF and the reference stay outside the file, and on short reads they cost more than one file saves.
@@ -74,6 +76,7 @@ For queries, give `--ref` as a plain `.kst` track (`compress -e low`): it is rea
 
 ```
 karyozip compress   -d features.tsv -i s.acrocentric.bed.gz -i s.chromosome.bed.gz ... -o s.all.kst
+karyozip compress   -d features.tsv -i s.acrocentric.kst -i s.chromosome.kst ... -o s.all.kst   # the same file, from per-set tracks
 karyozip decompress -d features.tsv -i s.all.kst --out-dir DIR      # every set's BED back
 karyozip decompress -d features.tsv -i s.all.kst --set gene         # one set
 karyozip decompress -d features.tsv -i s.all.kst --smooth --hier hierarchy.tsv --out-dir DIR   # every set smoothed, one BED each
@@ -106,7 +109,7 @@ Read names are stored in the file by default.
 
 | flag | on | effect |
 |---|---|---|
-| `-i`, `--input FILE` | all but aln-pack | compress: the BED, one `-i` per set under `-d`, else stdin; the others: the track |
+| `-i`, `--input FILE` | all but aln-pack | compress: the BED, else stdin; under `-d` one `-i` per set, a BED or a plain `.kst`; the others: the track |
 | `-o`, `--output FILE` | all but index | where the output goes, else stdout; aln-pack: the packed file, required |
 | `-r`, `--region NAME[:START-END]` | query | a sequence, or a range of it |
 | `--smooth` | decompress, query | KaryoScope's smoothed track instead of the stored one; with query the whole sequence is smoothed and the range printed |
@@ -145,7 +148,7 @@ Compress tries its codecs on a sample, and under `medium` and `high` four layout
 ## C and Rust
 
 A C implementation in `c/` writes the same bytes. How to build it, its library, and how the two are kept equal: [C-and-Rust.md](C-and-Rust.md).
-The C library `libkaryozip.a` prints a message and exits the process on any error, and it is not thread-safe.
+The Rust library's writer (`karyozip::writer::Writer`) returns every error as a `Result` with the CLI's words and never exits the process, and writers may run at once on several threads; the Rust reader, and the C library `libkaryozip.a`, still print a message and exit on an error, and the C library is not thread-safe.
 
 ## File format
 

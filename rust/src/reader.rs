@@ -1146,9 +1146,12 @@ impl Reader {
     }
 }
 
-pub(crate) fn skip(b: &[u8], mut i: usize) -> usize {
-    while i < b.len() && b[i] >= 0x80 { i += 1; }
-    i + 1
+/// past one varint, refusing the ones vget refuses past 63 bits (the C skips with its vget); a cut is the caller's to see
+pub(crate) fn skip(b: &[u8], i: usize) -> usize {
+    let mut j = i;
+    while j < b.len() && b[j] >= 0x80 { j += 1; }
+    if j - i >= 9 && (j - i > 9 || b.get(j).is_some_and(|&c| c > 1)) { crate::bail("corrupt varint"); }
+    j + 1
 }
 
 /* ------------------------------------------------------------ the index */

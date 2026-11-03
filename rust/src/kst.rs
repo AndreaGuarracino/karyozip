@@ -40,9 +40,10 @@ pub fn vget(b: &[u8], i: usize) -> (u64, usize) {
 fn vget_long(b: &[u8], mut i: usize) -> (u64, usize) {
     let (mut v, mut s) = (0u64, 0u32);
     loop {
-        if i >= b.len() || s > 63 { crate::bail("corrupt varint"); }
+        if i >= b.len() { crate::bail("corrupt varint"); }
         let c = b[i];
         i += 1;
+        if s == 63 && c > 1 { crate::bail("corrupt varint"); }   // the tenth byte holds bit 63 alone and ends it
         v |= ((c & 0x7f) as u64) << s;
         s += 7;
         if c < 0x80 { return (v, i); }
@@ -225,6 +226,49 @@ mod tests {
         assert_eq!(refused(|| vget(&[0x05], 1)), msg);            // past the end
         assert_eq!(refused(|| vget(&[0xff; 11], 0)), msg);        // longer than 64 bits
         assert_eq!(refused(|| vget(&[0xff, 0xff, 0x01], 0)), None);
+    }
+
+    /// ten bytes: nine continuations, then a last byte that may carry bit 63 and nothing above it
+    fn ten(top: u8) -> Vec<u8> { let mut b = vec![0x80u8; 9]; b.push(top); b }
+
+    #[test]
+    fn varint_refuses_a_tenth_byte_past_bit_63() {
+        let msg = Some("corrupt varint".to_string());
+        for top in 2u8..=127 {   // 2^64 and up, which a u64 cannot hold
+            assert_eq!(refused(|| vget(&ten(top), 0)), msg, "tenth byte {top:#x}");
+            assert_eq!(refused(|| crate::reader::skip(&ten(top), 0)), msg, "skip, tenth byte {top:#x}");
+        }
+        for top in [0x80u8, 0x81, 0xff] {   // a tenth byte that does not end it: an eleventh, or the cut
+            let mut b = ten(top); b.push(0x00);
+            assert_eq!(refused(|| vget(&b, 0)), msg, "tenth byte {top:#x}, then an eleventh");
+            assert_eq!(refused(|| crate::reader::skip(&b, 0)), msg, "skip, tenth byte {top:#x}, then an eleventh");
+            assert_eq!(refused(|| vget(&ten(top), 0)), msg, "tenth byte {top:#x}, then the end");
+        }
+        let mut b = vec![0xffu8; 9]; b.push(0x02);   // all 64 bits and one over
+        assert_eq!(refused(|| vget(&b, 0)), msg);
+        for n in 1..10 { assert_eq!(refused(|| vget(&ten(0x01)[..n], 0)), msg, "cut after {n} bytes"); }
+    }
+
+    #[test]
+    fn varint_ten_bytes_that_fit() {
+        let mut max = vec![0xffu8; 9]; max.push(0x01);
+        assert_eq!(vget(&max, 0), (u64::MAX, 10));
+        assert_eq!(vget(&ten(0x01), 0), (1 << 63, 10));
+        assert_eq!(vget(&ten(0x00), 0), (0, 10));   // not the shortest, but it fits: still read
+        assert_eq!(vget(&[0x80, 0x00], 0), (0, 2));
+        for b in [max, ten(0x01), ten(0x00)] { assert_eq!(crate::reader::skip(&b, 0), 10); }
+        // each width's ends, written and read back, with something after them
+        for w in 1..=10u32 {
+            let lo = if w == 1 { 0 } else { 1u64 << (7 * (w - 1)) };
+            let hi = if w == 10 { u64::MAX } else { (1u64 << (7 * w)) - 1 };
+            for v in [lo, hi] {
+                let mut b = Vec::new(); put(&mut b, v); assert_eq!(b.len(), w as usize, "width of {v:#x}");
+                b.push(0x05);
+                assert_eq!(vget(&b, 0), (v, w as usize));
+                assert_eq!(crate::reader::skip(&b, 0), w as usize);
+                assert_eq!(vget(&b, w as usize), (5, w as usize + 1));
+            }
+        }
     }
 
     #[test]

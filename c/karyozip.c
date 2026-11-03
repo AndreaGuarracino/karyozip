@@ -378,9 +378,9 @@ static inline uint64_t vget(const uint8_t **p) {
     const uint8_t *q = *p;      /* VGUARD bytes spare: bound once, not per byte */
     uint64_t v = 0; int s = 0; uint8_t b;
     do { b = *q++;
-         if (s < 64) v |= (uint64_t)(b & 0x7f) << s;
+         if (s == 63 && b > 1) die("corrupt varint");   /* the tenth byte holds bit 63 alone and ends it */
+         v |= (uint64_t)(b & 0x7f) << s;
          s += 7;
-         if (s > 70) die("corrupt stream: a varint does not terminate");
     } while (b & 0x80);
     if (PAYEND && q > PAYEND) die("corrupt block: a run reads past the payload");
     *p = q;
@@ -390,8 +390,9 @@ static inline uint64_t vget(const uint8_t **p) {
 static uint64_t vgetb(const uint8_t **p, const uint8_t *end) {
     uint64_t v = 0; int s = 0;
     for (;;) {
-        if (*p >= end || s > 63) die("corrupt varint in metadata");
+        if (*p >= end) die("corrupt varint");
         uint8_t b = *(*p)++;
+        if (s == 63 && b > 1) die("corrupt varint");   /* the tenth byte holds bit 63 alone and ends it */
         v |= (uint64_t)(b & 0x7f) << s;
         if (!(b & 0x80)) return v;
         s += 7;

@@ -232,7 +232,7 @@ pub mod prof {
         fn drop(&mut self) {
             NS[self.0].fetch_add(self.1.elapsed().as_nanos() as u64, Relaxed);
             let now = T0.get().map_or(0, |t| t.elapsed().as_nanos() as u64);
-            if now - LAST.load(Relaxed) > 10_000_000 {
+            if now.saturating_sub(LAST.load(Relaxed)) > 10_000_000 {   // another thread may have stored a later now
                 LAST.store(now, Relaxed);
                 HW[self.0].store(field("/proc/self/status", "VmHWM:"), Relaxed);
             }

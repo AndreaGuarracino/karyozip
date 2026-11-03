@@ -1,4 +1,5 @@
-//! The only unsafe in the crate: raw pointers and length checks live here; the codecs are the C ones from ../c
+//! The FFI: raw pointers and length checks for the codecs, which are the C ones from ../c.
+//! The only other unsafe is unchecked indexing in kst.rs (put_row, putu64_at) and smooth.rs (smooth_one, emit).
 
 use std::os::raw::{c_char, c_int, c_uchar, c_uint, c_void};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -165,6 +166,14 @@ pub fn lzma_version() -> String {
 pub fn zstd_version() -> String {
     // SAFETY: a static string from the linked libzstd
     unsafe { std::ffi::CStr::from_ptr(zstd_sys::ZSTD_versionString()).to_string_lossy().into_owned() }
+}
+
+/// The C's strerror(errno) words, without Rust's " (os error N)"
+pub fn strerror(e: &std::io::Error) -> String {
+    unsafe extern "C" { fn strerror(n: c_int) -> *const c_char; }
+    let Some(n) = e.raw_os_error() else { return e.to_string() };
+    // SAFETY: strerror returns a NUL-terminated string, read before any other call can reuse it
+    unsafe { std::ffi::CStr::from_ptr(strerror(n)).to_string_lossy().into_owned() }
 }
 
 /// bzip3 with the pieces' sizes given, each at most the block size, summing to the source: the C's bz3_compress_cuts
@@ -476,6 +485,7 @@ unsafe extern "C" {
 }
 pub struct Inflater(*mut LdDec);
 unsafe impl Send for Inflater {}
+impl Default for Inflater { fn default() -> Self { Inflater::new() } }
 impl Inflater {
     pub fn new() -> Inflater { let d = unsafe { libdeflate_alloc_decompressor() }; assert!(!d.is_null(), "out of memory"); Inflater(d) }
     /// Inflates raw deflate `i` into all of `o`: true when it fills `o` exactly

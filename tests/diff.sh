@@ -98,6 +98,7 @@ for f in ls.bed s.bed db.rall.bed; do
   for seq in $(awk -F'\t' '{print $1}' "$D/$f" | uniq | head -2); do
     for q in "-r $seq" "-r $seq:0-100"; do both "query $f [$q]" query -i "$W/t.kst" --hier "$W/h.tsv" --smooth --set fs $q; done
   done
+  EXPECT=fail both "query --smooth without -r $f" query -i "$W/t.kst" --hier "$W/h.tsv" --smooth --set fs; EXPECT=ok
 done
 # --chunk: two-level hierarchy, one long sequence
 python3 -c "
@@ -190,8 +191,10 @@ done
 printf 'q1\n\nq2\n' > "$W/blank"; gzip -c "$D/ref.bed" | head -c 40 > "$W/cut.gz"
 printf '\ns\t0\t10\t1\n' > "$W/dbblank.bed"; printf 's\t00\t10\t1\n' > "$W/dbzero.bed"
 "$C" aln-pack -a "$D/p.paf" --ref "$D/ref.bed" -o "$W/over.pk" >/dev/null 2>&1; printf '\0' >> "$W/over.pk"
+printf 'KSTAL1abc' > "$W/short.pk"; printf 'KST' > "$W/tiny.paf"   # the magic is read before the body
 "$C" compress --aln "$D/p.paf" --ref "$D/ref.bed" < "$D/s.bed" > "$W/a.kst" 2>/dev/null
 for form in "compress --aln $D/p.paf --ref $D/ref.bed --aln-names $W/blank" "compress --aln $D/p.paf --ref $W/cut.gz" "decompress --aln $W/over.pk --ref $D/ref.bed -i $W/a.kst" \
+            "decompress --aln $W/short.pk --ref $D/ref.bed -i $W/a.kst" "decompress --aln $W/tiny.paf --ref $D/ref.bed -i $W/a.kst" \
             "--db $D/db.features.tsv compress -i $W/dbblank.bed" "--db $D/db.features.tsv compress -i $W/dbzero.bed"; do
   "$C" $form < "$D/s.bed" 2> "$W/ce" >/dev/null; c1=$?; cm=$(tail -1 "$W/ce")
   "$R" $form < "$D/s.bed" 2> "$W/re" >/dev/null; r1=$?; rm2=$(tail -1 "$W/re")
@@ -282,9 +285,10 @@ cli compress --names foo; cli --effort low; cli -r x
 cli aln-pack --names foo -a a --ref b -o c; cli compress --db; cli --version compress
 cli index -i f x; cli decompress -i f x; cli query -i f --hier h --smooth --set fs -r s:9-3; cli aln-pack -a a --ref b -o c d
 cli query -i f --hier h --smooth --set fs -r s:1-2; cli query -i f -r s --halo 3; cli query -i f -r s:1-2
-cli decompress --max-gap x -i f --hier h --smooth --set fs
+cli decompress --max-gap x -i f --hier h --smooth --set fs; cli query -i f --hier h --smooth --set fs; cli query -i f --smooth --out-dir d
 cli decompress --out-dir D; cli decompress -i f --halo 2; cli query -i f -r s:+1-5; cli query -i f -r s:99999999999999999999-1
 cli compress --block +5; cli compress --aln p; cli compress --ref r
+cli --db $D/db.features.tsv compress -i nosuch.bed; cli --db $D/db.features.tsv compress -i $D/db.gene.bed -i nosuch.bed -i x -i y -i z -i w
 cli decompress --aln-names f; cli index --names ordinal
 cli decompress --aln p; cli decompress --ref r; cli decompress --aln p --ref r
 cli compress --names drop --aln p --ref r; cli decompress --db f; cli compress --db f

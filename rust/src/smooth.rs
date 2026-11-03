@@ -230,7 +230,8 @@ fn emit(h: &Hier, out: &mut Vec<u8>, seq: &[u8], st: &[u64], en: &[u64],
 /// The set a one-set track holds, as the C's inferset: the one set whose tree has every label but novel
 fn infer_set(hier: &str, r: &Reader) -> Vec<u8> {
     let data = crate::slurp(hier, "cannot open the hierarchy file");
-    let (mut set, mut node): (Vec<Vec<u8>>, Vec<(Vec<u8>, usize)>) = (Vec::new(), Vec::new());
+    let mut set: Vec<Vec<u8>> = Vec::new();
+    let mut node: Vec<(Vec<u8>, usize)> = Vec::new();
     for raw in data.split(|&c| c == b'\n') {
         let line = raw.strip_suffix(b"\r").unwrap_or(raw);
         let cols: Vec<&[u8]> = line.split(|&c| c == b'\t').collect();

@@ -310,8 +310,12 @@ impl Aln {
 
     /// aln-pack's own format: five coded streams behind a magic and the reference's contig-order hash; false when not one
     fn load_packed(&mut self, path: &str) -> bool {
-        let Ok(d) = std::fs::read(path) else { return false };
-        if d.len() < 6 || &d[..6] != b"KSTAL1" { return false; }
+        use std::io::Read;
+        let Ok(mut f) = std::fs::File::open(path) else { return false };
+        // the magic first, as the C peeks: a PAF is not read whole to learn it is not one
+        let mut d = Vec::new();
+        if f.by_ref().take(6).read_to_end(&mut d).is_err() || d != b"KSTAL1" { return false; }
+        if f.read_to_end(&mut d).is_err() { return false; }
         if d.len() < 14 { crate::bail("truncated packed alignment"); }
         let rh = u64::from_le_bytes(d[6..14].try_into().unwrap());
         if rh != refhash(self) {

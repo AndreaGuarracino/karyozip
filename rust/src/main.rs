@@ -119,6 +119,7 @@ fn main() {
         }
         Cmd::Smooth => {
             let track = track();
+            if c.query && c.region.is_none() { die("query needs -r NAME[:START-END]"); }   // as the C, before anything opens
             let fs = c.feature_set.as_deref();
             if c.out.is_some() && c.db.is_none() { die("--out-dir needs --db"); }
             if let Some(dir) = c.out.as_deref() {   // every set, or those --set names, one BED each

@@ -109,7 +109,7 @@ pub fn putu64_at(b: &mut [u8], v: u64) -> usize {
     const D2: &[u8; 200] = b"00010203040506070809101112131415161718192021222324\
 2526272829303132333435363738394041424344454647484950515253545556575859\
 60616263646566676869707172737475767778798081828384858687888990919293949596979899";
-    let mut n = ((63 - (v | 1).leading_zeros()) * 1233 >> 12) as usize + 1;
+    let mut n = (((63 - (v | 1).leading_zeros()) * 1233) >> 12) as usize + 1;
     if n <= 19 && v >= P[n - 1] { n += 1; }   // the estimate is off by one
     // n <= 20 and the table index is under 200, so the digit writes need no check
     assert!(b.len() >= n && n <= 20);

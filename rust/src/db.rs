@@ -424,6 +424,15 @@ fn wr(o: &mut (Sink, Vec<u8>), seq: &[u8], st: u64, en: u64, lab: &[u8]) {
     crate::kst::put_row(v, seq, st, en, lab);
 }
 
+/// SET.bed.old.* in DIR for a set about to be written: what an uncatchable end inside an earlier commit left (swap_in).
+/// Counted, said once, never touched; a name counts once however many sets it could belong to. As the C's stale_warn
+fn stale_warn(dir: &str, sets: &[&[u8]]) {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let n = rd.flatten().filter(|e| { let f = e.file_name(); let b = f.as_bytes();
+        sets.iter().any(|s| b.starts_with(s) && b[s.len()..].starts_with(b".bed.old.")) }).count();
+    if n > 0 { eprintln!("karyozip: warning: {dir} holds {n} old BED(s) from an interrupted run (*.bed.old.*); they are left in place"); }
+}
 /// --out-dir DIR: one staged BED a set, beside the old ones, each a new random name made exclusively, so never
 /// through a symlink, returned open; as the C's stage_open
 pub fn stage_open(dir: &str, sets: &[&[u8]]) -> (Vec<std::path::PathBuf>, Vec<std::fs::File>) {
@@ -435,6 +444,7 @@ pub fn stage_open(dir: &str, sets: &[&[u8]]) -> (Vec<std::path::PathBuf>, Vec<st
             if !m.is_file() { crate::bail("--out-dir: a set's BED exists and is not a regular file"); }
         }
     }
+    stale_warn(dir, sets);
     let mut fs = Vec::new();
     for s in sets {
         let (f, p) = crate::ffi::mkstemp(&setpath(dir, s, ".bed.tmp"), 0o666)

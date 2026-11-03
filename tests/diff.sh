@@ -169,6 +169,9 @@ both "--db --hier" compress --db "$D/db.features.tsv" --hier "$W/hv.tsv" $HV; cp
 "$C" --db "$D/db.features.tsv" compress $DB > "$W/fd.kst" 2>/dev/null
 both "--db decompress --smooth --out-dir" --db "$D/db.features.tsv" --hier "$W/full.tsv" decompress -i "$W/fd.kst" --smooth --out-dir "$W/sod"
 both "--db decompress --smooth --set gene,repeat --out-dir" --db "$D/db.features.tsv" --hier "$W/full.tsv" decompress -i "$W/fd.kst" --smooth --set gene,repeat --out-dir "$W/sod1"
+mkdir -p "$W/sost"; echo stale > "$W/sost/gene.bed.old.AAAAAA"; echo stale > "$W/sost/repeat.bed.old.12345"   # the stale-backup warning
+both "--db decompress --out-dir over stale backups" decompress --db "$D/db.features.tsv" --set gene,repeat --out-dir "$W/sost" -i "$W/fd.kst"
+both "--db decompress --smooth --out-dir over stale backups" --db "$D/db.features.tsv" --hier "$W/full.tsv" decompress -i "$W/fd.kst" --smooth --out-dir "$W/sost"
 EXPECT=fail both "--db --hier decompress --smooth --out-dir, a set not in the hierarchy" --db "$D/db.features.tsv" --hier "$W/hv.tsv" decompress -i "$W/hv.kst" --smooth --out-dir "$W/sod2"; EXPECT=ok
 both "--db --hier decompress" --db "$D/db.features.tsv" --hier "$W/hv.tsv" --set repeat decompress -i "$W/hv.kst"; tally "--db --hier"
 dn=0

@@ -24,6 +24,7 @@
 #include <sched.h>
 #include <math.h>
 #include <stdatomic.h>
+#include <dirent.h>
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -5309,6 +5310,19 @@ static void dbtmpsig(int s) {   /* atexit does not run on a signal */
     dbtmpclean(); outclean(); _exit(1);
 }
 
+/* SET.bed.old.* in DIR for a set about to be written: what an uncatchable end inside an earlier commit left (stage_swap).
+   Counted, said once, never touched; a name counts once however many sets it could belong to. As the Rust's
+   stale_warn */
+static void stale_warn(const char *dir) {
+    DIR *dp = opendir(dir); if (!dp) return;
+    size_t n = 0; struct dirent *e;
+    while ((e = readdir(dp))) for (size_t i = 0; i < NSETK; i++) {
+        size_t l = strlen(fset[SETK[i]]);
+        if (!strncmp(e->d_name, fset[SETK[i]], l) && !strncmp(e->d_name + l, ".bed.old.", 9)) { n++; break; }
+    }
+    closedir(dp);
+    if (n) fprintf(stderr, "karyozip: warning: %s holds %zu old BED(s) from an interrupted run (*.bed.old.*); they are left in place\n", dir, n);
+}
 /* --out-dir DIR: one staged BED a selected set, DBTMP[i] for SETK[i], each a new random name made exclusively, so
    never through a symlink; the open descriptors are returned, as the Rust's stage_open */
 static int *stage_open(const char *dir) {
@@ -5325,6 +5339,7 @@ static int *stage_open(const char *dir) {
         if (pn < 0 || (size_t)pn >= sizeof pb - 16) die("--out-dir: the output path is too long");
         if (!lstat(pb, &ts) && !S_ISREG(ts.st_mode)) die("--out-dir: a set's BED exists and is not a regular file");
     }
+    stale_warn(dir);
     DBTMP = xcalloc(NSETK, sizeof *DBTMP); ndbtmp = NSETK; atexit(dbtmpclean);
     signal(SIGINT, dbtmpsig); signal(SIGTERM, dbtmpsig); signal(SIGHUP, dbtmpsig);
     int *fd = xmalloc(NSETK * sizeof *fd);

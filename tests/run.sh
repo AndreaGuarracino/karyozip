@@ -1058,10 +1058,10 @@ else kill -KILL $pid 2>/dev/null || :; wait $pid 2>/dev/null || :; no "SIGTERM d
 # old output kept byte for byte, no temporaries left; -o, --out-dir, --smooth --out-dir, index and aln-pack
 FC=$W/failclose.so
 if "${CC:-cc}" -shared -fPIC -O2 -o "$FC" "$src/failclose.c" -ldl 2>"$W/fc.err"; then
-  fcfail() {  # DESC MESSAGE MATCH CMD...: exit 1 and MESSAGE alone, the shim failing $op on MATCH's descriptors
-    local what=$1 msg=$2 m=$3 rc=0; shift 3
+  fcfail() {  # DESC MESSAGE MATCH CMD...: exit 1 and MESSAGE alone, after the warning $fcw when set; the shim failing $op on MATCH's descriptors
+    local what=$1 msg=$2 m=$3 rc=0 want; shift 3; want="karyozip: $msg"; [ -z "${fcw:-}" ] || want="karyozip: $fcw"$'\n'"$want"
     env KZ_FAIL_FD_OP=$op KZ_FAIL_FD_MATCH="$m" LD_PRELOAD="$FC" "$@" >/dev/null 2>"$W/fc.err" || rc=$?
-    if [ $rc = 1 ] && [ "$(grep '^karyozip: ' "$W/fc.err")" = "karyozip: $msg" ]; then ok "$what: refused ($msg)"
+    if [ $rc = 1 ] && [ "$(grep '^karyozip: ' "$W/fc.err")" = "$want" ]; then ok "$what: refused ($msg)"
     else no "$what: WRONG, exit $rc: $(head -c 200 "$W/fc.err")"; fi
   }
   mkdir -p "$W/fc"; cd "$W/fc"
@@ -1069,6 +1069,7 @@ if "${CC:-cc}" -shared -fPIC -O2 -o "$FC" "$src/failclose.c" -ldl 2>"$W/fc.err";
     rm -rf ./*; mkdir od sm
     for s in gene repeat; do echo "OLD_$s" > od/$s.bed; echo "OLD_$s" > sm/$s.bed; done
     echo stale > od/gene.bed.old.AAAAAA; echo old > k.kt; echo old > pk; cp "$W/p.kt" ix.kt; echo oldidx > ix.kt.kzi   # not an index: ignored when read
+    fcw="warning: od holds 1 old BED(s) from an interrupted run (*.bed.old.*); they are left in place" \
     fcfail "failed $op, decompress --db --out-dir" "write failed" .bed.tmp. $KT decompress --db "$D/db.features.tsv" --set gene,repeat --out-dir od -i "$W/f.kt"
     fcfail "failed $op, --smooth --out-dir" "write failed" .bed.tmp. $KT --db "$D/db.features.tsv" --set gene,repeat decompress -i "$W/f.kt" --hier "$W/full.tsv" --smooth --out-dir sm
     fcfail "failed $op, index" "index write failed" .kzi. $KT index -i ix.kt
@@ -1110,10 +1111,12 @@ for at in backup install; do
       || no "SIGTERM in --out-dir's $at renames: rc=$rc, $g, left: $(ls -A "$W/sw" | tr '\n' ' ')"
   else kill -KILL $pid 2>/dev/null || :; wait $pid 2>/dev/null || :; no "SIGTERM in --out-dir's $at renames: the window never showed"; fi
 done
+# swdir's two stale backups: every --out-dir run over it warns first, once
+swwarn="karyozip: warning: $W/sw holds 2 old BED(s) from an interrupted run (*.bed.old.*); they are left in place"
 # a rename fails: a directory takes gene.bed's place inside the window; with no old gene.bed the rollback succeeds
 swdir "$W/sw"; rm "$W/sw/gene.bed"; ( swgo "$W/sw" ) & pid=$!
 if swwait "$W/sw" '[ ! -e repeat.bed ]' $pid; then mkdir -p "$W/sw/gene.bed/x"; wait $pid && rc=0 || rc=$?
-  [ $rc = 1 ] && [ "$(grep '^karyozip: ' "$W/sw.err")" = "karyozip: cannot rename a derived BED into place" ] && [ "$(cat "$W/sw/repeat.bed")" = OLD_repeat ] \
+  [ $rc = 1 ] && [ "$(grep '^karyozip: ' "$W/sw.err")" = "$swwarn"$'\n'"karyozip: cannot rename a derived BED into place" ] && [ "$(cat "$W/sw/repeat.bed")" = OLD_repeat ] \
     && rmdir "$W/sw/gene.bed/x" "$W/sw/gene.bed" && echo OLD_gene > "$W/sw/gene.bed" && swclean "$W/sw" \
     && ok "a failed --out-dir rename: rolled back, all old, no leftovers" || no "a failed --out-dir rename: rc=$rc, $(grep -m1 '^karyozip: ' "$W/sw.err" | head -c 200), left: $(ls -A "$W/sw" | tr '\n' ' ')"
 else kill -KILL $pid 2>/dev/null || :; wait $pid 2>/dev/null || :; no "a failed --out-dir rename: the window never showed"; fi
@@ -1121,7 +1124,7 @@ else kill -KILL $pid 2>/dev/null || :; wait $pid 2>/dev/null || :; no "a failed 
 swdir "$W/sw"; ( swgo "$W/sw" ) & pid=$!
 if swwait "$W/sw" '[ ! -e gene.bed ]' $pid; then mkdir -p "$W/sw/gene.bed/x"; wait $pid && rc=0 || rc=$?
   kept=$(ls "$W/sw" | grep -v AAAAAA | grep '^gene\.bed\.old\.' || :)
-  [ $rc = 1 ] && [ "$(grep '^karyozip: ' "$W/sw.err")" = "karyozip: cannot rename a derived BED into place, nor put every old one back: old BEDs remain as *.bed.old.* under $W/sw" ] \
+  [ $rc = 1 ] && [ "$(grep '^karyozip: ' "$W/sw.err")" = "$swwarn"$'\n'"karyozip: cannot rename a derived BED into place, nor put every old one back: old BEDs remain as *.bed.old.* under $W/sw" ] \
     && [ -n "$kept" ] && [ "$(cat "$W/sw/$kept")" = OLD_gene ] && [ "$(cat "$W/sw/repeat.bed")" = OLD_repeat ] \
     && rmdir "$W/sw/gene.bed/x" "$W/sw/gene.bed" && mv "$W/sw/$kept" "$W/sw/gene.bed" && swclean "$W/sw" \
     && ok "a failed --out-dir rollback: refused, the old BED kept as $kept" || no "a failed --out-dir rollback: rc=$rc, $(grep -m1 '^karyozip: ' "$W/sw.err" | head -c 200), left: $(ls -A "$W/sw" | tr '\n' ' ')"
@@ -1175,6 +1178,24 @@ for at in before inside; do
       || no "SIGTERM on a worker, its handler held, $at -o's commit window: rc=$rc, $g, left: $(ls -A "$W/or" | tr '\n' ' ')"
   else kill -KILL $pid 2>/dev/null || :; wait $pid 2>/dev/null || :; no "SIGTERM on a worker $at -o's commit window: no window, or no worker thread"; fi
 done
+
+# stale backups of the sets about to be written, left by an uncatchable end mid-commit: one warning with their count,
+# before any work, and every one left as it was; another set's, or another name, not counted
+rm -rf "$W/st"; mkdir -p "$W/st"
+for f in gene.bed.old.AAAAAA gene.bed.old.BBBBBB repeat.bed.old.12345 region.bed.old.CCCCCC gene.bedx.old.DDDDDD; do echo stale > "$W/st/$f"; done
+$KT decompress --db "$D/db.features.tsv" --set gene,repeat --out-dir "$W/st" -i "$W/f.kt" >/dev/null 2>"$W/st.err" && rc=0 || rc=$?
+[ $rc = 0 ] && [ "$(grep 'warning' "$W/st.err")" = "karyozip: warning: $W/st holds 3 old BED(s) from an interrupted run (*.bed.old.*); they are left in place" ] \
+  && [ "$(cat "$W/st"/*.old.* | tr '\n' ' ')" = "stale stale stale stale stale " ] && cmp -s "$W/st/gene.bed" "$D/db.gene.bed" \
+  && ok "--out-dir over 3 stale backups of its sets: warned once, with the count, none touched" || no "--out-dir over stale backups: rc=$rc, $(head -c 300 "$W/st.err")"
+rm -rf "$W/sts"; mkdir -p "$W/sts"; echo stale > "$W/sts/repeat.bed.old.ZZZZZZ"
+$KT --db "$W/rc/f.tsv" decompress -i "$W/rc/r.kt" --hier "$W/rc/h.tsv" --smooth --out-dir "$W/sts" >/dev/null 2>"$W/st.err" && rc=0 || rc=$?
+[ $rc = 0 ] && [ "$(grep 'warning' "$W/st.err")" = "karyozip: warning: $W/sts holds 1 old BED(s) from an interrupted run (*.bed.old.*); they are left in place" ] \
+  && [ "$(cat "$W/sts/repeat.bed.old.ZZZZZZ")" = stale ] && cmp -s "$W/sts/gene.bed" "$W/rc/new/gene.bed" \
+  && ok "--smooth --out-dir over a stale backup: warned, with the count, left" || no "--smooth --out-dir over a stale backup: rc=$rc, $(head -c 300 "$W/st.err")"
+rm -rf "$W/stn"; mkdir -p "$W/stn"; echo OLD > "$W/stn/gene.bed"
+$KT decompress --db "$D/db.features.tsv" --set gene,repeat --out-dir "$W/stn" -i "$W/f.kt" >/dev/null 2>"$W/st.err" && rc=0 || rc=$?
+[ $rc = 0 ] && ! grep -q 'warning' "$W/st.err" && cmp -s "$W/stn/gene.bed" "$D/db.gene.bed" \
+  && ok "--out-dir with no stale backups: no warning" || no "--out-dir with no stale backups: rc=$rc, $(head -c 300 "$W/st.err")"
 
 # pin the stored bytes to codec versions: `karyozip --block 4 compress` of the fixture db.rall.bed
 # (tests/fixtures.txt), default effort (medium), no other flag but $KT's -t (threads never change the bytes).

@@ -1156,6 +1156,26 @@ for at in before inside; do
   else kill -KILL $pid 2>/dev/null || :; wait $pid 2>/dev/null || :; no "SIGTERM on a worker $at the commit window: no window, or no worker thread"; fi
 done
 
+# -o's rename under the same protocol: a worker's handler held, signalled once the temporary is synced and closed,
+# before the window: exit 1, the old file kept (the new one only if the window opened first), no temporary; inside
+# the window, once the new file is in place: deferred, exit 1, the new file. --smooth --set over the 100 contigs
+orgo() { exec $KZ -t 4 --db "$W/rc/f.tsv" decompress -i "$W/rc/r.kt" --hier "$W/rc/h.tsv" --smooth --set gene -o "$1" >/dev/null 2>"$W/or.err"; }
+orrace() { KZ_TEST_SWAP_PAUSE_MS=$PAUSE KZ_TEST_SIG_PAUSE_MS=$((2 * PAUSE)) orgo "$1"; }
+( orgo "$W/rc/new.o" ) || :
+ostaged='compgen -G "out.bed.tmp.*" >/dev/null && ! ls -l /proc/$pid/fd 2>/dev/null | grep -q "out\.bed\.tmp\."'
+onew='cmp -s out.bed "$W/rc/new.o"'
+for at in before inside; do
+  rm -rf "$W/or"; mkdir -p "$W/or"; echo OLD > "$W/or/out.bed"; ( orrace "$W/or/out.bed" ) & pid=$!; [ $at = before ] && cond=$ostaged || cond=$onew; tid=
+  swwait "$W/or" "$cond" $pid && tid=$(ls /proc/$pid/task 2>/dev/null | grep -vx "$pid" | head -n1) || :
+  if [ -n "$tid" ]; then
+    kill -TERM "$tid" 2>/dev/null || :; wait $pid && rc=0 || rc=$?
+    if [ "$(cat "$W/or/out.bed")" = OLD ]; then g=old; elif cmp -s "$W/or/out.bed" "$W/rc/new.o"; then g=new; else g=mixed; fi
+    [ $rc = 1 ] && { [ $g = new ] || { [ $at = before ] && [ $g = old ]; }; } && [ "$(ls -A "$W/or")" = out.bed ] \
+      && ok "SIGTERM on a worker, its handler held, $at -o's commit window: exit 1, the $g file, no temporary" \
+      || no "SIGTERM on a worker, its handler held, $at -o's commit window: rc=$rc, $g, left: $(ls -A "$W/or" | tr '\n' ' ')"
+  else kill -KILL $pid 2>/dev/null || :; wait $pid 2>/dev/null || :; no "SIGTERM on a worker $at -o's commit window: no window, or no worker thread"; fi
+done
+
 # pin the stored bytes to codec versions: `karyozip --block 4 compress` of the fixture db.rall.bed
 # (tests/fixtures.txt), default effort (medium), no other flag but $KT's -t (threads never change the bytes).
 # It moves when a vendored codec, zstd or the format changes; then check diff.sh still passes and update the pin on purpose.

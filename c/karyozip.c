@@ -5338,14 +5338,32 @@ static int *stage_open(const char *dir) {
     }
     return fd;
 }
-/* KZ_TEST_SWAP_PAUSE_MS=N, for tests only: stage_swap sleeps N ms before the commit window opens and after each of its
-   renames, so a test can act just before and inside the window (with KZ_TEST_SIG_PAUSE_MS, sig_pause). Read nowhere
-   else; unset, nothing sleeps. As the Rust's swap_pause */
+/* KZ_TEST_SWAP_PAUSE_MS=N, for tests only: a commit, --out-dir's (stage_swap) or -o's (outcommit), sleeps N ms
+   before its window opens and after each of its renames, so a test can act just before and inside the window (with
+   KZ_TEST_SIG_PAUSE_MS, sig_pause). Read nowhere else; unset, nothing sleeps. As the Rust's swap_pause */
 static void swap_pause(void) {
     static long ms = -1;
     if (ms < 0) { const char *e = getenv("KZ_TEST_SWAP_PAUSE_MS"); ms = e ? atol(e) : 0; if (ms < 0) ms = 0; }
     struct timespec t = { ms / 1000, (ms % 1000) * 1000000L };
     while (ms && nanosleep(&t, &t) && errno == EINTR) {}
+}
+/* The commit window opens: SIGINT, SIGTERM and SIGHUP blocked in this thread, then IDLE to COMMITTING, after which a
+   handler on any other thread only records the signal. When a handler has already claimed EXITING, no rename starts:
+   this waits for that handler to end the process. As the Rust's commit_begin */
+static void win_open(sigset_t *was) {
+    sigset_t hs; sigemptyset(&hs); sigaddset(&hs, SIGINT); sigaddset(&hs, SIGTERM); sigaddset(&hs, SIGHUP);
+    pthread_sigmask(SIG_BLOCK, &hs, was);
+    int st = SIG_IDLE;
+    if (!atomic_compare_exchange_strong(&SIGSTATE, &st, SIG_COMMITTING)) await_exit();
+}
+/* The window closes, back to IDLE. A deferred signal is raised, pending until the mask is restored, then the handler
+   runs with nothing staged left; unless quiet, when the caller refuses and exits anyway. As the Rust's commit_end */
+static void win_close(const sigset_t *was, int quiet) {
+    atomic_store(&SIGSTATE, SIG_IDLE);
+    if (quiet) return;
+    int ps = atomic_load(&PENDSIG);
+    if (ps) raise(ps);
+    pthread_sigmask(SIG_SETMASK, was, NULL);
 }
 /* The staged BEDs swapped in together. The contract: --out-dir replaces the set of BEDs all or nothing with respect
    to SIGINT, SIGTERM and SIGHUP and to a failed rename. Either every BED is the new one, or every BED is the old one
@@ -5365,10 +5383,7 @@ static void stage_swap(const char *dir) {
     for (size_t j = 0; j < NSETK; j++)   /* allocated first: no die inside the window */
         if (asprintf(&ph[j], "%s/%s.bed.old.XXXXXX", dir, fset[SETK[j]]) < 0) die("oom");
     swap_pause();
-    sigset_t hs, was; sigemptyset(&hs); sigaddset(&hs, SIGINT); sigaddset(&hs, SIGTERM); sigaddset(&hs, SIGHUP);
-    pthread_sigmask(SIG_BLOCK, &hs, &was);
-    int st = SIG_IDLE;   /* a handler already claimed EXITING: no rename starts, it ends the process */
-    if (!atomic_compare_exchange_strong(&SIGSTATE, &st, SIG_COMMITTING)) await_exit();
+    sigset_t was; win_open(&was);
     int bad = 0, lost = 0;
     for (size_t j = 0; j < NSETK && !bad; j++) {   /* every live BED onto its own backup name */
         snprintf(pb, sizeof pb, "%s/%s.bed", dir, fset[SETK[j]]);
@@ -5394,14 +5409,11 @@ static void stage_swap(const char *dir) {
     } else {
         for (size_t j = 0; j < NSETK; j++) { if (had[j]) unlink(ph[j]); free(DBTMP[j]); DBTMP[j] = NULL; }
     }
-    atomic_store(&SIGSTATE, SIG_IDLE);
+    win_close(&was, bad);
     for (size_t j = 0; j < NSETK; j++) free(ph[j]);
     free(ph); free(had); free(inst);
     if (lost) die2("cannot rename a derived BED into place, nor put every old one back: old BEDs remain as *.bed.old.* under ", dir);
     if (bad) die("cannot rename a derived BED into place");
-    int ps = atomic_load(&PENDSIG);
-    if (ps) raise(ps);   /* pending here until the mask is restored, then the handler, with nothing to remove */
-    pthread_sigmask(SIG_SETMASK, &was, NULL);
 }
 
 /* --smooth --out-dir DIR on a -d track: every --set smoothed into DIR/SET.bed */
@@ -5534,12 +5546,21 @@ static const char *regparse(char *r, uint64_t *lo, uint64_t *hi) {
 
 /* -o to a regular file: written under a temporary name, renamed in on success; a device or a FIFO in place */
 static void outsig(int s) { dbtmpsig(s); }
+/* the rename inside the same window as --out-dir's (win_open): a handler that claimed EXITING first removes the
+   temporary and exits, the old file kept, and no rename starts; a signal during the rename is raised once it is done,
+   exit 1 with the new file in place. Until the window the handler still sees OUTTMP, so a signal while it is synced
+   removes it. As the Rust's commit_out */
 static void outcommit(void) {
     if (!OUTTMP) return;
     emitflush();
     if (fdfinish(1)) { fprintf(stderr, "karyozip: write failed\n"); exit(1); }   /* NFS reports some errors only here */
-    if (rename(OUTTMP, OUTDST)) { fprintf(stderr, "karyozip: cannot rename into %s\n", OUTFIN); exit(1); }
-    OUTKEPT = OUTTMP; OUTTMP = NULL;   /* not freed (OUTKEPT) */
+    swap_pause();
+    sigset_t was; win_open(&was);
+    int bad = rename(OUTTMP, OUTDST) != 0;
+    if (!bad) { OUTKEPT = OUTTMP; OUTTMP = NULL; }   /* not freed (OUTKEPT) */
+    swap_pause();
+    win_close(&was, bad);
+    if (bad) { fprintf(stderr, "karyozip: cannot rename into %s\n", OUTFIN); exit(1); }   /* atexit's outclean removes it */
 }
 
 /* -i and -o: the file takes the place of stdin or stdout. -o to a regular file, or to none yet, is staged in a

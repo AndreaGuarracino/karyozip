@@ -454,15 +454,6 @@ pub fn stage_done(dir: &str, sets: &[&[u8]], tmps: &[std::path::PathBuf]) {
     TMP.lock().unwrap().clear();
 }
 
-/// KZ_TEST_SWAP_PAUSE_MS=N, for tests only: swap_in sleeps N ms before the commit window opens and after each of its
-/// renames, so a test can act just before and inside the window (with KZ_TEST_SIG_PAUSE_MS, ffi.rs). Read nowhere
-/// else; unset, nothing sleeps. As the C's swap_pause
-fn swap_pause() {
-    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    let ms = *MS.get_or_init(|| std::env::var("KZ_TEST_SWAP_PAUSE_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(0));
-    if ms > 0 { std::thread::sleep(std::time::Duration::from_millis(ms)); }
-}
-
 /// Move every staged BED into place, or put back what was there. The contract: --out-dir replaces the set of BEDs
 /// all or nothing with respect to SIGINT, SIGTERM and SIGHUP and to a failed rename. Either every BED is the new one,
 /// or every BED is the old one (or absent, if it was absent before). Each live BED is first renamed onto
@@ -482,7 +473,7 @@ fn swap_in(dir: &str, sets: &[Vec<u8>], tmps: &[std::path::PathBuf]) {
     let mut had: Vec<Option<std::path::PathBuf>> = vec![None; n];
     let mut inst = vec![false; n];
     let (mut bad, mut lost) = (false, false);
-    swap_pause();
+    crate::ffi::swap_pause();
     let was = crate::ffi::commit_begin();
     for (j, s) in sets.iter().enumerate() {   // every live BED onto its own backup name
         let Ok((f, o)) = crate::ffi::mkstemp(&setpath(dir, s, ".bed.old"), 0o600) else { bad = true; break };
@@ -491,13 +482,13 @@ fn swap_in(dir: &str, sets: &[Vec<u8>], tmps: &[std::path::PathBuf]) {
             Ok(()) => had[j] = Some(o),
             Err(e) => { let _ = std::fs::remove_file(&o); if e.kind() != std::io::ErrorKind::NotFound { bad = true; } }
         }
-        swap_pause();
+        crate::ffi::swap_pause();
         if bad { break; }
     }
     for (j, s) in sets.iter().enumerate() {   // every staged BED in
         if bad { break; }
         if std::fs::rename(&tmps[j], live(s)).is_err() { bad = true; } else { inst[j] = true; }
-        swap_pause();
+        crate::ffi::swap_pause();
     }
     if bad {   // every old one back, over the new one; a new one with no old one removed
         for (j, s) in sets.iter().enumerate() {

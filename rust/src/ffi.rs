@@ -422,7 +422,7 @@ static RETIRED: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new())
 /// try_lock: a panic hook may retire one too (drop_tmp, drop_out)
 fn retire(p: usize) { if p != 0 { if let Ok(mut v) = RETIRED.try_lock() { v.push(p); } } }
 /// KZ_TEST_SIG_PAUSE_MS=N, for tests only: the handler sleeps N ms right after it decides, to exit or to defer, so
-/// a test can move the main thread on meanwhile (KZ_TEST_SWAP_PAUSE_MS, db.rs, holds it before and inside the commit
+/// a test can move the main thread on meanwhile (KZ_TEST_SWAP_PAUSE_MS, swap_pause, holds it before and inside a commit
 /// window). Read once by sig_test_init at startup, before any handler is installed (getenv is not async-signal-safe);
 /// unset or 0, nothing sleeps. As the C's SIGPAUSE_MS
 static SIGPAUSE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -493,17 +493,34 @@ pub fn drop_out() {
     if let Ok(mut o) = OUT.try_lock() { if let Some((t, ..)) = o.take() { unsafe { unlink(t.as_ptr()); } } }
 }
 
-/// On success: -o's temporary file renamed into place
+/// KZ_TEST_SWAP_PAUSE_MS=N, for tests only: a commit, --out-dir's (db.rs swap_in) or -o's (commit_out), sleeps N ms
+/// before its window opens and after each of its renames, so a test can act just before and inside the window (with
+/// KZ_TEST_SIG_PAUSE_MS). Read nowhere else; unset, nothing sleeps. As the C's swap_pause
+pub fn swap_pause() {
+    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let ms = *MS.get_or_init(|| std::env::var("KZ_TEST_SWAP_PAUSE_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(0));
+    if ms > 0 { std::thread::sleep(std::time::Duration::from_millis(ms)); }
+}
+
+/// On success: -o's temporary file renamed into place, the rename inside the same window as --out-dir's (commit_begin):
+/// a handler that claimed EXITING first removes the temporary and exits, the old file kept, and no rename starts; a
+/// signal during the rename is raised once it is done, exit 1 with the new file in place. Until the window the
+/// handler still sees the temporary, so a signal while it is synced removes it. As the C's outcommit
 pub fn commit_out() {
     use std::io::Write;
     let Some((t, dst, fin)) = OUT.lock().ok().and_then(|mut o| o.take()) else { return };
-    sig_out_clear();
     let tp = std::path::PathBuf::from(std::ffi::OsStr::from_bytes(t.as_bytes()));
     // NFS reports some errors only at close
     if std::io::stdout().flush().is_err() || !finish_fd(1) {
-        let _ = std::fs::remove_file(&tp); crate::bail("write failed");
+        sig_out_clear(); let _ = std::fs::remove_file(&tp); crate::bail("write failed");
     }
-    if std::fs::rename(&tp, &dst).is_err() { let _ = std::fs::remove_file(&tp); crate::bail(&format!("cannot rename into {fin}")) }
+    swap_pause();
+    let was = commit_begin();
+    let moved = std::fs::rename(&tp, &dst).is_ok();
+    sig_out_clear();
+    swap_pause();
+    if !moved { commit_end(was, true); let _ = std::fs::remove_file(&tp); crate::bail(&format!("cannot rename into {fin}")) }
+    commit_end(was, false);
 }
 
 /// A new file PREFIX.XXXXXX, as mkstemp: created exclusively, so never through a symlink, and a taken name retried

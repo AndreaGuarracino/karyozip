@@ -117,6 +117,22 @@ static void die2(const char *a, const char *b) {
 }
 static void die(const char *m) { die2(m, ""); }
 
+/* A staged output finished before it is renamed over anything: synced, then closed, both checked, since NFS, a
+   quota or a failing disk may report a lost write only at fsync or close. The rename that follows is not followed by
+   a directory fsync: the replacement is atomic, not promised to survive a crash. As the Rust's ffi::finish_fd. 0 on
+   success; fd is closed either way */
+static int fdfinish(int fd) { int bad = fdatasync(fd) != 0; return (close(fd) != 0) | bad; }
+/* n bytes to fd, past short writes and EINTR; 0 on success */
+static int fdput(int fd, const void *p, size_t n) {
+    while (n) {
+        ssize_t k = write(fd, p, n);
+        if (k < 0) { if (errno == EINTR) continue; return -1; }
+        if (!k) return -1;
+        p = (const char *)p + k; n -= (size_t)k;
+    }
+    return 0;
+}
+
 /* process wide, from the first file read on: decode-ahead workers and alnload are capped too, a writer reading nothing is not */
 static _Atomic size_t ALLOCMAX = 0;
 static void readcap(void) { atomic_store_explicit(&ALLOCMAX, (size_t)1 << 38, memory_order_relaxed); }
@@ -3823,13 +3839,12 @@ static void buildindex(const char *path) {
     if (asprintf(&ip, "%s.kzi", path) < 0 || asprintf(&tp, "%s.kzi.XXXXXX", path) < 0) die("oom");
     int fd = mkstemp(tp);
     mode_t um = umask(0); umask(um);   /* as a plain create: mkstemp's 0600 would hide it */
-    if (fd >= 0) (void)!fchmod(fd, 0666 & ~um);
-    FILE *f = fd < 0 ? NULL : fdopen(fd, "wb");
-    if (!f) die("cannot create the index file beside the track");
+    if (fd < 0) die("cannot create the index file beside the track");
+    (void)!fchmod(fd, 0666 & ~um);
     uint64_t tw[5] = { n, (uint64_t)k, r->mhash ^ namesrc(), pay, IDXMAGIC }; uint8_t tail[40];
     stwords(tail, tw, 5);
-    int bad = fwrite(t, 1, pay, f) != pay || fwrite(tail, 1, 40, f) != 40 || fflush(f);
-    if (fclose(f) || bad || rename(tp, ip)) { unlink(tp); die("index write failed"); }
+    int bad = fdput(fd, t, pay) || fdput(fd, tail, 40);
+    if ((fdfinish(fd) | bad) || rename(tp, ip)) { unlink(tp); die("index write failed"); }
     free(t); free(tp);
     fprintf(stderr, "index: %llu sequences, %llu B in %s, %llu fingerprint collisions\n",
             (unsigned long long)n, (unsigned long long)(pay + 40), ip, (unsigned long long)dup);
@@ -4836,10 +4851,11 @@ static size_t eo = 0;
 /* -o's temporary name, set by redirect; OUTDST is OUTFIN with a symlink resolved */
 static char *OUTTMP; static const char *OUTFIN, *OUTDST;
 static void outclean(void) { if (OUTTMP) { unlink(OUTTMP); OUTTMP = NULL; } }
+static void dbtmpclean(void);
 static void emitflush(void) {   /* runs from atexit: die would recurse */
-    if (eo && fwrite(out, 1, eo, stdout) != eo) { fprintf(stderr, "karyozip: write failed\n"); outclean(); _exit(1); }
+    if (eo && fwrite(out, 1, eo, stdout) != eo) { fprintf(stderr, "karyozip: write failed\n"); outclean(); dbtmpclean(); _exit(1); }
     eo = 0;
-    if (fflush(stdout)) { fprintf(stderr, "karyozip: write failed\n"); outclean(); _exit(1); }
+    if (fflush(stdout)) { fprintf(stderr, "karyozip: write failed\n"); outclean(); dbtmpclean(); _exit(1); }
 }
 
 /* One row emitter, to a FILE through a fixed buffer or into the caller's growing buffer, with one merging rule */
@@ -5229,12 +5245,14 @@ static void encode_db(int nfiles, char **files) {
     free(b);
 }
 
-typedef struct { FILE *f; char *b; size_t n, cap; } ow;
+typedef struct { FILE *f; int fd; char *b; size_t n, cap; } ow;   /* stdout through f, a staged BED through fd */
+/* the buffered rows out; 0 on success */
+static int owwrite(ow *w) { return w->f ? w->n && fwrite(w->b, 1, w->n, w->f) != w->n : fdput(w->fd, w->b, w->n); }
 
 static void owput(ow *w, const char *nm, size_t nl, uint64_t a, uint64_t b,
                   const char *lab, size_t ll) {
     if (w->n + nl + ll + 48 > w->cap) {
-        if (fwrite(w->b, 1, w->n, w->f) != w->n) die("write failed");
+        if (owwrite(w)) die("write failed");
         w->n = 0;
         if (nl + ll + 48 > w->cap) { w->cap = nl + ll + 64; w->b = xrealloc(w->b, w->cap); }   /* one row that is bigger */
     }
@@ -5248,7 +5266,13 @@ static void owput(ow *w, const char *nm, size_t nl, uint64_t a, uint64_t b,
 
 static char **DBTMP; static size_t ndbtmp;
 static void dbtmpclean(void) { for (size_t i = 0; i < ndbtmp; i++) if (DBTMP[i]) remove(DBTMP[i]); }
-static void dbtmpsig(int s) { dbtmpclean(); outclean(); (void)s; _exit(1); }   /* atexit does not run on a signal */
+/* set through stage_swap's renames: a handler on another thread (an OpenMP worker, which has the signals unblocked)
+   then only records the signal, and stage_swap raises it once its renames are done */
+static volatile sig_atomic_t INCOMMIT, PENDSIG;
+static void dbtmpsig(int s) {   /* atexit does not run on a signal */
+    if (INCOMMIT) { PENDSIG = s; return; }
+    dbtmpclean(); outclean(); _exit(1);
+}
 
 /* --out-dir DIR: one staged BED a selected set, DBTMP[i] for SETK[i], each a new random name made exclusively, so
    never through a symlink; the open descriptors are returned, as the Rust's stage_open */
@@ -5279,45 +5303,81 @@ static int *stage_open(const char *dir) {
     }
     return fd;
 }
-/* the staged BEDs swapped in together, the old ones restored on a failure */
+/* KZ_TEST_SWAP_PAUSE_MS=N, for tests only: stage_swap sleeps N ms after each of its renames, so a test can act
+   inside the commit window. Read nowhere else. As the Rust's swap_pause */
+static void swap_pause(void) {
+    static long ms = -1;
+    if (ms < 0) { const char *e = getenv("KZ_TEST_SWAP_PAUSE_MS"); ms = e ? atol(e) : 0; if (ms < 0) ms = 0; }
+    struct timespec t = { ms / 1000, (ms % 1000) * 1000000L };
+    while (ms && nanosleep(&t, &t) && errno == EINTR) {}
+}
+/* The staged BEDs swapped in together. The contract: --out-dir replaces the set of BEDs all or nothing with respect
+   to SIGINT, SIGTERM and SIGHUP and to a failed rename. Either every BED is the new one, or every BED is the old one
+   (or absent, if it was absent before). Each live BED is first renamed onto SET.bed.old.XXXXXX, an empty placeholder
+   made exclusively (mkstemp), so a backup never takes a name in use, a stale backup of an earlier run included; then
+   every staged BED is renamed in; then the backups are removed. On a failed rename every backup is renamed back and
+   every new BED that had no old one removed; when even that fails, the refusal says old BEDs remain. The handled
+   signals are blocked in this thread for all of it, and a handler running on another thread only records the signal
+   (INCOMMIT); either way the signal acts once the renames are done, when nothing staged is left. An uncatchable end
+   (SIGKILL, OOM, power loss) inside the window can leave old BEDs as SET.bed.old.XXXXXX beside the outputs, and nothing
+   reports them. No directory fsync follows. As the Rust's swap_in */
 static void stage_swap(const char *dir) {
     char pb[4096];
-    char **old = xcalloc(NSETK, sizeof *old), **mv = xcalloc(NSETK, sizeof *mv); size_t nmv = 0; int bad = 0;
-    for (size_t j = 0; j < NSETK && !bad; j++) {
+    char **ph = xcalloc(NSETK, sizeof *ph); char *had = xcalloc(NSETK, 1), *inst = xcalloc(NSETK, 1);
+    for (size_t j = 0; j < NSETK; j++)   /* allocated first: no die inside the window */
+        if (asprintf(&ph[j], "%s/%s.bed.old.XXXXXX", dir, fset[SETK[j]]) < 0) die("oom");
+    sigset_t hs, was; sigemptyset(&hs); sigaddset(&hs, SIGINT); sigaddset(&hs, SIGTERM); sigaddset(&hs, SIGHUP);
+    pthread_sigmask(SIG_BLOCK, &hs, &was); INCOMMIT = 1;
+    int bad = 0, lost = 0;
+    for (size_t j = 0; j < NSETK && !bad; j++) {   /* every live BED onto its own backup name */
         snprintf(pb, sizeof pb, "%s/%s.bed", dir, fset[SETK[j]]);
-        char *o2; if (asprintf(&o2, "%s/%s.bed.old.%d", dir, fset[SETK[j]], (int)getpid()) < 0) die("oom");
-        if (!rename(pb, o2)) { old[j] = o2; } else { free(o2); if (errno != ENOENT) bad = 1; }
+        int pf = mkstemp(ph[j]);
+        if (pf < 0) { bad = 1; break; }
+        close(pf);
+        if (!rename(pb, ph[j])) had[j] = 1;
+        else { int e = errno; unlink(ph[j]); if (e != ENOENT) bad = 1; }
+        swap_pause();
     }
-    for (size_t j = 0; j < NSETK && !bad; j++) {
+    for (size_t j = 0; j < NSETK && !bad; j++) {   /* every staged BED in */
         snprintf(pb, sizeof pb, "%s/%s.bed", dir, fset[SETK[j]]);
-        if (rename(DBTMP[j], pb)) bad = 1; else { mv[j] = DBTMP[j]; DBTMP[j] = NULL; nmv++; }
+        if (rename(DBTMP[j], pb)) bad = 1; else inst[j] = 1;
+        swap_pause();
     }
-    if (bad) {
-        for (size_t j = 0; j < nmv; j++) {   /* take the new ones back out */
+    if (bad) {   /* every old one back, over the new one; a new one with no old one removed */
+        for (size_t j = 0; j < NSETK; j++) {
             snprintf(pb, sizeof pb, "%s/%s.bed", dir, fset[SETK[j]]);
-            if (!rename(pb, mv[j])) DBTMP[j] = mv[j];
+            if (had[j]) { if (rename(ph[j], pb)) lost = 1; }
+            else if (inst[j] && unlink(pb)) lost = 1;
+            if (inst[j]) { free(DBTMP[j]); DBTMP[j] = NULL; }   /* gone from its staged name either way */
         }
-        for (size_t j = 0; j < NSETK; j++) if (old[j]) {
-            snprintf(pb, sizeof pb, "%s/%s.bed", dir, fset[SETK[j]]);
-            (void)!rename(old[j], pb); free(old[j]);
-        }
-        free(old); die("cannot rename a derived BED into place");
+    } else {
+        for (size_t j = 0; j < NSETK; j++) { if (had[j]) unlink(ph[j]); free(DBTMP[j]); DBTMP[j] = NULL; }
     }
-    for (size_t j = 0; j < NSETK; j++) { if (old[j]) remove(old[j]); free(old[j]); free(mv[j]); }
-    free(old); free(mv);
+    INCOMMIT = 0;
+    for (size_t j = 0; j < NSETK; j++) free(ph[j]);
+    free(ph); free(had); free(inst);
+    if (lost) die2("cannot rename a derived BED into place, nor put every old one back: old BEDs remain as *.bed.old.* under ", dir);
+    if (bad) die("cannot rename a derived BED into place");
+    if (PENDSIG) raise(PENDSIG);   /* pending here until the mask is restored, then the handler, with nothing to remove */
+    pthread_sigmask(SIG_SETMASK, &was, NULL);
 }
 
 /* --smooth --out-dir DIR on a -d track: every --set smoothed into DIR/SET.bed */
 static void smoothsets(const char *path, const char *hier, int v1, const char *dir) {
     int *fd = stage_open(dir);
+    fflush(stdout);
+    /* each set written through stdout, a second descriptor of its file. After the set, stdout is put back from sv
+       first, so dup2 drops only that second descriptor; the set's own one is then synced and closed, last, checked */
+    int sv = dup(1);
+    if (sv < 0) die("cannot write a derived BED");
     for (size_t i = 0; i < NSETK; i++) {
-        fflush(stdout);
         if (dup2(fd[i], 1) < 0) die("cannot write a derived BED");
-        close(fd[i]);
         if (i) hierreset();
         smoothcmd(path, hier, fset[SETK[i]], NULL, 0, 0, v1);
         emitflush();   /* the rows emit holds go to this set's file */
+        if (dup2(sv, 1) < 0 || fdfinish(fd[i])) die("write failed");
     }
+    close(sv);
     free(fd);
     stage_swap(dir);
     fprintf(stderr, "db: %zu smoothed tracks under %s\n", NSETK, dir);
@@ -5338,8 +5398,7 @@ static void decode_db(const char *path, const char *dir) {
     else {
         int *fd = stage_open(dir);
         for (size_t i = 0; i < NSETK; i++) {
-            o[i].f = fdopen(fd[i], "w");
-            if (!o[i].f) die("cannot write a derived BED");
+            o[i].fd = fd[i];
             o[i].cap = 1 << 20;
             o[i].b = xmalloc(o[i].cap);
         }
@@ -5405,7 +5464,7 @@ static void decode_db(const char *path, const char *dir) {
         for (size_t j = 0; j < nout; j++)
             owput(&o[j], cseq, cseqn, c0[j], c1[j], cl[j], cll[j]);
     for (size_t j = 0; j < nout; j++) {
-        if ((o[j].n && fwrite(o[j].b, 1, o[j].n, o[j].f) != o[j].n) || (tostd ? fflush(o[j].f) : fclose(o[j].f))) die("write failed");
+        if (owwrite(&o[j]) || (tostd ? fflush(o[j].f) : fdfinish(o[j].fd))) die("write failed");
         free(o[j].b);
     }
     free(jb[0]); free(jb[1]); free(fidof);
@@ -5432,11 +5491,11 @@ static const char *regparse(char *r, uint64_t *lo, uint64_t *hi) {
 }
 
 /* -o to a regular file: written under a temporary name, renamed in on success; a device or a FIFO in place */
-static void outsig(int s) { outclean(); dbtmpclean(); (void)s; _exit(1); }
+static void outsig(int s) { dbtmpsig(s); }
 static void outcommit(void) {
     if (!OUTTMP) return;
     emitflush();
-    if (close(1)) { fprintf(stderr, "karyozip: write failed\n"); exit(1); }   /* NFS reports some errors only here */
+    if (fdfinish(1)) { fprintf(stderr, "karyozip: write failed\n"); exit(1); }   /* NFS reports some errors only here */
     if (rename(OUTTMP, OUTDST)) { fprintf(stderr, "karyozip: cannot rename into %s\n", OUTFIN); exit(1); }
     free(OUTTMP); OUTTMP = NULL;
 }

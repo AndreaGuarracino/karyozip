@@ -50,6 +50,8 @@ impl Feats {
                     }
                     f.sets.push(s.to_vec());
                 }
+                // one intern map a set from the header on, so a table with no rows still answers labid (novel)
+                f.intern = vec![HashMap::default(); f.sets.len()];
                 first = false;
                 continue;
             }
@@ -72,7 +74,6 @@ impl Feats {
             f.idpos[id as usize] = f.labs.len() as u32;
             f.labs.push(cols[1..].iter().map(|c| c.to_vec()).collect());
             f.nids += 1;
-            if f.intern.is_empty() { f.intern = vec![HashMap::default(); f.sets.len()]; }
             let key = kst::Tup(cols[1..].iter().enumerate().map(|(k, c)| {
                 let n = f.intern[k].len() as u32; *f.intern[k].entry(c.to_vec()).or_insert(n) }).collect());
             f.tupint.entry(key).or_insert(id);

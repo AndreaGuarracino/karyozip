@@ -177,6 +177,11 @@ EXPECT=fail both "--db from a dropped-names .kst" compress --db "$D/db.features.
 head -c 100 "$W/ks.gene.kst" > "$W/ks.cut.kst"
 EXPECT=fail both "--db from a .kst cut in its header" compress --db "$D/db.features.tsv" ${KS/$W\/ks.gene.kst/$W\/ks.cut.kst}
 EXPECT=ok; tally "--db .kst inputs"
+# a features table with its header alone (finding 4)
+printf 'featureID\tsetA\n' > "$W/ho.tsv"; printf 'chr1\t0\t5\tnovel\n' > "$W/hn.bed"; printf 'chr1\t0\t5\tx\n' > "$W/hx.bed"
+both "--db, a header-only features table, a novel row" compress --db "$W/ho.tsv" -i "$W/hn.bed"
+EXPECT=fail both "--db, a header-only features table, a label not in it" compress --db "$W/ho.tsv" -i "$W/hx.bed"; EXPECT=ok
+tally "--db header-only features table"
 # outside tuple with --hier: 2^26 + rank
 { printf 'feature_set\tchild\tparent\nrepeat\trepeat\tcategorized\nrepeat\tLINE\trepeat\n'; } > "$W/hv.tsv"
 awk -F'\t' 'NR==5{$4="repeat"} {print}' OFS='\t' "$D/db.repeat.bed" > "$W/hv.repeat.bed"

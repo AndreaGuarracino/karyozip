@@ -293,3 +293,32 @@ fn db_encode_from_per_set_kst() {
     assert!(leftovers(&d).is_empty());
     let _ = std::fs::remove_dir_all(&d);
 }
+
+/// A features table with its header alone: a novel row encodes as the CLI's bytes, any other label is the CLI's
+/// refusal, returned; neither panics
+#[test]
+fn db_encode_with_a_header_only_table() {
+    let d = scratch("dbhdr");
+    let tsv = d.join("features.tsv");
+    std::fs::write(&tsv, "featureID\tsetA\n").unwrap();
+    let feats = karyozip::db::Feats::load(&tsv.display().to_string()).expect("features");
+    let (nb, xb) = (d.join("novel.bed"), d.join("x.bed"));
+    std::fs::write(&nb, "chr1\t0\t5\tnovel\n").unwrap();
+    std::fs::write(&xb, "chr1\t0\t5\tx\n").unwrap();
+    let want = std::process::Command::new(env!("CARGO_BIN_EXE_karyozip")).arg("-t").arg(test_threads())
+        .arg("compress").arg("--db").arg(&tsv).arg("-i").arg(&nb)
+        .stderr(std::process::Stdio::null()).output().expect("spawn").stdout;
+    assert!(!want.is_empty());
+    let mut w = Writer::new(Options::default(), &d).expect("temp file");
+    let used = karyozip::db::encode(&[nb.display().to_string()], &feats, &mut w).expect("a novel row");
+    w.set_feathash(if used { feats.hierhash } else { feats.hash }, used);
+    let mut out = Vec::new();
+    w.close(&mut out).expect("close");
+    assert_eq!(out, want, "a header-only table through the library");
+    let mut w = Writer::new(Options::default(), &d).expect("temp file");
+    let e = karyozip::db::encode(&[xb.display().to_string()], &feats, &mut w).expect_err("a label not in the table was accepted");
+    assert_eq!((e.message(), e.kind()), ("a label tuple is not in the features table", ErrorKind::Input));
+    drop(w);
+    assert!(leftovers(&d).is_empty());
+    let _ = std::fs::remove_dir_all(&d);
+}

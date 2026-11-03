@@ -175,6 +175,14 @@ for t in "$W/f.kt" "$W/drop.kst" "$W/rall.aln.kst"; do
 done
 head -c 100 "$W/set.gene.kst" > "$W/cut.kst"
 must_fail "a .kst input cut inside its header" $KT compress --db "$D/db.features.tsv" ${kin/$W\/set.gene.kst/$W\/cut.kst}
+# a features table with its header alone: a novel row is featureID 0, any other label is refused (finding 4)
+printf 'featureID\tsetA\n' > "$W/ho.tsv"; printf 'chr1\t0\t5\tnovel\n' > "$W/hn.bed"; printf 'chr1\t0\t5\tx\n' > "$W/hx.bed"
+rc=0; $KT compress --db "$W/ho.tsv" -i "$W/hn.bed" > "$W/ho.kt" 2>"$W/ho.err" || rc=$?
+[ $rc = 0 ] && $KT --db "$W/ho.tsv" decompress -i "$W/ho.kt" 2>/dev/null | cmp -s - "$W/hn.bed" \
+  && ok "a header-only features table, a novel row: written, and decoded back" || no "a header-only features table, a novel row: rc $rc [$(tail -1 "$W/ho.err")]"
+rc=0; $KT compress --db "$W/ho.tsv" -i "$W/hx.bed" > /dev/null 2>"$W/ho.err" || rc=$?
+[ $rc = 1 ] && [ "$(tail -1 "$W/ho.err")" = "karyozip: a label tuple is not in the features table" ] \
+  && ok "a header-only features table, a label not in it: refused" || no "a header-only features table, a label not in it: rc $rc [$(tail -1 "$W/ho.err")]"
 # smooth and region on every informed form
 { printf 'feature_set\tchild\tparent\n'; for l in $(cut -f4 "$D/db.acrocentric.bed" "$D/s.bed" "$D/ref.bed" | sort -u); do printf 'acrocentric\t%s\tcategorized\n' "$l"; done; } > "$W/inf.tsv"
 $KT compress < "$D/db.acrocentric.bed" > "$W/pa.kt" 2>/dev/null

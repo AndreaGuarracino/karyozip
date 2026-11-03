@@ -7,11 +7,20 @@
 #                      as its own TEST_JOBS; inside a suite it bounds the cases run at once (run.sh's readers,
 #                      fuzz.sh's xargs -P) and cargo test's -j and --test-threads
 #   KZ_TEST_THREADS=N  the -t every karyozip run gets unless the case tests a thread count; default the
-#                      suite's TEST_JOBS. N cases at once share it: each gets KZ_TEST_THREADS / N (share N)
+#                      suite's TEST_JOBS. N cases at once share it: each gets KZ_TEST_THREADS / N (share N).
+#                      The Rust integration tests pass their share as -t to the CLI they spawn (Makefile)
 #   TEST_LIGHT=1       serial and light: skip the stress cases, each with one "skipped (TEST_LIGHT): CASE"
 #                      line, counted apart in the summary. Stress cases run the thread counts they test
-#                      (-t 2, 4, 8, 1024, the default count, 8 readers at once) or address-limit and large
-#                      inputs; run them in a bounded Slurm job. Every `stress` call in the suites is one
+#                      (-t 2, 4, 8, 1024, the default count, 8 readers at once), an address limit, or size:
+#                      every generated input above 20000 rows, -e high on more than the fixtures and the
+#                      200-read tail inputs, featureID 2^26-1 (about 1 GB of --db tables for one row);
+#                      fuzz.sh drops its forged-index stage (140000 rows) and runs 10 cases per generator,
+#                      not 60. Everything else runs; the largest generated input kept is 20000 rows.
+#                      Every `stress` call in the suites is one. In every mode two karyozip outputs are
+#                      compared one run after the other (seqcmp), not through `cmd | cmp - <(cmd2)`.
+#                      TEST_JOBS=1 TEST_LIGHT=1 make test in a 1-CPU Slurm job (two runs, measured): 154 to
+#                      170 s, at most 3 runnable threads (a -t 1 compress, its reader and names threads), one
+#                      karyozip at a time, at most 302 MB MaxRSS. Run the stress cases in a bounded Slurm job
 #   TIMEOUT_SCALE=X    multiplies every fixed timeout; default 1, 4 under a sanitizer binary (see tscale)
 #   FUZZ_SEED=N        fuzz.sh's mutation offsets and bytes; printed at the start of every run
 
@@ -76,7 +85,6 @@ stress() {
   [ "${TEST_LIGHT:-0}" = 1 ] || return 0
   if want_case "$1"; then NSKIP=$((NSKIP + 1)); echo "skipped (TEST_LIGHT): $1"; fi; return 1
 }
-summary() { echo "$1: $NPASS passed, $NFAIL failed, $NSKIP skipped${CASE:+ (CASE=$CASE)}"; }
 # seqcmp CMD1... -- CMD2...: true if the two commands print the same bytes. They run one after the other, each into
 # a file in $W (never at once, as `CMD1 | cmp - <(CMD2)` would run them), their stderr and exit codes ignored
 seqcmp() {
@@ -86,3 +94,4 @@ seqcmp() {
   "$@" > "$W/seqcmp.2" 2>/dev/null || :
   cmp -s "$W/seqcmp.1" "$W/seqcmp.2"
 }
+summary() { echo "$1: $NPASS passed, $NFAIL failed, $NSKIP skipped${CASE:+ (CASE=$CASE)}"; }

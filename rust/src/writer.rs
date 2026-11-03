@@ -1524,3 +1524,69 @@ pub fn check_unique(names: &[u8]) -> Result<(), String> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// reads of 1, 2, 5, 40 and 300 runs (300 takes grp_unpack's counting path), lengths up to 3 bytes, ids up to 2
+    fn reads() -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<(u64, u64)>) {
+        let (mut lens, mut ids, mut ibx, mut runs) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let mut x = 7u64;
+        for &k in &[1u64, 2, 5, 40, 1, 300, 3] {
+            kst::put(&mut ibx, k);
+            for _ in 0..k {
+                x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                let (l, id) = ((x >> 33) % 70000 + 1, (x >> 20) % 7);
+                kst::put(&mut lens, l); kst::put(&mut ids, id); runs.push((l, id));
+            }
+        }
+        (lens, ids, ibx, runs)
+    }
+
+    #[test]
+    fn ilv_pack_splits_back() {
+        let (lens, ids, ibx, runs) = reads();
+        let packed = ilv_pack(&lens, &ids, &ibx).expect("packs");
+        let heads = splice_heads(&lens, &ibx).expect("heads");
+        let mut want = heads.clone(); want.extend_from_slice(&ids);
+        let got = crate::reader::ilv_split(packed, heads.len(), ids.len(), runs.len() as u64);
+        assert_eq!(got, want);
+        // a run count past the rows is no packing
+        let mut more = ibx.clone(); kst::put(&mut more, 1);
+        assert!(ilv_pack(&lens, &ids, &more).is_none());
+        assert!(ilv_pack(&lens, &ids[..ids.len() - 1], &ibx).is_none());
+    }
+
+    #[test]
+    fn grp_pack_unpacks_back() {
+        let (lens, ids, ibx, runs) = reads();
+        let packed = grp_pack(&lens, &ids, &ibx).expect("packs");
+        // lift the run counts out, as rmheads does, and note each read's runs
+        let (mut grouped, mut rtab, mut i, mut seen) = (Vec::new(), vec![0u32], 0usize, 0u64);
+        let mut r = 0usize;
+        while i < packed.len() {
+            let (k, n) = vget(&packed, i); i = n;
+            let (kk, _) = vget(&ibx, r); r = crate::reader::skip(&ibx, r); assert_eq!(k, kk);
+            // within a read, the lengths come in label order, stable
+            let mut want: Vec<(u64, usize, u64)> = runs[seen as usize..(seen + k) as usize].iter().enumerate()
+                .map(|(j, &(l, id))| (id, j, l)).collect();
+            want.sort();
+            for &(_, _, l) in &want {
+                let (v, n) = vget(&packed, i); assert_eq!(v, l);
+                grouped.extend_from_slice(&packed[i..n]); i = n;
+            }
+            seen += k; rtab.push(seen as u32);
+        }
+        assert_eq!(seen, runs.len() as u64);
+        assert_eq!(crate::reader::grp_unpack(&grouped, &ids, &rtab), lens);
+        let mut more = ibx.clone(); kst::put(&mut more, 1);
+        assert!(grp_pack(&lens, &ids, &more).is_none());
+    }
+
+    #[test]
+    fn ilv_flip_is_its_own_inverse() {
+        for v in [0u64, 1, 63, 64, 126, 127, 128, 1000, u64::MAX] { assert_eq!(ilv_flip(ilv_flip(v)), v); }
+        assert_eq!((ilv_flip(0), ilv_flip(127), ilv_flip(128)), (127, 0, 128));
+    }
+}

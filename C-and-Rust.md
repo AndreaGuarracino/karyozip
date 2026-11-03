@@ -21,6 +21,13 @@ The C finds zstd, zlib and libgomp at the path in its rpath; the Rust bundles zs
 The Rust compiles the C codecs too, through `rust/src/ffi.rs`: there is no Rust htscodecs, and the `bzip3` crate lacks the local changes in `c/bzip3/PROVENANCE` (`bz3_compress_cuts` among them). `zstd-sys` is pinned to `=2.1.2`, which bundles the zstd 1.5.7 the C links, because zstd does not promise the same bytes across releases.
 Outside `ffi.rs`, four hot loops write unchecked, each behind an assertion: the digit writer in `kst.rs`, the row writers in `reader.rs` and `smooth.rs`, and `smooth_one`.
 
+## Tests
+
+`make test` runs `tests/run.sh` on the C (with `c/build/karyozip-san`, the ASan/UBSan build, for the leak and fuzz stages), `tests/run.sh` on the Rust, and `tests/diff.sh`. `make test-rust-debug` runs `cargo test` in a debug build, with overflow checks on. The suites are Linux/GNU only and need python3, zstd, gzip, GNU coreutils (`realpath -m`, `stat -c`, `sha256sum`, `timeout`), GNU grep (`-P`) and awk; each script names what is missing and stops.
+The Rust half has no sanitizer binary, so its leak stage runs the Rust under **valgrind**. Without valgrind that stage prints `leaks: skipped: valgrind not installed` and the rest runs; set `REQUIRE_VALGRIND=1` to make it a failure, as CI should.
+Every check prints one line, failures start with `FAIL: `, and each script ends with `N passed, M failed`. Environment knobs: `CASE=REGEX` (diff.sh and fuzz.sh run only the matching sections; run.sh runs everything but reports only matching checks), `TEST_JOBS` (parallel test processes, default `SLURM_CPUS_PER_TASK`, else `nproc`), `TIMEOUT_SCALE` (multiplies fixed timeouts, default 1, 4 under an ASan binary) and `FUZZ_SEED` (fuzz.sh prints the seed it used; set it to repeat a run's mutations).
+`ci/github-actions.yml` is a ready GitHub Actions workflow; copy it to `.github/workflows/` to enable it.
+
 ## The C library
 
 `make` also builds `c/build/libkaryozip.a`, six calls in `c/karyozip.h` (`kt_open`, `kt_block`, `kt_level`, `kt_row`, `kt_close`, `kt_version`), for an annotator that writes `.kst` directly.

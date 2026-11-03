@@ -5,3 +5,5 @@ __pycache__/
 *.kst
 *.kzi
 notes/
+rust/fuzz/corpus/
+rust/fuzz/artifacts/

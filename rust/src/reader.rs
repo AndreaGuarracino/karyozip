@@ -577,7 +577,7 @@ impl Reader {
 }
 
 /// One stream a read, its run count then a label beside its own length, split back into the two regions
-fn ilv_split(v: Vec<u8>, nl: usize, ni: usize, rows: u64) -> Vec<u8> {
+pub(crate) fn ilv_split(v: Vec<u8>, nl: usize, ni: usize, rows: u64) -> Vec<u8> {
     let (mut lens, mut ids) = (Vec::with_capacity(nl + ni), Vec::with_capacity(ni));   // the ids join lens: no regrowth
     let (mut i, mut seen) = (0usize, 0u64);
     while i < v.len() {
@@ -628,7 +628,7 @@ fn rmheads(lens: &mut [u8], total: u64, rows: u64, nrd: u64) -> (usize, Vec<u32>
 }
 
 /// Undo grp_pack: the labels, in their own order, say which group each length came from; rtab holds the counts
-fn grp_unpack(lens: &[u8], ids: &[u8], rtab: &[u32]) -> Vec<u8> {
+pub(crate) fn grp_unpack(lens: &[u8], ids: &[u8], rtab: &[u32]) -> Vec<u8> {
     let mut out = Vec::with_capacity(lens.len() + ids.len());   // the ids join it next: no regrowth
     let (mut p, mut q) = (0usize, 0usize);
     // 8 B a run in each, as the C's

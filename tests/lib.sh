@@ -23,6 +23,11 @@
 #                      karyozip at a time, at most 302 MB MaxRSS. Run the stress cases in a bounded Slurm job
 #   TIMEOUT_SCALE=X    multiplies every fixed timeout; default 1, 4 under a sanitizer binary (see tscale)
 #   FUZZ_SEED=N        fuzz.sh's mutation offsets and bytes; printed at the start of every run
+# Read by the karyozip binaries themselves (C and Rust, release builds included), set only by run.sh's signal cases:
+#   KZ_TEST_SIG_PAUSE_MS=N   a SIGINT/SIGTERM/SIGHUP handler sleeps N ms right after it decides to exit or to defer
+#   KZ_TEST_SWAP_PAUSE_MS=N  an output commit (--out-dir's BEDs, -o's rename) sleeps N ms before its window opens and
+#                            after each rename, so a case can signal just before and inside the window
+#   Sleeps at those fixed points only: timing, never the bytes. Unset or 0, nothing sleeps. For the test suite only
 
 # need TOOL...: every missing tool named at once, then exit 1
 need() {

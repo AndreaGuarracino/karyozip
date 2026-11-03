@@ -126,6 +126,7 @@ Read names are stored in the file by default.
 | `-h`, `--help`, `--version` | all | usage; library versions |
 
 Flags work on either side of the command name. The readers are decompress and query.
+No environment variable changes the bytes karyozip writes. Two are read, for the test suite only: `KZ_TEST_SIG_PAUSE_MS` and `KZ_TEST_SWAP_PAUSE_MS` add sleeps at fixed points of a signal or an output commit, and do nothing when unset ([C-and-Rust.md](C-and-Rust.md#tests)).
 
 ## Advanced
 
@@ -152,4 +153,4 @@ The Rust library's writer (`karyozip::writer::Writer`) returns every error as a 
 
 ## File format
 
-[FORMAT.md](FORMAT.md) specifies the `.kst` track, the `.kzi` index and the `aln-pack` file. The magic `KST00001` has not changed while flags and codecs were added, and no release is tagged yet. A file is only guaranteed to be read by the karyozip that wrote it.
+[FORMAT.md](FORMAT.md) specifies the `.kst` track, the `.kzi` index and the `aln-pack` file. The magic `KST00001` has not changed while flags and codecs were added. 0.3.0 is the first tagged release: what it writes, it reads, and its readers refuse a header flag they do not know by name. A file from an untagged commit before 0.3.0 is not guaranteed to read.

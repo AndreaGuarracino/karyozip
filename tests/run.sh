@@ -843,8 +843,9 @@ must_fail "decompress two tracks" $KT decompress -i "$W/side1.kt" -i "$W/side2.k
 # nothing from htscodecs reaches stderr
 $KT compress < "$D/s.bed" 2>&1 >/dev/null | grep -qi "htscodecs" && no "compress stderr: HTSCODECS COMPLAINED" || ok "compress stderr: clean"
 
-# library API: same bytes as the CLI
+# library API: same bytes as the CLI; the library has no -t, so its test runs on KZ_TEST_THREADS CPUs
 if [ -x "$LT" ]; then
+  LTB=$LT; LT="$(pin "$KZ_TEST_THREADS") $LTB"
   lok=1
   for f in s.bed ls.bed db.rall.bed db.chromosome.bed ord.bed; do
     $KT compress < "$D/$f" > "$W/lc.kt" 2>/dev/null

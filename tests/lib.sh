@@ -41,6 +41,12 @@ case $KZ_TEST_THREADS in ''|*[!0-9]*|0) KZ_TEST_THREADS=1 ;; esac
 export KZ_TEST_THREADS
 # share N: the -t for each of N binaries running at once, KZ_TEST_THREADS / N, at least 1
 share() { local t=$((KZ_TEST_THREADS / $1)); [ $t -lt 1 ] && t=1; echo $t; }
+# pin N: "taskset -c CPUS", the first N CPUs this process may use, for a program with no -t (the C library's
+# test, which takes the default count, the allowed CPUs); empty without taskset
+pin() {
+  command -v taskset >/dev/null 2>&1 || return 0
+  echo "taskset -c $(python3 -c 'import os, sys; print(",".join(map(str, sorted(os.sched_getaffinity(0))[:int(sys.argv[1])])))' "$1")"
+}
 
 # tscale BINARY: TIMEOUT_SCALE, 4 if unset and BINARY carries ASan; tmo N: N seconds scaled
 tscale() {

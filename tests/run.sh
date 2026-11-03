@@ -244,6 +244,25 @@ for form in fifo psub; do
 done
 rc=0; timeout "$(tmo 30)" $KT compress --db "$W/po.tsv" -i - < "$W/p1.kst" > /dev/null 2>"$W/pg.err" || rc=$?
 [ $rc = 1 ] && [ "$(tail -1 "$W/pg.err")" = "$kp" ] && ok "-d, a .kst on stdin: refused" || no "-d, a .kst on stdin: rc $rc [$(tail -1 "$W/pg.err")]"
+# a .kst whose ninth byte is a newline (ten sequences: the count's low byte is 0x0a, so its first "line" is the magic
+# alone, no NUL): through a pipe still the .kst's refusal, not "bad line"; and a BED row whose name begins with the
+# magic is still a BED through a pipe (review r6, finding 5)
+for k in $(seq 1 10); do printf 'c%d\t0\t10\tx\n' $k; done > "$W/p10.bed"; $KT compress < "$W/p10.bed" > "$W/p10.kst" 2>/dev/null
+[ "$(od -An -tx1 -j8 -N1 "$W/p10.kst" | tr -d ' ')" = 0a ] && ok "a ten-sequence .kst: its ninth byte is a newline" || no "a ten-sequence .kst: ninth byte WRONG"
+for form in fifo psub; do
+  rc=0; dbform $form "$W/pg.kt" "$W/po.tsv" "$W/p10.kst" || rc=$?
+  [ $rc = 1 ] && [ "$(tail -1 "$W/pg.kt.err")" = "$kp" ] && ok "-d, a .kst with a newline after its magic through a $form: refused as a .kst" \
+    || no "-d, a .kst with a newline after its magic through a $form: rc $rc [$(tail -1 "$W/pg.kt.err")]"
+done
+rc=0; timeout "$(tmo 30)" $KT compress --db "$W/po.tsv" -i - < "$W/p10.kst" > /dev/null 2>"$W/pg.err" || rc=$?
+[ $rc = 1 ] && [ "$(tail -1 "$W/pg.err")" = "$kp" ] && ok "-d, a .kst with a newline after its magic on stdin: refused as a .kst" \
+  || no "-d, a .kst with a newline after its magic on stdin: rc $rc [$(tail -1 "$W/pg.err")]"
+printf 'KST00001x\t0\t5\tx\n' > "$W/pm.bed"
+for form in fifo psub; do
+  rc=0; dbform $form "$W/pm.kt" "$W/po.tsv" "$W/pm.bed" || rc=$?
+  [ $rc = 0 ] && $KT --db "$W/po.tsv" decompress -i "$W/pm.kt" 2>/dev/null | cmp -s - "$W/pm.bed" \
+    && ok "-d, a BED row named KST00001x through a $form: read as a BED, decoded back" || no "-d, a BED row named KST00001x through a $form: rc $rc [$(tail -1 "$W/pm.kt.err")]"
+done
 # a features table with its header alone: a novel row is featureID 0, any other label is refused (finding 4)
 printf 'featureID\tsetA\n' > "$W/ho.tsv"; printf 'chr1\t0\t5\tnovel\n' > "$W/hn.bed"; printf 'chr1\t0\t5\tx\n' > "$W/hx.bed"
 rc=0; $KT compress --db "$W/ho.tsv" -i "$W/hn.bed" > "$W/ho.kt" 2>"$W/ho.err" || rc=$?

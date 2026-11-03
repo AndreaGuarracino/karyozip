@@ -5098,9 +5098,14 @@ static void sset(char **d, size_t *cap, const char *s, size_t n) {   /* a string
 }
 
 #define KSTPIPE "--db: a .kst input must be a regular file: it is read with random access, not through a pipe or stdin"
-/* A BED input's first line that is a .kst's start: the magic, then a NUL or no newline at all, which no BED has */
+/* A BED input's first line that is a .kst's start: the magic, then what no BED row has, a NUL, fewer than three
+   tabs or no newline at all. The byte after the magic may be a newline (a sequence count of 10, 266, ...), so a
+   NUL alone is not enough; a BED row whose name begins with the magic has its three tabs and no NUL, and is read */
 static void kstpipe(const char *ln, size_t n, int nonl) {
-    if (n >= 8 && !memcmp(ln, MAGIC, 8) && (nonl || memchr(ln, 0, n))) die(KSTPIPE);
+    if (n < 8 || memcmp(ln, MAGIC, 8)) return;
+    size_t tabs = 0;
+    for (size_t i = 0; i < n && tabs < 3; i++) tabs += ln[i] == '\t';
+    if (nonl || memchr(ln, 0, n) || tabs < 3) die(KSTPIPE);
 }
 
 #define BRDBUF (8u << 20)

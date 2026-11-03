@@ -218,9 +218,12 @@ fn is_kst(f: &std::fs::File) -> bool {
 }
 
 const KSTPIPE: &str = "--db: a .kst input must be a regular file: it is read with random access, not through a pipe or stdin";
-/// A BED input's first line that is a .kst's start: the magic, then a NUL or no newline at all, which no BED has
+/// A BED input's first line that is a .kst's start: the magic, then what no BED row has, a NUL, fewer than three
+/// tabs or no newline at all. The byte after the magic may be a newline (a sequence count of 10, 266, ...), so a
+/// NUL alone is not enough; a BED row whose name begins with the magic has its three tabs and no NUL, and is read
 fn kst_pipe(line: &[u8], nl: bool) -> KzResult<()> {
-    if line.starts_with(crate::writer::MAGIC) && (!nl || crate::ffi::find(0, line).is_some()) {
+    if line.starts_with(crate::writer::MAGIC)
+        && (!nl || crate::ffi::find(0, line).is_some() || line.iter().filter(|&&c| c == b'\t').take(3).count() < 3) {
         return Err(Error::input(KSTPIPE));
     }
     Ok(())

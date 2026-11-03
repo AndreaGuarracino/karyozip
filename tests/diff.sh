@@ -691,6 +691,33 @@ done
 tally "alignment coordinates past 64 bits"
 fi
 
+# 22. a piped --db input that is a .kst whose ninth byte is a newline (ten sequences): the .kst's refusal from both,
+# not "bad line"; a BED row named KST00001x through a pipe: a BED, the same bytes from both (review r6, finding 5)
+if sec kstpipe; then
+for k in $(seq 1 10); do printf 'c%d\t0\t10\tx\n' $k; done > "$W/k10.bed"; "$C" compress < "$W/k10.bed" > "$W/k10.kst" 2>/dev/null
+printf 'featureID\ts1\n1\tx\n2\ty\n' > "$W/k10.tsv"; printf 'KST00001x\t0\t5\tx\n' > "$W/km.bed"
+kp='karyozip: --db: a .kst input must be a regular file: it is read with random access, not through a pipe or stdin'
+kpr() {  # BIN FORM IN OUT: BIN compress --db, IN through a FIFO or <(...), bounded; its exit code
+  local rc=0 pid=""
+  if [ "$2" = fifo ]; then rm -f "$W/kf"; mkfifo "$W/kf"; timeout "$(tmo 30)" sh -c 'exec cat "$1" > "$2"' _ "$3" "$W/kf" >/dev/null 2>&1 & pid=$!
+    timeout "$(tmo 30)" "$1" compress --db "$W/k10.tsv" -i "$W/kf" > "$4" 2>"$4.err" || rc=$?; wait $pid 2>/dev/null || :
+  else timeout "$(tmo 30)" "$1" compress --db "$W/k10.tsv" -i <(cat "$3") > "$4" 2>"$4.err" || rc=$?; fi
+  return $rc
+}
+for form in fifo psub; do
+  a=0; kpr "$C" $form "$W/k10.kst" "$W/kc" || a=$?; b=0; kpr "$R" $form "$W/k10.kst" "$W/kr" || b=$?
+  [ $a = 1 ] && [ $b = 1 ] && [ "$(tail -1 "$W/kc.err")" = "$kp" ] && cmp -s "$W/kc.err" "$W/kr.err" && ok=$((ok+1)) && tpass \
+    || { bad=$((bad+1)); tfail "a .kst with a newline after its magic through a $form: rc $a/$b [$(tail -1 "$W/kc.err")] [$(tail -1 "$W/kr.err")]"; }
+  a=0; kpr "$C" $form "$W/km.bed" "$W/kc" || a=$?; b=0; kpr "$R" $form "$W/km.bed" "$W/kr" || b=$?
+  [ $a = 0 ] && [ $b = 0 ] && [ -s "$W/kc" ] && cmp -s "$W/kc" "$W/kr" && cmp -s "$W/kc.err" "$W/kr.err" && ok=$((ok+1)) && tpass \
+    || { bad=$((bad+1)); tfail "a BED row named KST00001x through a $form: rc $a/$b [$(tail -1 "$W/kc.err")] [$(tail -1 "$W/kr.err")]"; }
+done
+for x in C R; do rc=0; timeout "$(tmo 30)" "${!x}" compress --db "$W/k10.tsv" -i - < "$W/k10.kst" > /dev/null 2>"$W/k$x.err" || rc=$?; eval "rc$x=$rc"; done
+[ $rcC = 1 ] && [ $rcR = 1 ] && [ "$(tail -1 "$W/kC.err")" = "$kp" ] && cmp -s "$W/kC.err" "$W/kR.err" && { ok=$((ok+1)); tpass; } \
+  || { bad=$((bad+1)); tfail "a .kst with a newline after its magic on stdin: rc $rcC/$rcR"; }
+tally "piped .kst inputs"
+fi
+
 summary diff.sh
 [ $fail = 0 ] && echo "DIFF_PASS" || echo "DIFF_FAIL"
 exit $fail

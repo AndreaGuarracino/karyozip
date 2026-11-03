@@ -181,6 +181,7 @@ impl Reader {
     pub fn cart(&self) -> bool { self.cart }
 
     pub fn open_with(path: &str, o: &ReadOpts) -> Reader {
+        crate::readcap();   // its stream lengths are forgeable, as the C's ropen
         let mut f = rd(std::fs::File::open(path), "open");
         let mut m = [0u8; 8];
         rd(f.read_exact(&mut m), "not a KST file: shorter than the magic");

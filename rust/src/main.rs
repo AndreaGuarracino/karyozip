@@ -1,4 +1,6 @@
 use karyozip::{aln, bail as die, bedcoord_r, db, ffi, prof, reader, smooth, writer};
+/// A refusal the library returned: the same `karyozip: ` line and exit as `die`
+use karyozip::die as fatal;
 
 use std::io::{BufWriter, Read, Write};
 
@@ -77,7 +79,7 @@ fn main() {
                     let mut w = new_writer(opt, std::path::Path::new(&tmpdir));
                     let aln_on = a.is_some();
                     if let Some(x) = a { w.set_aln(x); }
-                    let used = db::encode(&c.input, &feats, &mut w);
+                    let used = db::encode(&c.input, &feats, &mut w).unwrap_or_else(|e| fatal(&e));
                     w.set_feathash(if used { feats.hierhash } else { feats.hash }, used);
                     finish(w, aln_on);
                 }
@@ -163,9 +165,9 @@ fn main() {
         Cmd::AlnPack => {
             let (Some(paf), Some(rbed)) = (&c.aln, &c.refbed) else { unreachable!() };
             let mut a = aln::Aln::default();
-            a.load_ref(rbed, aln::Lazy::No);
+            a.load_ref(rbed, aln::Lazy::No).unwrap_or_else(|e| fatal(&e));
             let rh = aln::refhash(&a);
-            a.load_paf(paf);
+            a.load_paf(paf).unwrap_or_else(|e| fatal(&e));
             aln::pack(&a, rh);
         }
     }
@@ -177,8 +179,8 @@ fn main() {
 fn finish(w: writer::Writer, aln_on: bool) {
     let so = std::io::stdout();
     let mut o = BufWriter::new(so.lock());
-    let st = w.close(&mut o).unwrap_or_else(|m| die(&m));
-    o.flush().unwrap_or_else(|e| die(&e.to_string()));
+    let st = w.close(&mut o).unwrap_or_else(|e| fatal(&e));
+    o.flush().unwrap_or_else(|_| die("write failed"));
     if aln_on {
         eprintln!("aln: {} of {} rows matched the reference ({:.1}%)", st.alnhit,
                   st.rows, if st.rows > 0 { 100.0 * st.alnhit as f64 / st.rows as f64 } else { 0.0 });
@@ -211,10 +213,10 @@ fn informed(c: &Cli, ro: &mut reader::ReadOpts, who: &str, hier: Option<&str>,
 }
 
 fn load_feats(fp: &str, hier: Option<&str>) -> db::Feats {
-    let mut f = db::Feats::load(fp);
+    let mut f = db::Feats::load(fp).unwrap_or_else(|e| fatal(&e));
     eprintln!("features: {} ids, {} sets", f.nids, f.sets.len());
     if f.sets.len() <= 32 { eprintln!("features: integer-tuple index on"); }
-    if let Some(h) = hier { f.load_hier(h); }
+    if let Some(h) = hier { f.load_hier(h).unwrap_or_else(|e| fatal(&e)); }
     f
 }
 
@@ -228,9 +230,9 @@ fn load_aln(paf: &Option<String>, refbed: &Option<String>,
         (Some(p), Some(r)) => {
             // The C loads the ordinal map first, and the diagnostics are compared line for line
             let mut a = aln::Aln::default();
-            if let Some(o) = ordfile { a.load_ordinals(o); }
-            a.load_ref(r, lazy);
-            a.load_aln(p);
+            if let Some(o) = ordfile { a.load_ordinals(o).unwrap_or_else(|e| fatal(&e)); }
+            a.load_ref(r, lazy).unwrap_or_else(|e| fatal(&e));
+            a.load_aln(p).unwrap_or_else(|e| fatal(&e));
             Some(a)
         }
     }
@@ -238,8 +240,7 @@ fn load_aln(paf: &Option<String>, refbed: &Option<String>,
 
 /// The staging file goes under tmpdir; the C's words if it cannot
 fn new_writer(opt: writer::Options, tmpdir: &std::path::Path) -> writer::Writer {
-    writer::Writer::new(opt, tmpdir).unwrap_or_else(|_| die(&format!(
-        "cannot create a temp file under {} (see --tmp-dir)", tmpdir.display())))
+    writer::Writer::new(opt, tmpdir).unwrap_or_else(|e| fatal(&e))
 }
 
 fn encode(opt: writer::Options, tmpdir: &std::path::Path, a: Option<aln::Aln>) {
@@ -264,7 +265,7 @@ fn encode(opt: writer::Options, tmpdir: &std::path::Path, a: Option<aln::Aln>) {
             for r in a.rows.iter().flatten() {
                 w.push(&a.b[r.nm.0 as usize..r.nm.1 as usize], r.en - r.st,
                       &a.b[r.lab.0 as usize..r.lab.1 as usize], r.st, r.same)
-                    .unwrap_or_else(|m| die(&m));
+                    .unwrap_or_else(|e| fatal(&e));
             }
             drop(_s);
             if let Some(h) = h { h.join().unwrap_or_else(|_| die("the reader thread failed")); }

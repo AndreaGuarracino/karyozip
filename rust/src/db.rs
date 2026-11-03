@@ -1,6 +1,7 @@
 //! --db: featureID labels, so one merged track replaces the per-set BEDs and the mapping stays in features.tsv
 
 use crate::kst::{self, FNV0, FnvMap as HashMap};
+use crate::{Error, KzResult};
 use std::io::Write;
 
 pub struct Feats {
@@ -25,8 +26,8 @@ pub struct Feats {
 pub const CARTBASE: u32 = 1 << 26;
 
 impl Feats {
-    pub fn load(path: &str) -> Feats {
-        let data = crate::slurp(path, "cannot open the features table");
+    pub fn load(path: &str) -> KzResult<Feats> {
+        let data = crate::slurp_r(path, "cannot open the features table")?;
         let mut f = Feats { sets: Vec::new(), idpos: Vec::new(), labs: Vec::new(), nids: 0,
                             tup: HashMap::default(), intern: Vec::new(), tupint: HashMap::default(), hash: FNV0, voc: Vec::new(), stride: Vec::new(),
                             prod: 0, cart: false, hierhash: 0 };
@@ -38,34 +39,34 @@ impl Feats {
             let cols: Vec<&[u8]> = line.split(|&c| c == b'\t').collect();
             if first {
                 if cols.len() < 2 {
-                    crate::bail("features.tsv: the first line must be the tab-separated header");
+                    return Err(Error::input("features.tsv: the first line must be the tab-separated header"));
                 }
                 for s in &cols[1..] {
                     if s.is_empty() || s.contains(&b'/') {
-                        crate::bail("features.tsv: a set name is empty or has a slash");
+                        return Err(Error::input("features.tsv: a set name is empty or has a slash"));
                     }
                     if f.sets.iter().any(|x| x == s) {
-                        crate::bail("features.tsv names a set twice");
+                        return Err(Error::input("features.tsv names a set twice"));
                     }
                     f.sets.push(s.to_vec());
                 }
                 first = false;
                 continue;
             }
-            if cols.len() < 2 { if !line.is_empty() { crate::bail("features.tsv: a row without a tab"); } continue; }
+            if cols.len() < 2 { if !line.is_empty() { return Err(Error::input("features.tsv: a row without a tab")); } continue; }
             if cols[0].first() == Some(&b'0') && cols[0].len() > 1 {
-                crate::bail("features.tsv: a featureID with a leading zero");
+                return Err(Error::input("features.tsv: a featureID with a leading zero"));
             }
-            let id = num(cols[0], (1u32 << 26) - 1,
-                         "features.tsv: a featureID is not a number below 2^26");
-            if id == 0 { crate::bail("features.tsv defines featureID 0, which is reserved for novel"); }
-            if cols.len() - 1 < f.sets.len() { crate::bail("a features.tsv row has fewer labels than sets"); }
-            if cols.len() - 1 > f.sets.len() { crate::bail("a features.tsv row has more labels than sets"); }
-            if f.has(id) { crate::bail("features.tsv defines a featureID twice"); }
+            let id = num_r(cols[0], (1u32 << 26) - 1,
+                         "features.tsv: a featureID is not a number below 2^26")?;
+            if id == 0 { return Err(Error::input("features.tsv defines featureID 0, which is reserved for novel")); }
+            if cols.len() - 1 < f.sets.len() { return Err(Error::input("a features.tsv row has fewer labels than sets")); }
+            if cols.len() - 1 > f.sets.len() { return Err(Error::input("a features.tsv row has more labels than sets")); }
+            if f.has(id) { return Err(Error::input("features.tsv defines a featureID twice")); }
             f.tup.insert(cols[1..].join(&b'\t'), id);
             if f.idpos.len() <= id as usize {
                 let n = id as usize + 1024 - f.idpos.len();
-                f.idpos.try_reserve(n).unwrap_or_else(|_| crate::bail("oom"));
+                f.idpos.try_reserve(n).map_err(|_| Error::internal("oom"))?;
                 f.idpos.resize(id as usize + 1024, u32::MAX);
             }
             f.idpos[id as usize] = f.labs.len() as u32;
@@ -76,8 +77,8 @@ impl Feats {
                 let n = f.intern[k].len() as u32; *f.intern[k].entry(c.to_vec()).or_insert(n) }).collect());
             f.tupint.entry(key).or_insert(id);
         }
-        if f.sets.is_empty() { crate::bail("features table has no header"); }
-        f
+        if f.sets.is_empty() { return Err(Error::input("features table has no header")); }
+        Ok(f)
     }
     fn has(&self, id: u32) -> bool { self.idpos.get(id as usize).is_some_and(|&p| p != u32::MAX) }
     /// A label's interned id in set k, or MAX when no table tuple has it
@@ -102,8 +103,8 @@ impl Feats {
     }
 
     /// The vocabulary of every set, and the hash continued over the file
-    pub fn load_hier(&mut self, path: &str) {
-        let data = crate::slurp(path, "cannot open the hierarchy file");
+    pub fn load_hier(&mut self, path: &str) -> KzResult<()> {
+        let data = crate::slurp_r(path, "cannot open the hierarchy file")?;
         let n = self.sets.len();
         let mut voc: Vec<Vec<Vec<u8>>> = (0..n).map(|k| {
             let mut v = vec![b"novel".to_vec()];
@@ -118,7 +119,7 @@ impl Feats {
             if line.is_empty() { continue; }
             let cols: Vec<&[u8]> = line.split(|&c| c == b'\t').collect();
             if cols.len() < 3 { continue; }
-            if cols.len() > 3 { crate::bail("hierarchy: a row has more than three columns"); }
+            if cols.len() > 3 { return Err(Error::input("hierarchy: a row has more than three columns")); }
             if cols[0] == b"feature_set" { continue; }
             if let Some(k) = self.sets.iter().position(|s| s == cols[0]) {
                 voc[k].push(cols[1].to_vec()); voc[k].push(cols[2].to_vec());
@@ -130,23 +131,24 @@ impl Feats {
             voc[k].sort(); voc[k].dedup();
             self.stride[k] = self.prod;
             let u = voc[k].len() as u64;
-            if self.prod > (u32::MAX - CARTBASE) as u64 / u { crate::bail("the label vocabulary is too large for featureIDs"); }
+            if self.prod > (u32::MAX - CARTBASE) as u64 / u { return Err(Error::input("the label vocabulary is too large for featureIDs")); }
             self.prod *= u;
         }
         self.voc = voc;
         self.cart = true;
         eprintln!("hierarchy: {} label tuples possible", self.prod);
+        Ok(())
     }
 
     /// 2^26 + the mixed-radix rank of a tuple outside features.tsv
-    fn cart_id(&self, labs: &[&[u8]]) -> u32 {
+    fn cart_id(&self, labs: &[&[u8]]) -> KzResult<u32> {
         let mut rank = 0u64;
         for (k, l) in labs.iter().enumerate() {
             let x = self.voc[k].binary_search_by(|v| v.as_slice().cmp(l))
-                .unwrap_or_else(|_| crate::bail("a label is neither in features.tsv nor in the hierarchy of its set"));
+                .map_err(|_| Error::input("a label is neither in features.tsv nor in the hierarchy of its set"))?;
             rank += x as u64 * self.stride[k];
         }
-        CARTBASE + rank as u32
+        Ok(CARTBASE + rank as u32)
     }
 
     /// --set A,B as columns of features.tsv; None or all is every set
@@ -183,16 +185,17 @@ impl Feats {
 }
 
 /// Digits, in 64 bits, at most `max`: the C's num_arg, same words in the same order
-fn num(b: &[u8], max: u32, what: &str) -> u32 {
-    if b.is_empty() { crate::bail(what); }
+fn num(b: &[u8], max: u32, what: &str) -> u32 { num_r(b, max, what).unwrap_or_else(|e| crate::die(&e)) }
+fn num_r(b: &[u8], max: u32, what: &str) -> KzResult<u32> {
+    if b.is_empty() { return Err(Error::input(what)); }
     let mut v: u64 = 0;
     for &c in b {
-        if !c.is_ascii_digit() { crate::bail(what); }
-        if v > (u64::MAX - (c - b'0') as u64) / 10 { crate::bail("a coordinate does not fit in 64 bits"); }
+        if !c.is_ascii_digit() { return Err(Error::input(what)); }
+        if v > (u64::MAX - (c - b'0') as u64) / 10 { return Err(Error::input("a coordinate does not fit in 64 bits")); }
         v = v * 10 + (c - b'0') as u64;
     }
-    if v > max as u64 { crate::bail(what); }
-    v as u32
+    if v > max as u64 { return Err(Error::input(what)); }
+    Ok(v as u32)
 }
 
 /// One input BED, streamed a row at a time
@@ -200,64 +203,67 @@ struct Brd { lines: crate::Lines, seq: Vec<u8>, st: u64, en: u64, lab: Vec<u8>, 
              pseq: Vec<u8>, pen: u64, had: bool, eof: bool }
 
 impl Brd {
-    fn open(path: &str) -> Brd {
+    fn open(path: &str) -> KzResult<Brd> {
         let lines = if path == "-" { crate::Lines::new(std::io::stdin()) } else {
-            let f = std::fs::File::open(path).unwrap_or_else(|e| {   // as the C: the path and why, then the refusal
+            let f = std::fs::File::open(path).map_err(|e| {   // as the C: the path and why, then the refusal
                 eprintln!("cannot open {path}: {}", crate::ffi::strerror(&e));
-                crate::bail("cannot open an input BED")
-            });
+                Error::io("cannot open an input BED")
+            })?;
             crate::Lines::new(f)
         };
         let mut lines = lines; lines.err = "read error on an input BED";
         let mut b = Brd { lines, seq: Vec::new(), st: 0, en: 0, lab: Vec::new(), labid: u32::MAX,
                           pseq: Vec::new(), pen: 0, had: false, eof: false };
-        b.next();
-        if b.eof { crate::bail("an input BED is empty"); }
-        b
+        b.next()?;
+        if b.eof { return Err(Error::input("an input BED is empty")); }
+        Ok(b)
     }
 
     /// The row parsed in the reader's buffer, the previous label compared, not copied, as the C's bnext
-    fn next(&mut self) {
-        let Some((line, nl)) = self.lines.next_line_nl() else { self.eof = true; return; };
-        if line.is_empty() { crate::bail("bad line"); }   // as the C: a blank row is not skipped
-        if !nl { crate::bail("input does not end with a newline"); }
-        if crate::ffi::find(0, line).is_some() { crate::bail("a NUL byte inside a row"); }
+    fn next(&mut self) -> KzResult<()> {
+        let bad = |m: &str| Err(Error::input(m));
+        let Some((line, nl)) = self.lines.try_next_line_nl()? else { self.eof = true; return Ok(()); };
+        if line.is_empty() { return bad("bad line"); }   // as the C: a blank row is not skipped
+        if !nl { return bad("input does not end with a newline"); }
+        if crate::ffi::find(0, line).is_some() { return bad("a NUL byte inside a row"); }
         let mut it = line.splitn(4, |&x| x == b'\t');
         let mut c = [&line[..0]; 4];
-        for (i, s) in c.iter_mut().enumerate() { *s = it.next().unwrap_or_else(|| { if i < 4 { crate::bail("bad line") } else { &[] } }); }
-        if c[0].len() >= 512 { crate::bail("name too long"); }
-        if c[0].is_empty() { crate::bail("empty sequence name"); }
+        for s in c.iter_mut() { *s = match it.next() { Some(f) => f, None => return bad("bad line") }; }
+        if c[0].len() >= 512 { return bad("name too long"); }
+        if c[0].is_empty() { return bad("empty sequence name"); }
         if self.had {
             std::mem::swap(&mut self.pseq, &mut self.seq);
             self.pen = self.en;
         }
         self.seq.clear(); self.seq.extend_from_slice(c[0]);
-        self.st = crate::bedcoord(c[1], "start is not a number");
-        self.en = crate::bedcoord(c[2], "end is not a number");
+        self.st = crate::bedcoord_r(c[1], "start is not a number").map_err(Error::input)?;
+        self.en = crate::bedcoord_r(c[2], "end is not a number").map_err(Error::input)?;
         if c[1..3].iter().any(|v| v.len() > 1 && v[0] == b'0') {
-            crate::bail("a coordinate has a leading zero: it would not decode to the same bytes");
+            return bad("a coordinate has a leading zero: it would not decode to the same bytes");
         }
-        if self.en < self.st { crate::bail("end is before start"); }
+        if self.en < self.st { return bad("end is before start"); }
         if self.en == self.st {
-            crate::bail("end equals start: a run must cover at least one base");
+            return bad("end equals start: a run must cover at least one base");
         }
         let samelab = c[3] == self.lab.as_slice();
         if !samelab { self.lab.clear(); self.lab.extend_from_slice(c[3]); self.labid = u32::MAX - 1; }
         if self.had && self.st == self.pen && self.seq == self.pseq && samelab {
-            crate::bail("two touching runs carry the same label: merge them first");
+            return bad("two touching runs carry the same label: merge them first");
         }
         self.had = true;
+        Ok(())
     }
 }
 
 /// One BED per feature set in header order, or one merged featureID track; true when a featureID came from the vocabulary
-pub fn encode(files: &[String], feats: &Feats, w: &mut crate::writer::Writer) -> bool {
+pub fn encode(files: &[String], feats: &Feats, w: &mut crate::writer::Writer) -> KzResult<bool> {
+    let bad = |m: &str| Err(Error::input(m));
     let mut cart_used = false;
     let dbids = files.len() != feats.sets.len();
     if dbids && files.len() != 1 {
-        crate::bail("--db: give one BED per feature set in features.tsv column order, or one merged featureID track");
+        return bad("--db: give one BED per feature set in features.tsv column order, or one merged featureID track");
     }
-    let mut b: Vec<Brd> = files.iter().map(|f| Brd::open(f)).collect();
+    let mut b: Vec<Brd> = files.iter().map(|f| Brd::open(f)).collect::<KzResult<_>>()?;
     let (mut rows, mut missing) = (0u64, 0u64);
     let (mut prevfid, mut lastend) = (u32::MAX, 0u64);
     let mut lastseq: Vec<u8> = Vec::new();
@@ -267,13 +273,13 @@ pub fn encode(files: &[String], feats: &Feats, w: &mut crate::writer::Writer) ->
     while !b[0].eof {
         for i in 1..b.len() {
             if b[i].eof || b[i].seq != b[0].seq {
-                crate::bail("the input BEDs disagree on sequence order");
+                return bad("the input BEDs disagree on sequence order");
             }
         }
         let lo = b[0].st;
         let mut hi = b[0].en;
         for x in &b[1..] {
-            if x.st != lo { crate::bail("the input BEDs disagree on a run start"); }
+            if x.st != lo { return bad("the input BEDs disagree on a run start"); }
             if x.en < hi { hi = x.en; }              // cut at the first change
         }
         if !haveseq || lastseq != b[0].seq {
@@ -284,12 +290,12 @@ pub fn encode(files: &[String], feats: &Feats, w: &mut crate::writer::Writer) ->
         for (k, x) in b.iter_mut().enumerate() { if x.labid == u32::MAX - 1 { x.labid = feats.labid(k, &x.lab); } }
         let id = if dbids {
             if b[0].lab.first() == Some(&b'0') && b[0].lab.len() > 1 {
-                crate::bail("--db: a featureID with a leading zero");
+                return bad("--db: a featureID with a leading zero");
             }
-            let v = num(&b[0].lab, feats.idmax(),
-                        "--db: a label is not a featureID; give one BED per feature set instead");
+            let v = num_r(&b[0].lab, feats.idmax(),
+                          "--db: a label is not a featureID; give one BED per feature set instead")?;
             if v != 0 && v < CARTBASE && !feats.has(v) {
-                crate::bail("--db: featureID not in the features table");
+                return bad("--db: featureID not in the features table");
             }
             if v >= CARTBASE { cart_used = true; }
             v
@@ -299,28 +305,27 @@ pub fn encode(files: &[String], feats: &Feats, w: &mut crate::writer::Writer) ->
             match hit.or_else(|| feats.tup.get(&b.iter().map(|x| x.lab.clone()).collect::<Vec<_>>().join(&b'\t')).copied()) {
                 Some(v) => v,
                 None if b.iter().all(|x| x.lab == b"novel") => { missing += 1; 0 }
-                None if !feats.cart => crate::bail("a label tuple is not in the features table"),
-                None => { cart_used = true; feats.cart_id(&b.iter().map(|x| x.lab.as_slice()).collect::<Vec<_>>()) }
+                None if !feats.cart => return bad("a label tuple is not in the features table"),
+                None => { cart_used = true; feats.cart_id(&b.iter().map(|x| x.lab.as_slice()).collect::<Vec<_>>())? }
             }
         };
         if prevfid != u32::MAX && id == prevfid && lastend == lo {
-            crate::bail("two touching runs carry the same featureID: merge them first");
+            return bad("two touching runs carry the same featureID: merge them first");
         }
         prevfid = id;
         lastend = hi;
         lab.clear();
         kst::putu64(&mut lab, id as u64);
-        w.push(&b[0].seq, hi - lo, &lab, lo, false)
-            .unwrap_or_else(|m| crate::bail(&m));
+        w.push(&b[0].seq, hi - lo, &lab, lo, false)?;
         rows += 1;
         for x in b.iter_mut() {
             x.st = hi;
-            if x.st == x.en { x.next(); }
+            if x.st == x.en { x.next()?; }
         }
     }
-    if b[1..].iter().any(|x| !x.eof) { crate::bail("the input BEDs have different lengths"); }
+    if b[1..].iter().any(|x| !x.eof) { return bad("the input BEDs have different lengths"); }
     eprintln!("db: {rows} rows from {} tracks, {missing} all-novel", b.len());
-    cart_used
+    Ok(cart_used)
 }
 
 /// decode --db --out-dir DIR: staged BEDs, removed by `die` and on the way out, so a failure leaves no half output

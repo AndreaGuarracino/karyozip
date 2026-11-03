@@ -50,6 +50,49 @@ fn vget_long(b: &[u8], mut i: usize) -> (u64, usize) {
     }
 }
 
+/// `vget` with the refusal returned, for the loaders of the write path
+pub fn vget_r(b: &[u8], mut i: usize) -> crate::KzResult<(u64, usize)> {
+    let (mut v, mut s) = (0u64, 0u32);
+    let bad = || crate::Error::input("corrupt varint");
+    loop {
+        let c = *b.get(i).ok_or_else(bad)?;
+        i += 1;
+        if s == 63 && c > 1 { return Err(bad()); }   // the tenth byte holds bit 63 alone and ends it
+        v |= ((c & 0x7f) as u64) << s;
+        s += 7;
+        if c < 0x80 { return Ok((v, i)); }
+    }
+}
+
+/// The writer's own LEB128, which it wrote whole: decoded with no refusal (a cut one reads to the end), so
+/// nothing on the write path exits; the same values as `vget` on what `put` writes
+#[inline]
+pub fn vget_w(b: &[u8], i: usize) -> (u64, usize) {
+    match b.get(i) {
+        Some(&c) if c < 0x80 => (c as u64, i + 1),
+        _ => vget_soft(b, i),
+    }
+}
+#[cold]
+fn vget_soft(b: &[u8], mut i: usize) -> (u64, usize) {
+    let (mut v, mut s) = (0u64, 0u32);
+    while i < b.len() {
+        let c = b[i];
+        i += 1;
+        if s < 64 { v |= ((c & 0x7f) as u64) << s; }
+        s += 7;
+        if c < 0x80 { break; }
+    }
+    (v, i)
+}
+/// `reader::skip` for the writer's own varints: past one, never past the end, no refusal
+#[inline]
+pub fn skip_w(b: &[u8], i: usize) -> usize {
+    let mut j = i;
+    while j < b.len() && b[j] >= 0x80 { j += 1; }
+    (j + 1).min(b.len().max(i))
+}
+
 pub fn unzz(v: u64) -> u64 { ((v >> 1) as i64 ^ -((v & 1) as i64)) as u64 }
 
 pub fn zz(v: i64) -> u64 {
@@ -268,6 +311,27 @@ mod tests {
                 assert_eq!(crate::reader::skip(&b, 0), w as usize);
                 assert_eq!(vget(&b, w as usize), (5, w as usize + 1));
             }
+        }
+    }
+
+    /// vget_r and the writer's vget_w and skip_w read what put writes as vget does; vget_r returns what vget refuses
+    #[test]
+    fn varint_twins_agree() {
+        let mut vals = vec![0u64, 1, 0x7f, 0x80, 0x3fff, 0x4000, u32::MAX as u64, 1 << 63, u64::MAX];
+        for k in 0..64 { vals.push(1 << k); vals.push((1u64 << k).wrapping_sub(1)); }
+        let mut buf = Vec::new();
+        for &v in &vals { put(&mut buf, v); }
+        let (mut i, mut j, mut k) = (0, 0, 0);
+        for &v in &vals {
+            let (a, n) = vget(&buf, i);
+            assert_eq!(vget_r(&buf, j).ok(), Some((a, n)));
+            assert_eq!(vget_w(&buf, k), (a, n));
+            assert_eq!(skip_w(&buf, k), n);
+            assert_eq!(a, v);
+            (i, j, k) = (n, n, n);
+        }
+        for b in [&[][..], &[0x80], &[0xff; 11], &ten(0x02)] {
+            assert_eq!(vget_r(b, 0).map_err(|e| e.message().to_string()), Err("corrupt varint".to_string()));
         }
     }
 

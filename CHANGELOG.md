@@ -11,7 +11,8 @@ The first tagged release. File format `KST00001` ([FORMAT.md](FORMAT.md)); files
 - A ten-byte varint that overflows 64 bits is refused (it was silently truncated).
 - The Rust compressor no longer hangs when writing its temporary body fails.
 - The C library resets all encoder state in `kt_open`; `karyozip.h` documents the real contract (one block by default, not thread-safe, exits on error).
-- C: the lazy `.kst` reference fill is race-free; host byte order no longer reaches the file; 32-bit counters on very large inputs; the allocation cap applies on every thread; the default thread count follows the CPU affinity mask (Slurm allocations).
+- C: the lazy `.kst` reference fill is race-free; host byte order no longer reaches the file; 32-bit counters on very large inputs; the allocation cap applies on every thread.
+- The default thread count is one per CPU of the affinity mask (a Slurm or `taskset` allocation), at most 8, in both the C and the Rust; the Rust no longer counts a cgroup CPU quota instead.
 - Rust: `query --smooth` without `-r` is refused, as in the C; a packed alignment's magic is read before the whole file; a closed stdout pipe ends quietly, as the C.
 - PAF and packed-alignment coordinates that leave 64 bits are refused (`PAF coordinates overflow 64 bits`, `corrupt packed alignment: a coordinate overflows`); they used to wrap or, in a Rust debug build, panic.
 - A signal while `--out-dir` creates its staged BEDs no longer leaves one behind.

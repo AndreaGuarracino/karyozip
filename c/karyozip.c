@@ -63,7 +63,8 @@ static double WALL0 = 0;
 static int nthreads(void) {
     if (NTHREADS > 0) return NTHREADS;
 #ifdef _OPENMP
-    /* the CPUs this process may run on, as the Rust's available_parallelism: a Slurm or taskset allocation, not the machine */
+    /* the CPUs this process may run on, its affinity mask, as the Rust's affinity_cpus: a Slurm or taskset allocation,
+       not the machine, nor a cgroup quota */
     static _Atomic int ncpu;
     int m = ncpu;
     if (!m) { cpu_set_t cs;

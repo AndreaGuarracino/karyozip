@@ -23,11 +23,12 @@ fn main() {
     ffi::panic_clean();
     if !ffi::STDFDS_OPEN.load(std::sync::atomic::Ordering::Relaxed) { die("stdin, stdout or stderr is closed"); }
     let c = Cli::get();
-    // --threads, else one per core capped at 8, as the C; the pool is explicit, so no environment variable reaches it
+    // --threads, else one per CPU of the affinity mask capped at 8, as the C; the pool is explicit, so no environment
+    // variable reaches it
     const THRCAP: usize = 8;
     let n = match cnt(&c.threads, 1, 1024, "--threads is a number of 1 to 1024") {
         Some(t) => t as usize,
-        None => std::thread::available_parallelism().map_or(1, |p| p.get()).min(THRCAP),
+        None => ffi::affinity_cpus().min(THRCAP),
     };
     ffi::pin_mmap_threshold();
     ffi::omp_threads(n);

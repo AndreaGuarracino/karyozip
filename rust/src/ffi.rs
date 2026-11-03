@@ -70,6 +70,20 @@ pub fn omp_threads(n: usize) {
     unsafe { omp_set_num_threads(n as c_int); }
 }
 
+/// The CPUs this process may run on: its affinity mask counted (sched_getaffinity over a 1024-bit cpu_set_t, glibc's
+/// CPU_COUNT), a Slurm or taskset allocation, not the machine, and never a cgroup quota (cpu.max), which
+/// available_parallelism also honours. That only when the call fails, as the C falls back to omp_get_num_procs. As
+/// the C's nthreads
+pub fn affinity_cpus() -> usize {
+    unsafe extern "C" { fn sched_getaffinity(pid: c_int, size: usize, mask: *mut u64) -> c_int; }
+    let mut m = [0u64; 16];
+    // SAFETY: the mask is owned, 1024 bits, its size in bytes passed
+    if unsafe { sched_getaffinity(0, std::mem::size_of_val(&m), m.as_mut_ptr()) } != 0 {
+        return std::thread::available_parallelism().map_or(1, |p| p.get());
+    }
+    m.iter().map(|w| w.count_ones() as usize).sum::<usize>().max(1)
+}
+
 pub fn pin_mmap_threshold() {
     unsafe extern "C" { fn mallopt(param: c_int, value: c_int) -> c_int; }
     // SAFETY: M_MMAP_THRESHOLD is -3; mallopt takes two ints

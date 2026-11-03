@@ -121,7 +121,7 @@ Read names are stored in the file by default.
 | `--set A,B` | decompress, query | the sets of a `-d` track to print, default all; with `--smooth`, the one set smoothed |
 | `--out-dir DIR` | decompress | one BED per set under `-d`; the BEDs are replaced all or nothing on a SIGINT, SIGTERM, SIGHUP or failed rename (every new, or every old or absent as before), though an uncatchable kill (SIGKILL, OOM, power loss) mid-commit may leave the old ones as SET.bed.old.XXXXXX beside them |
 | `-a`, `--aln P.paf`, `--ref R` | compress, readers, aln-pack | see Compression modes |
-| `-t`, `--threads N` | all | default the cores, up to 8 |
+| `-t`, `--threads N` | all | default the CPUs this process may run on (its affinity mask: a Slurm or `taskset` allocation), up to 8 |
 | `--tmp-dir DIR` | all | where temporary files go, default /tmp |
 | `-h`, `--help`, `--version` | all | usage; library versions |
 

@@ -846,7 +846,7 @@ cb=0; for f in "$X"/cut[12].*.gz; do bx_no "cut" "$f" > "$W/bx.one" || true; gre
 bx_no "BGZF blocks claiming 4 GiB each" "$X/huge.gz"; bx_no "BGZF 300000 blocks claiming 64 KiB each" "$X/many.gz"
 for f in huge many; do   # refused before allocating what the trailers claim
   rc=0; ( ulimit -v 1500000; exec timeout 30 $KT compress -t 2 -i "$X/$f.gz" ) > /dev/null 2> "$W/bx.err" || rc=$?
-  [ $rc = 1 ] && grep -q '^karyozip: ' "$W/bx.err" && ok "BGZF $f.gz under a 1.5 GB address limit: refused" || no "BGZF $f.gz under a 1.5 GB address limit: WRONG, exit $rc: $(head -c 200 "$W/bx.err")"
+  [ $rc = 1 ] && grep -q '^karyozip: ' "$W/bx.err" && ! grep -q '^karyozip: oom' "$W/bx.err" && ok "BGZF $f.gz under a 1.5 GB address limit: refused, not out of memory" || no "BGZF $f.gz under a 1.5 GB address limit: WRONG, exit $rc: $(head -c 200 "$W/bx.err")"
 done
 
 # pin the stored bytes to codec versions

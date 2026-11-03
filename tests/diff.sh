@@ -283,6 +283,8 @@ cli query -i f -r s --out-dir d; cli query -i f -r s --raw; cli decompress -i f 
 cli --tmp-dir /nonexistent compress; cli --tmp-dir /nonexistent --db $D/db.features.tsv compress -i $D/db.gene.bed
 cli --block=4 compress; cli -b4 compress; cli -t4 compress; cli --effort=low compress; cli -V; cli foo --raw
 cli decompress -i f --max-gap -1; cli query -i f -r -x; cli compress -- -x; cli -o -i compress
+cli decompress --db f --out-dir d -o x -i f; cli decompress --db f --out-dir "" -i f; cli decompress -i f --hier h --smooth --out-dir ""
+ln -s nowhere/x "$W/dang"; cli compress -o dang; cli compress -o nosuchdir/x; cli aln-pack -a a --ref b -o nosuchdir/c
 [ $cbad = 0 ] && echo "cli: $cok forms give the same words and code" \
   || { echo "cli: $cbad of $((cok+cbad)) DIFFER"; fail=1; }
 

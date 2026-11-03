@@ -55,7 +55,10 @@ fn main() {
     let name = c.name();
     let pack = name == "aln-pack";
     if c.input.len() > 1 && !(name == "compress" && c.db.is_some()) { die("give one -i"); }
-    if let (Some(o), false) = (&c.output, pack) { ffi::redirect(o, 1); }
+    if pack && (c.aln.is_none() || c.refbed.is_none() || c.output.is_none()) {
+        die("usage: karyozip aln-pack -a P.paf --ref REF.bed|REF.kst -o OUT");
+    }
+    if let Some(o) = &c.output { ffi::redirect(o, 1); }
     let track = || c.input.first().map(|s| s.as_str())
         .unwrap_or_else(|| die(&format!("{name} needs -i TRACK")));
     match cmd {
@@ -125,9 +128,9 @@ fn main() {
                 let feats = informed(&c, &mut ro, "decompress ", Some(hier), aln::Lazy::Contig).unwrap();
                 let sets: Vec<Vec<u8>> = feats.setcols(fs).iter().map(|&k| feats.sets[k].clone()).collect();
                 let sr: Vec<&[u8]> = sets.iter().map(|s| s.as_slice()).collect();
-                let tmps = db::stage_open(dir, &sr);
-                for (s, t) in sr.iter().zip(&tmps) {
-                    let mut o = BufWriter::new(std::fs::File::create(t).unwrap_or_else(|_| die("cannot write a derived BED")));
+                let (tmps, fs) = db::stage_open(dir, &sr);
+                for (s, f) in sr.iter().zip(fs) {
+                    let mut o = BufWriter::new(f);
                     smooth::run(track, hier, Some(s), None, 0, 0, c.v1, maxgap, smchunk, &ro, Some(&feats), &mut o);
                     o.flush().unwrap_or_else(|_| die("write failed"));
                 }
@@ -154,13 +157,12 @@ fn main() {
             reader::Reader::open_with(track, &ro).build_index(track)
         }
         Cmd::AlnPack => {
-            let (Some(paf), Some(rbed), Some(dest)) = (&c.aln, &c.refbed, &c.output)
-                else { die("usage: karyozip aln-pack -a P.paf --ref REF.bed|REF.kst -o OUT") };
+            let (Some(paf), Some(rbed)) = (&c.aln, &c.refbed) else { unreachable!() };
             let mut a = aln::Aln::default();
             a.load_ref(rbed, aln::Lazy::No);
             let rh = aln::refhash(&a);
             a.load_paf(paf);
-            aln::pack(&a, dest, rh);
+            aln::pack(&a, rh);
         }
     }
     ffi::commit_out();
@@ -553,6 +555,8 @@ impl Cli {
             die(&if a.starts_with('-') && a.len() > 1 { format!("unknown flag {a}") }
                  else { format!("unexpected argument {a}") });
         }
+        if o.out.as_ref().is_some_and(|d| d.is_empty()) { die("--out-dir needs a directory"); }
+        if o.out.is_some() && o.output.is_some() { die("-o and --out-dir: give one"); }   // the sets go to DIR, nothing to -o
         o
     }
 

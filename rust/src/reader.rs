@@ -1202,9 +1202,11 @@ impl Reader {
         for v in [n, k as u64, self.mhash ^ self.namesrc(), pay, IDXMAGIC] { t.extend_from_slice(&v.to_le_bytes()); }
         // beside the track in TRACK.kzi, written whole, then renamed into place
         use std::io::Write;
-        let (ip, tp) = (format!("{path}.kzi"), format!("{path}.kzi.{}", std::process::id()));
-        let ok = std::fs::File::create(&tp).and_then(|mut f| { f.write_all(&t)?; f.flush() }).is_ok()
-            && std::fs::rename(&tp, &ip).is_ok();
+        // a new random name, made exclusively, as the C's mkstemp
+        let ip = format!("{path}.kzi");
+        let (mut f, tp) = crate::ffi::mkstemp(ip.as_ref(), 0o666)
+            .unwrap_or_else(|_| crate::bail("cannot create the index file beside the track"));
+        let ok = f.write_all(&t).and_then(|_| f.flush()).is_ok() && std::fs::rename(&tp, &ip).is_ok();
         if !ok { let _ = std::fs::remove_file(&tp); crate::bail("index write failed"); }
         eprintln!("index: {n} sequences, {} B in {ip}, {dup} fingerprint collisions", pay + 40);
     }

@@ -563,7 +563,7 @@ fn gap_get(b: &[u8], i: usize) -> (i64, i64, usize) {
     }
 }
 
-pub fn pack(a: &Aln, out: &str, refhash: u64) {
+pub fn pack(a: &Aln, refhash: u64) {
     use crate::ffi;
     // A block starting a target run has an absolute position, query offset varint and target in four byte planes; others zigzag deltas
     let (mut names, mut cnt, mut pos, mut len, mut seg_, mut fq) =
@@ -635,7 +635,9 @@ pub fn pack(a: &Aln, out: &str, refhash: u64) {
     f.extend_from_slice(b"KSTAL1");
     f.extend_from_slice(&refhash.to_le_bytes());
     f.extend_from_slice(&all);
-    std::fs::write(out, &f).unwrap_or_else(|_| crate::bail("cannot write the packed alignment"));
+    // -o OUT, staged by redirect and renamed in by commit_out
+    { use std::io::Write; let mut o = std::io::stdout().lock();
+      o.write_all(&f).and_then(|_| o.flush()).unwrap_or_else(|_| crate::bail("packed alignment write failed")); }
     let nq = a.qs.iter().filter(|(_, s)| !s.is_empty()).count();
     eprintln!("packed alignment: {nq} queries, {nb} blocks, {} B ({:.2} B/query)",
               f.len(), if nq > 0 { f.len() as f64 / nq as f64 } else { 0.0 });

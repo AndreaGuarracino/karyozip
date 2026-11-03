@@ -467,7 +467,7 @@ extern "C" fn outsig(sig: c_int) {
     use std::sync::atomic::Ordering::SeqCst;
     PENDSIG.store(sig, SeqCst);
     match SIGSTATE.compare_exchange(IDLE, EXITING, SeqCst, SeqCst) {
-        Ok(_) => sig_pause(),
+        Ok(_) => { sig_pause(); staging_wait(); }
         Err(COMMITTING) => { sig_pause(); return; }
         Err(_) => { sig_pause(); await_exit() }
     }
@@ -495,16 +495,63 @@ fn catch_signals() {
     }
 }
 
-/// The staged BEDs a signal removes; empty once they are swapped in. The old list is retired, not freed (OUTSIG)
+/// The staged BEDs a signal removes; empty once they are swapped in. The new list replaces the old in one swap, so a
+/// handler sees one or the other, never neither; the old is retired, not freed (OUTSIG)
 pub fn sig_stage(paths: &[std::path::PathBuf]) {
     use std::{os::unix::ffi::OsStrExt, sync::atomic::Ordering::SeqCst};
-    retire(STAGE.swap(std::ptr::null_mut(), SeqCst) as usize);
-    if paths.is_empty() { return; }
-    let mut v: Vec<*mut c_char> = paths.iter().filter_map(|p| std::ffi::CString::new(p.as_os_str().as_bytes()).ok())
-        .map(|c| c.into_raw()).collect();
-    v.push(std::ptr::null_mut());
-    STAGE.store(Box::leak(v.into_boxed_slice()).as_mut_ptr(), SeqCst);
+    let new = if paths.is_empty() { std::ptr::null_mut() } else {
+        let mut v: Vec<*mut c_char> = paths.iter().filter_map(|p| std::ffi::CString::new(p.as_os_str().as_bytes()).ok())
+            .map(|c| c.into_raw()).collect();
+        v.push(std::ptr::null_mut());
+        Box::leak(v.into_boxed_slice()).as_mut_ptr()
+    };
+    retire(STAGE.swap(new, SeqCst) as usize);
+    if !new.is_null() { catch_signals(); }
+}
+
+/// True while stage_open makes and publishes the staged BEDs, with the handled signals blocked in its thread
+/// (stage_begin): a handler on another thread that claimed EXITING waits for it to drop, so it never unlinks the list
+/// while a file being made is not yet on it. stage_begin sets it, then looks for EXITING; the handler claims EXITING,
+/// then looks at it; both SeqCst, so one of the two sees the other. As the C's STAGING
+static STAGING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// nanosleep only, so the handler may call it
+fn staging_wait() {
+    let t = TimeSpec { s: 0, ns: 1_000_000 };
+    // SAFETY: a valid timespec, no remainder wanted
+    while STAGING.load(std::sync::atomic::Ordering::SeqCst) { unsafe { nanosleep(&t, std::ptr::null_mut()); } }
+}
+/// Staging opens: the handler installed, SIGINT, SIGTERM and SIGHUP blocked in this thread, STAGING up. A handler that
+/// already claimed EXITING is on another thread ending the process: this waits for it. Returns the mask to put back
+pub fn stage_begin() -> SigSet {
+    use std::sync::atomic::Ordering::SeqCst;
     catch_signals();
+    let (mut hs, mut was) = (SigSet([0; 16]), SigSet([0; 16]));
+    // SAFETY: both sets are owned, the size glibc's sigset_t is
+    unsafe {
+        sigemptyset(&mut hs);
+        for s in [1, 2, 15] { sigaddset(&mut hs, s); }
+        pthread_sigmask(SIG_BLOCK, &hs, &mut was);
+    }
+    STAGING.store(true, SeqCst);
+    if SIGSTATE.load(SeqCst) == EXITING { await_exit(); }
+    was
+}
+/// Staging closes: STAGING down, the mask put back, so a signal held pending here runs its handler now, with every
+/// staged BED on the list
+pub fn stage_end(was: SigSet) {
+    STAGING.store(false, std::sync::atomic::Ordering::SeqCst);
+    // SAFETY: the mask stage_begin saved
+    unsafe { pthread_sigmask(SIG_SETMASK, &was, std::ptr::null_mut()); }
+}
+/// STAGING down without the mask put back: a refusal on its way out
+pub fn stage_abort() { STAGING.store(false, std::sync::atomic::Ordering::SeqCst); }
+/// KZ_TEST_STAGE_PAUSE_MS=N, for tests only: stage_open sleeps N ms after it makes each staged BED and before it
+/// publishes it, so a test can signal in what was once a window where the file existed and no handler knew it. Unset
+/// or 0, nothing sleeps. As the C's stage_pause_ms
+pub fn stage_pause() {
+    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let ms = *MS.get_or_init(|| std::env::var("KZ_TEST_STAGE_PAUSE_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(0));
+    if ms > 0 { std::thread::sleep(std::time::Duration::from_millis(ms)); }
 }
 
 /// Retires the handler's copy of -o's temporary name, never freed (OUTSIG)

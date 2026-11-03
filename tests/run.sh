@@ -1283,6 +1283,19 @@ if swwait "$W/sw" '[ ! -e gene.bed ]' $pid; then mkdir -p "$W/sw/gene.bed/x"; wa
     && ok "a failed --out-dir rollback: refused, the old BED kept as $kept" || no "a failed --out-dir rollback: rc=$rc, $(grep -m1 '^karyozip: ' "$W/sw.err" | head -c 200), left: $(ls -A "$W/sw" | tr '\n' ' ')"
 else kill -KILL $pid 2>/dev/null || :; wait $pid 2>/dev/null || :; no "a failed --out-dir rollback: the window never showed"; fi
 
+# a signal while --out-dir stages its BEDs: KZ_TEST_STAGE_PAUSE_MS holds stage_open after it makes each staged file
+# and before it records it for the handler, once a window where a signal left that file (the Rust's handler came only
+# after the last). Signalled with the first or both made: exit 1, all old, no staged file left (review r6, finding 6)
+stgo() { KZ_TEST_STAGE_PAUSE_MS=$PAUSE exec $KT decompress --db "$D/db.features.tsv" --set gene,repeat --out-dir "$1" -i "$W/f.kt" >/dev/null 2>"$W/sw.err"; }
+for n in 1 2; do
+  swdir "$W/sw"; ( stgo "$W/sw" ) & pid=$!
+  if swwait "$W/sw" "[ \$(ls | grep -c '\.bed\.tmp\.') -ge $n ]" $pid; then
+    kill -TERM $pid 2>/dev/null || :; wait $pid && rc=0 || rc=$?; g=$(swgen "$W/sw")
+    [ $rc = 1 ] && [ $g = old ] && swclean "$W/sw" && ok "SIGTERM while --out-dir stages BED $n of 2: exit 1, all old, no staged file left" \
+      || no "SIGTERM while --out-dir stages BED $n of 2: rc=$rc, $g, left: $(ls -A "$W/sw" | tr '\n' ' ')"
+  else kill -KILL $pid 2>/dev/null || :; wait $pid 2>/dev/null || :; no "SIGTERM while --out-dir stages BED $n of 2: the staged file never showed"; fi
+done
+
 # a handler that has decided to exit races the commit's start: KZ_TEST_SIG_PAUSE_MS holds the handler right after its
 # decision, on a worker thread (signalled by its thread id, the thread Linux then prefers), while KZ_TEST_SWAP_PAUSE_MS
 # holds the main thread just before the window, then lets it go on into the commit. --smooth --out-dir over 100

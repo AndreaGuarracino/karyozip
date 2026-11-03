@@ -5395,6 +5395,15 @@ static _Noreturn void await_exit(void) {   /* a handler claimed EXITING and is o
     struct timespec t = { 1, 0 };
     for (;;) nanosleep(&t, NULL);
 }
+/* 1 while stage_open creates and records the staged BEDs, with the handled signals blocked in its thread: a handler on
+   another thread that claimed EXITING waits for it to drop, so it never removes the list while a file being made is
+   not yet on it. stage_open sets it, then looks for EXITING; the handler claims EXITING, then looks at it; both
+   sequentially consistent, so one of the two sees the other. As the Rust's STAGING */
+static _Atomic int STAGING;
+static void staging_wait(void) {
+    struct timespec t = { 0, 1000000L };
+    while (atomic_load(&STAGING)) nanosleep(&t, NULL);
+}
 /* IDLE to EXITING, then the temporaries removed and _exit; COMMITTING, the signal recorded for stage_swap; EXITING,
    another handler is ending the process, so this one waits for it */
 static void dbtmpsig(int s) {   /* atexit does not run on a signal */
@@ -5404,7 +5413,7 @@ static void dbtmpsig(int s) {   /* atexit does not run on a signal */
         if (st == SIG_COMMITTING) { sig_pause(); return; }
         sig_pause(); await_exit();
     }
-    sig_pause();
+    sig_pause(); staging_wait();
     dbtmpclean(); outclean(); _exit(1);
 }
 /* SIGINT, SIGTERM and SIGHUP to h, with all three in sa_mask, so while any one's handler runs on a thread, none of
@@ -5430,6 +5439,13 @@ static void stale_warn(const char *dir) {
     closedir(dp);
     if (n) fprintf(stderr, "karyozip: warning: %s holds %zu old BED(s) from an interrupted run (*.bed.old.*); they are left in place\n", dir, n);
 }
+/* KZ_TEST_STAGE_PAUSE_MS=N, for tests only: stage_open sleeps N ms after it makes each staged BED and before it
+   records it, so a test can signal in what was once a window where the file existed and no handler knew it. Unset or
+   0, nothing sleeps. As the Rust's stage_pause_ms */
+static long stage_pause_ms(void) {
+    const char *e = getenv("KZ_TEST_STAGE_PAUSE_MS"); long ms = e ? atol(e) : 0;
+    return ms < 0 ? 0 : ms;
+}
 /* --out-dir DIR: one staged BED a selected set, DBTMP[i] for SETK[i], each a new random name made exclusively, so
    never through a symlink; the open descriptors are returned, as the Rust's stage_open */
 static int *stage_open(const char *dir) {
@@ -5451,13 +5467,25 @@ static int *stage_open(const char *dir) {
     catchsig(dbtmpsig);
     int *fd = xmalloc(NSETK * sizeof *fd);
     mode_t um = umask(0); umask(um);
+    long ms = stage_pause_ms();
+    /* each file made and recorded in DBTMP with the handled signals blocked here and STAGING up, so no handler runs
+       between the two: one on this thread waits, pending, until every name is recorded; one on another thread that
+       claimed EXITING waits for STAGING to drop (staging_wait) */
+    sigset_t hs, was;
+    sigemptyset(&hs); sigaddset(&hs, SIGINT); sigaddset(&hs, SIGTERM); sigaddset(&hs, SIGHUP);
+    pthread_sigmask(SIG_BLOCK, &hs, &was);
+    atomic_store(&STAGING, 1);
+    if (atomic_load(&SIGSTATE) == SIG_EXITING) await_exit();   /* a handler elsewhere is ending the process */
     for (size_t i = 0; i < NSETK; i++) {
         snprintf(pb, sizeof pb, "%s/%s.bed.tmp.XXXXXX", dir, fset[SETK[i]]);   /* fits: checked above */
         char *t = xstrdup(pb);
-        if ((fd[i] = mkstemp(t)) < 0) { free(t); die("cannot write a derived BED"); }
+        if ((fd[i] = mkstemp(t)) < 0) { free(t); atomic_store(&STAGING, 0); die("cannot write a derived BED"); }
+        if (ms) { struct timespec p = { ms / 1000, (ms % 1000) * 1000000L }; while (nanosleep(&p, &p) && errno == EINTR) {} }
         DBTMP[i] = t;
         (void)!fchmod(fd[i], 0666 & ~um);   /* as a plain create */
     }
+    atomic_store(&STAGING, 0);
+    pthread_sigmask(SIG_SETMASK, &was, NULL);
     return fd;
 }
 /* KZ_TEST_SWAP_PAUSE_MS=N, for tests only: a commit, --out-dir's (stage_swap) or -o's (outcommit), sleeps N ms

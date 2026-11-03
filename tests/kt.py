@@ -61,9 +61,34 @@ def bgzf(src, dst):   # bgzip-style BGZF: 65280-byte blocks, empty EOF
         o += struct.pack("<II", zlib.crc32(c), len(c))
     open(dst, "wb").write(o)
 
+def blk(c, isz=None, crc=None, pre=b"", bsz=None):   # one BGZF block of c; pre: subfields before BC; the rest forged
+    import zlib
+    z = zlib.compressobj(6, zlib.DEFLATED, -15); x = z.compress(c) + z.flush(); xl = len(pre) + 6
+    bs = 12 + xl + len(x) + 8 if bsz is None else bsz
+    return (b"\x1f\x8b\x08\x04" + bytes(6) + struct.pack("<H", xl) + pre + struct.pack("<BBHH", 66, 67, 2, bs - 1) + x
+            + struct.pack("<II", zlib.crc32(c) if crc is None else crc, len(c) if isz is None else isz))
+
+def bgzfx(dst):   # forged BGZF: ISIZE bounds, subfields before BC, cuts inside the extra field
+    def bed(n):   # a BED of exactly n bytes
+        r = b"".join(b"r%d\t0\t1\tA\n" % i for i in range(n // 20)); pad = n - len(r) - 7
+        return r + b"z\t0\t1\t" + b"B" * pad + b"\n"
+    eof = blk(b""); w = lambda n, b: open(os.path.join(dst, n), "wb").write(b)
+    for n in (65535, 65536, 65537):
+        w("isz%d.bed" % n, bed(n)); w("isz%d.gz" % n, blk(bed(n)) + eof)
+    w("huge.gz", b"".join(blk(b"r\t0\t1\tA\n", isz=0xffffffff) for _ in range(8)) + eof)     # each claims 4 GiB
+    w("many.gz", blk(b"r\t0\t1\tA\n") * 1 + blk(b"", isz=65536, crc=0) * 300000 + eof)   # 20 GB claimed, each in bounds
+    w("bsize.gz", blk(b"r\t0\t1\tA\n", pre=b"XY\x04\x00abcd", bsz=30) + eof)              # BSIZE ends inside its own header
+    s = bed(1000); w("bc.bed", s)
+    one = blk(s, pre=b"XY\x04\x00abcd"); w("bcafter.gz", one + blk(s[:0], pre=b"XY\x00\x00") + eof)
+    for k in range(10, 12 + 14 + 3):
+        w("cut1.%d.gz" % k, one[:k]); w("cut2.%d.gz" % k, blk(s) + one[:k])
+    tail = b"\x1f\x8b\x08\x04" + bytes(6) + struct.pack("<H", 12) + b"XY\x02\x00ab" + b"BC\x02\x00"   # BC payload past the end
+    w("bcend1.gz", tail); w("bcend2.gz", blk(s) + tail)
+
 if __name__ == "__main__":   # kt.py IN OUT IDX VALUE ...   (IDX "lo9" keeps the high 32 bits)
     if sys.argv[1] == "gen": gen(sys.argv[2], int(sys.argv[3])); sys.exit(0)
     if sys.argv[1] == "bgzf": bgzf(sys.argv[2], sys.argv[3]); sys.exit(0)
+    if sys.argv[1] == "bgzfx": bgzfx(sys.argv[2]); sys.exit(0)
     d, h = load(sys.argv[1])
     for i, v in zip(sys.argv[3::2], sys.argv[4::2]):
         v = int(v, 0)

@@ -196,6 +196,7 @@ static char *xstrdup(const char *s) { char *p = strdup(s); if (!p) die("oom"); r
 
 /* Every text input through one fopencookie FILE*, NULL for stdin: plain, BGZF inflated side by side and CRC-checked, or any gzip; a cut file is refused */
 #define ZCHUNK (8u << 20)
+#define BGZFOUT ((size_t)64 << 20)   /* most inflated bytes one batch of BGZF blocks holds */
 typedef struct {
     int fd, mode, reof, zend;           /* mode: 0 undecided, 1 plain, 2 BGZF, 3 gzip stream */
     uint8_t *raw; size_t rn, rp, rc;    /* compressed bytes read, [rp, rn) not yet used */
@@ -214,10 +215,9 @@ static int rawfill(zrd *z, size_t want) {   /* at least want unused bytes, or th
 }
 static size_t bgzfsize(const uint8_t *p, size_t n) {   /* one BGZF block's size, 0 if it is not one */
     if (n < 18 || p[0] != 0x1f || p[1] != 0x8b || p[2] != 8 || !(p[3] & 4)) return 0;
-    size_t xl = p[10] | (size_t)p[11] << 8, i = 12;
-    for (; i + 4 <= 12 + xl && i + 4 <= n; i += 4 + (p[i + 2] | (size_t)p[i + 3] << 8))
-        if (p[i] == 'B' && p[i + 1] == 'C' && p[i + 2] == 2 && p[i + 3] == 0)
-            return (p[i + 4] | (size_t)p[i + 5] << 8) + 1;
+    size_t xl = p[10] | (size_t)p[11] << 8, e = 12 + xl < n ? 12 + xl : n, sl;   /* each subfield whole, inside XLEN and p */
+    for (size_t i = 12; i + 4 <= e && (sl = p[i + 2] | (size_t)p[i + 3] << 8, i + 4 + sl <= e); i += 4 + sl)
+        if (p[i] == 'B' && p[i + 1] == 'C' && sl == 2) return (p[i + 4] | (size_t)p[i + 5] << 8) + 1;
     return 0;
 }
 static int bgzfread(zrd *z) {   /* the next run of whole blocks into out; -1 on a bad or cut one */
@@ -226,9 +226,12 @@ static int bgzfread(zrd *z) {   /* the next run of whole blocks into out; -1 on 
     while (q < z->rn) {
         size_t bs = bgzfsize(z->raw + q, z->rn - q);
         if (!bs || bs < 26 || q + bs > z->rn) break;
+        const uint8_t *b = z->raw + q, *t = b + bs - 4;   /* checked before anything is summed or allocated */
+        size_t isz = t[0] | (size_t)t[1] << 8 | (size_t)t[2] << 16 | (size_t)t[3] << 24;
+        if (isz > 65536 || 12 + (b[10] | (size_t)b[11] << 8) + 8 > bs) { free(bo); return -1; }
+        if (tot + isz > BGZFOUT) break;                   /* a batch's output is capped */
         if (nb + 1 >= cap) { cap *= 2; bo = xrealloc(bo, cap * sizeof *bo); }
-        bo[nb++] = q; q += bs;
-        tot += z->raw[q - 4] | (size_t)z->raw[q - 3] << 8 | (size_t)z->raw[q - 2] << 16 | (size_t)z->raw[q - 1] << 24;
+        bo[nb++] = q; q += bs; tot += isz;
     }
     bo[nb] = q;
     if (!nb) { free(bo); return z->rp < z->rn ? -2 : 0; }   /* -2: not a whole BGZF block here */
@@ -243,7 +246,6 @@ static int bgzfread(zrd *z) {   /* the next run of whole blocks into out; -1 on 
     for (size_t i = 0; i < nb; i++) {
         const uint8_t *b = z->raw + bo[i]; size_t bs = bo[i + 1] - bo[i], xl = b[10] | (size_t)b[11] << 8;
         size_t isz = oo[i + 1] - oo[i];
-        if (isz > 65536 || 12 + xl + 8 > bs) { bad = 1; continue; }
         static __thread struct libdeflate_decompressor *ld;   /* one a thread, kept */
         if (!ld && !(ld = libdeflate_alloc_decompressor())) { bad = 1; continue; }
         size_t got = 0;
@@ -259,6 +261,8 @@ static ssize_t zread_(void *c, char *b, size_t n) {
     zrd *z = c;
     if (!z->mode) {
         if (rawfill(z, 18) < 0) return -1;
+        if (z->rn >= 18 && z->raw[0] == 0x1f && z->raw[1] == 0x8b && z->raw[3] & 4   /* the whole extra field, to find BC */
+            && rawfill(z, 12 + (z->raw[10] | (size_t)z->raw[11] << 8)) < 0) return -1;
         const uint8_t *p = z->raw;
         z->mode = z->rn < 2 || p[0] != 0x1f || p[1] != 0x8b ? 1 : bgzfsize(p, z->rn) ? 2 : 3;
         if (z->mode == 3 && inflateInit2(&z->zs, 15 + 16) != Z_OK) return -1;

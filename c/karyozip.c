@@ -5407,29 +5407,9 @@ static int kzmain(int argc, char **argv) {
     for (int fd = 0; fd < 3; fd++) if (fcntl(fd, F_GETFD) < 0) die("stdin, stdout or stderr is closed");
     atexit(profdump);
     atexit(emitflush);
-    static const char *const USAGE = "usage:\n"
-            "  karyozip compress   [-i IN.bed[.gz]] [-o OUT.kst] [-e low|medium|high] [-n drop]\n"
-            "                      [-d features.tsv [--hier H] -i SET.bed ...] [-a P.paf --ref R.bed|R.kst]\n"
-            "  karyozip decompress -i F [-o OUT.bed] [-n FILE] [-d features.tsv [--set A,B] [--out-dir DIR]]\n"
-            "  karyozip query      -i F -r NAME[:START-END] [-o OUT.bed] [-n FILE]\n"
-            "  karyozip index      -i F        writes F.kzi, which makes query fast on tracks with many reads\n"
-            "  compress reads stdin without -i; decompress and query write stdout without -o\n"
-            "  -e, --effort: low is quickest to compress and query; medium, the default, is smaller and a query\n"
-            "               decodes one block of whole reads; high is smallest and a query decodes the whole file\n"
-            "  -r NAME:START-END is BED, 0-based, END excluded; -r NAME alone is the whole sequence\n"
-            "  --smooth --hier H [--set SET]: decompress and query give KaryoScope's smoothed track; the\n"
-            "               set is the one whose tree holds the track's labels, or --set when two do\n"
-            "               --v1 for tracks of KaryoScope 1.x, --chunk 20000 for those before 2026-01-08\n"
-            "  readers take -n, -d, --hier, -a, --ref as compress was given; -n FILE takes the names\n"
-            "               from a FASTA, FASTQ or list\n"
-            "  -d: --set A,B picks feature sets, default all; without --out-dir they print as columns;\n"
-            "               with --smooth, one set on stdout, or every picked set under --out-dir\n"
-            "  any command: -t N, --threads N  --tmp-dir DIR  -h, --help  --version\n"
-            "  long forms:  -i --input  -o --output  -r --region  -e --effort  -n --names  -d --db  -a --aln\n"
-            "advanced:\n"
-            "  karyozip aln-pack -a P.paf --ref REF.bed|REF.kst -o OUT   cuts a PAF to what -a reads\n"
-            "  -a with --aln-names F: the track names rows by ordinal, F names them\n"
-            "  --smooth --max-gap N: KaryoScope's gap bound, 1000 by default"
+    /* usage.txt, the Rust's too; the Makefile writes it as a literal, last newline dropped */
+    static const char *const USAGE =
+#include "build/usage.inc"
 /* Debug flags, out of the help: -b, --block N|all; --read-blocks N; --raw; --profile */;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) { puts(USAGE); return 0; }

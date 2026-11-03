@@ -398,8 +398,15 @@ fn fill_rows(s: &[u8], from: usize, to: usize, out: &mut Vec<Row>) -> Result<(),
 
 // The command line, parsed as the C parses it: the same flags, either side of the command, the same refusals in order
 
-/// The C's own usage text, lifted from karyozip.c by build.rs
-pub const USAGE: &str = include_str!(concat!(env!("OUT_DIR"), "/usage.txt"));
+/// The usage text, c/usage.txt, which the C embeds too; its last newline dropped, as the C's Makefile drops it
+pub const USAGE: &str = chomp(include_str!("../../c/usage.txt"));
+
+const fn chomp(s: &str) -> &str {
+    match s.as_bytes() {
+        [rest @ .., b'\n'] => match std::str::from_utf8(rest) { Ok(r) => r, Err(_) => s },
+        _ => s,
+    }
+}
 
 pub enum Cmd { Encode, Decode, Smooth, Index, AlnPack }
 

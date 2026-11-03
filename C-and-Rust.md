@@ -10,10 +10,11 @@ make rust       # builds rust/target/release/karyozip, the binary the tests use
 ```
 
 The C needs zstd, zlib, an OpenMP compiler and a C++ compiler for libzpaq. liblzma is vendored in `c/xz`, libzpaq in `c/zpaq`.
+`CFLAGS`, `CXXFLAGS`, `CPPFLAGS` and `LDFLAGS` from the environment, as a conda env sets them, are honoured; the flags the build needs are added to them. The build stops unless `zstd.h` is zstd 1.5.7, the one the Rust bundles (`ZSTD_CFLAGS` and `ZSTD_LIBS` choose another zstd).
 
 ## C and Rust
 
-`c/` and `rust/` write the same bytes, print the same `--help` and refuse the same inputs with the same words; `rust/build.rs` takes the usage text from `c/karyozip.c`.
+`c/` and `rust/` write the same bytes, print the same `--help` and refuse the same inputs with the same words; the usage text is `c/usage.txt`, which the C embeds and the Rust includes, and the liblzma file list is `c/xz/sources.txt`, which `c/Makefile` and `rust/build.rs` both read.
 `make test` (65 s) runs the shared suite in `tests/`, sanitizers and fuzzing on both and compares them compress by compress.
 The C finds zstd, zlib and libgomp at the path in its rpath; the Rust bundles zstd. Both compile the same liblzma from `c/xz`.
 The Rust compiles the C codecs too, through `rust/src/ffi.rs`: there is no Rust htscodecs, and the `bzip3` crate lacks the two fixes in `c/bzip3/PROVENANCE`. `zstd-sys` is pinned to `=2.0.16`, the zstd 1.5.7 the C links, because zstd does not promise the same bytes across releases.

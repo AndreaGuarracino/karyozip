@@ -10,6 +10,7 @@ cargo install --path rust       # puts karyozip in ~/.cargo/bin
 ```
 
 It needs cargo, a C and a C++ compiler and libgomp: the codecs under `c/` are compiled into the binary.
+It builds on Linux with glibc and GCC (or a compiler with `-fopenmp` and libgomp), and from a clone only: `rust/build.rs` reads `c/`, so the crate is not published.
 
 ## Quick start
 

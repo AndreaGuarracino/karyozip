@@ -696,6 +696,45 @@ $KT decompress -i "$W/fbad.kt" -o "$W/oo/k.kt" >/dev/null 2>&1 || :; $KT compres
 [ "$(cat "$W/oo/k.kt")" = old ] && [ "$(ls "$W/oo")" = k.kt ] && ok "failed -o: previous file intact, no temporaries" || no "failed -o: OUTPUT DAMAGED"
 $KT decompress -i "$W/nx.kt" -o "$W/oo/k.kt" >/dev/null 2>&1 || :; [ "$(ls "$W/oo")" = k.kt ] && [ -s "$W/oo/k.kt" ] && ok "-o over an old file: replaced" || no "-o over an old file: WRONG"
 
+# output and temp-file safety: a failed -o, --out-dir, index or aln-pack never harms what was there
+mkdir -p "$W/os"; cd "$W/os"
+printf 'r0\tx\t5\tA\n' > bad.bed; echo old > k.kt; cp bad.bed same.bed
+must_fail "-o, malformed input" $KT compress -i bad.bed -o k.kt
+must_fail "-o names the input, malformed" $KT compress -i same.bed -o same.bed
+[ "$(cat k.kt)" = old ] && cmp -s same.bed bad.bed && [ "$(ls | tr '\n' ' ')" = "bad.bed k.kt same.bed " ] \
+  && ok "failed -o: sentinel and input intact, no temporaries" || no "failed -o: DAMAGED: $(ls | tr '\n' ' ')"
+if [ "$(id -u)" != 0 ]; then   # root ignores the mode
+  mkdir ro; echo old > ro/k.kt; cp "$D/s.bed" ro/s.bed; chmod 555 ro
+  must_fail "-o in a directory that forbids new files" $KT compress -i "$D/s.bed" -o ro/k.kt
+  must_fail "-o names the input, no staging" $KT compress -i ro/s.bed -o ro/s.bed
+  must_fail "aln-pack in a directory that forbids new files" $KT aln-pack -a "$D/p.paf" --ref "$D/ref.bed" -o ro/k.kt
+  [ "$(cat ro/k.kt)" = old ] && cmp -s ro/s.bed "$D/s.bed" && ok "-o unstageable: never truncated" || no "-o unstageable: TRUNCATED"
+  chmod 755 ro
+fi
+# the old names were TARGET.tmp.PID, TRACK.kzi.PID and SET.bed.tmp.PID: a link planted there is not followed
+echo victim > victim
+( ln -s "$W/os/victim" "k.kt.tmp.$BASHPID"; exec $KT compress -i "$D/s.bed" -o k.kt ) 2>/dev/null
+cp "$W/p.kt" ix.kt; ( ln -s "$W/os/victim" "ix.kt.kzi.$BASHPID"; exec $KT index -i ix.kt ) 2>/dev/null
+mkdir -p sd; ( ln -s "$W/os/victim" "sd/gene.bed.tmp.$BASHPID"; exec $KT decompress --db "$D/db.features.tsv" --out-dir sd -i "$W/f.kt" ) 2>/dev/null
+[ "$(cat victim)" = victim ] && cmp -s k.kt "$W/p.kt" && [ -s ix.kt.kzi ] && cmp -s sd/gene.bed "$D/db.gene.bed" \
+  && [ "$(ls | grep -c 'k\.kt\.tmp\|kzi\.')" = 2 ] && [ "$(ls sd | grep -c tmp)" = 1 ] && ok "a link at an old temporary name: target untouched" || no "a link at an old temporary name: FOLLOWED"
+# -o through a symlink: the target replaced, the link kept; a dangling link refused
+echo old > tgt.kt; ln -s tgt.kt lnk.kt; $KT compress -i "$D/s.bed" -o lnk.kt 2>/dev/null
+[ -L lnk.kt ] && cmp -s tgt.kt "$W/p.kt" && [ -z "$(ls | grep 'tgt.kt.tmp\|lnk.kt.tmp')" ] && ok "-o to a symlink: target replaced, link kept" || no "-o to a symlink: WRONG"
+ln -s nowhere/x.kt dang.kt; must_fail "-o to a dangling symlink" $KT compress -i "$D/s.bed" -o dang.kt
+[ -L dang.kt ] && [ ! -e nowhere ] && ok "dangling -o link: left alone" || no "dangling -o link: WRONG"
+# aln-pack: staged as -o is
+$KT aln-pack -a "$D/p.paf" --ref "$D/ref.bed" -o pk 2>/dev/null; cp pk pk.want
+must_fail "aln-pack of a missing PAF" $KT aln-pack -a nosuch.paf --ref "$D/ref.bed" -o pk
+cmp -s pk pk.want && [ -z "$(ls | grep 'pk.tmp')" ] && ok "failed aln-pack: old file intact" || no "failed aln-pack: OLD FILE DAMAGED"
+echo old > pk2; $KT aln-pack -a "$D/p.paf" --ref "$D/ref.bed" -o pk2 2>/dev/null; cmp -s pk2 pk.want && ok "aln-pack over an old file: replaced" || no "aln-pack over an old file: WRONG"
+echo old > od.bed
+must_fail "-o with --out-dir" $KT decompress --db "$D/db.features.tsv" --out-dir od -o od.bed -i "$W/f.kt"
+must_fail "--out-dir ''" $KT decompress --db "$D/db.features.tsv" --out-dir "" -i "$W/f.kt"
+must_fail "--smooth --out-dir ''" $KT --db "$D/db.features.tsv" decompress -i "$W/f.kt" --hier "$W/full.tsv" --smooth --out-dir ""
+[ "$(cat od.bed)" = old ] && [ ! -e od ] && ok "-o with --out-dir: refused before writing" || no "-o with --out-dir: WROTE"
+cd - >/dev/null
+
 # round 27 findings, one case each
 printf 'r0\nr1\nr2\nr3\n' > "$W/pn.txt"
 $KT --names <(cat "$W/pn.txt") decompress -i "$W/nx.kt" 2>/dev/null | cmp -s - "$W/nx.bed" && ok "name file from a pipe: restored" || no "name file from a pipe: WRONG"

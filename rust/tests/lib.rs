@@ -209,13 +209,28 @@ fn a_failing_output_is_an_error() {
     let _ = std::fs::remove_dir_all(&d);
 }
 
-/// Writers one after another in one process, and two at once on two threads, each the CLI's bytes
+/// Writers one after another in one process, each the CLI's bytes
 #[test]
-fn writers_in_sequence_and_at_once() {
+fn writers_in_sequence() {
+    let bed = fixture();
+    let want = cli(&["--block", "4"], &bed);
+    for _ in 0..3 { assert_eq!(build(&bed, Options { block: 4, ..Options::default() }), want, "a later writer in the same process"); }
+}
+
+/// TEST_LIGHT=1: serial and light (tests/lib.sh); a test that starts threads of its own returns early, saying so
+fn light(what: &str) -> bool {
+    let on = std::env::var("TEST_LIGHT").is_ok_and(|v| v == "1");
+    if on { eprintln!("skipped (TEST_LIGHT): {what}"); }
+    on
+}
+
+/// Two writers at once on two threads, each the CLI's bytes; skipped under TEST_LIGHT=1, as it runs two at once
+#[test]
+fn writers_at_once() {
+    if light("two writers at once") { return; }
     let bed = fixture();
     let want = cli(&["--block", "4"], &bed);
     let opt = || Options { block: 4, ..Options::default() };
-    for _ in 0..3 { assert_eq!(build(&bed, opt()), want, "a later writer in the same process"); }
     let (a, b) = std::thread::scope(|s| {
         let a = s.spawn(|| build(&bed, opt()));
         let b = s.spawn(|| build(&bed, opt()));

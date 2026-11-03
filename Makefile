@@ -15,6 +15,9 @@ SUITE_TJ := $(shell n=$(TEST_JOBS); [ "$$n" -ge 1 ] 2>/dev/null || n=1; echo $$(
 # threads, at least 1
 rayon = $(shell t=$${KZ_TEST_THREADS:-$(1)}; t=$$((t / $(1))); [ $$t -ge 1 ] || t=1; echo $$t)
 export TEST_JOBS
+# TEST_LIGHT=1 (environment or command line) reaches every suite, cargo test's included (rust/tests/lib.rs skips
+# its concurrent-writer test under it)
+export TEST_LIGHT
 
 rust:
 	cd rust && cargo build --release -j $(TEST_JOBS)

@@ -19,6 +19,7 @@ fn cnt(v: &Option<String>, lo: u64, hi: u64, what: &'static str) -> Option<u64> 
 fn main() {
     ffi::ignore_sigxfsz();
     ffi::sig_test_init();
+    ffi::default_sigpipe();   // a closed stdout ends the process quietly, as it ends the C
     ffi::panic_clean();
     if !ffi::STDFDS_OPEN.load(std::sync::atomic::Ordering::Relaxed) { die("stdin, stdout or stderr is closed"); }
     let c = Cli::get();
@@ -466,12 +467,17 @@ impl Cli {
     pub fn get() -> Cli {
         let mut av: Vec<String> = std::env::args().skip(1).collect();
         for a in &av {
-            if a == "--help" || a == "-h" { println!("{USAGE}"); std::process::exit(0); }
+            if a == "--help" || a == "-h" {
+                let _ = std::io::stdout().write_all(format!("{USAGE}\n").as_bytes()).and_then(|_| std::io::stdout().flush());
+                std::process::exit(0);
+            }
             if a == "--version" {
-                println!("karyozip {}, format KST00001\n  zstd       {}\n  libbz3     {}\n  htscodecs  {}\n  libdeflate {}\n  liblzma    {}",
-                         env!("CARGO_PKG_VERSION"), karyozip::ffi::zstd_version(),
-                         karyozip::ffi::bzip3_version(), karyozip::ffi::HTSCODECS_VERSION, karyozip::ffi::LIBDEFLATE_VERSION,
-                         karyozip::ffi::lzma_version());
+                // one write, as the C's one buffered printf: println! panics on a closed pipe
+                let v = format!("karyozip {}, format KST00001\n  zstd       {}\n  libbz3     {}\n  htscodecs  {}\n  libdeflate {}\n  liblzma    {}\n",
+                                env!("CARGO_PKG_VERSION"), karyozip::ffi::zstd_version(),
+                                karyozip::ffi::bzip3_version(), karyozip::ffi::HTSCODECS_VERSION, karyozip::ffi::LIBDEFLATE_VERSION,
+                                karyozip::ffi::lzma_version());
+                let _ = std::io::stdout().write_all(v.as_bytes()).and_then(|_| std::io::stdout().flush());
                 std::process::exit(0);
             }
         }

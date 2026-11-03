@@ -56,6 +56,13 @@ pub fn ignore_sigxfsz() {
     unsafe { signal(25, 1); }
 }
 
+/// SIGPIPE back to the default the C runs under: Rust's runtime ignores it, so a write to a closed pipe was an
+/// EPIPE error (and println! a panic); now `karyozip ... | head` ends quietly, killed by the signal, as the C
+pub fn default_sigpipe() {
+    // SAFETY: SIG_DFL is 0, and signal takes no argument we own
+    unsafe { signal(13, 0); }
+}
+
 /// glibc's mmap threshold pinned at the default, so big buffers are mapped and unmapped as the C's; OpenMP's team is -t
 pub fn omp_threads(n: usize) {
     unsafe extern "C" { fn omp_set_num_threads(n: c_int); }

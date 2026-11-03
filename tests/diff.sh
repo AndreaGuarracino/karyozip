@@ -350,6 +350,17 @@ cli --block=4 compress; cli -b4 compress; cli -t4 compress; cli --effort=low com
 cli decompress -i f --max-gap -1; cli query -i f -r -x; cli compress -- -x; cli -o -i compress
 cli decompress --db f --out-dir d -o x -i f; cli decompress --db f --out-dir "" -i f; cli decompress -i f --hier h --smooth --out-dir ""
 ln -s nowhere/x "$W/dang"; cli compress -o dang; cli compress -o nosuchdir/x; cli aln-pack -a a --ref b -o nosuchdir/c
+# a reader that closes the pipe early: both quiet, both ended by SIGPIPE once they write again (--version: one
+# write, which may land before the reader goes)
+awk 'BEGIN{for(r=0;r<400;r++){p=0; for(k=0;k<50;k++){printf "read%05d\t%d\t%d\tchr%d\n", r, p, p+20+k, (r+k)%22; p+=20+k}}}' > "$W/ep.bed"
+"$C" compress < "$W/ep.bed" > "$W/ep.kst" 2>/dev/null
+for c in "--version" "decompress -i $W/ep.kst" "decompress --raw -i $W/ep.kst"; do
+  "$CB" $c 2>"$W/ep.c" | head -c 10 >/dev/null; cr=${PIPESTATUS[0]}
+  "$RB" $c 2>"$W/ep.r" | head -c 10 >/dev/null; rr=${PIPESTATUS[0]}
+  if [ "$c" = --version ]; then same=$( { [ $cr = 0 ] || [ $cr = 141 ]; } && { [ $rr = 0 ] || [ $rr = 141 ]; } && echo y); else same=$([ $cr = $rr ] && [ $cr = 141 ] && echo y); fi
+  if [ "$same" = y ] && [ ! -s "$W/ep.c" ] && [ ! -s "$W/ep.r" ]; then cok=$((cok+1)); tpass
+  else cbad=$((cbad+1)); tfail "cli differs: [${c% -i*} | head -c 10] rc $cr/$rr, c=[$(head -c 100 "$W/ep.c")] rust=[$(head -c 100 "$W/ep.r")]"; fi
+done
 [ $cbad = 0 ] && echo "cli: $cok forms give the same words and code" \
   || echo "cli: $cbad of $((cok+cbad)) DIFFER"
 fi

@@ -535,6 +535,16 @@ $KT compress --tmp-dir "$L" --names drop < "$W/long.bed" > "$W/long.kt" 2>/dev/n
 fi
 $KT compress < "$D/s.bed" >&- 2>/dev/null && no "compress with stdout closed: EXIT 0" || ok "compress with stdout closed: refused"
 $KT compress < "$W" > "$W/dir.kt" 2>/dev/null && no "compress from a directory: EXIT 0" || ok "compress from a directory: refused"
+# a reader that closes the pipe: quiet, no panic, no "write failed"; a later write ends the process by SIGPIPE, as the C's default
+"$KZ" --version 2>"$W/ep.err" | head -1 >/dev/null; rc=${PIPESTATUS[0]}
+{ [ $rc = 0 ] || [ $rc = 141 ]; } && [ ! -s "$W/ep.err" ] && ok "--version | head -1: quiet, exit $rc" || no "--version | head -1: exit $rc, $(head -c 200 "$W/ep.err")"
+awk 'BEGIN{for(r=0;r<400;r++){p=0; for(k=0;k<50;k++){printf "read%05d\t%d\t%d\tchr%d\n", r, p, p+20+k, (r+k)%22; p+=20+k}}}' > "$W/ep.bed"
+$KT compress < "$W/ep.bed" > "$W/ep.kst" 2>/dev/null
+for c in "decompress -i $W/ep.kst" "decompress --raw -i $W/ep.kst" "--help"; do
+  $KT $c 2>"$W/ep.err" | head -c 10 >/dev/null; rc=${PIPESTATUS[0]}
+  if [ "$c" = --help ]; then want="0 141"; else want=141; fi
+  [[ " $want " == *" $rc "* ]] && [ ! -s "$W/ep.err" ] && ok "${c% -i*} | head -c 10: quiet, exit $rc" || no "${c% -i*} | head -c 10: exit $rc, $(head -c 200 "$W/ep.err")"
+done
 printf 'a\t0\t10\tA\nb\t0\t10\tB\na\t0\t10\tC\n' > "$W/dupname.bed"
 must_fail "a sequence name that repeats later" $KT compress < "$W/dupname.bed"
 N512=$(head -c 512 /dev/zero | tr '\0' n); printf '%s\t0\t10\tA\n' "$N512" > "$W/n512.bed"

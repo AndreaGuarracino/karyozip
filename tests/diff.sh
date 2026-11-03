@@ -4,7 +4,9 @@
 # Every compared form counts once; failures are prefixed "FAIL: "; the last lines are
 # "diff.sh: N passed, M failed, K skipped" and DIFF_PASS or DIFF_FAIL.
 # KZ_TEST_THREADS, TEST_LIGHT: see lib.sh. "$C" and "$R" are wrappers that add
-#   -t $KZ_TEST_THREADS; $CB and $RB are the bare binaries, for the cli section's exact argument lists.
+#   -t $KZ_TEST_THREADS; $CB and $RB are the bare binaries, for the cli section: its cli forms put
+#   -t $KZ_TEST_THREADS first, its cli0 forms (no arguments, --help, --version) and its stress-gated default-count
+#   case pass none.
 # CASE=REGEX runs only the sections whose name matches: versions compress decompress cross region index
 #   reader-flags smooth db aln refusals awkward gzip cli tail zpaq damaged forged edge bodytmp forged2 varint finalize
 set -u
@@ -390,22 +392,28 @@ fi
 # 12. CLI: same words, same exit code
 if sec cli; then
 cok=0; cbad=0
-cli() {
-  (cd "$W" && "$CB" "$@" </dev/null > cliout.c 2>&1); local cr=$?   # in $W, since forms may write files
-  (cd "$W" && "$RB" "$@" </dev/null > cliout.r 2>&1); local rr=$?
+# cli ARGS...: both bare binaries with -t $KZ_TEST_THREADS before ARGS (a later -t in ARGS wins), so a form that
+# gets past the argument parsing starts no default-sized pool; cli0 ARGS...: exactly ARGS, for the forms whose whole
+# argument list is the case and which end before any thread starts (none, --help, -h, --version)
+cli() { clirun "-t $KZ_TEST_THREADS" "$@"; }
+cli0() { clirun "" "$@"; }
+clirun() {
+  local pre=$1; shift
+  (cd "$W" && "$CB" $pre "$@" </dev/null > cliout.c 2>&1); local cr=$?   # in $W, since forms may write files
+  (cd "$W" && "$RB" $pre "$@" </dev/null > cliout.r 2>&1); local rr=$?
   if cmp -s "$W/cliout.c" "$W/cliout.r" && [ "$cr" = "$rr" ]; then cok=$((cok+1)); tpass; return; fi
   cbad=$((cbad+1)); tfail "cli differs: [$*] rc $cr/$rr"; echo "    c=[$(head -c 200 "$W/cliout.c" | tr -d '\0' | head -1)]"
   echo "    rust=[$(head -c 200 "$W/cliout.r" | tr -d '\0' | head -1)]"
 }
-cli; cli --help; cli -h; cli --version; cli --bogus; cli --bogus compress
-cli decompress; cli compress extra; cli --profile; cli --threads; cli --threads 4
+cli0; cli0 --help; cli0 -h; cli0 --version; cli --bogus; cli --bogus compress
+cli decompress; cli compress extra; cli --profile; cli --threads; stress "cli: --threads 4, no command (4 threads)" && cli --threads 4
 cli badcmd; cli region; cli decompress -i f; cli index; cli decompress -i f; cli aln-pack
 cli compress --names ordinal; cli index --effort low
 cli compress --block; cli compress --effort max; cli compress --block 0
 cli -t; cli -t 0; cli -t 99999; cli --tmp-dir; cli decompress --raw x --raw
 cli index --block 0; cli aln-pack -a a --ref b; cli decompress -i f --hier h; cli query -i f -r s:5-5
 cli compress --names foo; cli --effort low; cli -r x
-cli aln-pack --names foo -a a --ref b -o c; cli compress --db; cli --version compress
+cli aln-pack --names foo -a a --ref b -o c; cli compress --db; cli0 --version compress
 cli index -i f x; cli decompress -i f x; cli query -i f --hier h --smooth --set fs -r s:9-3; cli aln-pack -a a --ref b -o c d
 cli query -i f --hier h --smooth --set fs -r s:1-2; cli query -i f -r s --halo 3; cli query -i f -r s:1-2
 cli decompress --max-gap x -i f --hier h --smooth --set fs; cli query -i f --hier h --smooth --set fs; cli query -i f --smooth --out-dir d
@@ -422,13 +430,21 @@ cli --block=4 compress; cli -b4 compress; stress "cli: -t4 compress (4 threads)"
 cli decompress -i f --max-gap -1; cli query -i f -r -x; cli compress -- -x; cli -o -i compress
 cli decompress --db f --out-dir d -o x -i f; cli decompress --db f --out-dir "" -i f; cli decompress -i f --hier h --smooth --out-dir ""
 ln -s nowhere/x "$W/dang"; cli compress -o dang; cli compress -o nosuchdir/x; cli aln-pack -a a --ref b -o nosuchdir/c
+# the default thread count, no -t: the CPUs this process may use, at most 8, in both (a stress case: up to 8 threads)
+if stress "cli: the default thread count, min(CPUs, 8)"; then
+  nd=$(python3 -c 'import os; print(min(len(os.sched_getaffinity(0)), 8))')
+  dc=$("$CB" --profile compress < "$D/s.bed" 2>&1 >/dev/null | grep -o '([0-9]* allowed)')
+  dr=$("$RB" --profile compress < "$D/s.bed" 2>&1 >/dev/null | grep -o '([0-9]* allowed)')
+  if [ "$dc" = "($nd allowed)" ] && [ "$dr" = "($nd allowed)" ]; then cok=$((cok+1)); tpass
+  else cbad=$((cbad+1)); tfail "cli differs: default thread count, want ($nd allowed), c=[$dc] rust=[$dr]"; fi
+fi
 # a reader that closes the pipe early: both quiet, both ended by SIGPIPE once they write again (--version: one
-# write, which may land before the reader goes)
+# write, which may land before the reader goes); through the wrappers, -t $KZ_TEST_THREADS
 awk 'BEGIN{for(r=0;r<400;r++){p=0; for(k=0;k<50;k++){printf "read%05d\t%d\t%d\tchr%d\n", r, p, p+20+k, (r+k)%22; p+=20+k}}}' > "$W/ep.bed"
 "$C" compress < "$W/ep.bed" > "$W/ep.kst" 2>/dev/null
 for c in "--version" "decompress -i $W/ep.kst" "decompress --raw -i $W/ep.kst"; do
-  "$CB" $c 2>"$W/ep.c" | head -c 10 >/dev/null; cr=${PIPESTATUS[0]}
-  "$RB" $c 2>"$W/ep.r" | head -c 10 >/dev/null; rr=${PIPESTATUS[0]}
+  "$C" $c 2>"$W/ep.c" | head -c 10 >/dev/null; cr=${PIPESTATUS[0]}
+  "$R" $c 2>"$W/ep.r" | head -c 10 >/dev/null; rr=${PIPESTATUS[0]}
   if [ "$c" = --version ]; then same=$( { [ $cr = 0 ] || [ $cr = 141 ]; } && { [ $rr = 0 ] || [ $rr = 141 ]; } && echo y); else same=$([ $cr = $rr ] && [ $cr = 141 ] && echo y); fi
   if [ "$same" = y ] && [ ! -s "$W/ep.c" ] && [ ! -s "$W/ep.r" ]; then cok=$((cok+1)); tpass
   else cbad=$((cbad+1)); tfail "cli differs: [${c% -i*} | head -c 10] rc $cr/$rr, c=[$(head -c 100 "$W/ep.c")] rust=[$(head -c 100 "$W/ep.r")]"; fi

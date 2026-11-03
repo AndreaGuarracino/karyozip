@@ -518,7 +518,7 @@ $KT decompress --aln "$W/mn.paf" --ref "$W/mn.ref" -i "$W/mn.kt" 2>/dev/null | c
 # NOSZ codecs carry no size: refused
 
 # flags with no command: usage, no crash
-must_fail "--threads with no command" $KT --threads 4
+must_fail "--threads with no command" $KT --threads "$KZ_TEST_THREADS"   # the budget: the Rust starts its pool before the usage
 must_fail "--tmp-dir with no command" $KT --tmp-dir /tmp
 must_fail "--effort low with no command" $KT --effort low
 $KT --profile 2>&1 | grep -q '^karyozip: usage:' && ok "flags with no command: usage, not a crash" || no "flags with no command: WRONG"

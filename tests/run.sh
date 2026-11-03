@@ -1327,6 +1327,26 @@ for at in before inside; do
   else kill -KILL $pid 2>/dev/null || :; wait $pid 2>/dev/null || :; no "SIGTERM on a worker $at the commit window: no window, or no worker thread"; fi
 done
 
+# a handler claims the exit as --out-dir's staging starts: KZ_TEST_STAGE_ENTRY_PAUSE_MS holds stage_open with
+# STAGING up and before it looks for EXITING, and SIGTERM goes to a worker thread meanwhile (tgkill, once the
+# stale-backup warning, printed just before, shows). The handler waits for STAGING to drop; staging, seeing EXITING,
+# once waited for the handler with STAGING still up, and both waited forever. Exit 1, all old, no staged file left;
+# bounded (dwait: killed after 30 s, scaled, and the case fails). decompress --db over a BGZF features table of
+# 60000 rows, about 19 blocks, which the C inflates on its OpenMP team, so the C too has idle workers, signals
+# unblocked, before it stages. A stress case: -t 4, whatever the budget
+if stress "SIGTERM on a worker as --out-dir's staging starts"; then
+  { cat "$W/rc/f.tsv"; awk 'BEGIN { for (i = 5; i < 60000; i++) printf "%d\tg%d\tr%d\n", i, i, i }'; } > "$W/rc/fb.tsv"
+  python3 "$D/kt.py" bgzf "$W/rc/fb.tsv" "$W/rc/fb.tsv.gz"
+  $KT compress --db "$W/rc/fb.tsv.gz" -i "$W/rc/gene.bed" -i "$W/rc/repeat.bed" > "$W/rc/rb.kt" 2>/dev/null || :
+  swdir "$W/sw"; : > "$W/sw.err"; tid=
+  ( KZ_TEST_STAGE_ENTRY_PAUSE_MS=$PAUSE exec $KZ -t 4 decompress --db "$W/rc/fb.tsv.gz" --set gene,repeat --out-dir "$W/sw" -i "$W/rc/rb.kt" >/dev/null 2>"$W/sw.err" ) & pid=$!
+  swwait "$W/sw" 'grep -q "old BED" "$W/sw.err"' $pid && tid=$(ls /proc/$pid/task 2>/dev/null | grep -vx "$pid" | head -n1) || :
+  if [ -n "$tid" ] && tgk $pid "$tid" 15; then dwait $pid 30; g=$(rcgen "$W/sw")
+    [ $rc = 1 ] && [ $g = old ] && swclean "$W/sw" && ok "SIGTERM on a worker as --out-dir's staging starts: exit 1, all old, no staged file left" \
+      || no "SIGTERM on a worker as --out-dir's staging starts: rc=$rc (124: hung, killed), $g, left: $(ls -A "$W/sw" | tr '\n' ' ')"
+  else kill -KILL $pid 2>/dev/null || :; wait $pid 2>/dev/null || :; no "SIGTERM on a worker as --out-dir's staging starts: no warning, or no worker thread"; fi
+fi
+
 # -o's rename under the same protocol: a worker's handler held, signalled once the temporary is synced and closed,
 # before the window: exit 1, the old file kept (the new one only if the window opened first), no temporary; inside
 # the window, once the new file is in place: deferred, exit 1, the new file. --smooth --set over the 100 contigs

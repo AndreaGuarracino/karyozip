@@ -126,7 +126,7 @@ Read names are stored in the file by default.
 | `-h`, `--help`, `--version` | all | usage; library versions |
 
 Flags work on either side of the command name. The readers are decompress and query.
-No environment variable changes the bytes karyozip writes. Three are read, for the test suite only: `KZ_TEST_SIG_PAUSE_MS`, `KZ_TEST_SWAP_PAUSE_MS` and `KZ_TEST_STAGE_PAUSE_MS` add sleeps at fixed points of a signal, an output commit or `--out-dir`'s staging, and do nothing when unset ([C-and-Rust.md](C-and-Rust.md#tests)).
+No environment variable changes the bytes karyozip writes. Four are read, for the test suite only: `KZ_TEST_SIG_PAUSE_MS`, `KZ_TEST_SWAP_PAUSE_MS`, `KZ_TEST_STAGE_PAUSE_MS` and `KZ_TEST_STAGE_ENTRY_PAUSE_MS` add sleeps at fixed points of a signal, an output commit or `--out-dir`'s staging, and do nothing when unset ([C-and-Rust.md](C-and-Rust.md#tests)).
 
 ## Advanced
 

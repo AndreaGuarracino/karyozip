@@ -531,12 +531,12 @@ pub fn stage_open(dir: &str, sets: &[&[u8]]) -> (Vec<std::path::PathBuf>, Vec<st
     let mut fs = Vec::new();
     // each file made and published with the handled signals blocked here (ffi::stage_begin), so no handler runs
     // between the two: one on this thread waits, pending, until every name is published; one on another thread that
-    // claimed EXITING waits for staging to end (ffi::staging_wait)
+    // claimed EXITING waits for staging to end (ffi::staging_wait). Every way out drops STAGING first (ffi::STAGING)
     let was = crate::ffi::stage_begin();
     for s in sets {
         let (f, p) = crate::ffi::mkstemp(&setpath(dir, s, ".bed.tmp"), 0o666)
             .unwrap_or_else(|_| { crate::ffi::stage_abort(); crate::bail("cannot write a derived BED") });
-        crate::ffi::stage_pause();
+        crate::ffi::stage_pause(&crate::ffi::STAGE_MS, "KZ_TEST_STAGE_PAUSE_MS");
         let mut t = TMP.lock().unwrap();
         t.push(p); fs.push(f);
         crate::ffi::sig_stage(&t);

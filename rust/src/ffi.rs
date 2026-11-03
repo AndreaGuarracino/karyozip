@@ -512,7 +512,10 @@ pub fn sig_stage(paths: &[std::path::PathBuf]) {
 /// True while stage_open makes and publishes the staged BEDs, with the handled signals blocked in its thread
 /// (stage_begin): a handler on another thread that claimed EXITING waits for it to drop, so it never unlinks the list
 /// while a file being made is not yet on it. stage_begin sets it, then looks for EXITING; the handler claims EXITING,
-/// then looks at it; both SeqCst, so one of the two sees the other. As the C's STAGING
+/// then looks at it; both SeqCst, so one of the two sees the other. Never a mutual wait: the handler waits only for
+/// STAGING to drop, and staging never waits for a handler, nor exits, with STAGING up. Seeing EXITING, stage_begin
+/// drops it first, nothing yet staged, then waits for that handler to end the process (await_exit); a refusal drops
+/// it (stage_abort) before it exits. As the C's STAGING
 static STAGING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// nanosleep only, so the handler may call it
 fn staging_wait() {
@@ -521,7 +524,8 @@ fn staging_wait() {
     while STAGING.load(std::sync::atomic::Ordering::SeqCst) { unsafe { nanosleep(&t, std::ptr::null_mut()); } }
 }
 /// Staging opens: the handler installed, SIGINT, SIGTERM and SIGHUP blocked in this thread, STAGING up. A handler that
-/// already claimed EXITING is on another thread ending the process: this waits for it. Returns the mask to put back
+/// already claimed EXITING is on another thread ending the process, waiting for STAGING to drop: this drops it, then
+/// waits for that handler. Returns the mask to put back
 pub fn stage_begin() -> SigSet {
     use std::sync::atomic::Ordering::SeqCst;
     catch_signals();
@@ -533,7 +537,8 @@ pub fn stage_begin() -> SigSet {
         pthread_sigmask(SIG_BLOCK, &hs, &mut was);
     }
     STAGING.store(true, SeqCst);
-    if SIGSTATE.load(SeqCst) == EXITING { await_exit(); }
+    stage_pause(&STAGE_ENTRY_MS, "KZ_TEST_STAGE_ENTRY_PAUSE_MS");
+    if SIGSTATE.load(SeqCst) == EXITING { STAGING.store(false, SeqCst); await_exit(); }
     was
 }
 /// Staging closes: STAGING down, the mask put back, so a signal held pending here runs its handler now, with every
@@ -545,12 +550,15 @@ pub fn stage_end(was: SigSet) {
 }
 /// STAGING down without the mask put back: a refusal on its way out
 pub fn stage_abort() { STAGING.store(false, std::sync::atomic::Ordering::SeqCst); }
-/// KZ_TEST_STAGE_PAUSE_MS=N, for tests only: stage_open sleeps N ms after it makes each staged BED and before it
-/// publishes it, so a test can signal in what was once a window where the file existed and no handler knew it. Unset
-/// or 0, nothing sleeps. As the C's stage_pause_ms
-pub fn stage_pause() {
-    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    let ms = *MS.get_or_init(|| std::env::var("KZ_TEST_STAGE_PAUSE_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(0));
+/// For tests only, unset or 0 nothing sleeps. KZ_TEST_STAGE_PAUSE_MS=N (STAGE_MS): stage_open sleeps N ms after it
+/// makes each staged BED and before it publishes it, so a test can signal in what was once a window where the file
+/// existed and no handler knew it. KZ_TEST_STAGE_ENTRY_PAUSE_MS=N (STAGE_ENTRY_MS): stage_begin sleeps N ms once
+/// STAGING is up and before it looks for EXITING, so a handler on another thread can claim EXITING and find STAGING
+/// up (once a mutual wait). As the C's stage_pause_ms
+pub static STAGE_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+static STAGE_ENTRY_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+pub fn stage_pause(ms: &std::sync::OnceLock<u64>, var: &str) {
+    let ms = *ms.get_or_init(|| std::env::var(var).ok().and_then(|v| v.parse().ok()).unwrap_or(0));
     if ms > 0 { std::thread::sleep(std::time::Duration::from_millis(ms)); }
 }
 

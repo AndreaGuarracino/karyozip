@@ -30,6 +30,7 @@
 #   KZ_TEST_SWAP_PAUSE_MS=N  an output commit (--out-dir's BEDs, -o's rename) sleeps N ms before its window opens and
 #                            after each rename, so a case can signal just before and inside the window
 #   KZ_TEST_STAGE_PAUSE_MS=N --out-dir sleeps N ms after creating each staged BED, before recording its name
+#   KZ_TEST_STAGE_ENTRY_PAUSE_MS=N  --out-dir's staging sleeps N ms once STAGING is up, before it looks for EXITING
 #   Sleeps at those fixed points only: timing, never the bytes. Unset or 0, nothing sleeps. For the test suite only
 
 # need TOOL...: every missing tool named at once, then exit 1

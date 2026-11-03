@@ -408,10 +408,19 @@ pub fn commit_end(was: SigSet, quiet: bool) {
 
 /// -o's temporary name, where it is renamed to and the name given, as the C's OUTTMP, OUTDST and OUTFIN; the signal handler reads the leaked C string, never the mutex
 static OUT: std::sync::Mutex<Option<(std::ffi::CString, std::path::PathBuf, String)>> = std::sync::Mutex::new(None);
+/// The handler's strings, OUTSIG's and STAGE's, are leaked and never freed: a handler that claimed EXITING may hold
+/// one it loaded before the main thread cleared the pointer, and nothing tells the main thread when that handler is
+/// done with it. Clearing only stores null; a handler holding an old string at worst unlinks a name already gone.
+/// A few bytes, once or twice a run, kept in RETIRED, reachable, so a leak checker does not count them. As the C's
+/// OUTTMP and OUTKEPT
 static OUTSIG: std::sync::atomic::AtomicPtr<c_char> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
-/// --out-dir's staged BEDs for the handler: a leaked array of leaked C strings
+/// --out-dir's staged BEDs for the handler: a leaked, null-terminated array of leaked C strings, one pointer, so the
+/// handler never pairs one array with another's length
 static STAGE: std::sync::atomic::AtomicPtr<*mut c_char> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
-static STAGEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// OUTSIG's and STAGE's old pointers, as addresses; the handler never touches it
+static RETIRED: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+/// try_lock: a panic hook may retire one too (drop_tmp, drop_out)
+fn retire(p: usize) { if p != 0 { if let Ok(mut v) = RETIRED.try_lock() { v.push(p); } } }
 /// KZ_TEST_SIG_PAUSE_MS=N, for tests only: the handler sleeps N ms right after it decides, to exit or to defer, so
 /// a test can move the main thread on meanwhile (KZ_TEST_SWAP_PAUSE_MS, db.rs, holds it before and inside the commit
 /// window). Read once by sig_test_init at startup, before any handler is installed (getenv is not async-signal-safe);
@@ -439,11 +448,11 @@ extern "C" fn outsig(sig: c_int) {
         Err(COMMITTING) => { sig_pause(); return; }
         Err(_) => { sig_pause(); await_exit() }
     }
-    let (p, a, n) = (OUTSIG.load(SeqCst), STAGE.load(SeqCst), STAGEN.load(SeqCst));
-    // SAFETY: unlink and _exit are async-signal-safe; every pointer is leaked
+    let (p, a) = (OUTSIG.load(SeqCst), STAGE.load(SeqCst));
+    // SAFETY: unlink and _exit are async-signal-safe; every pointer is leaked, never freed, and a is null-terminated
     unsafe {
         if !p.is_null() { unlink(p); }
-        if !a.is_null() { for i in 0..n { unlink(*a.add(i)); } }
+        if !a.is_null() { let mut i = 0; while !(*a.add(i)).is_null() { unlink(*a.add(i)); i += 1; } }
         _exit(1)
     }
 }
@@ -454,28 +463,20 @@ fn catch_signals() {
     unsafe { for s in [1, 2, 15] { signal(s, outsig as extern "C" fn(c_int) as usize); } }
 }
 
-/// The staged BEDs a signal removes; empty once they are swapped in
+/// The staged BEDs a signal removes; empty once they are swapped in. The old list is retired, not freed (OUTSIG)
 pub fn sig_stage(paths: &[std::path::PathBuf]) {
     use std::{os::unix::ffi::OsStrExt, sync::atomic::Ordering::SeqCst};
-    let n = STAGEN.swap(0, SeqCst);
-    let a = STAGE.swap(std::ptr::null_mut(), SeqCst);
-    // SAFETY: a and its strings came from the leaks below, n long
-    if !a.is_null() { unsafe { for c in Box::from_raw(std::ptr::slice_from_raw_parts_mut(a, n)) { drop(std::ffi::CString::from_raw(c)); } } }
+    retire(STAGE.swap(std::ptr::null_mut(), SeqCst) as usize);
     if paths.is_empty() { return; }
-    let v: Vec<*mut c_char> = paths.iter().filter_map(|p| std::ffi::CString::new(p.as_os_str().as_bytes()).ok())
+    let mut v: Vec<*mut c_char> = paths.iter().filter_map(|p| std::ffi::CString::new(p.as_os_str().as_bytes()).ok())
         .map(|c| c.into_raw()).collect();
-    let n = v.len();
+    v.push(std::ptr::null_mut());
     STAGE.store(Box::leak(v.into_boxed_slice()).as_mut_ptr(), SeqCst);
-    STAGEN.store(n, SeqCst);
     catch_signals();
 }
 
-/// Frees the handler's copy of -o's temporary name
-fn sig_out_clear() {
-    let p = OUTSIG.swap(std::ptr::null_mut(), std::sync::atomic::Ordering::SeqCst);
-    // SAFETY: p came from CString::into_raw in redirect
-    if !p.is_null() { unsafe { drop(std::ffi::CString::from_raw(p)); } }
-}
+/// Retires the handler's copy of -o's temporary name, never freed (OUTSIG)
+fn sig_out_clear() { retire(OUTSIG.swap(std::ptr::null_mut(), std::sync::atomic::Ordering::SeqCst) as usize); }
 
 /// A panic is a bug, yet leaves no temporaries behind either
 pub fn panic_clean() {

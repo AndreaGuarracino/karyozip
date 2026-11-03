@@ -4850,6 +4850,10 @@ static char out[1 << 22];
 static size_t eo = 0;
 /* -o's temporary name, set by redirect; OUTDST is OUTFIN with a symlink resolved */
 static char *OUTTMP; static const char *OUTFIN, *OUTDST;
+/* OUTTMP, the handler's too, is never freed once a handler is installed: one that claimed EXITING may hold it, at
+   worst unlinking a name already renamed. Kept here, reachable, so a leak checker does not count it. As the Rust's
+   OUTSIG */
+static char *volatile OUTKEPT;   /* volatile: written, never read, else the store is optimised away */
 static void outclean(void) { if (OUTTMP) { unlink(OUTTMP); OUTTMP = NULL; } }
 static void dbtmpclean(void);
 static void emitflush(void) {   /* runs from atexit: die would recurse */
@@ -5264,7 +5268,8 @@ static void owput(ow *w, const char *nm, size_t nl, uint64_t a, uint64_t b,
     w->n = (size_t)(o - w->b);
 }
 
-static char **DBTMP; static size_t ndbtmp;
+static char **DBTMP; static size_t ndbtmp;   /* the handler's too: an entry is freed only in stage_swap, COMMITTING, when no
+                                                handler can have claimed EXITING (SIGSTATE) */
 static void dbtmpclean(void) { for (size_t i = 0; i < ndbtmp; i++) if (DBTMP[i]) remove(DBTMP[i]); }
 /* The one state the handler and the commit agree through, so that a signal either ends the process before a commit
    starts or waits for it to finish, never cuts it in two. IDLE: a handler may claim EXITING, then removes the
@@ -5534,7 +5539,7 @@ static void outcommit(void) {
     emitflush();
     if (fdfinish(1)) { fprintf(stderr, "karyozip: write failed\n"); exit(1); }   /* NFS reports some errors only here */
     if (rename(OUTTMP, OUTDST)) { fprintf(stderr, "karyozip: cannot rename into %s\n", OUTFIN); exit(1); }
-    free(OUTTMP); OUTTMP = NULL;
+    OUTKEPT = OUTTMP; OUTTMP = NULL;   /* not freed (OUTKEPT) */
 }
 
 /* -i and -o: the file takes the place of stdin or stdout. -o to a regular file, or to none yet, is staged in a

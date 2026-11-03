@@ -20,7 +20,9 @@
 #                      compared one run after the other (seqcmp), not through `cmd | cmp - <(cmd2)`.
 #                      TEST_JOBS=1 TEST_LIGHT=1 make test in a 1-CPU Slurm job (two runs, measured): 154 to
 #                      170 s, at most 3 runnable threads (a -t 1 compress, its reader and names threads), one
-#                      karyozip at a time, at most 302 MB MaxRSS. Run the stress cases in a bounded Slurm job
+#                      karyozip at a time, at most 302 MB MaxRSS. In an 8-CPU job with KZ_TEST_THREADS=1: 357 s, one
+#                      karyozip at a time, at most 4 threads in any (a -t 1 compress; sampled, and strace -f over
+#                      diff.sh's cli forms). Run the stress cases in a bounded Slurm job
 #   TIMEOUT_SCALE=X    multiplies every fixed timeout; default 1, 4 under a sanitizer binary (see tscale)
 #   FUZZ_SEED=N        fuzz.sh's mutation offsets and bytes; printed at the start of every run
 # Read by the karyozip binaries themselves (C and Rust, release builds included), set only by run.sh's signal cases:

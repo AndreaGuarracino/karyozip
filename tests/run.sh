@@ -784,6 +784,13 @@ if [ -x "$LT" ]; then
   $LT "$D/db.rall.bed" "$W/ll.kt" 4 2>/dev/null
   $LT -twice "$W/lt1.kt" "$W/lt2.kt" 2>/dev/null; printf 't1\t0\t7\tCCC\nt1\t7\t12\tAAA\n' | $KT compress 2>/dev/null | cmp -s - "$W/lt2.kt" \
     && ok "library API: a second writer starts clean" || no "library API: a second writer keeps the first's state"
+  # the first through the one-block layout search, the second many blocks: the CLI's bytes and its stderr, totals included
+  $KT --block 4 compress < "$D/db.rall.bed" > "$W/sq.want" 2> "$W/sq.wanterr"
+  $LT -seq "$D/s.bed" "$W/sq1.kt" "$D/db.rall.bed" "$W/sq2.kt" 4 2> "$W/sq.err"
+  cmp -s "$W/sq2.kt" "$W/sq.want" && grep -q '^layout: interleaved' "$W/sq.err" \
+    && tail -n "$(wc -l < "$W/sq.wanterr")" "$W/sq.err" | cmp -s - "$W/sq.wanterr" \
+    && ok "library API: a many-block writer after a one-block one: the CLI's bytes and messages" \
+    || no "library API: a many-block writer after a one-block one keeps the first's state"
   cmp -s "$W/lc.kt" "$W/ll.kt" || { lok=0; echo "  library differs on --block 4"; }
   [ $lok = 1 ] && ok "library API: same bytes as the CLI" || no "library API: DIFFERS from the CLI"
   # library refuses all 12 contract violations

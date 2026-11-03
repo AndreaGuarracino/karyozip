@@ -25,8 +25,9 @@ Outside `ffi.rs`, four hot loops write unchecked, each behind an assertion: the 
 
 `make` also builds `c/build/libkaryozip.a`, six calls in `c/karyozip.h` (`kt_open`, `kt_block`, `kt_level`, `kt_row`, `kt_close`, `kt_version`), for an annotator that writes `.kst` directly.
 Rows must arrive grouped by sequence, each sequence once, starting at 0, gapless; anything else is refused with the CLI's message.
-By default a writer makes one block, with no random access: `kt_block(w, rows)` before the first row sets fixed blocks of that many rows, as `-e low` does with 262144. The default zstd level is 17.
-The library is not thread-safe: it keeps global state, so use one writer at a time, from one thread. On any error it prints the message and calls `exit(1)`; it never returns an error code.
+`kt_block` sets the rows per block, 0 or by default one block (no random access; the CLI's `-e low` uses 262144); `kt_level` the zstd level, default 17. Both set process-wide state: call them after `kt_open` and before the first `kt_row`.
+The library is not thread-safe: one writer at a time per process, from one thread; `kt_open` resets the encoder, so a second writer writes what a fresh process would.
+Errors are not returned: each prints `karyozip: ...` to stderr and calls `exit(1)`, as the CLI does.
 
 ```c
 kt_writer *w = kt_open(f);

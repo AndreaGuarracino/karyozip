@@ -33,20 +33,12 @@ static int abuse(int c) {
     return 0;
 }
 
-int main(int argc, char **argv) {
-    if (argc == 3 && !strcmp(argv[1], "-abuse")) return abuse(atoi(argv[2]));
-    if (argc == 4 && !strcmp(argv[1], "-twice")) {      /* two writers in one process */
-        FILE *a = fopen(argv[2], "wb"), *b = fopen(argv[3], "wb");
-        kt_writer *w = kt_open(a); kt_row(w, "s1", 2, 10, "AAA", 3, 0); kt_row(w, "s1", 2, 10, "BBB", 3, 10); kt_close(w); fclose(a);
-        w = kt_open(b); kt_row(w, "t1", 2, 7, "CCC", 3, 0); kt_row(w, "t1", 2, 5, "AAA", 3, 7); kt_close(w); fclose(b);
-        return 0;
-    }
-    if (argc < 3) { fprintf(stderr, "usage: libtest IN.bed OUT.kst [BLOCK]\n"
-                                    "       libtest -abuse N\n"); return 2; }
-    FILE *in = fopen(argv[1], "r"), *out = fopen(argv[2], "wb");
+/* A BED through one writer; rows 0 leaves the block size alone */
+static int bedfile(const char *inp, const char *outp, uint64_t rows) {
+    FILE *in = fopen(inp, "r"), *out = fopen(outp, "wb");
     if (!in || !out) { perror("open"); return 2; }
     kt_writer *w = kt_open(out);
-    if (argc > 3) kt_block(w, strtoull(argv[3], NULL, 10));
+    if (rows) kt_block(w, rows);
     char *line = NULL; size_t cap = 0; ssize_t n;
     while ((n = getline(&line, &cap, in)) > 0) {
         if (line[n - 1] == '\n') line[--n] = 0;
@@ -61,4 +53,22 @@ int main(int argc, char **argv) {
     free(line); fclose(in);
     if (fclose(out)) { perror("close"); return 2; }
     return 0;
+}
+
+int main(int argc, char **argv) {
+    if (argc == 3 && !strcmp(argv[1], "-abuse")) return abuse(atoi(argv[2]));
+    if (argc == 4 && !strcmp(argv[1], "-twice")) {      /* two writers in one process */
+        FILE *a = fopen(argv[2], "wb"), *b = fopen(argv[3], "wb");
+        kt_writer *w = kt_open(a); kt_row(w, "s1", 2, 10, "AAA", 3, 0); kt_row(w, "s1", 2, 10, "BBB", 3, 10); kt_close(w); fclose(a);
+        w = kt_open(b); kt_row(w, "t1", 2, 7, "CCC", 3, 0); kt_row(w, "t1", 2, 5, "AAA", 3, 7); kt_close(w); fclose(b);
+        return 0;
+    }
+    if (argc == 7 && !strcmp(argv[1], "-seq")) {       /* two BEDs, the second at BLOCK rows a block, in one process */
+        int r = bedfile(argv[2], argv[3], 0);
+        return r ? r : bedfile(argv[4], argv[5], strtoull(argv[6], NULL, 10));
+    }
+    if (argc < 3) { fprintf(stderr, "usage: libtest IN.bed OUT.kst [BLOCK]\n"
+                                    "       libtest -seq A.bed A.kst B.bed B.kst BLOCK\n"
+                                    "       libtest -abuse N\n"); return 2; }
+    return bedfile(argv[1], argv[2], argc > 3 ? strtoull(argv[3], NULL, 10) : 0);
 }

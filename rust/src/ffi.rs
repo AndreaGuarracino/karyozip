@@ -339,7 +339,9 @@ unsafe extern "C" {
     fn sigemptyset(set: *mut SigSet) -> c_int;
     fn sigaddset(set: *mut SigSet, sig: c_int) -> c_int;
     fn pthread_sigmask(how: c_int, set: *const SigSet, old: *mut SigSet) -> c_int;
+    fn nanosleep(req: *const TimeSpec, rem: *mut TimeSpec) -> c_int;
 }
+#[repr(C)] struct TimeSpec { s: i64, ns: i64 }
 /// glibc's sigset_t: 1024 bits
 #[repr(C)] pub struct SigSet([u64; 16]);
 const SIG_BLOCK: c_int = 0;
@@ -390,9 +392,27 @@ static OUTSIG: std::sync::atomic::AtomicPtr<c_char> = std::sync::atomic::AtomicP
 /// --out-dir's staged BEDs for the handler: a leaked array of leaked C strings
 static STAGE: std::sync::atomic::AtomicPtr<*mut c_char> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
 static STAGEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// KZ_TEST_SIG_PAUSE_MS=N, for tests only: the handler sleeps N ms right after it decides, to exit or to defer, so
+/// a test can move the main thread on meanwhile (KZ_TEST_SWAP_PAUSE_MS, db.rs, holds it before and inside the commit
+/// window). Read once by sig_test_init at startup, before any handler is installed (getenv is not async-signal-safe);
+/// unset or 0, nothing sleeps. As the C's SIGPAUSE_MS
+static SIGPAUSE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub fn sig_test_init() {
+    let ms = std::env::var("KZ_TEST_SIG_PAUSE_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    SIGPAUSE_MS.store(ms, std::sync::atomic::Ordering::SeqCst);
+}
+/// nanosleep, async-signal-safe, through EINTR
+fn sig_pause() {
+    let ms = SIGPAUSE_MS.load(std::sync::atomic::Ordering::SeqCst);
+    if ms == 0 { return; }
+    let mut t = TimeSpec { s: (ms / 1000) as i64, ns: (ms % 1000) as i64 * 1_000_000 };
+    // SAFETY: both pointers are to the one owned timespec, which nanosleep may rewrite with what is left
+    while unsafe { nanosleep(&t, &mut t) } != 0 {}
+}
 extern "C" fn outsig(sig: c_int) {
     use std::sync::atomic::Ordering::SeqCst;
-    if INCOMMIT.load(SeqCst) { PENDSIG.store(sig, SeqCst); return; }
+    if INCOMMIT.load(SeqCst) { PENDSIG.store(sig, SeqCst); sig_pause(); return; }
+    sig_pause();
     let (p, a, n) = (OUTSIG.load(SeqCst), STAGE.load(SeqCst), STAGEN.load(SeqCst));
     // SAFETY: unlink and _exit are async-signal-safe; every pointer is leaked
     unsafe {

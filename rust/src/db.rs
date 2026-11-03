@@ -454,8 +454,9 @@ pub fn stage_done(dir: &str, sets: &[&[u8]], tmps: &[std::path::PathBuf]) {
     TMP.lock().unwrap().clear();
 }
 
-/// KZ_TEST_SWAP_PAUSE_MS=N, for tests only: swap_in sleeps N ms after each of its renames, so a test can act inside
-/// the commit window. Read nowhere else. As the C's swap_pause
+/// KZ_TEST_SWAP_PAUSE_MS=N, for tests only: swap_in sleeps N ms before the commit window opens and after each of its
+/// renames, so a test can act just before and inside the window (with KZ_TEST_SIG_PAUSE_MS, ffi.rs). Read nowhere
+/// else; unset, nothing sleeps. As the C's swap_pause
 fn swap_pause() {
     static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     let ms = *MS.get_or_init(|| std::env::var("KZ_TEST_SWAP_PAUSE_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(0));
@@ -478,6 +479,7 @@ fn swap_in(dir: &str, sets: &[Vec<u8>], tmps: &[std::path::PathBuf]) {
     let mut had: Vec<Option<std::path::PathBuf>> = vec![None; n];
     let mut inst = vec![false; n];
     let (mut bad, mut lost) = (false, false);
+    swap_pause();
     let was = crate::ffi::commit_begin();
     for (j, s) in sets.iter().enumerate() {   // every live BED onto its own backup name
         let Ok((f, o)) = crate::ffi::mkstemp(&setpath(dir, s, ".bed.old"), 0o600) else { bad = true; break };

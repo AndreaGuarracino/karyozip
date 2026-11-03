@@ -5269,8 +5269,18 @@ static void dbtmpclean(void) { for (size_t i = 0; i < ndbtmp; i++) if (DBTMP[i])
 /* set through stage_swap's renames: a handler on another thread (an OpenMP worker, which has the signals unblocked)
    then only records the signal, and stage_swap raises it once its renames are done */
 static volatile sig_atomic_t INCOMMIT, PENDSIG;
+/* KZ_TEST_SIG_PAUSE_MS=N, for tests only: the handler sleeps N ms right after it decides, to exit or to defer, so a
+   test can move the main thread on meanwhile (KZ_TEST_SWAP_PAUSE_MS, swap_pause, holds it before and inside the commit
+   window). Read once by kzmain at startup, before any handler is installed (getenv is not async-signal-safe); unset
+   or 0, nothing sleeps. As the Rust's SIGPAUSE_MS */
+static long SIGPAUSE_MS;
+static void sig_pause(void) {   /* nanosleep, async-signal-safe, through EINTR */
+    struct timespec t = { SIGPAUSE_MS / 1000, (SIGPAUSE_MS % 1000) * 1000000L };
+    while (SIGPAUSE_MS && nanosleep(&t, &t)) {}
+}
 static void dbtmpsig(int s) {   /* atexit does not run on a signal */
-    if (INCOMMIT) { PENDSIG = s; return; }
+    if (INCOMMIT) { PENDSIG = s; sig_pause(); return; }
+    sig_pause();
     dbtmpclean(); outclean(); _exit(1);
 }
 
@@ -5303,8 +5313,9 @@ static int *stage_open(const char *dir) {
     }
     return fd;
 }
-/* KZ_TEST_SWAP_PAUSE_MS=N, for tests only: stage_swap sleeps N ms after each of its renames, so a test can act
-   inside the commit window. Read nowhere else. As the Rust's swap_pause */
+/* KZ_TEST_SWAP_PAUSE_MS=N, for tests only: stage_swap sleeps N ms before the commit window opens and after each of its
+   renames, so a test can act just before and inside the window (with KZ_TEST_SIG_PAUSE_MS, sig_pause). Read nowhere
+   else; unset, nothing sleeps. As the Rust's swap_pause */
 static void swap_pause(void) {
     static long ms = -1;
     if (ms < 0) { const char *e = getenv("KZ_TEST_SWAP_PAUSE_MS"); ms = e ? atol(e) : 0; if (ms < 0) ms = 0; }
@@ -5326,6 +5337,7 @@ static void stage_swap(const char *dir) {
     char **ph = xcalloc(NSETK, sizeof *ph); char *had = xcalloc(NSETK, 1), *inst = xcalloc(NSETK, 1);
     for (size_t j = 0; j < NSETK; j++)   /* allocated first: no die inside the window */
         if (asprintf(&ph[j], "%s/%s.bed.old.XXXXXX", dir, fset[SETK[j]]) < 0) die("oom");
+    swap_pause();
     sigset_t hs, was; sigemptyset(&hs); sigaddset(&hs, SIGINT); sigaddset(&hs, SIGTERM); sigaddset(&hs, SIGHUP);
     pthread_sigmask(SIG_BLOCK, &hs, &was); INCOMMIT = 1;
     int bad = 0, lost = 0;
@@ -5532,6 +5544,7 @@ static int kzmain(int argc, char **argv) {
     /* glibc raises its mmap threshold to the first large chunk it frees, after which big buffers stay resident: pin it */
     mallopt(M_MMAP_THRESHOLD, 128 << 10);
     signal(SIGXFSZ, SIG_IGN);
+    { const char *e = getenv("KZ_TEST_SIG_PAUSE_MS"); SIGPAUSE_MS = e ? atol(e) : 0; if (SIGPAUSE_MS < 0) SIGPAUSE_MS = 0; }
     for (int fd = 0; fd < 3; fd++) if (fcntl(fd, F_GETFD) < 0) die("stdin, stdout or stderr is closed");
     atexit(profdump);
     atexit(emitflush);

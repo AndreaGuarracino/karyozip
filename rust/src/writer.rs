@@ -446,7 +446,11 @@ impl Writer {
         // As the C's ordered loop: pool threads take the next block, this thread writes them in order
         let (nb, win) = (self.bm.len(), 4 * rayon::current_num_threads());
         let next = std::sync::atomic::AtomicUsize::new(0);
-        let st = (std::sync::Mutex::new((0usize, std::collections::BTreeMap::<usize, Done>::new())), std::sync::Condvar::new());
+        // (next to write, done blocks, cancelled): every wait also wakes on a cancel, so a failed side never strands the other
+        let st = (std::sync::Mutex::new((0usize, std::collections::BTreeMap::<usize, Done>::new(), false)), std::sync::Condvar::new());
+        let cancel = || { st.0.lock().unwrap_or_else(|e| e.into_inner()).2 = true; st.1.notify_all(); };
+        struct OnPanic<F: Fn()>(F);   // a producer that unwinds releases the writer
+        impl<F: Fn()> Drop for OnPanic<F> { fn drop(&mut self) { if std::thread::panicking() { (self.0)(); } } }
         let work = |i: usize, lens: &mut Vec<u8>, ids: &mut Vec<u8>| -> Done {
             self.read_into(i, lens, ids).unwrap_or_else(|_| crate::bail("cannot read back a staged block"));
             let (lens, ids): (&Vec<u8>, &Vec<u8>) = (lens, ids);
@@ -511,25 +515,31 @@ impl Writer {
         };
         std::thread::scope(|ts| -> Result<(), String> {
             // a buffer pair a thread, kept, as the C's rb: fresh ones faulted their pages in again
-            ts.spawn(|| rayon::broadcast(|_| { let (mut lb, mut ib) = (Vec::new(), Vec::new()); loop {
+            ts.spawn(|| rayon::broadcast(|_| { let _g = OnPanic(cancel); let (mut lb, mut ib) = (Vec::new(), Vec::new()); loop {
                 let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if i >= nb { break; }
                 let mut g = st.0.lock().unwrap();
-                while i >= g.0 + win { g = st.1.wait(g).unwrap(); }
+                while i >= g.0 + win && !g.2 { g = st.1.wait(g).unwrap(); }
+                if g.2 { break; }
                 drop(g);
                 let d = work(i, &mut lb, &mut ib);
-                st.0.lock().unwrap().1.insert(i, d);
+                let mut g = st.0.lock().unwrap();
+                if g.2 { break; }
+                g.1.insert(i, d);
+                drop(g);
                 st.1.notify_all();
             } }));
-            for i in 0..nb {
+            let r = (0..nb).try_for_each(|i| -> Result<(), String> {
                 let (a, b, nl, ni, rows, bp, nosent) = {
                     let mut g = st.0.lock().unwrap();
-                    loop { if let Some(d) = g.1.remove(&i) { g.0 = i + 1; break d; } g = st.1.wait(g).unwrap(); }
+                    loop { if let Some(d) = g.1.remove(&i) { g.0 = i + 1; break d; }
+                           if g.2 { return Err("block compression failed".into()); }
+                           g = st.1.wait(g).unwrap(); }
                 };
                 st.1.notify_all();
                 let (a, b, nl, ni, rows, bp, nosent) = (&a, &b, &nl, &ni, &rows, &bp, &nosent);
-                body.write_all(a).map_err(io)?;
-                body.write_all(b).map_err(io)?;
+                body.write_all(a).map_err(|_| "tmp write")?;
+                body.write_all(b).map_err(|_| "tmp write")?;
                 byt_lens += a.len() as u64;
                 byt_labs += b.len() as u64;
                 kst::put(&mut sizes, a.len() as u64);
@@ -540,8 +550,10 @@ impl Writer {
                 kst::put(&mut sizes, *bp);
                 kst::put(&mut sizes, kst::fnv(kst::fnv(FNV0, a), b));
                 if varon { kst::put(&mut sizes, self.bm[i].nrd - if i > 0 { self.bm[i - 1].nrd } else { 0 }); }
-            }
-            Ok(())
+                Ok(())
+            });
+            if r.is_err() { cancel(); }   // the producers stop at their next wait, then the scope joins them
+            r
         })?;
         if runhead { self.ibx.clear(); }
 

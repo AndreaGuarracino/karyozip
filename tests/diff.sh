@@ -368,5 +368,15 @@ for m in wrap shift; do both "forged chunk table $m" query -i "$W/$m.kst" -r r0;
 EXPECT=ok
 tally "forged chunk tables"
 
+# 16. a body temp file that fills: the staging fits, the one-row blocks' frames do not; the Rust used to hang here
+awk 'BEGIN{p=0; for(k=0;k<20000;k++){printf "r1\t%d\t%d\tchr%d\n", p, p+20, k%22; p+=20}}' > "$W/body.bed"
+mkdir -p "$W/btmp"
+for x in C R; do
+  rc=0; ( ulimit -f 64; trap "" XFSZ; timeout 60 "${!x}" -t 2 --tmp-dir "$W/btmp" --block 1 compress < "$W/body.bed" >/dev/null 2>"$W/$x.berr" ) || rc=$?
+  eval "rc$x=$rc"
+done
+if [ $rcC = 1 ] && [ $rcR = 1 ] && cmp -s "$W/C.berr" "$W/R.berr" && [ -z "$(ls -A "$W/btmp")" ]; then echo "full body temp file: both refuse alike, $(cat "$W/R.berr" | tail -1)"
+else echo "full body temp file: DIFFER (rc $rcC/$rcR)"; diff "$W/C.berr" "$W/R.berr" | head -4; ls "$W/btmp"; fail=1; fi
+
 [ $fail = 0 ] && echo "DIFF_PASS" || echo "DIFF_FAIL"
 exit $fail

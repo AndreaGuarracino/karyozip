@@ -438,6 +438,53 @@ $KT compress --aln "$W/p.kta" --ref "$W/ref2.bed" < "$D/s.bed" > "$W/pk.kt" 2>/d
 must_fail "packed alignment with a reordered reference" $KT decompress --aln "$W/p.kta" --ref "$W/ref.rev" -i "$W/pk.kt"
 { printf 'KSTAL2'; tail -c +7 "$W/p.kta"; } > "$W/old.kta"
 must_fail "a packed alignment with another magic" $KT decompress --aln "$W/old.kta" --ref "$W/ref2.bed" -i "$W/pk.kt"
+# a forged stream length is a clean refusal, not an oom; an empty stream's bytes are skipped, as the Rust
+head -2 "$D/p.paf" > "$W/p2.paf"   # one gapless block a query: the deltas stream is empty
+$KT aln-pack -a "$W/p2.paf" --ref "$W/ref2.bed" -o "$W/p2.kta" >/dev/null 2>&1
+$KT compress --aln "$W/p2.kta" --ref "$W/ref2.bed" < "$D/s.bed" > "$W/pk2.kt" 2>/dev/null
+python3 - "$D" "$W/p.kta" "$W/big.kta" "$W/p2.kta" "$W/skip.kta" <<'PY'
+import sys
+sys.path.insert(0, sys.argv[1]); import kt
+def secs(p):
+    d = open(p, "rb").read(); body = d[14:]; i = 0; sec = []
+    for _ in range(10):
+        cd, i = kt.vget(body, i); rl, i = kt.vget(body, i); cl, i = kt.vget(body, i); sec.append((cd, rl, body[i:i + cl])); i += cl
+    return d[:14], sec
+pack = lambda hd, s: hd + b"".join(kt.vput(c) + kt.vput(r) + kt.vput(len(x)) + x for c, r, x in s)
+hd, sec = secs(sys.argv[2]); open(sys.argv[3], "wb").write(pack(hd, [(1, 1 << 40, b"")] + sec[1:]))
+hd, sec = secs(sys.argv[4]); k = [j for j, x in enumerate(sec) if x[0] == 0]
+if k: sec[k[0]] = (0, 0, b"junk")
+open(sys.argv[5], "wb").write(pack(hd, sec)); print(k[0] if k else -1)
+PY
+must_fail "a packed alignment claiming a 1 TB stream" $KT decompress --aln "$W/big.kta" --ref "$W/ref2.bed" -i "$W/pk.kt"
+grep -q 'impossible allocation size' "$W/mf.err" && ok "a packed alignment claiming a 1 TB stream: the allocation cap" || no "a packed alignment claiming a 1 TB stream: not the allocation cap"
+$KT decompress --aln "$W/skip.kta" --ref "$W/ref2.bed" -i "$W/pk2.kt" 2>/dev/null | cmp -s - "$D/s.bed" && ! cmp -s "$W/skip.kta" "$W/p2.kta" \
+  && ok "packed alignment, bytes behind an empty stream: skipped" || no "packed alignment, bytes behind an empty stream: WRONG"
+
+# a header flag this reader does not know: a newer writer, refused before any size is read
+for bit in 53 54; do
+  python3 -c "import sys; d = bytearray(open(sys.argv[1], 'rb').read()); d[16 + $bit // 8] |= 1 << ($bit % 8); open(sys.argv[2], 'wb').write(d)" "$W/p.kt" "$W/fl$bit.kt"
+  must_fail "header flag bit $bit" $KT decompress -i "$W/fl$bit.kt"
+  grep -q 'written by a newer karyozip: unknown header flags' "$W/mf.err" && ok "header flag bit $bit: named as a newer writer" || no "header flag bit $bit: WRONG words"
+done
+# more than 64 -i: --db takes one BED per feature set
+python3 - "$W" <<'PY'
+import sys
+W = sys.argv[1]; n = 65
+open(W + "/f65.tsv", "w").write("featureID\t" + "\t".join("s%d" % k for k in range(n)) + "\n"
+                                 + "".join("%d\t" % i + "\t".join("L%d" % ((i + k) % 3) for k in range(n)) + "\n" for i in range(1, 4)))
+for k in range(n): open(W + "/f65.%d.bed" % k, "w").write("".join("c\t%d\t%d\tL%d\n" % (10 * j, 10 * j + 10, (j % 3 + k) % 3) for j in range(6)))
+PY
+in65=""; for k in $(seq 0 64); do in65="$in65 -i $W/f65.$k.bed"; done
+mkdir -p "$W/o65"
+$KT compress --db "$W/f65.tsv" $in65 > "$W/f65.kt" 2>/dev/null && $KT decompress --db "$W/f65.tsv" --out-dir "$W/o65" -i "$W/f65.kt" 2>/dev/null
+n=0; for k in $(seq 0 64); do cmp -s "$W/o65/s$k.bed" "$W/f65.$k.bed" && n=$((n+1)); done
+[ "$n" = 65 ] && ok "--db with 65 feature sets: 65/65 identical" || no "--db with 65 feature sets: only $n/65 identical"
+# the default thread count is the CPUs this process may use, as the Rust's
+if command -v taskset >/dev/null; then
+  taskset -c "$(python3 -c 'import os; print(min(os.sched_getaffinity(0)))')" $KT --profile compress < "$D/s.bed" 2>&1 >/dev/null | grep -q '(1 allowed)' \
+    && ok "default threads under a one-CPU affinity: 1" || no "default threads under a one-CPU affinity: WRONG"
+fi
 
 # label count with no label table: refused
 $KT compress < /dev/null > "$W/mt.kt" 2>/dev/null

@@ -853,7 +853,8 @@ pub fn pick(all: &dyn Fn(usize) -> (Vec<u8>, Vec<u8>), nraw: usize, rawtot: usiz
                      each(&lens, &|s| ffi::zstd(s, lv).len()))
                 }
             }).collect();
-            for k in 0..nc + 2 { ti[k] += step[k].0; tl[k] += step[k].1; }
+            // a dead candidate's sentinel summed over blocks must not wrap back to a winner, as the C's satadd
+            for k in 0..nc + 2 { ti[k] = ti[k].saturating_add(step[k].0); tl[k] = tl[k].saturating_add(step[k].1); }
         }
         let (mut qi, mut ql);
         loop {

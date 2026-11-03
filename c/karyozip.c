@@ -23,6 +23,7 @@
 #include <setjmp.h>
 #include <sched.h>
 #include <math.h>
+#include <stdatomic.h>
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -56,12 +57,18 @@ static inline double nowsec(void) {
     if (_n - PHLAST > 0.01) { PHRSS[i] = rss_now(); PHLAST = _n; } } } while (0)
 static size_t PHRSS[10]; static double PHLAST;
 static double WALL0 = 0;
-/* --threads, else one per core capped at 8: encode is half serial, so more threads only spin; no environment variable changes it */
+/* --threads, else one per allowed CPU capped at 8: encode is half serial, so more threads only spin; no environment variable changes it */
 #define THRCAP 8
 static int nthreads(void) {
     if (NTHREADS > 0) return NTHREADS;
 #ifdef _OPENMP
-    int m = omp_get_num_procs();
+    /* the CPUs this process may run on, as the Rust's available_parallelism: a Slurm or taskset allocation, not the machine */
+    static _Atomic int ncpu;
+    int m = ncpu;
+    if (!m) { cpu_set_t cs;
+              m = sched_getaffinity(0, sizeof cs, &cs) ? omp_get_num_procs() : CPU_COUNT(&cs);
+              if (m < 1) m = 1;
+              ncpu = m; }
     return m < THRCAP ? m : THRCAP;
 #else
     return 1;
@@ -110,9 +117,12 @@ static void die2(const char *a, const char *b) {
 }
 static void die(const char *m) { die2(m, ""); }
 
-static __thread size_t ALLOCMAX = 0;
+/* process wide, from the first file read on: decode-ahead workers and alnload are capped too, a writer reading nothing is not */
+static _Atomic size_t ALLOCMAX = 0;
+static void readcap(void) { atomic_store_explicit(&ALLOCMAX, (size_t)1 << 38, memory_order_relaxed); }
 static void ckalloc(size_t n) {
-    if (ALLOCMAX && n > ALLOCMAX) die("corrupt file: an impossible allocation size");
+    size_t m = atomic_load_explicit(&ALLOCMAX, memory_order_relaxed);
+    if (m && n > m) die("corrupt file: an impossible allocation size");
 }
 
 /* the reporting form: a thread inside a parallel region must not exit */
@@ -170,7 +180,20 @@ static inline uint64_t rowmix(uint64_t h, uint64_t nh, uint64_t st, uint64_t en,
     h = (h ^ en) * 0x100000001b3ULL; return (h ^ lh) * 0x100000001b3ULL;
 }
 static uint64_t fnvstr(const char *s) { return fnvbuf(FNV0, s, strlen(s)); }
-static uint64_t ld64(const void *p) { uint64_t v; memcpy(&v, p, 8); return v; }
+/* the format is little-endian on every host, as the Rust's to_le_bytes */
+static uint64_t ld64(const void *p) {
+    const uint8_t *b = p; uint64_t v = 0;
+    for (int i = 7; i >= 0; i--) v = v << 8 | b[i];
+    return v;
+}
+static uint32_t ld32(const void *p) { const uint8_t *b = p; return b[0] | b[1] << 8 | b[2] << 16 | (uint32_t)b[3] << 24; }
+static void st64(void *p, uint64_t v) { uint8_t *b = p; for (int i = 0; i < 8; i++) b[i] = (uint8_t)(v >> 8 * i); }
+static void st32(void *p, uint32_t v) { uint8_t *b = p; for (int i = 0; i < 4; i++) b[i] = (uint8_t)(v >> 8 * i); }
+static uint64_t fnv64(uint64_t h, uint64_t v) { uint8_t b[8]; st64(b, v); return fnvbuf(h, b, 8); }
+static uint64_t fnv32(uint64_t h, uint32_t v) { uint8_t b[4]; st32(b, v); return fnvbuf(h, b, 4); }
+/* n words to and from their file bytes */
+static void stwords(uint8_t *b, const uint64_t *w, size_t n) { for (size_t i = 0; i < n; i++) st64(b + 8 * i, w[i]); }
+static void ldwords(uint64_t *w, const uint8_t *b, size_t n) { for (size_t i = 0; i < n; i++) w[i] = ld64(b + 8 * i); }
 
 static long int_arg(const char *p, long lo, long hi, const char *what) {   /* digits only, in range */
     if (!p || !*p || strspn(p, "0123456789") != strlen(p) || strlen(p) > 18) die(what);
@@ -187,12 +210,15 @@ static uint64_t num_arg(const char *p, uint64_t max, const char *what) {
 
 static void *xmalloc(size_t n) { ckalloc(n); void *p = malloc(n); if (!p) die("oom"); return p; }
 
+/* a dead candidate's sentinel, summed over blocks, must not wrap back to a winner */
+static size_t satadd(size_t a, size_t b) { return a > SIZE_MAX - b ? SIZE_MAX : a + b; }
 static size_t mul(size_t n, size_t sz) { if (sz && n > SIZE_MAX / sz) die("allocation size overflows"); return n * sz; }
 static void *xcalloc(size_t n, size_t sz) {
     if (sz && n > SIZE_MAX / sz) die("allocation size overflows");
     ckalloc(n * sz); void *p = calloc(n, sz); if (!p) die("oom"); return p; }
 static void *xrealloc(void *p, size_t n) { ckalloc(n); void *q = realloc(p, n); if (!q) die("oom"); return q; }
 static char *xstrdup(const char *s) { char *p = strdup(s); if (!p) die("oom"); return p; }
+static char *xstrndup(const char *s, size_t n) { char *p = strndup(s, n); if (!p) die("oom"); return p; }
 
 /* Every text input through one fopencookie FILE*, NULL for stdin: plain, BGZF inflated side by side and CRC-checked, or any gzip; a cut file is refused */
 #define ZCHUNK (8u << 20)
@@ -435,7 +461,7 @@ static int intern(const char *s, size_t n) {
         labnlen = xrealloc(labnlen, labcap * sizeof(size_t));
         labh = xrealloc(labh, labcap * sizeof(uint64_t));
     }
-    labtab[nlabtab] = strndup(s, n);
+    labtab[nlabtab] = xstrndup(s, n);
     labnlen[nlabtab] = n;
     labh[nlabtab] = fnvbuf(FNV0, s, n);
     labhash[k] = nlabtab;
@@ -520,6 +546,10 @@ static uint64_t BYT_LENS = 0, BYT_LABS = 0;
 static int IDCODEC = -1, LENCODEC = -1;   /* the search sets them */
 #define INTFLAG (1ULL << 62)
 #define FLDFLAG (1ULL << 50)   /* names as field deltas */
+/* every flag a reader knows; any other bit above the 49-bit names length is from a newer writer */
+#define KNOWNFLAGS (TOKFLAG | INTFLAG | FLDFLAG | DROPPED | ALNFLAG | DBFLAG | LENFLAG \
+                    | TAILFLAG | CARTFLAG | RUNFLAG | ILVFLAG | GRPFLAG | VARFLAG)
+#define NMLBITS 49
 
 static size_t intnames(buf *names, uint64_t n, uint8_t **out) {
     const char *p = (const char *)names->d, *end = p + names->n;
@@ -832,10 +862,12 @@ static size_t tokc(buf *in, uint8_t **out, uint32_t chunk) {
 #endif
     for (size_t i = 0; i < nchunk; i++) {
         if (failed) continue;
+        /* the tokeniser takes an int: a longer chunk falls back to zstd, as the Rust tok_encode */
+        if (off[i + 1] - off[i] > INT_MAX) { failed = 1; continue; }
         int ol = 0;
         uint8_t *o = tok3_encode_names((char *)base + off[i],
                                        (int)(off[i + 1] - off[i]), 9, 0, &ol, NULL);
-        if (!o) { failed = 1; continue; }
+        if (!o || ol <= 0) { free(o); failed = 1; continue; }
         blob[i] = o; clen[i] = (uint32_t)ol;
     }
 
@@ -850,11 +882,9 @@ static size_t tokc(buf *in, uint8_t **out, uint32_t chunk) {
     for (size_t i = 0; i < nchunk; i++) total += clen[i];
     uint8_t *b = xmalloc(hdr + total);
     *out = b;
-    uint32_t h0 = chunk, h1 = (uint32_t)nchunk;
-    memcpy(b, &h0, 4); memcpy(b + 4, &h1, 4);
-    uint32_t *rl = (uint32_t *)(b + 8);
-    for (size_t i = 0; i < nchunk; i++) rl[i] = (uint32_t)(off[i + 1] - off[i]);
-    memcpy(b + 8 + 4 * nchunk, clen, 4 * nchunk);
+    st32(b, chunk); st32(b + 4, (uint32_t)nchunk);
+    for (size_t i = 0; i < nchunk; i++) { st32(b + 8 + 4 * i, (uint32_t)(off[i + 1] - off[i]));
+                                          st32(b + 8 + 4 * (nchunk + i), clen[i]); }
     uint8_t *q = b + hdr;
     for (size_t i = 0; i < nchunk; i++) { memcpy(q, blob[i], clen[i]); q += clen[i]; free(blob[i]); }
     free(blob); free(clen); free(off);
@@ -863,7 +893,7 @@ static size_t tokc(buf *in, uint8_t **out, uint32_t chunk) {
 
 static char *tokd(const uint8_t *b, size_t n, size_t *outn) {
     if (n < 8) die("truncated tokenised names");
-    uint32_t nchunk; memcpy(&nchunk, b + 4, 4);
+    uint32_t nchunk = ld32(b + 4);
 
     size_t hdr = 8 + 8 * (size_t)nchunk, raw = 0;
     if (nchunk > (n - 8) / 8 || hdr > n) die("corrupt tokenised names header");
@@ -871,7 +901,7 @@ static char *tokd(const uint8_t *b, size_t n, size_t *outn) {
     size_t *coff = xmalloc(((size_t)nchunk + 1) * sizeof *coff);
     woff[0] = coff[0] = 0;
     for (uint32_t i = 0; i < nchunk; i++) {   /* unaligned in a packed alignment */
-        uint32_t rl, cl; memcpy(&rl, b + 8 + 4 * (size_t)i, 4); memcpy(&cl, b + 8 + 4 * ((size_t)nchunk + i), 4);
+        uint32_t rl = ld32(b + 8 + 4 * (size_t)i), cl = ld32(b + 8 + 4 * ((size_t)nchunk + i));
         raw += rl;
         woff[i + 1] = woff[i] + rl;
         coff[i + 1] = coff[i] + cl;
@@ -1385,7 +1415,8 @@ typedef struct { char *name; uint64_t *st, end; uint32_t *lab, *st32; size_t n, 
                  _Atomic int filled;              /* every run is in st and lab */
                  uint64_t bp0, row0, *bend;       /* .kst per block: bases and row before the contig */
                  uint32_t firstblk, lastblk;      /* its block range, and the position after each */
-                 uint8_t *blkin; uint32_t nblkin; } rcon;
+                 /* a block's flag is released after its rows, the array after refprep: refwin acquires both outside the lock */
+                 _Atomic uint8_t *_Atomic blkin; uint32_t nblkin; } rcon;
 
 static qseg *QS; static size_t nqs, cqs;
 static rcon *RC; static size_t nrc, crc;
@@ -1497,7 +1528,7 @@ static void seghash(void) {
         uint64_t h = FNV0;
         h = fnvbuf(h, QS[i].name, strlen(QS[i].name) + 1);
         for (size_t k = 0; k < QS[i].n; k++) { const seg *g = QS[i].s + k;
-            h = fnvbuf(h, &g->q, 8); h = fnvbuf(h, &g->t, 4); h = fnvbuf(h, &g->n, 4); h = fnvbuf(h, &g->tp, 8); h = fnvbuf(h, &g->rev, 4); }
+            h = fnv64(h, g->q); h = fnv32(h, g->t); h = fnv32(h, g->n); h = fnv64(h, g->tp); h = fnv32(h, (uint32_t)g->rev); }
         if (QS[i].n) sum += h;
     }
     ALNHASH ^= sum;
@@ -1676,8 +1707,8 @@ static void alnpack(const char *inpaf, const char *out) {
     }
     FILE *f = fopen(out, "wb");
     if (!f) die("cannot write the packed alignment");
-    uint64_t rh = refhash();
-    if (fwrite(ALNMAGIC, 1, ALNMAGLEN, f) != ALNMAGLEN || fwrite(&rh, 8, 1, f) != 1 ||
+    uint8_t rh[8]; st64(rh, refhash());
+    if (fwrite(ALNMAGIC, 1, ALNMAGLEN, f) != ALNMAGLEN || fwrite(rh, 1, 8, f) != 8 ||
         (all.n && fwrite(all.d, 1, all.n, f) != all.n) || fclose(f)) die("packed alignment write failed");
     size_t nb = 0; for (size_t i = 0; i < nqs; i++) nb += QS[i].n;
     fprintf(stderr, "packed alignment: %zu queries, %zu blocks, %zu B (%.2f B/query)\n",
@@ -1693,9 +1724,10 @@ static int alnload(const char *path) {
     if (fread(mg, 1, ALNMAGLEN, f) != ALNMAGLEN || memcmp(mg, ALNMAGIC, ALNMAGLEN)) {
         fclose(f); return 0;                       /* not packed: it is a PAF */
     }
-    uint64_t rh;
-    if (fread(&rh, 8, 1, f) != 1) die("truncated packed alignment");
-    if (rh != refhash()) die("this packed alignment was made against another reference, or another contig order");
+    readcap();                                     /* its stream lengths are forgeable */
+    uint8_t rh[8];
+    if (fread(rh, 1, 8, f) != 8) die("truncated packed alignment");
+    if (ld64(rh) != refhash()) die("this packed alignment was made against another reference, or another contig order");
     if (fseek(f, 0, SEEK_END)) die("cannot seek the packed alignment");
     long fsz = ftell(f);
     if (fsz < ALNMAGLEN + 8) die("truncated packed alignment");
@@ -1710,7 +1742,7 @@ static int alnload(const char *path) {
     for (int k = 0; k < 10; k++) {
         uint64_t cd = vgetb(&p, e), rl = vgetb(&p, e), cl2 = vgetb(&p, e);
         if (cl2 > (size_t)(e - p)) die("corrupt packed alignment: a stream overruns the file");
-        if (!cd) { sec[k] = p; slen[k] = 0; continue; }
+        if (!cd) { sec[k] = p; slen[k] = 0; p += cl2; continue; }   /* skipped, as the Rust */
         if (cd == 2) {                                   /* tokenised names */
             size_t on = 0;
             raw[k] = (uint8_t *)tokd(p, (size_t)cl2, &on);
@@ -2106,7 +2138,7 @@ static int CARTON, CARTUSED;
 static int cmpstr(const void *a, const void *b) { return strcmp(*(char *const *)a, *(char *const *)b); }
 static void vocadd(size_t k, const char *w, size_t n) {
     if (NVOC[k] % 1024 == 0) VOC[k] = xrealloc(VOC[k], (NVOC[k] + 1024) * sizeof **VOC);
-    VOC[k][NVOC[k]++] = strndup(w, n);
+    VOC[k][NVOC[k]++] = xstrndup(w, n);
 }
 static void loadvocab(const char *path) {
     FILE *f = zfopen(path);
@@ -2198,7 +2230,9 @@ static void *slabfill(void *a) {
     const char *perr[33] = {0};   /* a worker records, the first one wins */
     char *slab = S->b; prow **pr = S->pr; size_t *prc = S->prc;
     double _tpar = nowsec();
+#ifdef _OPENMP
 #pragma omp parallel for schedule(static) num_threads(T)
+#endif
     for (int t = 0; t < T; t++) {
         size_t n = 0;
         const char *e = NULL;
@@ -2446,16 +2480,16 @@ static void pickcodecs(int rawfd, const blkmeta *bm, size_t nraw) {
                     if (!live_i[k] && !live_l[k]) continue;
                     uint8_t *t = NULL; size_t g;
                     if (k < NCAND) {
-                        if (ni && live_i[k]) { g = paycomp(src + nl, ni, CAND[k], &t); ti[k] += g ? g : (size_t)-1 / 4; free(t); t = NULL; }
-                        if (nl && live_l[k]) { g = paycomp(src, nl, CAND[k], &t); tl[k] += g ? g : (size_t)-1 / 4; free(t); }
+                        if (ni && live_i[k]) { g = paycomp(src + nl, ni, CAND[k], &t); ti[k] = satadd(ti[k], g ? g : (size_t)-1 / 4); free(t); t = NULL; }
+                        if (nl && live_l[k]) { g = paycomp(src, nl, CAND[k], &t); tl[k] = satadd(tl[k], g ? g : (size_t)-1 / 4); free(t); }
                     } else {
                         int lv = k == NCAND ? LEVEL : 22;
                         if (ni) { t = malloc(ZSTD_compressBound(ni));
                                   g = t ? ZSTD_compress(t, ZSTD_compressBound(ni), src + nl, ni, lv) : (size_t)-1;
-                                  ti[k] += (!t || ZSTD_isError(g)) ? (size_t)-1 / 4 : g; free(t); t = NULL; }
+                                  ti[k] = satadd(ti[k], (!t || ZSTD_isError(g)) ? (size_t)-1 / 4 : g); free(t); t = NULL; }
                         if (nl) { t = malloc(ZSTD_compressBound(nl));
                                   g = t ? ZSTD_compress(t, ZSTD_compressBound(nl), src, nl, lv) : (size_t)-1;
-                                  tl[k] += (!t || ZSTD_isError(g)) ? (size_t)-1 / 4 : g; free(t); }
+                                  tl[k] = satadd(tl[k], (!t || ZSTD_isError(g)) ? (size_t)-1 / 4 : g); free(t); }
                     }
                 }
             }
@@ -2797,7 +2831,9 @@ static uint64_t idxbuild(const buf *ib, buf *ichunks, buf *itab) {
     }
     uint8_t **cz = xcalloc(nichunk ? nichunk : 1, sizeof *cz);
     size_t *cl = xcalloc(nichunk ? nichunk : 1, sizeof *cl);
+#ifdef _OPENMP
 #pragma omp parallel for schedule(dynamic, 1) num_threads(nthreads())
+#endif
     for (uint64_t i = 0; i < nichunk; i++) {
         buf one = { (uint8_t *)cb[i], (size_t)(cb[i + 1] - cb[i]), 0 };
         cl[i] = zcl(&one, &cz[i], METALEVEL);
@@ -3148,12 +3184,14 @@ static void ktw_close(ktw *w) {
                       (uint64_t)(uint32_t)IDCODEC | (DBFEATS ? (fh >> 32) << 32 : 0), nichunk, itl,
                       TAILPRED, (uint64_t)TAILSKIP | ((ALNPAF ? ALNHASH : ROWHASH) << 8), 0, 0 };
 
-    {   uint64_t mh = fnvbuf(FNV0, h, 128); mh = fnvbuf(mh, lz, lzl);
+    uint8_t hb[128]; stwords(hb, h, 16);
+    {   uint64_t mh = fnvbuf(FNV0, hb, 128); mh = fnvbuf(mh, lz, lzl);
         mh = fnvbuf(mh, nz, nzl);
         mh = fnvbuf(mh, iz, izl); mh = fnvbuf(mh, sz, szl);
         h[15] = fnvbuf(mh, itz, itl);
     }
-    if (fwrite(h, 8, 16, w->out) != 16) die("write failed");
+    st64(hb + 120, h[15]);
+    WR(hb, 128);
     WR(lz, lzl);
     WR(nz, nzl);
     WR(iz, izl);
@@ -3366,16 +3404,18 @@ static R *ropen(const char *path) {
         fprintf(stderr, "karyozip: file starts with \"%s\", not \"%.8s\"\n", sh, MAGIC);
         die("not a KST file");
     }
-    uint64_t h[16]; if (fread(h, 8, 16, r->f) != 16) die("short header");
-    uint64_t h1_raw = h[1];             /* flags included, for the hash */
+    uint8_t hb[128]; uint64_t h[16];
+    if (fread(hb, 1, 128, r->f) != 128) die("short header");
+    ldwords(h, hb, 16);
+    if (h[1] >> NMLBITS & ~(KNOWNFLAGS >> NMLBITS))
+        die("this track was written by a newer karyozip: unknown header flags");
 
     if (fseeko(r->f, 0, SEEK_END)) die("seek");
     uint64_t fsz = (uint64_t)ftello(r->f);
     r->fsz = fsz;
-    ALLOCMAX = (size_t)1 << 38;
+    readcap();
     if (fseeko(r->f, 8 + 128, SEEK_SET)) die("seek");
-    uint64_t nml = h[1] & ~(TOKFLAG | INTFLAG | FLDFLAG | DROPPED | ALNFLAG | DBFLAG
-                            | LENFLAG | TAILFLAG | CARTFLAG | RUNFLAG | ILVFLAG | GRPFLAG | VARFLAG);   /* h[1] also holds flags */
+    uint64_t nml = h[1] & ~KNOWNFLAGS;   /* h[1] also holds flags */
 
     if (nml > fsz || h[2] > fsz || h[3] > fsz || h[6] > fsz || h[11] > fsz
         || 8 + 128 + nml + h[2] + h[3] + h[6] + h[11] > fsz)
@@ -3437,8 +3477,7 @@ static R *ropen(const char *path) {
     r->runhead = runhead; r->ilv = ilv; r->grp = (h[1] & GRPFLAG) != 0; r->varblk = (h[1] & VARFLAG) != 0;
     if (r->grp && (ilv || !runhead)) die("corrupt file: grouped lengths without their run counts");
     if (r->cart && !was_db) die("corrupt file: vocabulary featureIDs without --db");
-    h[1] &= ~(TOKFLAG | INTFLAG | DROPPED | ALNFLAG | DBFLAG | LENFLAG
-              | TAILFLAG | CARTFLAG | RUNFLAG | ILVFLAG | FLDFLAG | GRPFLAG | VARFLAG);
+    h[1] &= ~KNOWNFLAGS;
     uint8_t *iz = xmalloc(h[2]), *sz = xmalloc(h[3]);
     uint8_t *nz = NULL;
     r->nz_off = ftello(r->f);
@@ -3446,11 +3485,9 @@ static R *ropen(const char *path) {
     if (fread(iz, 1, h[2], r->f) != h[2]) die("short index");
     if (fread(sz, 1, h[3], r->f) != h[3]) die("short sizes");
     {
-        uint64_t want = h[15], mh = FNV0, hz[16];
-        memcpy(hz, h, 128); hz[15] = 0;
-
-        hz[1] = h1_raw;
-        mh = fnvbuf(mh, hz, 128); mh = fnvbuf(mh, lzraw, lzl);
+        uint64_t want = h[15], mh = FNV0;
+        memset(hb + 120, 0, 8);   /* the file's own bytes, flags included, the hash word zero */
+        mh = fnvbuf(mh, hb, 128); mh = fnvbuf(mh, lzraw, lzl);
         if (h[1]) { off_t keep = ftello(r->f);
             uint8_t *nb = xmalloc(h[1]);
             if (fseeko(r->f, (off_t)r->nz_off, SEEK_SET) || fread(nb, 1, h[1], r->f) != h[1])
@@ -3580,9 +3617,12 @@ static void buildhash(R *r) {
 static uint64_t NAMESRC_H;
 static uint64_t stathash(const struct stat *st) {
     uint64_t h = fnvbuf(FNV0, NAMEFILE, strlen(NAMEFILE));
-    h = fnvbuf(h, &st->st_size, sizeof st->st_size); h = fnvbuf(h, &st->st_ino, sizeof st->st_ino);
-    h = fnvbuf(h, &st->st_dev, sizeof st->st_dev); h = fnvbuf(h, &st->st_mtim, sizeof st->st_mtim);
-    return fnvbuf(h, &st->st_ctim, sizeof st->st_ctim);
+    /* the fields as the Rust's namesrc: seven little-endian words */
+    uint64_t v[7] = { (uint64_t)st->st_size, (uint64_t)st->st_ino, (uint64_t)st->st_dev,
+                      (uint64_t)st->st_mtim.tv_sec, (uint64_t)st->st_mtim.tv_nsec,
+                      (uint64_t)st->st_ctim.tv_sec, (uint64_t)st->st_ctim.tv_nsec };
+    for (int i = 0; i < 7; i++) h = fnv64(h, v[i]);
+    return h;
 }
 static char *readnamefile(uint64_t nreads) {
     char *names;
@@ -3592,7 +3632,7 @@ static char *readnamefile(uint64_t nreads) {
         struct stat st0; if (stat(NAMEFILE, &st0)) die("cannot stat the file given to --names");
         size_t cap = 1 << 20, w = 0;
         names = xmalloc(cap);
-        char *ln = NULL; size_t lcap = 0; uint64_t got = 0; int fq = 2, lineno = 0;
+        char *ln = NULL; size_t lcap = 0; uint64_t got = 0, lineno = 0; int fq = 2;
 
         char *hd[3] = { NULL, NULL, NULL }; size_t hc[3] = { 0, 0, 0 }; int nhd = 0;
         while (nhd < 3 && getline(&hd[nhd], &hc[nhd], nf) > 0) nhd++;
@@ -3600,8 +3640,8 @@ static char *readnamefile(uint64_t nreads) {
             if (hd[0][0] == '@' && nhd >= 3 && hd[2][0] == '+') fq = 1;
             else if (hd[0][0] == '>' && hd[1][0] != '>') fq = 0;
         }
-        for (int h = 0; ; h++) {
-            if (h < nhd) { free(ln); ln = hd[h]; lcap = hc[h]; hd[h] = NULL; }
+        for (uint64_t h = 0; ; h++) {   /* past 2^31 lines on a large FASTQ */
+            if (h < (uint64_t)nhd) { free(ln); ln = hd[h]; lcap = hc[h]; hd[h] = NULL; }
             else if (getline(&ln, &lcap, nf) <= 0) break;
             lineno++;
             char *q = ln;
@@ -3725,8 +3765,7 @@ static void rclose(R *r);
 #define IXFP(h, o) ((uint32_t)((h) ^ (o) * 0x9e3779b97f4a7c15ULL))
 static int ixw(uint64_t n) { int w = 1; while (w < 32 && (n - 1) >> w) w++; return w; }
 static uint64_t ixget(const uint8_t *p, uint64_t bit, int nb) {
-    uint64_t v; memcpy(&v, p + (bit >> 3), 8);
-    return (v >> (bit & 7)) & ((1ULL << nb) - 1);
+    return (ld64(p + (bit >> 3)) >> (bit & 7)) & ((1ULL << nb) - 1);
 }
 
 static void buildindex(const char *path) {
@@ -3761,7 +3800,7 @@ static void buildindex(const char *path) {
         }
     }
     for (uint64_t g = 0, sum = 0; g < ns; g++) {
-        memcpy(t + nb + g * 8, &sum, 8);
+        st64(t + nb + g * 8, sum);
         for (uint64_t b = g * 1024; b < nb && b < (g + 1) * 1024; b++) sum += cnt[b];
     }
     free(key);
@@ -3773,8 +3812,9 @@ static void buildindex(const char *path) {
     if (fd >= 0) (void)!fchmod(fd, 0666 & ~um);
     FILE *f = fd < 0 ? NULL : fdopen(fd, "wb");
     if (!f) die("cannot create the index file beside the track");
-    uint64_t tail[5] = { n, (uint64_t)k, r->mhash ^ namesrc(), pay, IDXMAGIC };
-    int bad = fwrite(t, 1, pay, f) != pay || fwrite(tail, 8, 5, f) != 5 || fflush(f);
+    uint64_t tw[5] = { n, (uint64_t)k, r->mhash ^ namesrc(), pay, IDXMAGIC }; uint8_t tail[40];
+    stwords(tail, tw, 5);
+    int bad = fwrite(t, 1, pay, f) != pay || fwrite(tail, 1, 40, f) != 40 || fflush(f);
     if (fclose(f) || bad || rename(tp, ip)) { unlink(tp); die("index write failed"); }
     free(t); free(tp);
     fprintf(stderr, "index: %llu sequences, %llu B in %s, %llu fingerprint collisions\n",
@@ -3785,8 +3825,9 @@ static void buildindex(const char *path) {
 
 /* Returns the ordinal, or -1 when absent */
 static int64_t idxlookup(R *r, const char *path, const char *nm) {
-    char ip[4096]; snprintf(ip, sizeof ip, "%s.kzi", path);
+    char *ip; if (asprintf(&ip, "%s.kzi", path) < 0) die("oom");
     int fd = open(ip, O_RDONLY);
+    free(ip);
     if (fd < 0) return -1;
     struct stat st;
     if (fstat(fd, &st) || (size_t)st.st_size < 40) { close(fd); return -1; }
@@ -4393,7 +4434,7 @@ static int nodeid(const char *nm, size_t n) {
     for (int i = 0; i < NNODE; i++)
         if (strlen(NODE[i]) == n && !memcmp(NODE[i], nm, n)) return i;
     if (NNODE >= MAXNODE) die("too many hierarchy nodes");
-    NODE[NNODE] = strndup(nm, n);
+    NODE[NNODE] = xstrndup(nm, n);
     NPAR[NNODE] = -1;
     return NNODE++;
 }
@@ -4619,10 +4660,10 @@ static R *refopen(const char *path) {   /* a plain track, opened as no companion
     return r;
 }
 static void loadref_kst(const char *path) {
-    uint64_t hh[16];
+    uint64_t hh[16]; uint8_t hb[128];
     {   FILE *f = fopen(path, "rb");
-        if (!f || fseek(f, 8, SEEK_SET) || fread(hh, 8, 16, f) != 16) die("cannot read the reference track");
-        fclose(f); }
+        if (!f || fseek(f, 8, SEEK_SET) || fread(hb, 1, 128, f) != 128) die("cannot read the reference track");
+        fclose(f); ldwords(hh, hb, 16); }
     if (hh[1] & (ALNFLAG | DBFLAG | DROPPED))
         die("the reference .kst must be a plain track: not --aln, not --db, and its names in the file, not dropped");
     R *r = refopen(path);
@@ -4706,7 +4747,7 @@ static void refprep(R *r, rcon *rc) {
     rc->bend = xcalloc(r->nblk, 8);
     rc->firstblk = q.blk;
     rc->lastblk = (uint32_t)blkat(r, rc->row0 + (rc->n ? rc->n - 1 : 0), 0);
-    rc->blkin = xcalloc(r->nblk, 1);            /* last: it is the ready flag */
+    atomic_store_explicit(&rc->blkin, xcalloc(r->nblk, 1), memory_order_release);   /* last: it is the ready flag */
 }
 static void refblk(R *r, rcon *rc, uint64_t b) {
     loadblk(r, b);
@@ -4726,7 +4767,7 @@ static void refblk(R *r, rcon *rc, uint64_t b) {
         pos += len;
     }
     rc->bend[b] = pos;
-    rc->blkin[b] = 1;
+    atomic_store_explicit(&rc->blkin[b], 1, memory_order_release);
     /* every block in: the contig is whole, and the window checks stop */
     if (++rc->nblkin == rc->lastblk - rc->firstblk + 1) {
         rc->end = rc->bend[rc->lastblk];
@@ -4753,20 +4794,21 @@ static void refwin(rcon *rc, uint64_t tpos, size_t *lo, size_t *hi, uint64_t *we
         return;
     }
     R *r = REFR;
-    if (!rc->blkin) {
+    _Atomic uint8_t *in = atomic_load_explicit(&rc->blkin, memory_order_acquire);
+    if (!in) {
 #ifdef _OPENMP
 #pragma omp critical(reffill)
 #endif
-        if (!rc->blkin) refload(rc, 0, 1);
+        if (!(in = atomic_load_explicit(&rc->blkin, memory_order_acquire))) { refload(rc, 0, 1); in = rc->blkin; }
     }
     uint64_t b = rc->firstblk, e = rc->lastblk;      /* the block holding tpos */
     while (b < e) { uint64_t m = (b + e + 1) / 2;
                     if (r->b[m].bp <= tpos) b = m; else e = m - 1; }
-    if (!rc->blkin[b]) {
+    if (!atomic_load_explicit(&in[b], memory_order_acquire)) {
 #ifdef _OPENMP
 #pragma omp critical(reffill)
 #endif
-        if (!rc->blkin[b]) refload(rc, b, 0);
+        if (!atomic_load_explicit(&in[b], memory_order_acquire)) refload(rc, b, 0);
     }
     uint64_t be = r->b[b].row0 + r->b[b].rows;
     *lo = b == rc->firstblk ? 0 : (size_t)(r->b[b].row0 - rc->row0);
@@ -5445,7 +5487,8 @@ static int kzmain(int argc, char **argv) {
         }
     }
     if (argc < 2) die(USAGE);
-    const char *INS[64]; int NIN = 0;
+    static const char **INS; int NIN = 0;   /* no cap: --db takes one BED per feature set; static, so reachable at exit */
+    INS = xmalloc(mul((size_t)argc, sizeof *INS));
     const char *OUTPUT = NULL, *FSA = NULL, *HIERA = NULL;
     char *REGA = NULL;
     static const struct { const char *f; int nv; } FLAGS[] = {
@@ -5520,7 +5563,6 @@ static int kzmain(int argc, char **argv) {
         else if (!strcmp(a, "--ref")) { ok = inf || pack; ALNREF = v; take = 2; }
         else if (!strcmp(a, "--out-dir")) { ok = dec || (sm && !qry); OUTDIR = v; take = 2; }
         else if (!strcmp(a, "--input")) { ok = !pack;
-            if (NIN == 64) die("too many input files");
             INS[NIN++] = v; take = 2; }
         else if (!strcmp(a, "--output")) { ok = strcmp(cmd, "index") != 0; OUTPUT = v; take = 2; }
         else if (!strcmp(a, "--region")) { ok = qry; REGA = (char *)v; take = 2; }

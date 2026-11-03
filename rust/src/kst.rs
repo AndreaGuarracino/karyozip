@@ -16,6 +16,7 @@ pub const GRPFLAG: u64 = 1 << 49;   // lengths grouped by label
 pub const VARFLAG: u64 = 1 << 57;   // blocks of whole reads, a read count each
 pub const FLAGS: u64 = TOKFLAG | INTFLAG | RUNFLAG | DROPPED | ALNFLAG | DBFLAG | LENFLAG
                       | TAILFLAG | CARTFLAG | ILVFLAG | FLDFLAG | GRPFLAG | VARFLAG;
+pub const NMLBITS: u32 = 49;        // the names length below the flags
 pub const ICHUNK: u64 = 65536;      // sequences per index chunk
 
 #[inline]

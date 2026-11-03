@@ -518,8 +518,9 @@ EXPECT=ok
 both "a ten-byte varint of 0, not the shortest but it fits" decompress -i "$W/v10.0x00.kst"
 if cmp -s "$W/c.out" "$D/s.bed"; then tpass; else tfail "a ten-byte varint of 0: rows WRONG"; fi
 tally "ten-byte varints"
+fi
 
-# a staged output whose fsync or close fails (tests/failclose.c, LD_PRELOAD): the same refusal, every old output kept
+# 20. a staged output whose fsync or close fails (tests/failclose.c, LD_PRELOAD): the same refusal, every old output kept
 if sec finalize; then
 FC=$W/failclose.so
 if "${CC:-cc}" -shared -fPIC -O2 -o "$FC" "$src/failclose.c" -ldl 2>"$W/fc.err"; then

@@ -359,12 +359,32 @@ pub fn finish_fd(fd: i32) -> bool {
 /// `finish_fd` on a File
 pub fn finish(f: std::fs::File) -> bool { use std::os::fd::IntoRawFd; finish_fd(f.into_raw_fd()) }
 
-/// Set through --out-dir's renames: a handler then only records the signal, raised once the renames are done
-static INCOMMIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// The one state the handler and the commit agree through, so that a signal either ends the process before a commit
+/// starts or waits for it to finish, never cuts it in two. IDLE: a handler may claim EXITING, then removes the
+/// temporaries and exits. COMMITTING: --out-dir's renames are under way; a handler only records the signal in
+/// PENDSIG, raised once the renames are done. EXITING: a handler has claimed the exit; the commit never starts, and
+/// any other handler waits for the process to end. Both sides move it by compare-and-swap from IDLE, so a handler that
+/// has decided to exit and is then descheduled cannot have a commit start under it. AtomicI32 exists only where it is
+/// lock-free, so the handler may use it. As the C's SIGSTATE
+const IDLE: i32 = 0;
+const COMMITTING: i32 = 1;
+const EXITING: i32 = 2;
+static SIGSTATE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(IDLE);
+/// Stored before the handler's compare-and-swap, so a commit that ended after it saw COMMITTING still reads the signal
 static PENDSIG: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
-/// The commit window opens: SIGINT, SIGTERM and SIGHUP blocked in this thread, deferred by a handler on any other
-/// (a rayon worker has them unblocked). Returns the mask to put back, as the C's stage_swap
+/// Sleeps until the process ends: a handler has claimed EXITING and is on its way to _exit. nanosleep only, so a
+/// handler may call it too
+fn await_exit() -> ! {
+    let t = TimeSpec { s: 1, ns: 0 };
+    // SAFETY: a valid timespec, no remainder wanted
+    loop { unsafe { nanosleep(&t, std::ptr::null_mut()); } }
+}
+/// The commit window opens: SIGINT, SIGTERM and SIGHUP blocked in this thread, then IDLE to COMMITTING, after which
+/// a handler on any other thread (a rayon worker has them unblocked) only records the signal. When a handler has
+/// already claimed EXITING, no rename starts: this waits for that handler to end the process. Returns the mask to put
+/// back, as the C's stage_swap
 pub fn commit_begin() -> SigSet {
+    use std::sync::atomic::Ordering::SeqCst;
     let (mut hs, mut was) = (SigSet([0; 16]), SigSet([0; 16]));
     // SAFETY: both sets are owned, the size glibc's sigset_t is
     unsafe {
@@ -372,14 +392,14 @@ pub fn commit_begin() -> SigSet {
         for s in [1, 2, 15] { sigaddset(&mut hs, s); }
         pthread_sigmask(SIG_BLOCK, &hs, &mut was);
     }
-    INCOMMIT.store(true, std::sync::atomic::Ordering::SeqCst);
+    if SIGSTATE.compare_exchange(IDLE, COMMITTING, SeqCst, SeqCst).is_err() { await_exit(); }
     was
 }
-/// The window closes. A deferred signal is raised, pending until the mask is put back, then the handler runs with
-/// nothing staged left; unless `quiet`, when the caller refuses and exits anyway
+/// The window closes, back to IDLE. A deferred signal is raised, pending until the mask is put back, then the handler
+/// runs with nothing staged left; unless `quiet`, when the caller refuses and exits anyway
 pub fn commit_end(was: SigSet, quiet: bool) {
     use std::sync::atomic::Ordering::SeqCst;
-    INCOMMIT.store(false, SeqCst);
+    SIGSTATE.store(IDLE, SeqCst);
     if quiet { return; }
     let p = PENDSIG.load(SeqCst);
     // SAFETY: raise and pthread_sigmask on a valid signal and the saved mask
@@ -409,10 +429,16 @@ fn sig_pause() {
     // SAFETY: both pointers are to the one owned timespec, which nanosleep may rewrite with what is left
     while unsafe { nanosleep(&t, &mut t) } != 0 {}
 }
+/// IDLE to EXITING, then the temporaries removed and _exit; COMMITTING, the signal recorded for commit_end; EXITING,
+/// another handler is ending the process, so this one waits for it
 extern "C" fn outsig(sig: c_int) {
     use std::sync::atomic::Ordering::SeqCst;
-    if INCOMMIT.load(SeqCst) { PENDSIG.store(sig, SeqCst); sig_pause(); return; }
-    sig_pause();
+    PENDSIG.store(sig, SeqCst);
+    match SIGSTATE.compare_exchange(IDLE, EXITING, SeqCst, SeqCst) {
+        Ok(_) => sig_pause(),
+        Err(COMMITTING) => { sig_pause(); return; }
+        Err(_) => { sig_pause(); await_exit() }
+    }
     let (p, a, n) = (OUTSIG.load(SeqCst), STAGE.load(SeqCst), STAGEN.load(SeqCst));
     // SAFETY: unlink and _exit are async-signal-safe; every pointer is leaked
     unsafe {

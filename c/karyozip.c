@@ -5266,9 +5266,18 @@ static void owput(ow *w, const char *nm, size_t nl, uint64_t a, uint64_t b,
 
 static char **DBTMP; static size_t ndbtmp;
 static void dbtmpclean(void) { for (size_t i = 0; i < ndbtmp; i++) if (DBTMP[i]) remove(DBTMP[i]); }
-/* set through stage_swap's renames: a handler on another thread (an OpenMP worker, which has the signals unblocked)
-   then only records the signal, and stage_swap raises it once its renames are done */
-static volatile sig_atomic_t INCOMMIT, PENDSIG;
+/* The one state the handler and the commit agree through, so that a signal either ends the process before a commit
+   starts or waits for it to finish, never cuts it in two. IDLE: a handler may claim EXITING, then removes the
+   temporaries and exits. COMMITTING: stage_swap's renames are under way; a handler on another thread (an OpenMP
+   worker, which has the signals unblocked) only records the signal in PENDSIG, raised once the renames are done.
+   EXITING: a handler has claimed the exit; the commit never starts, and any other handler waits for the process to
+   end. Both sides move it by compare-and-swap from IDLE, so a handler that has decided to exit and is then
+   descheduled cannot have a commit start under it. Lock-free, so the handler may use it. As the Rust's SIGSTATE */
+enum { SIG_IDLE, SIG_COMMITTING, SIG_EXITING };
+static _Atomic int SIGSTATE = SIG_IDLE;
+_Static_assert(ATOMIC_INT_LOCK_FREE == 2, "the signal state must be lock-free");
+static _Atomic int PENDSIG;   /* stored before the handler's compare-and-swap, so a commit that ended after it saw
+                                  COMMITTING still reads the signal */
 /* KZ_TEST_SIG_PAUSE_MS=N, for tests only: the handler sleeps N ms right after it decides, to exit or to defer, so a
    test can move the main thread on meanwhile (KZ_TEST_SWAP_PAUSE_MS, swap_pause, holds it before and inside the commit
    window). Read once by kzmain at startup, before any handler is installed (getenv is not async-signal-safe); unset
@@ -5278,8 +5287,19 @@ static void sig_pause(void) {   /* nanosleep, async-signal-safe, through EINTR *
     struct timespec t = { SIGPAUSE_MS / 1000, (SIGPAUSE_MS % 1000) * 1000000L };
     while (SIGPAUSE_MS && nanosleep(&t, &t)) {}
 }
+static _Noreturn void await_exit(void) {   /* a handler claimed EXITING and is on its way to _exit: nanosleep until then */
+    struct timespec t = { 1, 0 };
+    for (;;) nanosleep(&t, NULL);
+}
+/* IDLE to EXITING, then the temporaries removed and _exit; COMMITTING, the signal recorded for stage_swap; EXITING,
+   another handler is ending the process, so this one waits for it */
 static void dbtmpsig(int s) {   /* atexit does not run on a signal */
-    if (INCOMMIT) { PENDSIG = s; sig_pause(); return; }
+    int st = SIG_IDLE;
+    atomic_store(&PENDSIG, s);
+    if (!atomic_compare_exchange_strong(&SIGSTATE, &st, SIG_EXITING)) {
+        if (st == SIG_COMMITTING) { sig_pause(); return; }
+        sig_pause(); await_exit();
+    }
     sig_pause();
     dbtmpclean(); outclean(); _exit(1);
 }
@@ -5328,8 +5348,10 @@ static void swap_pause(void) {
    made exclusively (mkstemp), so a backup never takes a name in use, a stale backup of an earlier run included; then
    every staged BED is renamed in; then the backups are removed. On a failed rename every backup is renamed back and
    every new BED that had no old one removed; when even that fails, the refusal says old BEDs remain. The handled
-   signals are blocked in this thread for all of it, and a handler running on another thread only records the signal
-   (INCOMMIT); either way the signal acts once the renames are done, when nothing staged is left. An uncatchable end
+   signals are blocked in this thread for all of it, and the window opens only by one compare-and-swap of SIGSTATE,
+   IDLE to COMMITTING, the same one a handler on another thread races, IDLE to EXITING (dbtmpsig). A handler that won
+   exits before any rename, the commit waiting for it; one that lost only records the signal, raised once the renames
+   are done, when nothing staged is left. So a signal leaves every old BED or every new one. An uncatchable end
    (SIGKILL, OOM, power loss) inside the window can leave old BEDs as SET.bed.old.XXXXXX beside the outputs, and nothing
    reports them. No directory fsync follows. As the Rust's swap_in */
 static void stage_swap(const char *dir) {
@@ -5339,7 +5361,9 @@ static void stage_swap(const char *dir) {
         if (asprintf(&ph[j], "%s/%s.bed.old.XXXXXX", dir, fset[SETK[j]]) < 0) die("oom");
     swap_pause();
     sigset_t hs, was; sigemptyset(&hs); sigaddset(&hs, SIGINT); sigaddset(&hs, SIGTERM); sigaddset(&hs, SIGHUP);
-    pthread_sigmask(SIG_BLOCK, &hs, &was); INCOMMIT = 1;
+    pthread_sigmask(SIG_BLOCK, &hs, &was);
+    int st = SIG_IDLE;   /* a handler already claimed EXITING: no rename starts, it ends the process */
+    if (!atomic_compare_exchange_strong(&SIGSTATE, &st, SIG_COMMITTING)) await_exit();
     int bad = 0, lost = 0;
     for (size_t j = 0; j < NSETK && !bad; j++) {   /* every live BED onto its own backup name */
         snprintf(pb, sizeof pb, "%s/%s.bed", dir, fset[SETK[j]]);
@@ -5365,12 +5389,13 @@ static void stage_swap(const char *dir) {
     } else {
         for (size_t j = 0; j < NSETK; j++) { if (had[j]) unlink(ph[j]); free(DBTMP[j]); DBTMP[j] = NULL; }
     }
-    INCOMMIT = 0;
+    atomic_store(&SIGSTATE, SIG_IDLE);
     for (size_t j = 0; j < NSETK; j++) free(ph[j]);
     free(ph); free(had); free(inst);
     if (lost) die2("cannot rename a derived BED into place, nor put every old one back: old BEDs remain as *.bed.old.* under ", dir);
     if (bad) die("cannot rename a derived BED into place");
-    if (PENDSIG) raise(PENDSIG);   /* pending here until the mask is restored, then the handler, with nothing to remove */
+    int ps = atomic_load(&PENDSIG);
+    if (ps) raise(ps);   /* pending here until the mask is restored, then the handler, with nothing to remove */
     pthread_sigmask(SIG_SETMASK, &was, NULL);
 }
 

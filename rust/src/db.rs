@@ -469,10 +469,13 @@ fn swap_pause() {
 /// SET.bed.old.XXXXXX, an empty placeholder made exclusively (ffi::mkstemp), so a backup never takes a name in use, a
 /// stale backup of an earlier run included; then every staged BED is renamed in; then the backups are removed. On a
 /// failed rename every backup is renamed back and every new BED that had no old one removed; when even that fails,
-/// the refusal says old BEDs remain. The handled signals are blocked in this thread for all of it, and a handler on
-/// another thread only records the signal (ffi::commit_begin); either way the signal acts once the renames are done,
-/// when nothing staged is left. An uncatchable end (SIGKILL, OOM, power loss) inside the window can leave old BEDs as
-/// SET.bed.old.XXXXXX beside the outputs, and nothing reports them. No directory fsync follows. As the C's stage_swap
+/// the refusal says old BEDs remain. The handled signals are blocked in this thread for all of it, and the window
+/// opens only by one compare-and-swap of ffi's SIGSTATE, IDLE to COMMITTING, the same one a handler on another thread
+/// races, IDLE to EXITING (ffi::commit_begin, ffi::outsig). A handler that won exits before any rename, the commit
+/// waiting for it; one that lost only records the signal, raised once the renames are done, when nothing staged is
+/// left. So a signal leaves every old BED or every new one. An uncatchable end (SIGKILL, OOM, power loss) inside the
+/// window can leave old BEDs as SET.bed.old.XXXXXX beside the outputs, and nothing reports them. No directory fsync
+/// follows. As the C's stage_swap
 fn swap_in(dir: &str, sets: &[Vec<u8>], tmps: &[std::path::PathBuf]) {
     let live = |s: &[u8]| setpath(dir, s, ".bed");
     let n = sets.len();

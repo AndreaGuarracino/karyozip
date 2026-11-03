@@ -786,6 +786,11 @@ awk 'BEGIN{p=0; for(k=0;k<400000;k++){printf "r1\t%d\t%d\tchr%d\n", p, p+20, k%2
 ( ulimit -f 512; trap "" XFSZ; $KT --tmp-dir "$W/tinytmp" compress < "$W/stage.bed" >/dev/null 2>&1 ) && { echo "a full staging filesystem: ACCEPTED"; fail=1; } \
   || echo "a full staging filesystem: refused"
 [ -z "$(ls -A "$W/tinytmp" 2>/dev/null)" ] && ok "a full staging filesystem: no temp files left" || no "a full staging filesystem: TEMP FILES LEFT"
+# the staging fits, the compressed body does not: one-row blocks make it three times the staged bytes
+awk 'BEGIN{p=0; for(k=0;k<20000;k++){printf "r1\t%d\t%d\tchr%d\n", p, p+20, k%22; p+=20}}' > "$W/body.bed"
+rc=0; ( ulimit -f 64; trap "" XFSZ; timeout 60 $KT -t 2 --tmp-dir "$W/tinytmp" --block 1 compress < "$W/body.bed" >/dev/null 2>"$W/body.err" ) || rc=$?
+[ $rc = 1 ] && grep -qx 'karyozip: tmp write' "$W/body.err" && ok "a full body temp file: refused at once (tmp write)" || no "a full body temp file: WRONG, exit $rc: $(head -c 200 "$W/body.err")"
+[ -z "$(ls -A "$W/tinytmp" 2>/dev/null)" ] && ok "a full body temp file: no temp files left" || no "a full body temp file: TEMP FILES LEFT"
 
 # whole-read blocks: layouts, queries, --db, --aln, --smooth
 awk 'BEGIN { for (r = 0; r < 3000; r++) { n = 1 + r % 4; p = 0; for (i = 0; i < n; i++) { l = i + 1 == n ? 151 - p : 20 + (r * 7 + i * 13) % 40; printf "q%d\t%d\t%d\t%s\n", r, p, p + l, (r + i) % 5 ? "chr" (1 + (r + i) % 3) : "novel"; p += l } } }' > "$W/vb.bed"

@@ -2990,8 +2990,8 @@ static void ktw_close(ktw *w) {
             if (!tc || !rb) failed = 1;
             for (;;) {
                 size_t i = nextb++;
-                if (i >= nraw || failed) break;
-                while (i >= wrote + win && !failed)   /* a waiting thread writes, or none might */
+                if (i >= nraw || failed || wfail) break;   /* a failed tmp write stops the rest, as the Rust's cancel */
+                while (i >= wrote + win && !failed && !wfail)   /* a waiting thread writes, or none might */
                     if (!pthread_mutex_trylock(&cwm)) { cflush(cs, nraw, &wrote, bm, tmp, &sizes, &wfail); pthread_mutex_unlock(&cwm); }
                     else sched_yield();
                 rawget(w->rawfd, (off_t)bm[i].off, rb, bm[i].len);

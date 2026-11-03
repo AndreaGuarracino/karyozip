@@ -170,8 +170,9 @@ $KT --raw decompress -i "$W/hv.kt" 2>/dev/null | awk -F'\t' '$4>=67108864' | gre
 # featureID 2^26-1 round trips, 2^26 refused
 printf 'featureID\tacrocentric\tchromosome\n67108863\tacro\tchr1\n' > "$W/big.tsv"
 printf 'a\t0\t10\t67108863\n' > "$W/big.bed"
-$KT compress --db "$W/big.tsv" -i "$W/big.bed" > "$W/big.kt" 2>/dev/null && $KT decompress --db "$W/big.tsv" --set acrocentric -i "$W/big.kt" 2>/dev/null | grep -q acro \
-  && ok "featureID 2^26-1: round trip" || no "featureID 2^26-1: WRONG"
+# the --db tables are indexed by featureID: about 0.6 GB to compress and 1 GB to decompress this one row (measured, C)
+stress "featureID 2^26-1, about 1 GB of --db tables: round trip" && { $KT compress --db "$W/big.tsv" -i "$W/big.bed" > "$W/big.kt" 2>/dev/null && $KT decompress --db "$W/big.tsv" --set acrocentric -i "$W/big.kt" 2>/dev/null | grep -q acro \
+  && ok "featureID 2^26-1: round trip" || no "featureID 2^26-1: WRONG"; }
 printf 'featureID\tacrocentric\tchromosome\n67108864\tacro\tchr1\n' > "$W/over.tsv"
 must_fail "featureID 2^26" $KT compress --db "$W/over.tsv" -i "$W/big.bed"
 mkdir -p "$W/hvo"; $KT decompress --db "$D/db.features.tsv" --hier "$W/hv.tsv" --out-dir "$W/hvo" -i "$W/hv.kt" 2>/dev/null
@@ -526,10 +527,12 @@ $KT compress --names drop < "$W/gt.bed" > "$W/gt.kt" 2>/dev/null
 $KT --names "$W/gt.names" decompress -i "$W/gt.kt" 2>/dev/null | cmp -s - "$W/gt.bed" && ok "name list starting with >: restored" || no "name list starting with >: WRONG"
 L="$W"; for i in 1 2 3 4 5; do L="$L/$(printf 'd%.0s' $(seq 1 120))"; done; mkdir -p "$L"
 echo keep > "${L:0:511}" 2>/dev/null || true
+if stress "long temp dir, 80000 rows: round-trip, bystander intact"; then
 awk 'BEGIN{for(i=0;i<80000;i++)printf "s%d\t0\t10\tA\n",i}' > "$W/long.bed"
 $KT compress --tmp-dir "$L" --names drop < "$W/long.bed" > "$W/long.kt" 2>/dev/null \
   && $KT decompress --names <(cut -f1 "$W/long.bed") -i "$W/long.kt" 2>/dev/null | cmp -s - "$W/long.bed" && [ "$(cat "${L:0:511}" 2>/dev/null)" = keep ] \
   && ok "long temp dir: round-trip, bystander intact" || no "long temp dir: WRONG"
+fi
 $KT compress < "$D/s.bed" >&- 2>/dev/null && no "compress with stdout closed: EXIT 0" || ok "compress with stdout closed: refused"
 $KT compress < "$W" > "$W/dir.kt" 2>/dev/null && no "compress from a directory: EXIT 0" || ok "compress from a directory: refused"
 printf 'a\t0\t10\tA\nb\t0\t10\tB\na\t0\t10\tC\n' > "$W/dupname.bed"
@@ -616,7 +619,6 @@ must_fail "a name file name past 511 bytes" $KT --names "$W/n1000.names" decompr
 cat "$D/s.bed" | $KT compress > "$W/pipe.kt" 2>/dev/null
 (while IFS= read -r l; do printf '%s\n' "$l"; sleep 0.02; done < "$D/s.bed") | $KT compress > "$W/slow.kt" 2>/dev/null
 cmp -s "$W/p.kt" "$W/pipe.kt" && cmp -s "$W/p.kt" "$W/slow.kt" && ok "compress from a pipe and a slow producer: byte-identical" || no "compress from a pipe: WRONG"
-awk 'BEGIN{srand(3);for(i=0;i<20000;i++){p=0;for(j=0;j<5;j++){c=p+int(rand()*300)+1;printf "read%d\t%d\t%d\tL%d\n",i,p,c,int(rand()*6);p=c}}}' > "$W/pbig.bed"
 $KT decompress --raw -i "$W/f.kt" 2>/dev/null > "$W/merged.bed"; $KT compress --db "$D/db.features.tsv" -i "$W/merged.bed" > "$W/filedb.kt" 2>/dev/null
 cat "$W/merged.bed" | $KT compress --db "$D/db.features.tsv" -i - > "$W/pipedb.kt" 2>/dev/null   # one karyozip at a time
 cmp -s "$W/pipedb.kt" "$W/filedb.kt" && ok "db compress from a pipe: byte-identical" || no "db compress from a pipe: WRONG"
@@ -727,22 +729,29 @@ $KT --max-gap 18446744073709551615 decompress -i "$W/sm.kt" --hier "$W/sm.tsv" -
 must_fail "region with END before START" $KT query -i "$W/p.kt" -r q1:150-20
 
 # round 24 findings, one case each
+if stress "file-size limit, 100000 rows: exit 1, not a signal"; then
+awk 'BEGIN{srand(3);for(i=0;i<20000;i++){p=0;for(j=0;j<5;j++){c=p+int(rand()*300)+1;printf "read%d\t%d\t%d\tL%d\n",i,p,c,int(rand()*6);p=c}}}' > "$W/pbig.bed"
 rc=0; (ulimit -f 1; $KT compress < "$W/pbig.bed" > "$W/lim.kt" 2> "$W/lim.err") || rc=$?
 [ $rc = 1 ] && ok "file-size limit: exit 1, not a signal" || no "file-size limit: rc=$rc"
+fi
 # ls.bed (a fixture) at each effort: a higher effort tries a superset of codecs, so it is never larger
 sz=""; for e in high medium low; do sz="$sz $($KT -e $e compress < "$D/ls.bed" 2>/dev/null | wc -c)"; done
 [ "$(echo $sz | tr ' ' '\n' | sort -n | tr '\n' ' ')" = "$(echo $sz) " ] && ok "effort high <= medium <= low:$sz B" || no "effort sizes out of order:$sz B"
 # -e high: zpaq on both frames
+if stress "-e high on six contigs of 20000 to 40000 rows: zpaq on both frames, round-trip"; then
 awk 'BEGIN { srand(5); for (c = 0; c < 6; c++) { g = c % 4; nr = 20000 + int(rand() * 20000); p = 0; for (r = 0; r < nr; r++) { l = 1 + int(rand() * (g ? 9 * g : 37)); u = rand(); printf "ctg%d\t%d\t%d\t%s\n", c, p, p + l, u < 0.5 + g / 10 ? "chr" (1 + g) : "novel" int(rand() * 3); p += l } } }' > "$W/zt.bed"
 $KT -e high compress -i "$W/zt.bed" -o "$W/zt.kt" 2> "$W/zt.err"
 grep -q "lengths zpaq-64MB, labels zpaq-64MB" "$W/zt.err" && ok "high: zpaq on both frames of six contigs" || no "high: zpaq not picked: $(grep layout "$W/zt.err")"
 $KT decompress -i "$W/zt.kt" 2>/dev/null | cmp -s - "$W/zt.bed" && ok "zpaq frames: round-trip" || no "zpaq frames: WRONG"
+fi
 # -e high: interleaved zpaq model, short reads
+if stress "-e high on 60000 short reads: the interleaved zpaq model, round-trip"; then
 awk 'BEGIN { srand(7); for (r = 0; r < 60000; r++) { k = rand() < 0.4 ? 1 : 2 + int(rand() * rand() * 12); p = 0; g = int(rand() * 4); for (j = 0; j < k; j++) { l = j == k - 1 ? 120 - p : 1 + int(rand() * (120 - p - (k - j - 1)) / (k - j)); printf "r%d\t%d\t%d\t%s\n", r, p, p + l, "chr" (1 + (g + j) % 5); p += l } } }' > "$W/zi.bed"
 $KT -e high compress -i "$W/zi.bed" -o "$W/zi.kt" 2> "$W/zi.err"
 # the layout line on stderr names the model the search picked; this input is built so the interleaved one wins
 grep -q "lengths zpaq-64MB+ilv" "$W/zi.err" && ok "high: the interleaved zpaq model on short reads" || no "high: interleaved model not picked: $(grep layout "$W/zi.err")"
 $KT decompress -i "$W/zi.kt" 2>/dev/null | cmp -s - "$W/zi.bed" && ok "interleaved zpaq model: round-trip" || no "interleaved zpaq model: WRONG"
+fi
 must_fail "--tmp-dir that does not exist" $KT --tmp-dir /nonexistent/dir compress < "$D/s.bed"
 $KT --tmp-dir "$W" compress < "$D/s.bed" 2>/dev/null | cmp -s - "$W/p.kt" && ok "--tmp-dir honoured: same bytes" || no "--tmp-dir honoured: WRONG"
 
@@ -883,6 +892,7 @@ fi
 printf 'r1\t0\t10\tabcXYZ\nr1\t10\t20\tabqXYZ\nr1\t20\t30\tabcXYZ\n' > "$W/coll.bed"
 $KT compress < "$W/coll.bed" > "$W/coll.kt" 2>/dev/null
 $KT decompress -i "$W/coll.kt" 2>/dev/null | cmp -s - "$W/coll.bed" && ok "label cache: colliding keys round-trip" || no "label cache: COLLIDING KEYS WRONG"
+if stress "label cache, 20000 labels on 60000 rows: round-trip"; then
 python3 -c "
 p=0
 f=open('$W/many.bed','w')
@@ -891,6 +901,7 @@ for i in range(60000):
 "
 $KT compress < "$W/many.bed" > "$W/many.kt" 2>/dev/null
 $KT decompress -i "$W/many.kt" 2>/dev/null | cmp -s - "$W/many.bed" && ok "label cache: 20000 labels round-trip" || no "label cache: 20000 labels WRONG"
+fi
 printf 'r1\t0\t10\tA\nr11\t0\t10\tB\nr111\t0\t10\tC\n' > "$W/pre.bed"
 $KT compress < "$W/pre.bed" > "$W/pre.kt" 2>/dev/null
 $KT decompress -i "$W/pre.kt" 2>/dev/null | cmp -s - "$W/pre.bed" && ok "prefix sequence names: round-trip" || no "prefix sequence names: WRONG"
@@ -904,11 +915,13 @@ $KT decompress -i "$W/chunk.kt" 2>/dev/null | cmp -s - "$W/chunk.bed" && ok "200
 fi
 # a full temp filesystem must be fatal
 mkdir -p "$W/tinytmp"
+if stress "a full staging filesystem, 400000 rows: refused, no temp files left"; then
 awk 'BEGIN{p=0; for(k=0;k<400000;k++){printf "r1\t%d\t%d\tchr%d\n", p, p+20, k%22; p+=20}}' > "$W/stage.bed"
 # 256 KB cap, below the staging payload
 ( ulimit -f 512; trap "" XFSZ; $KT --tmp-dir "$W/tinytmp" compress < "$W/stage.bed" >/dev/null 2>&1 ) && no "a full staging filesystem: ACCEPTED" \
   || ok "a full staging filesystem: refused"
 [ -z "$(ls -A "$W/tinytmp" 2>/dev/null)" ] && ok "a full staging filesystem: no temp files left" || no "a full staging filesystem: TEMP FILES LEFT"
+fi
 # the staging fits, the compressed body does not: one-row blocks make it three times the staged bytes; -t 2, the ordered loop
 if stress "a full body temp file at 2 threads"; then
 awk 'BEGIN{p=0; for(k=0;k<20000;k++){printf "r1\t%d\t%d\tchr%d\n", p, p+20, k%22; p+=20}}' > "$W/body.bed"
@@ -1125,6 +1138,7 @@ else
   echo "  want $want"; echo "  got  $got"; $KT --version | sed 's/^/  /'
 fi
 
+# fuzz.sh reads TEST_LIGHT itself: under TEST_LIGHT=1 it runs its light subset (10 cases per generator, no forged-index)
 if [ -n "${CASE:-}" ] && ! [[ fuzz =~ $CASE ]]; then echo "fuzz: skipped (CASE=$CASE)"
 elif CASE= bash "$D/fuzz.sh" "$KZ" "$KZSAN"; then ok "fuzz: clean"; else no "fuzz: FOUND SOMETHING"; fi
 

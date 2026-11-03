@@ -1,7 +1,8 @@
 #!/bin/bash
 # Sanitizer and leak checks, then generative tests
 #   fuzz.sh BINARY [SANITIZER_BINARY] [N]
-# N: cases per generator (default 60)
+# N: cases per generator (default 60; 10 under TEST_LIGHT=1, which also skips the forged-index stage and its
+#   140000-row input, see lib.sh)
 # Failures are prefixed "FAIL: "; the last line is "fuzz.sh: N passed, M failed, K skipped".
 # FUZZ_SEED=N repeats a run's mutation offsets and bytes (the seed is printed first); the generated
 #   corpora keep their fixed seeds. CASE=REGEX runs only the stages whose name matches: leaks malformed
@@ -13,12 +14,13 @@ set -u
 need python3 zstd awk realpath timeout xargs dd stat cmp cut head mktemp seq
 need_gnu
 KZ=$(realpath -m "$1"); KZSAN=$(realpath -m "${2:-$1}"); N=${3:-60}; J=$TEST_JOBS   # forged files run J at a time
+[ "${TEST_LIGHT:-0}" = 1 ] && [ -z "${3:-}" ] && N=10   # the light subset: every stage but forged-index, 10 cases per generator
 KT="$KZ -t $KZ_TEST_THREADS"; SAN="$KZSAN -t $KZ_TEST_THREADS"; export SANX="$KZSAN -t $(share "$J")"   # SANX: xargs workers
 SCASE=${CASE:-}; CASE=   # stages, not lines, are filtered here
 stage() { [ -z "$SCASE" ] || [[ $1 =~ $SCASE ]]; }
 tscale "$KZSAN"; T30=$(tmo 30); T60=$(tmo 60); export T30 T60
 FUZZ_SEED=${FUZZ_SEED:-$(python3 -c 'import random; print(random.SystemRandom().randrange(1 << 32))')}
-echo "fuzz: FUZZ_SEED=$FUZZ_SEED, timeouts x$TIMEOUT_SCALE, $J jobs, $KZ_TEST_THREADS threads${SCASE:+, stages matching $SCASE}"
+echo "fuzz: FUZZ_SEED=$FUZZ_SEED, timeouts x$TIMEOUT_SCALE, $J jobs, $KZ_TEST_THREADS threads, $N cases per generator$([ "${TEST_LIGHT:-0}" = 1 ] && echo " (TEST_LIGHT)")${SCASE:+, stages matching $SCASE}"
 # muts TAG SIZE COUNT: COUNT "offset byte" lines below SIZE, from FUZZ_SEED and TAG
 muts() {
   python3 -c 'import random, sys; r = random.Random("%s/%s" % (sys.argv[1], sys.argv[2])); n = int(sys.argv[3])
@@ -305,7 +307,7 @@ tally "$g" "$W/fsz.out"
 fi
 
 # 5. forged index entries and chunk table
-if stage forged-index; then
+if stage forged-index && stress "fuzz: forged index entries and chunk table of a 140000-row file"; then
 awk 'BEGIN{for(i=0;i<70000;i++){printf "s%d\t0\t7\tA\ns%d\t7\t9\tB\n",i,i}}' > "$W/t5.bed"
 $KT compress --block 1000 < "$W/t5.bed" > "$W/t5.kt" 2>/dev/null
 python3 - "$W" "$D" <<'PY' || { echo "FAIL: fuzz: stage 5 generator FAILED"; exit 1; }

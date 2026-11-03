@@ -280,6 +280,7 @@ for b in "$C" "$R"; do
   else gbad=$((gbad+1)); tfail "gz --aln differs: $b"; fi
 done
 # many BGZF blocks, file and pipe
+if stress "many BGZF blocks, 300000 rows, file and pipe, cut and byte-flipped: same bytes, same refusal"; then
 awk 'BEGIN{for(i=0;i<60000;i++){p=0;for(j=0;j<5;j++){printf "read%d\t%d\t%d\tL%d\n",i,p,p+j+7,j%3;p+=j+7}}}' > "$W/bz.bed"
 python3 "$D/kt.py" bgzf "$W/bz.bed" "$W/bz.bgz"
 "$C" compress < "$W/bz.bed" > "$W/bz.plain" 2>/dev/null
@@ -296,6 +297,7 @@ for f in bzcut bzflip; do
   "$R" compress -i "$W/$f.bgz" 2> "$W/re" >/dev/null; r1=$?; rm2=$(tail -1 "$W/re")
   [ "$cm" = "$rm2" ] && [ "$c1" = 1 ] && [ "$r1" = 1 ] && { gok=$((gok+1)); tpass; } || { gbad=$((gbad+1)); tfail "$f refusal differs: c=[$cm] rc $c1, rust=[$rm2] rc $r1"; }
 done
+fi
 # forged BGZF: ISIZE bounds, BC after another subfield, cuts inside the extra field; same bytes or same refusal
 mkdir -p "$W/bx"; python3 "$D/kt.py" bgzfx "$W/bx"
 for f in "$W"/bx/*.gz; do
@@ -371,18 +373,22 @@ fi
 
 # 13b. -e high's zpaq frames, both ways
 if sec zpaq; then
+if stress "-e high on six contigs of 20000 to 40000 rows: zpaq frames identical, each reads the other"; then
 awk 'BEGIN { srand(5); for (c = 0; c < 6; c++) { g = c % 4; nr = 20000 + int(rand() * 20000); p = 0; for (r = 0; r < nr; r++) { l = 1 + int(rand() * (g ? 9 * g : 37)); u = rand(); printf "ctg%d\t%d\t%d\t%s\n", c, p, p + l, u < 0.5 + g / 10 ? "chr" (1 + g) : "novel" int(rand() * 3); p += l } } }' > "$W/zt.bed"
 "$C" -e high compress -i "$W/zt.bed" > "$W/c.kst" 2>/dev/null; "$R" -e high compress -i "$W/zt.bed" > "$W/r.kst" 2>/dev/null
 if cmp -s "$W/c.kst" "$W/r.kst" && "$R" decompress -i "$W/c.kst" 2>/dev/null | cmp -s - "$W/zt.bed" && "$C" decompress -i "$W/r.kst" 2>/dev/null | cmp -s - "$W/zt.bed"
 then tpass "zpaq frames: identical, each reads the other"; else tfail "zpaq frames: DIFFER"; fi
+fi
+if stress "-e high on 60000 short reads: interleaved zpaq model identical, each reads the other"; then
 awk 'BEGIN { srand(7); for (r = 0; r < 60000; r++) { k = rand() < 0.4 ? 1 : 2 + int(rand() * rand() * 12); p = 0; g = int(rand() * 4); for (j = 0; j < k; j++) { l = j == k - 1 ? 120 - p : 1 + int(rand() * (120 - p - (k - j - 1)) / (k - j)); printf "r%d\t%d\t%d\t%s\n", r, p, p + l, "chr" (1 + (g + j) % 5); p += l } } }' > "$W/zi.bed"
 "$C" -e high compress -i "$W/zi.bed" > "$W/c.kst" 2>/dev/null; "$R" -e high compress -i "$W/zi.bed" > "$W/r.kst" 2>/dev/null
 if cmp -s "$W/c.kst" "$W/r.kst" && "$R" decompress -i "$W/c.kst" 2>/dev/null | cmp -s - "$W/zi.bed" && "$C" decompress -i "$W/r.kst" 2>/dev/null | cmp -s - "$W/zi.bed"
 then tpass "interleaved zpaq model: identical, each reads the other"; else tfail "interleaved zpaq model: DIFFER"; fi
 fi
+fi
 
 # 14. damaged file: same rows before refusal
-if sec damaged; then
+if sec damaged && stress "damaged decompress of a 400000-row file: same rows before refusal"; then
 python3 -c "
 import random; random.seed(9)
 with open('$W/many.bed','w') as f:
@@ -398,7 +404,7 @@ done
 fi
 
 # 15. forged chunk tables, re-signed
-if sec forged; then
+if sec forged && stress "forged chunk tables of a 65537-row file: same refusal"; then
 python3 -c "
 with open('$W/ck.bed','w') as f:
     for i in range(65537): f.write(f'r{i}\t0\t1\t{\"B\" if i & 1 else \"A\"}\n')"

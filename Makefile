@@ -31,8 +31,9 @@ test: all rust san
 # env, not make: a TEST_JOBS given on make's command line would reach sub-makes over the suite's share
 test-c:
 	@env TEST_JOBS=$(SUITE_TJ) bash tests/run.sh c/build/karyozip c/build/libtest c/build/karyozip-san
+# the Rust's own unit tests (--lib --bins: the #[cfg(test)] modules) and tests/lib.rs, in the release build, then run.sh
 test-rust:
-	@cd rust && env TEST_JOBS=$(SUITE_TJ) RAYON_NUM_THREADS=$(call rayon,$(SUITE_TJ)) KZ_TEST_THREADS=$(call rayon,$(SUITE_TJ)) cargo test --release -q -j $(SUITE_TJ) --test lib -- --test-threads=$(SUITE_TJ)
+	@cd rust && env TEST_JOBS=$(SUITE_TJ) RAYON_NUM_THREADS=$(call rayon,$(SUITE_TJ)) KZ_TEST_THREADS=$(call rayon,$(SUITE_TJ)) cargo test --release -q -j $(SUITE_TJ) --lib --bins --test lib -- --test-threads=$(SUITE_TJ)
 	@env TEST_JOBS=$(SUITE_TJ) bash tests/run.sh rust/target/release/karyozip c/build/libtest
 test-diff:
 	@env TEST_JOBS=$(SUITE_TJ) bash tests/diff.sh

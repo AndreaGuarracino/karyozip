@@ -1027,6 +1027,79 @@ if sigwait "$W/sgd" '*.bed.tmp.*' $pid; then kill -TERM $pid 2>/dev/null || :; w
   [ $rc = 1 ] && [ -z "$(ls -A "$W/sgd")" ] && ok "SIGTERM during decompress --out-dir: exit 1, no temporaries, no BEDs" || no "SIGTERM during decompress --out-dir: rc=$rc, left: $(ls "$W/sgd")"
 else kill -KILL $pid 2>/dev/null; wait $pid 2>/dev/null; no "SIGTERM during decompress --out-dir: no temporary appeared"; fi
 
+# delayed write errors (tests/failclose.c, LD_PRELOAD): a staged output whose fsync or close fails is refused, every
+# old output kept byte for byte, no temporaries left; -o, --out-dir, --smooth --out-dir, index and aln-pack
+FC=$W/failclose.so
+if "${CC:-cc}" -shared -fPIC -O2 -o "$FC" "$src/failclose.c" -ldl 2>"$W/fc.err"; then
+  fcfail() {  # DESC MESSAGE MATCH CMD...: exit 1 and MESSAGE alone, the shim failing $op on MATCH's descriptors
+    local what=$1 msg=$2 m=$3 rc=0; shift 3
+    env KZ_FAIL_FD_OP=$op KZ_FAIL_FD_MATCH="$m" LD_PRELOAD="$FC" "$@" >/dev/null 2>"$W/fc.err" || rc=$?
+    if [ $rc = 1 ] && [ "$(grep '^karyozip: ' "$W/fc.err")" = "karyozip: $msg" ]; then ok "$what: refused ($msg)"
+    else no "$what: WRONG, exit $rc: $(head -c 200 "$W/fc.err")"; fi
+  }
+  mkdir -p "$W/fc"; cd "$W/fc"
+  for op in sync close; do
+    rm -rf ./*; mkdir od sm
+    for s in gene repeat; do echo "OLD_$s" > od/$s.bed; echo "OLD_$s" > sm/$s.bed; done
+    echo stale > od/gene.bed.old.AAAAAA; echo old > k.kt; echo old > pk; cp "$W/p.kt" ix.kt; echo oldidx > ix.kt.kzi   # not an index: ignored when read
+    fcfail "failed $op, decompress --db --out-dir" "write failed" .bed.tmp. $KT decompress --db "$D/db.features.tsv" --set gene,repeat --out-dir od -i "$W/f.kt"
+    fcfail "failed $op, --smooth --out-dir" "write failed" .bed.tmp. $KT --db "$D/db.features.tsv" --set gene,repeat decompress -i "$W/f.kt" --hier "$W/full.tsv" --smooth --out-dir sm
+    fcfail "failed $op, index" "index write failed" .kzi. $KT index -i ix.kt
+    fcfail "failed $op, -o" "write failed" k.kt.tmp. $KT compress -i "$D/s.bed" -o k.kt
+    fcfail "failed $op, aln-pack" "write failed" pk.tmp. $KT aln-pack -a "$D/p.paf" --ref "$D/ref.bed" -o pk
+    [ "$(cat od/gene.bed od/repeat.bed od/gene.bed.old.AAAAAA sm/gene.bed sm/repeat.bed k.kt pk ix.kt.kzi | tr '\n' ' ')" = "OLD_gene OLD_repeat stale OLD_gene OLD_repeat old old oldidx " ] \
+      && cmp -s ix.kt "$W/p.kt" && [ "$(ls -A . od sm | tr '\n' ' ')" = ".: ix.kt ix.kt.kzi k.kt od pk sm  od: gene.bed gene.bed.old.AAAAAA repeat.bed  sm: gene.bed repeat.bed " ] \
+      && ok "failed $op: every old output intact, no temporaries" || no "failed $op: DAMAGED: $(ls -A . od sm | tr '\n' ' ')"
+  done
+  # the shim loaded, nothing failed: replaced, the stale backup kept
+  env KZ_FAIL_FD_MATCH=nomatch LD_PRELOAD="$FC" $KT decompress --db "$D/db.features.tsv" --set gene,repeat --out-dir od -i "$W/f.kt" 2>/dev/null
+  cmp -s od/gene.bed "$D/db.gene.bed" && cmp -s od/repeat.bed "$D/db.repeat.bed" && [ "$(cat od/gene.bed.old.AAAAAA)" = stale ] \
+    && [ "$(ls -A od | tr '\n' ' ')" = "gene.bed gene.bed.old.AAAAAA repeat.bed " ] && ok "the shim, nothing failing: replaced, a stale backup kept" || no "the shim, nothing failing: WRONG: $(ls -A od | tr '\n' ' ')"
+  cd - >/dev/null
+else no "tests/failclose.c: does not build with ${CC:-cc}: $(head -c 200 "$W/fc.err")"; fi
+
+# --out-dir's commit, all or nothing: KZ_TEST_SWAP_PAUSE_MS pauses after each of its renames, so the test acts in
+# the window. Two old BEDs and two stale backups (of an earlier run, one with the old PID naming) beside them
+PAUSE=$(awk -v s="${TIMEOUT_SCALE:-1}" 'BEGIN { print int(600 * s) }')
+swdir() { rm -rf "$1"; mkdir -p "$1"; echo OLD_gene > "$1/gene.bed"; echo OLD_repeat > "$1/repeat.bed"
+  echo stale > "$1/gene.bed.old.AAAAAA"; echo stale > "$1/repeat.bed.old.12345"; }
+# swgo DIR: exec, so $! is karyozip itself
+swgo() { KZ_TEST_SWAP_PAUSE_MS=$PAUSE exec $KT decompress --db "$D/db.features.tsv" --set gene,repeat --out-dir "$1" -i "$W/f.kt" >/dev/null 2>"$W/sw.err"; }
+# swgen DIR: old, new or mixed; swclean DIR: nothing but the BEDs and the untouched stale backups
+swgen() { if [ "$(cat "$1/gene.bed" "$1/repeat.bed" 2>/dev/null | tr '\n' ' ')" = "OLD_gene OLD_repeat " ]; then echo old
+  elif cmp -s "$1/gene.bed" "$D/db.gene.bed" && cmp -s "$1/repeat.bed" "$D/db.repeat.bed"; then echo new; else echo mixed; fi; }
+swclean() { [ "$(ls -A "$1" | tr '\n' ' ')" = "gene.bed gene.bed.old.AAAAAA repeat.bed repeat.bed.old.12345 " ] \
+  && [ "$(cat "$1/gene.bed.old.AAAAAA" "$1/repeat.bed.old.12345" | tr '\n' ' ')" = "stale stale " ]; }
+# swwait DIR COND PID: up to 30 s (scaled) for the shell test COND, run in DIR, while PID lives
+swwait() { local n=0 lim; lim=$(awk -v t="$(tmo 30)" 'BEGIN { print int(t * 50) }')
+  while [ $n -lt $lim ] && kill -0 "$3" 2>/dev/null; do (cd "$1" && eval "$2") && return 0; sleep 0.02; n=$((n+1)); done; return 1; }
+nold='[ $(ls | grep -c "\.bed\.old\.") -gt 2 ]'; ntmp='[ $(ls | grep -c "\.bed\.tmp\.") -lt 2 ]'
+swdir "$W/sw"; ( swgo "$W/sw" ) && [ "$(swgen "$W/sw")" = new ] && swclean "$W/sw" && ok "--out-dir over old BEDs and stale backups: replaced, the stale ones kept" || no "--out-dir over stale backups: WRONG: $(ls -A "$W/sw" | tr '\n' ' ')"
+for at in backup install; do
+  swdir "$W/sw"; ( swgo "$W/sw" ) & pid=$!
+  if swwait "$W/sw" "$nold" $pid && { [ $at = backup ] || swwait "$W/sw" "$ntmp" $pid; }; then
+    kill -TERM $pid 2>/dev/null || :; wait $pid && rc=0 || rc=$?; g=$(swgen "$W/sw")
+    { [ $rc = 0 ] || [ $rc = 1 ]; } && [ $g != mixed ] && swclean "$W/sw" && ok "SIGTERM in --out-dir's $at renames: exit $rc, all $g, no leftovers" \
+      || no "SIGTERM in --out-dir's $at renames: rc=$rc, $g, left: $(ls -A "$W/sw" | tr '\n' ' ')"
+  else kill -KILL $pid 2>/dev/null; wait $pid 2>/dev/null; no "SIGTERM in --out-dir's $at renames: the window never showed"; fi
+done
+# a rename fails: a directory takes gene.bed's place inside the window; with no old gene.bed the rollback succeeds
+swdir "$W/sw"; rm "$W/sw/gene.bed"; ( swgo "$W/sw" ) & pid=$!
+if swwait "$W/sw" '[ ! -e repeat.bed ]' $pid; then mkdir -p "$W/sw/gene.bed/x"; wait $pid && rc=0 || rc=$?
+  [ $rc = 1 ] && [ "$(grep '^karyozip: ' "$W/sw.err")" = "karyozip: cannot rename a derived BED into place" ] && [ "$(cat "$W/sw/repeat.bed")" = OLD_repeat ] \
+    && rmdir "$W/sw/gene.bed/x" "$W/sw/gene.bed" && echo OLD_gene > "$W/sw/gene.bed" && swclean "$W/sw" \
+    && ok "a failed --out-dir rename: rolled back, all old, no leftovers" || no "a failed --out-dir rename: rc=$rc, $(grep -m1 '^karyozip: ' "$W/sw.err" | head -c 200), left: $(ls -A "$W/sw" | tr '\n' ' ')"
+else kill -KILL $pid 2>/dev/null; wait $pid 2>/dev/null; no "a failed --out-dir rename: the window never showed"; fi
+# the rollback fails too: gene.bed's old file cannot go back over the directory, and the refusal says so
+swdir "$W/sw"; ( swgo "$W/sw" ) & pid=$!
+if swwait "$W/sw" '[ ! -e gene.bed ]' $pid; then mkdir -p "$W/sw/gene.bed/x"; wait $pid && rc=0 || rc=$?
+  kept=$(ls "$W/sw" | grep -v AAAAAA | grep '^gene\.bed\.old\.' || :)
+  [ $rc = 1 ] && [ "$(grep '^karyozip: ' "$W/sw.err")" = "karyozip: cannot rename a derived BED into place, nor put every old one back: old BEDs remain as *.bed.old.* under $W/sw" ] \
+    && [ -n "$kept" ] && [ "$(cat "$W/sw/$kept")" = OLD_gene ] && [ "$(cat "$W/sw/repeat.bed")" = OLD_repeat ] \
+    && rmdir "$W/sw/gene.bed/x" "$W/sw/gene.bed" && mv "$W/sw/$kept" "$W/sw/gene.bed" && swclean "$W/sw" \
+    && ok "a failed --out-dir rollback: refused, the old BED kept as $kept" || no "a failed --out-dir rollback: rc=$rc, $(grep -m1 '^karyozip: ' "$W/sw.err" | head -c 200), left: $(ls -A "$W/sw" | tr '\n' ' ')"
+else kill -KILL $pid 2>/dev/null; wait $pid 2>/dev/null; no "a failed --out-dir rollback: the window never showed"; fi
+
 # pin the stored bytes to codec versions: `karyozip --block 4 compress` of the fixture db.rall.bed
 # (tests/fixtures.txt), default effort (medium), default threads, no other flag. It moves when a vendored
 # codec, zstd or the format changes; then check diff.sh still passes and update the pin on purpose.

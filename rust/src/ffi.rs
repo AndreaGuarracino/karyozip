@@ -1,6 +1,7 @@
 //! The only unsafe in the crate: raw pointers and length checks live here; the codecs are the C ones from ../c
 
 use std::os::raw::{c_char, c_int, c_uchar, c_uint, c_void};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 
 pub const CODEC_ARITH: i32 = 0x10000;
 pub const CODEC_BZIP3: i32 = 0x20000;
@@ -326,8 +327,8 @@ unsafe extern "C" {
     fn signal(sig: c_int, handler: usize) -> usize;
 }
 
-/// -o's temporary and final names, as the C's OUTTMP and OUTFIN; the signal handler reads the leaked C string, never the mutex
-static OUT: std::sync::Mutex<Option<(std::ffi::CString, String)>> = std::sync::Mutex::new(None);
+/// -o's temporary name, where it is renamed to and the name given, as the C's OUTTMP, OUTDST and OUTFIN; the signal handler reads the leaked C string, never the mutex
+static OUT: std::sync::Mutex<Option<(std::ffi::CString, std::path::PathBuf, String)>> = std::sync::Mutex::new(None);
 static OUTSIG: std::sync::atomic::AtomicPtr<c_char> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
 /// --out-dir's staged BEDs for the handler: a leaked array of leaked C strings
 static STAGE: std::sync::atomic::AtomicPtr<*mut c_char> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
@@ -384,41 +385,68 @@ pub fn panic_clean() {
 /// Removes -o's temporary file on any failure; try_lock, since a panic hook may run with the lock held
 pub fn drop_out() {
     sig_out_clear();
-    if let Ok(mut o) = OUT.try_lock() { if let Some((t, _)) = o.take() { unsafe { unlink(t.as_ptr()); } } }
+    if let Ok(mut o) = OUT.try_lock() { if let Some((t, ..)) = o.take() { unsafe { unlink(t.as_ptr()); } } }
 }
 
 /// On success: -o's temporary file renamed into place
 pub fn commit_out() {
     use std::io::Write;
-    let Some((t, fin)) = OUT.lock().ok().and_then(|mut o| o.take()) else { return };
+    let Some((t, dst, fin)) = OUT.lock().ok().and_then(|mut o| o.take()) else { return };
     sig_out_clear();
-    let tp = t.to_string_lossy().into_owned();   // made from a &str
+    let tp = std::path::PathBuf::from(std::ffi::OsStr::from_bytes(t.as_bytes()));
     // NFS reports some errors only at close
     if std::io::stdout().flush().is_err() || unsafe { close(1) } != 0 {
         let _ = std::fs::remove_file(&tp); crate::bail("write failed");
     }
-    if std::fs::rename(&tp, &fin).is_err() { let _ = std::fs::remove_file(&tp); crate::bail(&format!("cannot rename into {fin}")) }
+    if std::fs::rename(&tp, &dst).is_err() { let _ = std::fs::remove_file(&tp); crate::bail(&format!("cannot rename into {fin}")) }
 }
 
-/// -i and -o in place of stdin and stdout; -o to a regular file goes under a temporary name, renamed in by `commit_out`
-pub fn redirect(path: &str, fd: i32) {
-    use std::os::{fd::AsRawFd, unix::fs::{OpenOptionsExt, PermissionsExt}};
-    let old = std::fs::symlink_metadata(path).ok();
-    let mut f = None;
-    if fd == 1 && old.as_ref().is_none_or(|m| m.file_type().is_file()) {
-        let t = format!("{path}.tmp.{}", std::process::id());
-        if let Ok(h) = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o644).open(&t) {
-            if let Some(m) = &old { let _ = h.set_permissions(std::fs::Permissions::from_mode(m.permissions().mode() & 0o7777)); }
-            let c = std::ffi::CString::new(t).unwrap_or_else(|_| crate::bail("cannot open the output"));
-            OUTSIG.store(c.clone().into_raw(), std::sync::atomic::Ordering::SeqCst);
-            *OUT.lock().unwrap() = Some((c, path.to_string()));
-            catch_signals();
-            f = Some(Ok(h));
+/// A new file PREFIX.XXXXXX, as mkstemp: created exclusively, so never through a symlink, and a taken name retried
+pub fn mkstemp(prefix: &std::path::Path, mode: u32) -> std::io::Result<(std::fs::File, std::path::PathBuf)> {
+    use std::{hash::{BuildHasher, Hasher}, os::unix::fs::OpenOptionsExt};
+    const A: &[u8; 62] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    let mut n = prefix.as_os_str().as_bytes().to_vec(); n.extend_from_slice(b".XXXXXX");
+    let at = n.len() - 6;
+    for i in 0..1000u64 {
+        // RandomState: random keys a process, moved on at every call
+        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+        h.write_u64(i); h.write_u128(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos()));
+        let mut r = h.finish();
+        for c in &mut n[at..] { *c = A[(r % 62) as usize]; r /= 62; }
+        let p = std::path::PathBuf::from(std::ffi::OsStr::from_bytes(&n));
+        match std::fs::OpenOptions::new().write(true).create_new(true).mode(mode).open(&p) {
+            Ok(f) => return Ok((f, p)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e),
         }
     }
-    let f = f.unwrap_or_else(|| if fd == 0 { std::fs::File::open(path) }
-            else { std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o644).open(path) });
-    if !f.is_ok_and(|f| unsafe { dup2(f.as_raw_fd(), fd) } >= 0) { crate::bail(&format!("cannot open {path}")) }
+    Err(std::io::ErrorKind::AlreadyExists.into())
+}
+
+/// -i and -o in place of stdin and stdout. -o to a regular file, or to none yet, is staged in a new random name
+/// beside it, renamed in by `commit_out`, so a failure to stage is fatal and never truncates the old file. A symlink
+/// is resolved and its target staged and replaced, the link kept; a dangling one is refused. As the C's redirect
+pub fn redirect(path: &str, fd: i32) {
+    use std::os::{fd::AsRawFd, unix::fs::PermissionsExt};
+    fn refuse(p: &str) -> ! { crate::bail(&format!("cannot open {p}")) }
+    let mut old = std::fs::symlink_metadata(path).ok();
+    let mut dst = std::path::PathBuf::from(path);
+    if fd == 1 && old.as_ref().is_some_and(|m| m.file_type().is_symlink()) {
+        dst = std::fs::canonicalize(path).unwrap_or_else(|_| refuse(path));
+        old = Some(std::fs::metadata(&dst).unwrap_or_else(|_| refuse(path)));
+    }
+    let f = if fd == 1 && old.as_ref().is_none_or(|m| m.file_type().is_file()) {
+        let mut pre = dst.clone().into_os_string(); pre.push(".tmp");
+        let (h, t) = mkstemp(pre.as_ref(), 0o644)
+            .unwrap_or_else(|_| crate::bail(&format!("cannot create a temporary file beside {path}")));
+        if let Some(m) = &old { let _ = h.set_permissions(std::fs::Permissions::from_mode(m.permissions().mode() & 0o7777)); }
+        let c = std::ffi::CString::new(t.into_os_string().into_vec()).unwrap_or_else(|_| refuse(path));
+        OUTSIG.store(c.clone().into_raw(), std::sync::atomic::Ordering::SeqCst);
+        *OUT.lock().unwrap() = Some((c, dst, path.to_string()));
+        catch_signals();
+        Ok(h)
+    } else if fd == 0 { std::fs::File::open(path) } else { std::fs::OpenOptions::new().write(true).open(&dst) };
+    if !f.is_ok_and(|f| unsafe { dup2(f.as_raw_fd(), fd) } >= 0) { refuse(path) }
 }
 
 // glibc's byte search: fewer instructions than the memchr crate on short fields, the code the C calls

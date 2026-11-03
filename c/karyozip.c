@@ -1609,7 +1609,7 @@ static void gapget(const uint8_t **p, const uint8_t *e, int64_t *dq, int64_t *dt
     else if (v) die("corrupt packed alignment: a bad gap code");
 }
 
-static void alnpack(const char *inpaf, const char *out) {
+static void alnpack(const char *inpaf) {
     loadpaf(inpaf);
     /* A block starting a target run has an absolute position, query offset varint and target in four byte planes; others the gaps since the last */
     buf names = {0}, cnt = {0}, pos = {0}, len = {0}, seg_ = {0}, fq = {0}, pl[4] = {{0}, {0}, {0}, {0}};
@@ -1674,11 +1674,10 @@ static void alnpack(const char *inpaf, const char *out) {
         if (bn) bput(&all, best, bn);
         free(best);
     }
-    FILE *f = fopen(out, "wb");
-    if (!f) die("cannot write the packed alignment");
+    FILE *f = stdout;   /* -o OUT, staged by redirect and renamed in by outcommit */
     uint64_t rh = refhash();
     if (fwrite(ALNMAGIC, 1, ALNMAGLEN, f) != ALNMAGLEN || fwrite(&rh, 8, 1, f) != 1 ||
-        (all.n && fwrite(all.d, 1, all.n, f) != all.n) || fclose(f)) die("packed alignment write failed");
+        (all.n && fwrite(all.d, 1, all.n, f) != all.n) || fflush(f)) die("packed alignment write failed");
     size_t nb = 0; for (size_t i = 0; i < nqs; i++) nb += QS[i].n;
     fprintf(stderr, "packed alignment: %zu queries, %zu blocks, %zu B (%.2f B/query)\n",
             nqs, nb, all.n + ALNMAGLEN + 8, nqs ? (double)(all.n + ALNMAGLEN + 8) / (double)nqs : 0.0);
@@ -4777,8 +4776,8 @@ static void refwin(rcon *rc, uint64_t tpos, size_t *lo, size_t *hi, uint64_t *we
 
 static char out[1 << 22];
 static size_t eo = 0;
-/* -o's temporary name, set by redirect */
-static char *OUTTMP; static const char *OUTFIN;
+/* -o's temporary name, set by redirect; OUTDST is OUTFIN with a symlink resolved */
+static char *OUTTMP; static const char *OUTFIN, *OUTDST;
 static void outclean(void) { if (OUTTMP) { unlink(OUTTMP); OUTTMP = NULL; } }
 static void emitflush(void) {   /* runs from atexit: die would recurse */
     if (eo && fwrite(out, 1, eo, stdout) != eo) { fprintf(stderr, "karyozip: write failed\n"); outclean(); _exit(1); }
@@ -5194,8 +5193,9 @@ static char **DBTMP; static size_t ndbtmp;
 static void dbtmpclean(void) { for (size_t i = 0; i < ndbtmp; i++) if (DBTMP[i]) remove(DBTMP[i]); }
 static void dbtmpsig(int s) { dbtmpclean(); outclean(); (void)s; _exit(1); }   /* atexit does not run on a signal */
 
-/* --out-dir DIR: one staged BED a selected set, DBTMP[i] for SETK[i] */
-static void stage_open(const char *dir) {
+/* --out-dir DIR: one staged BED a selected set, DBTMP[i] for SETK[i], each a new random name made exclusively, so
+   never through a symlink; the open descriptors are returned, as the Rust's stage_open */
+static int *stage_open(const char *dir) {
     char pb[4096];
     char *d = xstrdup(dir);                     /* mkdir -p, as the Rust does */
     for (char *q = d + 1; ; q++) if (*q == '/' || !*q) {
@@ -5211,16 +5211,21 @@ static void stage_open(const char *dir) {
     }
     DBTMP = xcalloc(NSETK, sizeof *DBTMP); ndbtmp = NSETK; atexit(dbtmpclean);
     signal(SIGINT, dbtmpsig); signal(SIGTERM, dbtmpsig); signal(SIGHUP, dbtmpsig);
+    int *fd = xmalloc(NSETK * sizeof *fd);
+    mode_t um = umask(0); umask(um);
     for (size_t i = 0; i < NSETK; i++) {
-        int pn = snprintf(pb, sizeof pb, "%s/%s.bed.tmp.%d", dir, fset[SETK[i]], (int)getpid());
-        if (pn < 0 || (size_t)pn >= sizeof pb - 16) die("--out-dir: the output path is too long");
-        DBTMP[i] = xstrdup(pb);
+        snprintf(pb, sizeof pb, "%s/%s.bed.tmp.XXXXXX", dir, fset[SETK[i]]);   /* fits: checked above */
+        char *t = xstrdup(pb);
+        if ((fd[i] = mkstemp(t)) < 0) { free(t); die("cannot write a derived BED"); }
+        DBTMP[i] = t;
+        (void)!fchmod(fd[i], 0666 & ~um);   /* as a plain create */
     }
+    return fd;
 }
 /* the staged BEDs swapped in together, the old ones restored on a failure */
 static void stage_swap(const char *dir) {
     char pb[4096];
-    char **old = xcalloc(NSETK, sizeof *old); size_t nmv = 0; int bad = 0;
+    char **old = xcalloc(NSETK, sizeof *old), **mv = xcalloc(NSETK, sizeof *mv); size_t nmv = 0; int bad = 0;
     for (size_t j = 0; j < NSETK && !bad; j++) {
         snprintf(pb, sizeof pb, "%s/%s.bed", dir, fset[SETK[j]]);
         char *o2; if (asprintf(&o2, "%s/%s.bed.old.%d", dir, fset[SETK[j]], (int)getpid()) < 0) die("oom");
@@ -5228,13 +5233,12 @@ static void stage_swap(const char *dir) {
     }
     for (size_t j = 0; j < NSETK && !bad; j++) {
         snprintf(pb, sizeof pb, "%s/%s.bed", dir, fset[SETK[j]]);
-        if (rename(DBTMP[j], pb)) bad = 1; else { free(DBTMP[j]); DBTMP[j] = NULL; nmv++; }
+        if (rename(DBTMP[j], pb)) bad = 1; else { mv[j] = DBTMP[j]; DBTMP[j] = NULL; nmv++; }
     }
     if (bad) {
         for (size_t j = 0; j < nmv; j++) {   /* take the new ones back out */
             snprintf(pb, sizeof pb, "%s/%s.bed", dir, fset[SETK[j]]);
-            if (asprintf(&DBTMP[j], "%s/%s.bed.tmp.%d", dir, fset[SETK[j]], (int)getpid()) >= 0)
-                (void)!rename(pb, DBTMP[j]);
+            if (!rename(pb, mv[j])) DBTMP[j] = mv[j];
         }
         for (size_t j = 0; j < NSETK; j++) if (old[j]) {
             snprintf(pb, sizeof pb, "%s/%s.bed", dir, fset[SETK[j]]);
@@ -5242,22 +5246,22 @@ static void stage_swap(const char *dir) {
         }
         free(old); die("cannot rename a derived BED into place");
     }
-    for (size_t j = 0; j < NSETK; j++) if (old[j]) { remove(old[j]); free(old[j]); }
-    free(old);
+    for (size_t j = 0; j < NSETK; j++) { if (old[j]) remove(old[j]); free(old[j]); free(mv[j]); }
+    free(old); free(mv);
 }
 
 /* --smooth --out-dir DIR on a -d track: every --set smoothed into DIR/SET.bed */
 static void smoothsets(const char *path, const char *hier, int v1, const char *dir) {
-    stage_open(dir);
+    int *fd = stage_open(dir);
     for (size_t i = 0; i < NSETK; i++) {
         fflush(stdout);
-        int fd = open(DBTMP[i], O_WRONLY | O_CREAT | O_TRUNC, 0666);
-        if (fd < 0 || dup2(fd, 1) < 0) die("cannot write a derived BED");
-        close(fd);
+        if (dup2(fd[i], 1) < 0) die("cannot write a derived BED");
+        close(fd[i]);
         if (i) hierreset();
         smoothcmd(path, hier, fset[SETK[i]], NULL, 0, 0, v1);
         emitflush();   /* the rows emit holds go to this set's file */
     }
+    free(fd);
     stage_swap(dir);
     fprintf(stderr, "db: %zu smoothed tracks under %s\n", NSETK, dir);
 }
@@ -5275,13 +5279,14 @@ static void decode_db(const char *path, const char *dir) {
     ensurenames(r);
     if (tostd) { o[0].f = stdout; o[0].cap = 1 << 20; o[0].b = xmalloc(o[0].cap); }
     else {
-        stage_open(dir);
+        int *fd = stage_open(dir);
         for (size_t i = 0; i < NSETK; i++) {
-            o[i].f = fopen(DBTMP[i], "w");
+            o[i].f = fdopen(fd[i], "w");
             if (!o[i].f) die("cannot write a derived BED");
             o[i].cap = 1 << 20;
             o[i].b = xmalloc(o[i].cap);
         }
+        free(fd);
     }
     char *jb[2] = { NULL, NULL }; size_t jcap[2] = { 0, 0 }; int jw = 0;   /* joined labels, pending and current */
     /* a label's featureID, parsed the first time its table entry is seen */
@@ -5375,24 +5380,31 @@ static void outcommit(void) {
     if (!OUTTMP) return;
     emitflush();
     if (close(1)) { fprintf(stderr, "karyozip: write failed\n"); exit(1); }   /* NFS reports some errors only here */
-    if (rename(OUTTMP, OUTFIN)) { fprintf(stderr, "karyozip: cannot rename into %s\n", OUTFIN); exit(1); }
+    if (rename(OUTTMP, OUTDST)) { fprintf(stderr, "karyozip: cannot rename into %s\n", OUTFIN); exit(1); }
     free(OUTTMP); OUTTMP = NULL;
 }
 
-/* -i and -o: the file takes the place of stdin or stdout */
+/* -i and -o: the file takes the place of stdin or stdout. -o to a regular file, or to none yet, is staged in a
+   new random name beside it, so a failure to stage is fatal and never truncates the old file. A symlink is
+   resolved and its target staged and replaced, the link kept; a dangling one is refused. As the Rust's redirect */
 static void redirect(const char *path, int fd) {
     struct stat st; int f, ex = !lstat(path, &st);
-    if (fd && (!ex || S_ISREG(st.st_mode)) && asprintf(&OUTTMP, "%s.tmp.XXXXXX", path) >= 0) {
+    const char *dst = path;
+    if (fd && ex && S_ISLNK(st.st_mode)) {
+        char *rp = realpath(path, NULL);
+        if (!rp || stat(rp, &st)) { fprintf(stderr, "karyozip: cannot open %s\n", path); exit(1); }
+        dst = rp;   /* kept to the rename */
+    }
+    if (fd && (!ex || S_ISREG(st.st_mode))) {
+        if (asprintf(&OUTTMP, "%s.tmp.XXXXXX", dst) < 0) die("oom");
         mode_t um = umask(0); umask(um);
         f = mkstemp(OUTTMP);
-        if (f < 0) { free(OUTTMP); OUTTMP = NULL; }
-        else {
-            (void)!fchmod(f, ex ? st.st_mode & 07777 : 0644 & ~um);   /* as a plain create, or the old file's */
-            OUTFIN = path; atexit(outclean);
-            signal(SIGINT, outsig); signal(SIGTERM, outsig); signal(SIGHUP, outsig);
-        }
-    } else f = -1;
-    if (f < 0) f = fd ? open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644) : open(path, O_RDONLY);
+        if (f < 0) { free(OUTTMP); OUTTMP = NULL;
+            fprintf(stderr, "karyozip: cannot create a temporary file beside %s\n", path); exit(1); }
+        (void)!fchmod(f, ex ? st.st_mode & 07777 : 0644 & ~um);   /* as a plain create, or the old file's */
+        OUTFIN = path; OUTDST = dst; atexit(outclean);
+        signal(SIGINT, outsig); signal(SIGTERM, outsig); signal(SIGHUP, outsig);
+    } else f = open(dst, fd ? O_WRONLY : O_RDONLY);
     if (f < 0 || dup2(f, fd) < 0) { fprintf(stderr, "karyozip: cannot open %s\n", path); exit(1); }
     close(f);
 }
@@ -5540,6 +5552,8 @@ static int kzmain(int argc, char **argv) {
         if (argv[i][0] == '-' && argv[i][1]) fprintf(stderr, "karyozip: unknown flag %s\n", argv[i]);
         else fprintf(stderr, "karyozip: unexpected argument %s\n", argv[i]);
         exit(1); }
+    if (OUTDIR && !*OUTDIR) die("--out-dir needs a directory");
+    if (OUTDIR && OUTPUT) die("-o and --out-dir: give one");   /* the sets go to DIR, nothing to -o */
     if (NTHREADS > 1024) NTHREADS = 1024;   /* libgomp keeps team state on the stack */
 #ifdef _OPENMP
     omp_set_num_threads(nthreads());   /* teams with no num_threads, bzip3's, follow -t too */
@@ -5550,11 +5564,11 @@ static int kzmain(int argc, char **argv) {
 
     if (sm) { HIERTAB = DBFEATS ? HIERA : NULL; } else HIERTAB = HIERA;   /* smooth's own, and --db's */
     if (NIN > 1 && !(enc && DBFEATS)) die("give one -i");
-    if (OUTPUT && !pack) redirect(OUTPUT, 1);
+    if (pack && (!ALNPAF || !ALNREF || !OUTPUT)) die("usage: karyozip aln-pack -a P.paf --ref REF.bed|REF.kst -o OUT");
+    if (OUTPUT) redirect(OUTPUT, 1);
     if (pack) {
-        if (!ALNPAF || !ALNREF || !OUTPUT) die("usage: karyozip aln-pack -a P.paf --ref REF.bed|REF.kst -o OUT");
         loadref(ALNREF);
-        alnpack(ALNPAF, OUTPUT);
+        alnpack(ALNPAF);
         return 0;
     }
     if (enc) {

@@ -343,9 +343,8 @@ pub fn decode(r: &mut crate::reader::Reader, feats: &Feats, dir: Option<&str>, c
     // each output its own 1 MB row buffer, written whole, as the C's ow
     let mut out: Vec<(Box<dyn Write>, Vec<u8>)> = Vec::new();
     if let Some(dir) = dir {
-        tmps = stage_open(dir, &sets);
-        out = tmps.iter().map(|p| (Box::new(std::fs::File::create(p)
-                .unwrap_or_else(|_| crate::bail("cannot write a derived BED"))) as Box<dyn Write>, Vec::with_capacity(OCAP))).collect();
+        let fs; (tmps, fs) = stage_open(dir, &sets);
+        out = fs.into_iter().map(|f| (Box::new(f) as Box<dyn Write>, Vec::with_capacity(OCAP))).collect();
     } else {
         out.push((Box::new(std::io::stdout()), Vec::with_capacity(OCAP)));
     }
@@ -413,8 +412,9 @@ fn wr(o: &mut (Box<dyn Write>, Vec<u8>), seq: &[u8], st: u64, en: u64, lab: &[u8
     crate::kst::put_row(v, seq, st, en, lab);
 }
 
-/// --out-dir DIR: one staged BED a set, beside the old ones, as the C's stage_open
-pub fn stage_open(dir: &str, sets: &[&[u8]]) -> Vec<std::path::PathBuf> {
+/// --out-dir DIR: one staged BED a set, beside the old ones, each a new random name made exclusively, so never
+/// through a symlink, returned open; as the C's stage_open
+pub fn stage_open(dir: &str, sets: &[&[u8]]) -> (Vec<std::path::PathBuf>, Vec<std::fs::File>) {
     std::fs::create_dir_all(dir).unwrap_or_else(|_| crate::bail("cannot create the output directory"));
     for s in sets {
         let p = setpath(dir, s, ".bed");
@@ -423,11 +423,15 @@ pub fn stage_open(dir: &str, sets: &[&[u8]]) -> Vec<std::path::PathBuf> {
             if !m.is_file() { crate::bail("--out-dir: a set's BED exists and is not a regular file"); }
         }
     }
-    let pid = std::process::id();
-    let tmps: Vec<std::path::PathBuf> = sets.iter().map(|s| setpath(dir, s, &format!(".bed.tmp.{pid}"))).collect();
-    *TMP.lock().unwrap() = tmps.clone();
+    let mut fs = Vec::new();
+    for s in sets {
+        let (f, p) = crate::ffi::mkstemp(&setpath(dir, s, ".bed.tmp"), 0o666)
+            .unwrap_or_else(|_| crate::bail("cannot write a derived BED"));
+        TMP.lock().unwrap().push(p); fs.push(f);
+    }
+    let tmps = TMP.lock().unwrap().clone();
     crate::ffi::sig_stage(&tmps);
-    tmps
+    (tmps, fs)
 }
 
 /// The staged BEDs swapped in together, as the C's stage_swap

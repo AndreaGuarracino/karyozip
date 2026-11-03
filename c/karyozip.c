@@ -3190,15 +3190,25 @@ static void ktw_close(ktw *w) {
 
 /* ------------------------------------------------------- the library API */
 /* karyozip.h documents the contract; the CLI and a library caller go through the same writer, so the bytes are the same */
-kt_writer *kt_open(FILE *out) {
-    /* the encoder keeps global state: a second writer starts from nothing; the CLI interns the reference's labels before it opens the writer */
-    static int idc0 = -2, lenc0, lvl0, lvlset0, blkset0; static uint64_t blk0;
-    if (idc0 == -2) { idc0 = IDCODEC; lenc0 = LENCODEC; lvl0 = LEVEL; lvlset0 = LEVELSET; blk0 = BLOCK; blkset0 = BLOCKSET; }
-    IDCODEC = idc0; LENCODEC = lenc0; LEVEL = lvl0; LEVELSET = lvlset0; BLOCK = blk0; BLOCKSET = blkset0;
-    for (int i = 0; i < nlabtab; i++) free(labtab[i]);
-    free(labhash); labhash = NULL;
+/* Every file-scope static a writer changes, back to its initializer, so a second writer in one process writes what a fresh process would.
+   A new encoder global must be added here. Left out: options only main sets (SLOW, FASTMODE, VARBLK, NAMEMODE, NTHREADS, PROF, ...),
+   the --aln, --ref and --db state, and the reader's thread-locals, none of which a library writer reaches or changes */
+static void encoder_reset(void) {
+    BLOCK = UINT64_MAX; BLOCKSET = 0; LEVEL = 17; LEVELSET = 0;      /* kt_block, kt_level */
+    IDCODEC = LENCODEC = -1; LEVEL_I = LEVEL_L = -1;                  /* pickcodecs, the layout search */
+    VARON = RUNHEAD = ILV = GRP = 0;
+    RCUT = 0; CUTROWS_L = CUTROWS_I = 0; ZPQM_L = 0;
+    for (int t = 0; t < 2; t++) { free(ZK[t]); ZK[t] = NULL; ZKN[t] = 0; }
+    TOKPICK = 250000; FLDSEP = ':';                                   /* the names coders */
+    TAILSEEN = 0; TAILON = -1; TAILPRED = 0; memset(TAILSAMP, 0, sizeof TAILSAMP);
+    ROWHASH = 0; ALNHIT = 0; RAWHELD = 0; BYT_LENS = BYT_LABS = 0;
+    for (int i = 0; i < nlabtab; i++) free(labtab[i]);              /* the label table; its arrays are kept for reuse */
+    free(labhash); labhash = NULL; LABHASH = 0;
     nlabtab = 0; lastid = -1; labhash_init = 0; lcache_init = 0;
-    TAILSEEN = 0; TAILON = -1; TAILPRED = 0; ALNHIT = 0; RUNHEAD = ILV = GRP = VARON = 0;
+}
+/* The CLI calls ktw_open directly: it interns the reference's labels before it opens the writer */
+kt_writer *kt_open(FILE *out) {
+    encoder_reset();
     return ktw_open(out);
 }
 void kt_block(kt_writer *w, uint64_t rows) { (void)w; BLOCK = rows ? rows : UINT64_MAX; BLOCKSET = 1; }

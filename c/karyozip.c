@@ -3642,6 +3642,8 @@ static void ensurenames(R *r);
 
 static void buildhash(R *r) {
     if (r->htab) return;
+    /* before the names are decoded, as the Rust's find */
+    if (r->nreads > UINT32_MAX) die("more than 2^32 sequences: the name table stores the ordinal in 32 bits");
     ensurenames(r);
     uint64_t cap = 1; while (cap < r->nreads * 2) cap <<= 1;
     r->hmask = cap - 1;

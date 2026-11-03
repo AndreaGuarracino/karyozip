@@ -175,6 +175,54 @@ for t in "$W/f.kt" "$W/drop.kst" "$W/rall.aln.kst"; do
 done
 head -c 100 "$W/set.gene.kst" > "$W/cut.kst"
 must_fail "a .kst input cut inside its header" $KT compress --db "$D/db.features.tsv" ${kin/$W\/set.gene.kst/$W\/cut.kst}
+# --db inputs through a FIFO, <(...) and stdin: probed for a .kst only when a regular file, so a pipe's bytes are read
+# once, by the BED reader; each run bounded, every form the regular file's bytes (review 7133774, finding 2)
+printf 'featureID\ts1\ts2\n1\tx\ty\n2\tw\tz\n' > "$W/pg.tsv"; printf 'featureID\ts1\n1\tx\n2\ty\n' > "$W/po.tsv"
+printf 'c1\t0\t10\tx\nc1\t10\t20\tw\n' > "$W/p1.bed"; printf 'c1\t0\t10\ty\nc1\t10\t20\tz\n' > "$W/p2.bed"
+printf 'c1\t0\t10\tx\nc1\t10\t20\ty\n' > "$W/po.bed"
+printf 'c\t0\t1\tx\n' > "$W/pr1.bed"; printf 'c\t0\t1\ty\n' > "$W/pr2.bed"   # one row, 8 bytes: the magic's length
+gzip -c "$W/p1.bed" > "$W/p1.bed.gz"; $KT compress < "$W/p1.bed" > "$W/p1.kst" 2>/dev/null; ln -sf "$W/p1.kst" "$W/p1.lnk"
+dbform() {  # FORM OUT TSV INPUT...: compress --db TSV, every INPUT through FORM (file, fifo, psub), bounded; its exit code
+  local form=$1 out=$2 tsv=$3 k=0 x ins="" pids="" rc=0; shift 3
+  for x in "$@"; do
+    k=$((k+1))
+    case $form in
+      file) ins="$ins -i $(printf %q "$x")" ;;
+      fifo) rm -f "$W/pf.$k"; mkfifo "$W/pf.$k"
+            timeout "$(tmo 30)" sh -c 'exec cat "$1" > "$2"' _ "$x" "$W/pf.$k" >/dev/null 2>&1 & pids="$pids $!"
+            ins="$ins -i $(printf %q "$W/pf.$k")" ;;
+      psub) ins="$ins -i <(cat $(printf %q "$x"))" ;;
+    esac
+  done
+  eval "timeout $(tmo 30) $KT compress --db $(printf %q "$tsv") $ins" > "$out" 2>"$out.err" || rc=$?
+  for x in $pids; do wait "$x" 2>/dev/null || :; done
+  return $rc
+}
+for c in "one BED|po.tsv|po.bed" "two BEDs|pg.tsv|p1.bed p2.bed" "a one-row BED|po.tsv|pr1.bed" "two one-row BEDs|pg.tsv|pr1.bed pr2.bed" \
+         "a gzipped BED|pg.tsv|p1.bed.gz p2.bed"; do
+  IFS='|' read -r what tsv fs <<< "$c"; pa=(); for f in $fs; do pa+=("$W/$f"); done
+  rc=0; dbform file "$W/pw.kt" "$W/$tsv" "${pa[@]}" || rc=$?
+  [ $rc = 0 ] && [ -s "$W/pw.kt" ] || no "-d, $what from regular files: rc $rc $(tail -1 "$W/pw.kt.err")"
+  for form in fifo psub; do
+    rc=0; dbform $form "$W/pg.kt" "$W/$tsv" "${pa[@]}" || rc=$?
+    [ $rc = 0 ] && cmp -s "$W/pg.kt" "$W/pw.kt" && ok "-d, $what through a $form: the regular file's bytes" \
+      || no "-d, $what through a $form: rc $rc, $(cmp -s "$W/pg.kt" "$W/pw.kt" && echo same || echo DIFFERENT) [$(tail -1 "$W/pg.kt.err")]"
+  done
+done
+$KT compress --db "$W/po.tsv" -i - < "$W/po.bed" > "$W/pg.kt" 2>/dev/null && dbform file "$W/pw.kt" "$W/po.tsv" "$W/po.bed" && cmp -s "$W/pg.kt" "$W/pw.kt" \
+  && ok "-d, a BED on stdin: the regular file's bytes" || no "-d, a BED on stdin: WRONG"
+dbform file "$W/pw.kt" "$W/pg.tsv" "$W/p1.bed" "$W/p2.bed" || :
+for k in p1.kst p1.lnk; do
+  rc=0; dbform file "$W/pg.kt" "$W/pg.tsv" "$W/$k" "$W/p2.bed" || rc=$?
+  [ $rc = 0 ] && cmp -s "$W/pg.kt" "$W/pw.kt" && ok "-d, a .kst input as $k: the BEDs' bytes" || no "-d, a .kst input as $k: rc $rc [$(tail -1 "$W/pg.kt.err")]"
+done
+kp='karyozip: --db: a .kst input must be a regular file: it is read with random access, not through a pipe or stdin'
+for form in fifo psub; do
+  rc=0; dbform $form "$W/pg.kt" "$W/pg.tsv" "$W/p1.kst" "$W/p2.bed" || rc=$?
+  [ $rc = 1 ] && [ "$(tail -1 "$W/pg.kt.err")" = "$kp" ] && ok "-d, a .kst through a $form: refused" || no "-d, a .kst through a $form: rc $rc [$(tail -1 "$W/pg.kt.err")]"
+done
+rc=0; timeout "$(tmo 30)" $KT compress --db "$W/po.tsv" -i - < "$W/p1.kst" > /dev/null 2>"$W/pg.err" || rc=$?
+[ $rc = 1 ] && [ "$(tail -1 "$W/pg.err")" = "$kp" ] && ok "-d, a .kst on stdin: refused" || no "-d, a .kst on stdin: rc $rc [$(tail -1 "$W/pg.err")]"
 # a features table with its header alone: a novel row is featureID 0, any other label is refused (finding 4)
 printf 'featureID\tsetA\n' > "$W/ho.tsv"; printf 'chr1\t0\t5\tnovel\n' > "$W/hn.bed"; printf 'chr1\t0\t5\tx\n' > "$W/hx.bed"
 rc=0; $KT compress --db "$W/ho.tsv" -i "$W/hn.bed" > "$W/ho.kt" 2>"$W/ho.err" || rc=$?

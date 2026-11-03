@@ -350,9 +350,14 @@ static int zclose_(void *c) {
     if (z->mode == 3) inflateEnd(&z->zs);
     free(z->raw); free(z->out); free(z); return r ? -1 : 0;
 }
+static FILE *zfdopen(int fd);
 static FILE *zfopen(const char *path) {
     int fd = path ? open(path, O_RDONLY) : dup(0);
     if (fd < 0) return NULL;
+    return zfdopen(fd);
+}
+/* an open descriptor as zfopen's stream, plain or .gz by its bytes; it owns fd, closed on failure too */
+static FILE *zfdopen(int fd) {
     zrd *z = xcalloc(1, sizeof *z); z->fd = fd;
     cookie_io_functions_t io = { zread_, NULL, NULL, zclose_ };
     FILE *f = fopencookie(z, "r", io);
@@ -5077,12 +5082,18 @@ typedef struct { FILE *f; char *ln; size_t cap;
                  char seq[512]; uint64_t st, en; char *lab; size_t labcap; int eof;
                  size_t labn; uint32_t labid; int set;
                  char pseq[512]; uint64_t pen;   /* the run before */
-                 char *buf; size_t bp, bn, bcap;
+                 char *buf; size_t bp, bn, bcap; uint64_t lines;   /* BED lines read */
                  /* a per-set .kst instead of a BED: its rows decoded in step, as dump walks them */
                  R *r; cur_t c; span sp; const uint8_t *lp, *ip; uint64_t ri, k, nr, kpos, emitted; } brd;
 static void sset(char **d, size_t *cap, const char *s, size_t n) {   /* a string on the heap */
     if (n + 1 > *cap) { *cap = n + 64; *d = xrealloc(*d, *cap); }
     memcpy(*d, s, n); (*d)[n] = 0;
+}
+
+#define KSTPIPE "--db: a .kst input must be a regular file: it is read with random access, not through a pipe or stdin"
+/* A BED input's first line that is a .kst's start: the magic, then a NUL or no newline at all, which no BED has */
+static void kstpipe(const char *ln, size_t n, int nonl) {
+    if (n >= 8 && !memcmp(ln, MAGIC, 8) && (nonl || memchr(ln, 0, n))) die(KSTPIPE);
 }
 
 #define BRDBUF (8u << 20)
@@ -5108,6 +5119,7 @@ static ssize_t brd_line(brd *b, char **lnp) {
         if (!got) {
             if (ferror(b->f)) die("read error on an input BED");
             if (!b->bn) return -1;               /* real end of file */
+            if (!b->lines) kstpipe(b->buf, b->bn, 1);
             die("input does not end with a newline");
         }
         b->bn += got;
@@ -5122,6 +5134,7 @@ static void bnext(brd *b) {
     if (n <= 0) { b->eof = 1; return; }
     b->ln = line;
     if (b->ln[n - 1] == '\n') b->ln[--n] = 0;
+    if (!b->lines++) kstpipe(b->ln, (size_t)n, 0);
     if (memchr(b->ln, 0, (size_t)n)) die("a NUL byte inside a row");
     char *t1 = memchr(b->ln, '\t', (size_t)n);            if (!t1) die("bad line");
     char *t2 = memchr(t1 + 1, '\t', (size_t)(n - (t1 + 1 - b->ln))); if (!t2) die("bad line");
@@ -5144,12 +5157,14 @@ static void bnext(brd *b) {
     if (DBFAST && !same) b->labid = si_get(&SI[b->set], b->lab, 0);   /* the same label spans several rows */
 }
 
-/* A per-set .kst in place of its BED: a plain track, as --ref takes one, opened as no companion */
-static int iskst(const char *path) {
-    FILE *k = fopen(path, "rb"); char m[8];
-    int kst = k && fread(m, 1, 8, k) == 8 && !memcmp(m, MAGIC, 8);
-    if (k) fclose(k);
-    return kst;
+/* A per-set .kst in place of its BED: a plain track, as --ref takes one, opened as no companion.
+   Known by its magic, read with pread from the descriptor the BED reader would take, so nothing is consumed;
+   only a regular file (a symlink followed) is probed, since a .kst is read with random access: a FIFO, a
+   /dev/fd pipe or a device goes to the BED reader unprobed, opened once, and a .kst through one is refused
+   by kstpipe. 1: fd is a .kst; 0: a BED */
+static int iskst(int fd) {
+    struct stat st; char m[8];
+    return !fstat(fd, &st) && S_ISREG(st.st_mode) && pread(fd, m, 8, 0) == 8 && !memcmp(m, MAGIC, 8);
 }
 static void kopen(brd *b, const char *path) {
     uint64_t hh[16]; uint8_t hb[128];
@@ -5219,9 +5234,11 @@ static void encode_db(int nfiles, char **files) {
     brd *b = xcalloc((size_t)nfiles, sizeof *b);
     for (int i = 0; i < nfiles; i++) {
         b[i].set = i;
-        if (strcmp(files[i], "-") && iskst(files[i])) kopen(&b[i], files[i]);   /* a per-set .kst, by its magic */
+        /* each input opened once: a regular file probed for a per-set .kst's magic, anything else a BED */
+        int fd = strcmp(files[i], "-") ? open(files[i], O_RDONLY) : dup(0);
+        if (fd >= 0 && strcmp(files[i], "-") && iskst(fd)) { close(fd); kopen(&b[i], files[i]); }
         else {
-            b[i].f = zfopen(strcmp(files[i], "-") ? files[i] : NULL);
+            b[i].f = fd < 0 ? NULL : zfdopen(fd);
             if (!b[i].f) { fprintf(stderr, "cannot open %s: %s\n", files[i], strerror(errno));
                            die("cannot open an input BED"); }
         }

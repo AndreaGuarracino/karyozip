@@ -204,12 +204,26 @@ enum Src { Bed(crate::Lines), Kst(Box<(crate::reader::Reader, crate::reader::Row
 
 /// One input, streamed a row at a time
 struct Brd { src: Src, seq: Vec<u8>, st: u64, en: u64, lab: Vec<u8>, labid: u32,
-             pseq: Vec<u8>, pen: u64, had: bool, eof: bool }
+             pseq: Vec<u8>, pen: u64, had: bool, eof: bool,
+             /// BED lines read
+             lines: u64 }
 
-/// A .kst by its magic; a file that cannot be read is left to the BED path's refusal
-fn is_kst(path: &str) -> bool {
+/// A .kst by its magic, read at offset 0 from the file the BED reader would take, so nothing is consumed. Only a
+/// regular file (a symlink followed) is probed, since a .kst is read with random access: a FIFO, a /dev/fd pipe or a
+/// device goes to the BED reader unprobed, opened once, and a .kst through one is refused by `kst_pipe`, as the C's iskst
+fn is_kst(f: &std::fs::File) -> bool {
+    use std::os::unix::fs::FileExt;
     let mut m = [0u8; 8];
-    std::fs::File::open(path).and_then(|mut f| std::io::Read::read_exact(&mut f, &mut m)).is_ok() && &m == crate::writer::MAGIC
+    f.metadata().is_ok_and(|md| md.is_file()) && f.read_exact_at(&mut m, 0).is_ok() && &m == crate::writer::MAGIC
+}
+
+const KSTPIPE: &str = "--db: a .kst input must be a regular file: it is read with random access, not through a pipe or stdin";
+/// A BED input's first line that is a .kst's start: the magic, then a NUL or no newline at all, which no BED has
+fn kst_pipe(line: &[u8], nl: bool) -> KzResult<()> {
+    if line.starts_with(crate::writer::MAGIC) && (!nl || crate::ffi::find(0, line).is_some()) {
+        return Err(Error::input(KSTPIPE));
+    }
+    Ok(())
 }
 
 /// A set's .kst in place of its BED: a plain track, as --ref takes one, opened as no companion, as the C's kopen
@@ -229,19 +243,23 @@ fn kst_open(path: &str) -> KzResult<Src> {
 
 impl Brd {
     fn open(path: &str) -> KzResult<Brd> {
-        let src = if path != "-" && is_kst(path) { kst_open(path)? } else {
-            let lines = if path == "-" { crate::Lines::new(std::io::stdin()) } else {
-                let f = std::fs::File::open(path).map_err(|e| {   // as the C: the path and why, then the refusal
-                    eprintln!("cannot open {path}: {}", crate::ffi::strerror(&e));
-                    Error::io("cannot open an input BED")
-                })?;
-                crate::Lines::new(f)
-            };
-            let mut lines = lines; lines.err = "read error on an input BED";
-            Src::Bed(lines)
+        // each input opened once: a regular file probed for a per-set .kst's magic, anything else a BED
+        let f = if path == "-" { None } else {
+            Some(std::fs::File::open(path).map_err(|e| {   // as the C: the path and why, then the refusal
+                eprintln!("cannot open {path}: {}", crate::ffi::strerror(&e));
+                Error::io("cannot open an input BED")
+            })?)
+        };
+        let src = match f {
+            Some(f) if is_kst(&f) => { drop(f); kst_open(path)? }
+            f => {
+                let mut lines = match f { Some(f) => crate::Lines::new(f), None => crate::Lines::new(std::io::stdin()) };
+                lines.err = "read error on an input BED";
+                Src::Bed(lines)
+            }
         };
         let mut b = Brd { src, seq: Vec::new(), st: 0, en: 0, lab: Vec::new(), labid: u32::MAX,
-                          pseq: Vec::new(), pen: 0, had: false, eof: false };
+                          pseq: Vec::new(), pen: 0, had: false, eof: false, lines: 0 };
         b.next()?;
         if b.eof { return Err(Error::input("an input BED is empty")); }
         Ok(b)
@@ -276,6 +294,8 @@ impl Brd {
             }
         };
         let Some((line, nl)) = lines.try_next_line_nl()? else { self.eof = true; return Ok(()); };
+        self.lines += 1;
+        if self.lines == 1 { kst_pipe(line, nl)?; }
         if line.is_empty() { return bad("bad line"); }   // as the C: a blank row is not skipped
         if !nl { return bad("input does not end with a newline"); }
         if crate::ffi::find(0, line).is_some() { return bad("a NUL byte inside a row"); }

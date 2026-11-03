@@ -9,7 +9,7 @@
 #   reader-flags smooth db aln refusals awkward gzip cli tail zpaq damaged forged edge bodytmp forged2 varint finalize
 set -u
 . "$(dirname "$0")/lib.sh"
-need python3 zstd gzip awk realpath mktemp cmp diff dd stat cut sort uniq sed tr head tail
+need python3 zstd gzip awk realpath mktemp cmp diff dd stat cut sort uniq sed tr head tail mkfifo timeout
 SCASE=${CASE:-}; CASE=   # sections, not lines, are filtered here
 sec() { [ -z "$SCASE" ] || [[ $1 =~ $SCASE ]]; }
 C=${1:-$(dirname "$0")/../c/build/karyozip}
@@ -177,6 +177,56 @@ EXPECT=fail both "--db from a dropped-names .kst" compress --db "$D/db.features.
 head -c 100 "$W/ks.gene.kst" > "$W/ks.cut.kst"
 EXPECT=fail both "--db from a .kst cut in its header" compress --db "$D/db.features.tsv" ${KS/$W\/ks.gene.kst/$W\/ks.cut.kst}
 EXPECT=ok; tally "--db .kst inputs"
+# inputs through a FIFO and <(...): unprobed, read once; the C's and the Rust's bytes, words and exit codes, bounded,
+# and the regular files' bytes (review 7133774, finding 2)
+printf 'featureID\ts1\ts2\n1\tx\ty\n2\tw\tz\n' > "$W/pg.tsv"; printf 'featureID\ts1\n1\tx\n2\ty\n' > "$W/po.tsv"
+printf 'c1\t0\t10\tx\nc1\t10\t20\tw\n' > "$W/p1.bed"; printf 'c1\t0\t10\ty\nc1\t10\t20\tz\n' > "$W/p2.bed"
+printf 'c1\t0\t10\tx\nc1\t10\t20\ty\n' > "$W/po.bed"; printf 'c\t0\t1\tx\n' > "$W/pr1.bed"; printf 'c\t0\t1\ty\n' > "$W/pr2.bed"
+gzip -c "$W/p1.bed" > "$W/p1.bed.gz"; "$C" compress < "$W/p1.bed" > "$W/p1.kst" 2>/dev/null
+dbrun() {  # BIN FORM OUT TSV INPUT...: BIN compress --db TSV, every INPUT through FORM (file, fifo, psub), bounded; its exit code
+  local bin=$1 form=$2 out=$3 tsv=$4 k=0 x ins="" pids="" rc=0; shift 4
+  for x in "$@"; do
+    k=$((k+1))
+    case $form in
+      file) ins="$ins -i $(printf %q "$x")" ;;
+      fifo) rm -f "$W/pf.$k"; mkfifo "$W/pf.$k"
+            timeout "$(tmo 30)" sh -c 'exec cat "$1" > "$2"' _ "$x" "$W/pf.$k" >/dev/null 2>&1 & pids="$pids $!"
+            ins="$ins -i $(printf %q "$W/pf.$k")" ;;
+      psub) ins="$ins -i <(cat $(printf %q "$x"))" ;;
+    esac
+  done
+  eval "timeout $(tmo 30) $(printf %q "$bin") compress --db $(printf %q "$tsv") $ins" > "$out" 2>"$out.err" || rc=$?
+  for x in $pids; do wait "$x" 2>/dev/null || :; done
+  return $rc
+}
+dbboth() {  # DESC WANT_RC TSV INPUT...: through a regular file, a FIFO and <(...), the C and the Rust alike; rc 0: the files' bytes
+  local l=$1 want=$2 tsv=$3 form a b; shift 3
+  dbrun "$C" file "$W/pw.c" "$tsv" "$@"
+  for form in file fifo psub; do
+    dbrun "$C" $form "$W/pc" "$tsv" "$@"; a=$?
+    dbrun "$R" $form "$W/pr" "$tsv" "$@"; b=$?
+    if [ $a = "$want" ] && [ $b = "$want" ] && cmp -s "$W/pc" "$W/pr" && cmp -s "$W/pc.err" "$W/pr.err" && { [ "$want" != 0 ] || cmp -s "$W/pc" "$W/pw.c"; }; then ok=$((ok+1)); tpass
+    else bad=$((bad+1)); tfail "differs: $l through a $form (rc $a/$b)"; diff "$W/pc.err" "$W/pr.err" | head -4; fi
+  done
+}
+dbboth "-d, one BED" 0 "$W/po.tsv" "$W/po.bed"
+dbboth "-d, two BEDs" 0 "$W/pg.tsv" "$W/p1.bed" "$W/p2.bed"
+dbboth "-d, a one-row BED" 0 "$W/po.tsv" "$W/pr1.bed"
+dbboth "-d, two one-row BEDs" 0 "$W/pg.tsv" "$W/pr1.bed" "$W/pr2.bed"
+dbboth "-d, a gzipped BED" 0 "$W/pg.tsv" "$W/p1.bed.gz" "$W/p2.bed"
+dbrun "$C" file "$W/pk.c" "$W/pg.tsv" "$W/p1.kst" "$W/p2.bed"; dbrun "$R" file "$W/pk.r" "$W/pg.tsv" "$W/p1.kst" "$W/p2.bed"
+dbrun "$C" file "$W/pw.c" "$W/pg.tsv" "$W/p1.bed" "$W/p2.bed"
+if cmp -s "$W/pk.c" "$W/pw.c" && cmp -s "$W/pk.r" "$W/pw.c" && cmp -s "$W/pk.c.err" "$W/pk.r.err"; then ok=$((ok+1)); tpass
+else bad=$((bad+1)); tfail "differs: -d, a .kst input as a regular file"; fi
+for form in fifo psub; do   # a .kst through a pipe: the same refusal, in both
+  dbrun "$C" $form "$W/pc" "$W/pg.tsv" "$W/p1.kst" "$W/p2.bed"; a=$?
+  dbrun "$R" $form "$W/pr" "$W/pg.tsv" "$W/p1.kst" "$W/p2.bed"; b=$?
+  if [ $a = 1 ] && [ $b = 1 ] && cmp -s "$W/pc.err" "$W/pr.err" && grep -q 'must be a regular file' "$W/pc.err"; then ok=$((ok+1)); tpass
+  else bad=$((bad+1)); tfail "differs: -d, a .kst through a $form (rc $a/$b)"; diff "$W/pc.err" "$W/pr.err" | head -4; fi
+done
+EXPECT=fail IN="$W/p1.kst" both "-d, a .kst on stdin" compress --db "$W/po.tsv" -i -
+IN="$W/po.bed" both "-d, a BED on stdin" compress --db "$W/po.tsv" -i -
+tally "--db inputs through pipes"
 # a features table with its header alone (finding 4)
 printf 'featureID\tsetA\n' > "$W/ho.tsv"; printf 'chr1\t0\t5\tnovel\n' > "$W/hn.bed"; printf 'chr1\t0\t5\tx\n' > "$W/hx.bed"
 both "--db, a header-only features table, a novel row" compress --db "$W/ho.tsv" -i "$W/hn.bed"

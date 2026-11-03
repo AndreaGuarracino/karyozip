@@ -363,7 +363,7 @@ cli compress --names drop --aln p --ref r; cli decompress --db f; cli compress -
 cli decompress -i a -i b; cli compress -i nosuch; cli index -i f -o x; cli query -i f -r s:2-1
 cli query -i f -r s --out-dir d; cli query -i f -r s --raw; cli decompress -i f --halo 2; cli region -i f -r s
 cli --tmp-dir /nonexistent compress; cli --tmp-dir /nonexistent --db $D/db.features.tsv compress -i $D/db.gene.bed
-cli --block=4 compress; cli -b4 compress; cli -t4 compress; cli --effort=low compress; cli -V; cli foo --raw
+cli --block=4 compress; cli -b4 compress; stress "cli: -t4 compress (4 threads)" && cli -t4 compress; cli --effort=low compress; cli -V; cli foo --raw
 cli decompress -i f --max-gap -1; cli query -i f -r -x; cli compress -- -x; cli -o -i compress
 cli decompress --db f --out-dir d -o x -i f; cli decompress --db f --out-dir "" -i f; cli decompress -i f --hier h --smooth --out-dir ""
 ln -s nowhere/x "$W/dang"; cli compress -o dang; cli compress -o nosuchdir/x; cli aln-pack -a a --ref b -o nosuchdir/c

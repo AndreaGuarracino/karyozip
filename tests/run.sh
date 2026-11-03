@@ -1192,7 +1192,7 @@ else kill -KILL $pid 2>/dev/null || :; wait $pid 2>/dev/null || :; no "a failed 
 # holds the main thread just before the window, then lets it go on into the commit. --smooth --out-dir over 100
 # contigs, so the C too keeps a team of workers. Signalled once both BEDs are staged and closed, before the window:
 # the handler exits and the commit must not start, all old (all new only if the window opened first). Signalled
-# inside the window: the handler defers, all new, exit 1.
+# inside the window: the handler defers, all new, exit 1. Each a stress case: -t 4, whatever the budget
 mkdir -p "$W/rc"; printf 'featureID\tgene\trepeat\n1\tCDS\tLINE\n2\tCDS\tSINE\n3\tintergenic\tLINE\n4\tintergenic\tSINE\n' > "$W/rc/f.tsv"
 printf 'feature_set\tchild\tparent\ngene\tCDS\tcategorized\ngene\tintergenic\tcategorized\nrepeat\tLINE\tcategorized\nrepeat\tSINE\tcategorized\n' > "$W/rc/h.tsv"
 awk -v d="$W/rc" 'BEGIN { for (c = 0; c < 100; c++) for (j = 0; j < 4; j++) {
@@ -1204,8 +1204,10 @@ rcrace() { KZ_TEST_SWAP_PAUSE_MS=$PAUSE KZ_TEST_SIG_PAUSE_MS=$((2 * PAUSE)) rcgo
 rcgen() { if [ "$(cat "$1/gene.bed" "$1/repeat.bed" 2>/dev/null | tr '\n' ' ')" = "OLD_gene OLD_repeat " ]; then echo old
   elif cmp -s "$1/gene.bed" "$W/rc/new/gene.bed" && cmp -s "$1/repeat.bed" "$W/rc/new/repeat.bed"; then echo new; else echo mixed; fi; }
 staged='[ $(ls | grep -c "\.bed\.tmp\.") = 2 ] && ! ls -l /proc/$pid/fd 2>/dev/null | grep -q "\.bed\.tmp\."'
-( rcgo "$W/rc/new" ) || :
+# the new BEDs, at the suite's -t (threads never change the bytes): the stale-backup case below reads them too
+$KT --db "$W/rc/f.tsv" decompress -i "$W/rc/r.kt" --hier "$W/rc/h.tsv" --smooth --out-dir "$W/rc/new" >/dev/null 2>&1 || :
 for at in before inside; do
+  stress "SIGTERM on a worker, its handler held, $at the commit window" || continue
   swdir "$W/sw"; ( rcrace "$W/sw" ) & pid=$!; [ $at = before ] && cond=$staged || cond=$nold; tid=
   swwait "$W/sw" "$cond" $pid && tid=$(ls /proc/$pid/task 2>/dev/null | grep -vx "$pid" | head -n1) || :
   if [ -n "$tid" ]; then
@@ -1221,10 +1223,11 @@ done
 # the window, once the new file is in place: deferred, exit 1, the new file. --smooth --set over the 100 contigs
 orgo() { exec $KZ -t 4 --db "$W/rc/f.tsv" decompress -i "$W/rc/r.kt" --hier "$W/rc/h.tsv" --smooth --set gene -o "$1" >/dev/null 2>"$W/or.err"; }
 orrace() { KZ_TEST_SWAP_PAUSE_MS=$PAUSE KZ_TEST_SIG_PAUSE_MS=$((2 * PAUSE)) orgo "$1"; }
-( orgo "$W/rc/new.o" ) || :
+[ "${TEST_LIGHT:-0}" = 1 ] || ( orgo "$W/rc/new.o" ) || :   # the new file, for the stress cases only
 ostaged='compgen -G "out.bed.tmp.*" >/dev/null && ! ls -l /proc/$pid/fd 2>/dev/null | grep -q "out\.bed\.tmp\."'
 onew='cmp -s out.bed "$W/rc/new.o"'
 for at in before inside; do
+  stress "SIGTERM on a worker, its handler held, $at -o's commit window" || continue
   rm -rf "$W/or"; mkdir -p "$W/or"; echo OLD > "$W/or/out.bed"; ( orrace "$W/or/out.bed" ) & pid=$!; [ $at = before ] && cond=$ostaged || cond=$onew; tid=
   swwait "$W/or" "$cond" $pid && tid=$(ls /proc/$pid/task 2>/dev/null | grep -vx "$pid" | head -n1) || :
   if [ -n "$tid" ]; then

@@ -4,7 +4,7 @@
 # Every compared form counts once; failures are prefixed "FAIL: "; the last lines are
 # "diff.sh: N passed, M failed" and DIFF_PASS or DIFF_FAIL.
 # CASE=REGEX runs only the sections whose name matches: versions compress decompress cross region index
-#   reader-flags smooth db aln refusals awkward gzip cli tail zpaq damaged forged edge bodytmp forged2 varint
+#   reader-flags smooth db aln refusals awkward gzip cli tail zpaq damaged forged edge bodytmp forged2 varint finalize
 set -u
 . "$(dirname "$0")/lib.sh"
 need python3 zstd gzip awk realpath mktemp cmp diff dd stat cut sort uniq sed tr head tail
@@ -518,6 +518,32 @@ EXPECT=ok
 both "a ten-byte varint of 0, not the shortest but it fits" decompress -i "$W/v10.0x00.kst"
 if cmp -s "$W/c.out" "$D/s.bed"; then tpass; else tfail "a ten-byte varint of 0: rows WRONG"; fi
 tally "ten-byte varints"
+
+# a staged output whose fsync or close fails (tests/failclose.c, LD_PRELOAD): the same refusal, every old output kept
+if sec finalize; then
+FC=$W/failclose.so
+if "${CC:-cc}" -shared -fPIC -O2 -o "$FC" "$src/failclose.c" -ldl 2>"$W/fc.err"; then
+  fin=""; for f in acrocentric chromosome gene region repeat subtelomeric; do fin="$fin -i $D/db.$f.bed"; done
+  "$C" compress --db "$D/db.features.tsv" $fin > "$W/fz.kt" 2>/dev/null; "$C" compress < "$D/s.bed" > "$W/fz.p.kt" 2>/dev/null
+  { printf 'feature_set\tchild\tparent\n'; for s in $(head -1 "$D/db.features.tsv" | cut -f2-); do cut -f4 "$D/db.$s.bed" | sort -u | grep -vx novel | sed "s/^/$s\t/; s/\$/\tcategorized/"; done; } > "$W/fz.hier"
+  mkdir -p "$W/fz/od" "$W/fz/sm"; for s in gene repeat; do echo "OLD_$s" > "$W/fz/od/$s.bed"; echo "OLD_$s" > "$W/fz/sm/$s.bed"; done
+  echo old > "$W/fz/k"; echo old > "$W/fz/pk"; echo oldidx > "$W/fz.p.kt.kzi"
+  EXPECT=fail
+  for op in sync close; do
+    KZ_FAIL_FD_OP=$op KZ_FAIL_FD_MATCH=.bed.tmp. LD_PRELOAD=$FC both "failed $op, decompress --db --out-dir" \
+      decompress --db "$D/db.features.tsv" --set gene,repeat --out-dir "$W/fz/od" -i "$W/fz.kt"
+    KZ_FAIL_FD_OP=$op KZ_FAIL_FD_MATCH=.bed.tmp. LD_PRELOAD=$FC both "failed $op, --smooth --out-dir" \
+      --db "$D/db.features.tsv" --set gene,repeat decompress -i "$W/fz.kt" --hier "$W/fz.hier" --smooth --out-dir "$W/fz/sm"
+    KZ_FAIL_FD_OP=$op KZ_FAIL_FD_MATCH=.kzi. LD_PRELOAD=$FC both "failed $op, index" index -i "$W/fz.p.kt"
+    KZ_FAIL_FD_OP=$op KZ_FAIL_FD_MATCH=fz/k.tmp. LD_PRELOAD=$FC both "failed $op, -o" compress -i "$D/s.bed" -o "$W/fz/k"
+    KZ_FAIL_FD_OP=$op KZ_FAIL_FD_MATCH=fz/pk.tmp. LD_PRELOAD=$FC both "failed $op, aln-pack" aln-pack -a "$D/p.paf" --ref "$D/ref.bed" -o "$W/fz/pk"
+  done
+  EXPECT=ok
+  grep -q '^karyozip: write failed$' "$W/r.err" && [ "$(cat "$W"/fz/od/*.bed "$W"/fz/sm/*.bed "$W/fz/k" "$W/fz/pk" "$W/fz.p.kt.kzi" | tr '\n' ' ')" = "OLD_gene OLD_repeat OLD_gene OLD_repeat old old oldidx " ] \
+    && [ "$(ls -A "$W/fz" "$W/fz/od" "$W/fz/sm" | tr '\n' ' ')" = "$W/fz: k od pk sm  $W/fz/od: gene.bed repeat.bed  $W/fz/sm: gene.bed repeat.bed " ] \
+    && tpass || tfail "failed sync or close: an old output DAMAGED or a temporary left: $(ls -A "$W/fz" "$W/fz/od" "$W/fz/sm" | tr '\n' ' ')"
+else tfail "tests/failclose.c: does not build with ${CC:-cc}: $(head -c 200 "$W/fc.err")"; fi
+tally "sync and close failures"
 fi
 
 summary diff.sh

@@ -116,7 +116,7 @@ Read names are stored in the file by default.
 | `-n`, `--names ...` | compress, readers | see Read names |
 | `-d`, `--db features.tsv` | compress, readers | see Compression modes |
 | `--set A,B` | decompress, query | the sets of a `-d` track to print, default all; with `--smooth`, the one set smoothed |
-| `--out-dir DIR` | decompress | one BED per set under `-d` |
+| `--out-dir DIR` | decompress | one BED per set under `-d`; the BEDs are replaced all or nothing on a SIGINT, SIGTERM, SIGHUP or failed rename (every new, or every old or absent as before), though an uncatchable kill (SIGKILL, OOM, power loss) mid-commit may leave the old ones as SET.bed.old.XXXXXX beside them |
 | `-a`, `--aln P.paf`, `--ref R` | compress, readers, aln-pack | see Compression modes |
 | `-t`, `--threads N` | all | default the cores, up to 8 |
 | `--tmp-dir DIR` | all | where temporary files go, default /tmp |

@@ -149,16 +149,16 @@ $KT --db "$D/db.features.tsv" query -i "$W/f.kt" -r "$sq":0-100000 2>/dev/null >
 [ "$(awk -F'\t' '{print NF}' "$W/inf.got" | sort -u)" = 9 ] && ok "decompress --db: 6 label columns" || no "decompress --db: wrong column count"
 awk -F'\t' 'NR>1 && $1==p && $2==e && $4==l {e=$3; next} NR>1 {print p"\t"s"\t"e"\t"l} {p=$1; s=$2; e=$3; l=$4} END{print p"\t"s"\t"e"\t"l}' <(cut -f1-4 "$W/inf.got") | cmp -s - "$W/inf.want" && ok "decompress --db: acrocentric column, merged, same as plain" || no "decompress --db: DIFFERS"
 $KT --db "$D/db.features.tsv" --aln "$D/db.self.paf" --ref "$D/db.rall.bed" query -i "$W/da.kt" -r "$sq":0-100000 2>/dev/null | cmp -s - "$W/inf.got" && ok "decompress --db --aln: same as --db" || no "decompress --db --aln: DIFFERS"
-$KT --aln "$D/p.paf" --ref "$D/ref.bed" query -i "$W/d.kt" -r q1 2>/dev/null | cmp -s <($KT query -i "$W/p.kt" -r q1 2>/dev/null) && ok "decompress --aln: same as plain" || no "decompress --aln: DIFFERS"
+seqcmp $KT --aln "$D/p.paf" --ref "$D/ref.bed" query -i "$W/d.kt" -r q1 -- $KT query -i "$W/p.kt" -r q1 && ok "decompress --aln: same as plain" || no "decompress --aln: DIFFERS"
 # --set: one set equals its own track
 n=0; for f in $sets; do $KT --db "$D/db.features.tsv" --set $f decompress -i "$W/f.kt" 2>/dev/null | cmp -s - "$D/db.$f.bed" && n=$((n+1)); done
 [ "$n" = 6 ] && ok "decompress --set: 6/6 equal to the set's track" || no "decompress --set: only $n/6"
 $KT --db "$D/db.features.tsv" --aln "$D/db.self.paf" --ref "$D/db.rall.bed" --set gene decompress -i "$W/da.kt" 2>/dev/null | cmp -s - "$D/db.gene.bed" && ok "decompress --set on db+aln: same" || no "decompress --set on db+aln: DIFFERS"
-n=0; for r in "-r $sq" "-r $sq:100-101" "-r $sq:0-100000"; do $KT --db "$D/db.features.tsv" --set acrocentric query $r -i "$W/f.kt" 2>/dev/null | cmp -s - <($KT query $r -i "$W/pa.kt" 2>/dev/null) && [ -n "$($KT query $r -i "$W/pa.kt" 2>/dev/null)" ] && n=$((n+1)); done
+n=0; for r in "-r $sq" "-r $sq:100-101" "-r $sq:0-100000"; do seqcmp $KT --db "$D/db.features.tsv" --set acrocentric query $r -i "$W/f.kt" -- $KT query $r -i "$W/pa.kt" && [ -n "$($KT query $r -i "$W/pa.kt" 2>/dev/null)" ] && n=$((n+1)); done
 [ "$n" = 3 ] && ok "query --set: 3/3 forms equal the set's track" || no "query --set: only $n/3"
 $KT --db "$D/db.features.tsv" --set gene,acrocentric decompress -i "$W/f.kt" 2>/dev/null > "$W/ga.bed"
 [ "$(awk -F'\t' '{print NF}' "$W/ga.bed" | sort -u)" = 5 ] && awk -F'\t' 'NR>1 && $1==p && $2==e && $5==l {e=$3; next} NR>1 {print p"\t"s"\t"e"\t"l} {p=$1; s=$2; e=$3; l=$5} END{print p"\t"s"\t"e"\t"l}' "$W/ga.bed" | cmp -s - "$D/db.acrocentric.bed" && ok "decompress --set gene,acrocentric: two columns, merged jointly" || no "decompress --set gene,acrocentric: WRONG"
-$KT --db "$D/db.features.tsv" decompress -i "$W/f.kt" 2>/dev/null | cmp -s - <($KT --db "$D/db.features.tsv" --set all decompress -i "$W/f.kt" 2>/dev/null) && ok "decompress --db on stdout: all sets, same as --set all" || no "decompress --db on stdout: DIFFERS from --set all"
+seqcmp $KT --db "$D/db.features.tsv" decompress -i "$W/f.kt" -- $KT --db "$D/db.features.tsv" --set all decompress -i "$W/f.kt" && ok "decompress --db on stdout: all sets, same as --set all" || no "decompress --db on stdout: DIFFERS from --set all"
 # --hier: outside tuples get 2^26 + rank
 { printf 'feature_set\tchild\tparent\n'; for f in $sets; do for l in $(cut -f4 "$D/db.$f.bed" | sort -u | grep -v '^novel$'); do printf '%s\t%s\tcategorized\n' "$f" "$l"; done; done; printf 'repeat\tLINE\trepeat\nrepeat\trepeat\tcategorized\n'; } | awk -F'\t' '!s[$1 FS $2]++' > "$W/hv.tsv"
 mkdir -p "$W/hv"; for f in $sets; do cp "$D/db.$f.bed" "$W/hv/$f.bed"; done
@@ -183,12 +183,12 @@ sed '$d' "$W/hv.tsv" > "$W/hv2.tsv"
 must_fail "a vocabulary track with another hierarchy" $KT decompress --db "$D/db.features.tsv" --hier "$W/hv2.tsv" --out-dir "$W/hvo" -i "$W/hv.kt"
 must_fail "--hier without --db" $KT --hier "$W/hv.tsv" decompress -i "$W/hv.kt"
 $KT compress < "$W/hv/repeat.bed" > "$W/hvp.kt" 2>/dev/null
-$KT --db "$D/db.features.tsv" decompress -i "$W/hv.kt" --hier "$W/hv.tsv" --smooth --set repeat 2>/dev/null | cmp -s - <($KT decompress -i "$W/hvp.kt" --hier "$W/hv.tsv" --smooth --set repeat 2>/dev/null) && ok "--hier: decompress --db same as the plain track" || no "--hier: decompress --db DIFFERS"
+seqcmp $KT --db "$D/db.features.tsv" decompress -i "$W/hv.kt" --hier "$W/hv.tsv" --smooth --set repeat -- $KT decompress -i "$W/hvp.kt" --hier "$W/hv.tsv" --smooth --set repeat && ok "--hier: decompress --db same as the plain track" || no "--hier: decompress --db DIFFERS"
 $KT --db "$D/db.features.tsv" --hier "$W/hv.tsv" --set repeat decompress -i "$W/hv.kt" 2>/dev/null | cmp -s - "$W/hv/repeat.bed" && ok "--hier: --set repeat gives the input" || no "--hier: --set repeat DIFFERS"
 mkdir -p "$W/so"; $KT --db "$D/db.features.tsv" --set repeat,gene --out-dir "$W/so/new" decompress -i "$W/f.kt" 2>/dev/null; [ "$(ls "$W/so/new" | tr '\n' ' ')" = "gene.bed repeat.bed " ] && cmp -s "$W/so/new/gene.bed" "$D/db.gene.bed" && ok "decompress --set --out: only the picked sets, directory created" || no "decompress --set --out: WRONG"
 # index needs no --aln or --db companions
 cp "$W/d.kt" "$W/di.kt"; cp "$W/f.kt" "$W/fi.kt"
-$KT index -i "$W/di.kt" >/dev/null 2>&1 && $KT index -i "$W/fi.kt" >/dev/null 2>&1 && $KT --aln "$D/p.paf" --ref "$D/ref.bed" query -i "$W/di.kt" -r q1 2>/dev/null | cmp -s - <($KT --aln "$D/p.paf" --ref "$D/ref.bed" query -i "$W/d.kt" -r q1 2>/dev/null) && ok "index on --aln and --db tracks: built, same answers" || no "index on --aln and --db tracks: FAILED"
+$KT index -i "$W/di.kt" >/dev/null 2>&1 && $KT index -i "$W/fi.kt" >/dev/null 2>&1 && seqcmp $KT --aln "$D/p.paf" --ref "$D/ref.bed" query -i "$W/di.kt" -r q1 -- $KT --aln "$D/p.paf" --ref "$D/ref.bed" query -i "$W/d.kt" -r q1 && ok "index on --aln and --db tracks: built, same answers" || no "index on --aln and --db tracks: FAILED"
 must_fail "--set without --db" $KT --set gene decompress -i "$W/pa.kt"
 must_fail "--set not in features.tsv" $KT --db "$D/db.features.tsv" --set gene,nosuch decompress -i "$W/f.kt"
 must_fail "--set names a set twice" $KT --db "$D/db.features.tsv" --set gene,gene decompress -i "$W/f.kt"
@@ -617,8 +617,8 @@ cat "$D/s.bed" | $KT compress > "$W/pipe.kt" 2>/dev/null
 (while IFS= read -r l; do printf '%s\n' "$l"; sleep 0.02; done < "$D/s.bed") | $KT compress > "$W/slow.kt" 2>/dev/null
 cmp -s "$W/p.kt" "$W/pipe.kt" && cmp -s "$W/p.kt" "$W/slow.kt" && ok "compress from a pipe and a slow producer: byte-identical" || no "compress from a pipe: WRONG"
 awk 'BEGIN{srand(3);for(i=0;i<20000;i++){p=0;for(j=0;j<5;j++){c=p+int(rand()*300)+1;printf "read%d\t%d\t%d\tL%d\n",i,p,c,int(rand()*6);p=c}}}' > "$W/pbig.bed"
-$KT decompress --raw -i "$W/f.kt" 2>/dev/null | $KT compress --db "$D/db.features.tsv" -i - > "$W/pipedb.kt" 2>/dev/null
 $KT decompress --raw -i "$W/f.kt" 2>/dev/null > "$W/merged.bed"; $KT compress --db "$D/db.features.tsv" -i "$W/merged.bed" > "$W/filedb.kt" 2>/dev/null
+cat "$W/merged.bed" | $KT compress --db "$D/db.features.tsv" -i - > "$W/pipedb.kt" 2>/dev/null   # one karyozip at a time
 cmp -s "$W/pipedb.kt" "$W/filedb.kt" && ok "db compress from a pipe: byte-identical" || no "db compress from a pipe: WRONG"
 
 # round 19 findings, one case each
@@ -937,7 +937,7 @@ $KT compress --read-blocks 3 --aln "$D/p.paf" --ref "$D/ref.bed" -i "$D/s.bed" -
 $KT decompress --aln "$D/p.paf" --ref "$D/ref.bed" -i "$W/vba.kt" 2>/dev/null | cmp -s - "$D/s.bed" && ok "--read-blocks 3 --aln: byte-identical" || no "--read-blocks 3 --aln: WRONG"
 { printf 'feature_set\tchild\tparent\n'; for l in chr1 chr2 chr3 novel; do printf 'fs\t%s\tcategorized\n' $l; done; } > "$W/vbh.tsv"
 $KT compress -i "$W/vb.bed" -o "$W/vb1.kt" 2>/dev/null; $KT compress --read-blocks 7 -i "$W/vb.bed" -o "$W/vb.kt" 2>/dev/null
-for t in 1 4; do [ $t = 1 ] || stress "--read-blocks 7 --smooth -t $t: same as one block" || continue; $KT decompress -t $t -i "$W/vb.kt" --smooth --hier "$W/vbh.tsv" 2>/dev/null | cmp -s - <($KT decompress -i "$W/vb1.kt" --smooth --hier "$W/vbh.tsv" 2>/dev/null) && ok "--read-blocks 7 --smooth -t $t: same as one block" || no "--read-blocks 7 --smooth -t $t: DIFFERS"; done
+for t in 1 4; do [ $t = 1 ] || stress "--read-blocks 7 --smooth -t $t: same as one block" || continue; seqcmp $KT decompress -t $t -i "$W/vb.kt" --smooth --hier "$W/vbh.tsv" -- $KT decompress -i "$W/vb1.kt" --smooth --hier "$W/vbh.tsv" && ok "--read-blocks 7 --smooth -t $t: same as one block" || no "--read-blocks 7 --smooth -t $t: DIFFERS"; done
 
 # decode ahead: same rows, same stop
 if stress "decode ahead at -t 4: same rows as -t 1, same stop, sanitizer clean"; then

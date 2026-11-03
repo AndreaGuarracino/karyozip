@@ -77,3 +77,12 @@ stress() {
   if want_case "$1"; then NSKIP=$((NSKIP + 1)); echo "skipped (TEST_LIGHT): $1"; fi; return 1
 }
 summary() { echo "$1: $NPASS passed, $NFAIL failed, $NSKIP skipped${CASE:+ (CASE=$CASE)}"; }
+# seqcmp CMD1... -- CMD2...: true if the two commands print the same bytes. They run one after the other, each into
+# a file in $W (never at once, as `CMD1 | cmp - <(CMD2)` would run them), their stderr and exit codes ignored
+seqcmp() {
+  local a=()
+  while [ $# -gt 0 ] && [ "$1" != -- ]; do a+=("$1"); shift; done; shift
+  "${a[@]}" > "$W/seqcmp.1" 2>/dev/null || :
+  "$@" > "$W/seqcmp.2" 2>/dev/null || :
+  cmp -s "$W/seqcmp.1" "$W/seqcmp.2"
+}

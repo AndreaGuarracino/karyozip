@@ -202,8 +202,11 @@ struct Brd { lines: crate::Lines, seq: Vec<u8>, st: u64, en: u64, lab: Vec<u8>, 
 impl Brd {
     fn open(path: &str) -> Brd {
         let lines = if path == "-" { crate::Lines::new(std::io::stdin()) } else {
-            if std::fs::metadata(path).is_err() { eprintln!("cannot open {path}"); }
-            crate::Lines::open(path, "cannot open an input BED")
+            let f = std::fs::File::open(path).unwrap_or_else(|e| {   // as the C: the path and why, then the refusal
+                eprintln!("cannot open {path}: {}", crate::ffi::strerror(&e));
+                crate::bail("cannot open an input BED")
+            });
+            crate::Lines::new(f)
         };
         let mut lines = lines; lines.err = "read error on an input BED";
         let mut b = Brd { lines, seq: Vec::new(), st: 0, en: 0, lab: Vec::new(), labid: u32::MAX,

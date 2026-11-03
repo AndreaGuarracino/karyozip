@@ -121,8 +121,11 @@ pub struct Reader {
 #[derive(Clone)]
 struct Dec { b: Vec<Blk>, data0: u64, rows: u64, lencodec: i32, idcodec: i32, ilv: bool, runhead: bool, grp: bool }
 
+/// A decoded block: its two regions back to back, the split, its rows, the run-count prefix sums
+type Decoded = (Vec<u8>, usize, u64, Option<Vec<u32>>);
+
 /// One block's frames, its two regions back to back, the split, its rows, and its run-count prefix sums when counts head the lengths
-fn block_dec(f: &mut std::fs::File, d: &Dec, b: usize) -> (Vec<u8>, usize, u64, Option<Vec<u32>>) {
+fn block_dec(f: &mut std::fs::File, d: &Dec, b: usize) -> Decoded {
     if b >= d.b.len() { crate::bail("corrupt index: a block number is past the end"); }
     let m = d.b[b];
     let mut cb = ffi::raw_buf(crate::ckalloc(m.size as usize));
@@ -156,7 +159,7 @@ fn block_dec(f: &mut std::fs::File, d: &Dec, b: usize) -> (Vec<u8>, usize, u64, 
     (data, split, m.rows, tab)
 }
 
-type Got = Result<(Vec<u8>, usize, u64, Option<Vec<u32>>), String>;
+type Got = Result<Decoded, String>;
 struct PfSt { used: usize, next: usize, stop: bool, got: std::collections::HashMap<usize, Got>, spare: Vec<Vec<u8>> }
 /// Decode ahead, as the C's: threads decode the next blocks on their own file handles; a refusal waits for its block
 struct Pf { st: std::sync::Arc<(std::sync::Mutex<PfSt>, std::sync::Condvar)>, th: Vec<std::thread::JoinHandle<()>> }
@@ -554,7 +557,7 @@ impl Reader {
     }
 
     /// The walk's next block, decoded ahead
-    fn pf_take(&mut self, b: usize) -> Option<(Vec<u8>, usize, u64, Option<Vec<u32>>)> {
+    fn pf_take(&mut self, b: usize) -> Option<Decoded> {
         let pf = self.pf.as_ref()?;
         let (m, cv) = &*pf.st;
         let mut g = m.lock().unwrap();
@@ -603,13 +606,13 @@ fn rmheads(lens: &mut [u8], total: u64, rows: u64, nrd: u64) -> (usize, Vec<u32>
     tab.push(0);
     while i < lens.len() {
         if tab.len() as u64 > nrd { crate::bail("corrupt block: more reads than the header claims"); }
-        let (k, n) = vget(&lens, i); i = n;
+        let (k, n) = vget(lens, i); i = n;
         if k == 0 || k > rows - seen { crate::bail("corrupt block: a run count is out of range"); }
         seen += k; tab.push(seen as u32);
         let s0 = i;   // the read's lengths sit together: one move a read
         for _ in 0..k {
             if i >= lens.len() { crate::bail("corrupt block: a read runs past its lengths"); }
-            i = skip(&lens, i);
+            i = skip(lens, i);
             if i > lens.len() { crate::bail("corrupt block: a length runs past the lengths"); }
         }
         lens.copy_within(s0..i, w); w += i - s0;
@@ -1012,7 +1015,7 @@ impl Reader {
         for &c in &cnt[..cnt.len() - 1] { at += c as u64; }
         let (e0, e1) = (at, (at + cnt[cnt.len() - 1] as u64).min(n));
         let byte0 = (e0 * (32 + w)) >> 3;
-        let ent = if e1 > e0 { get(nb + ns * 8 + byte0, ((e1 - e0) * (32 + w) + 7) / 8 + 8) } else { Vec::new() };
+        let ent = if e1 > e0 { get(nb + ns * 8 + byte0, ((e1 - e0) * (32 + w)).div_ceil(8) + 8) } else { Vec::new() };
         let hits: Vec<u64> = (e0..e1).filter_map(|e| {
             let bit = e * (32 + w) - byte0 * 8;
             let o = ixget(&ent, bit + 32, w);

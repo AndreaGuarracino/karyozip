@@ -170,8 +170,9 @@ impl Writer {
         }
         kst::put(&mut self.ibx, self.currun);
         if self.ordok {
-            let want = self.nidx.to_string();
-            if self.cur == want.as_bytes() {
+            let mut b = [0u8; 20];
+            let n = kst::putu64_at(&mut b, self.nidx);
+            if self.cur == b[..n] {
                 self.nidx += 1;
                 return Ok(());
             }
@@ -309,8 +310,8 @@ impl Writer {
         let level = self.opt.level;
         let mut early = self.early.take();   // joined by the names job
         // The names rank beside the searches when nothing below changes them, as the C's, in their own pool
-        let bg = (!(self.ordok && self.nidx > 0) && !self.opt.drop_names
-                  && !self.names.is_empty() && self.names.len() <= 64 << 20).then(|| {
+        let bg = (!(self.ordok && self.nidx > 0 || self.opt.drop_names
+                  || self.names.is_empty() || self.names.len() > 64 << 20)).then(|| {
             let (mut nm, n, whole, slow, e) = (std::mem::take(&mut self.names), self.nidx, self.opt.whole, self.opt.slow, early.take());
             let t = rayon::current_num_threads();
             std::thread::spawn(move || {
@@ -458,7 +459,7 @@ impl Writer {
                 let o = if grp { grp_pack(lens, ids, ib) } else if ilv { ilv_pack(lens, ids, ib) } else { splice_heads(lens, ib) };
                 (o.unwrap_or_else(|| crate::bail("block compression failed")), lens.len() + ib.len())
             });
-            let mut vs: [Option<&[u8]>; 3] = [Some(&lens), None, None];
+            let mut vs: [Option<&[u8]>; 3] = [Some(lens), None, None];
             if aln_on {
                 for v in 0..2 {
                     let alt = &self.rawalt[v][m.aoff[v]..m.aoff[v] + m.alen[v]];
@@ -497,7 +498,7 @@ impl Writer {
             };
             let ids_job = || if ilv { Vec::new() } else {
                 let kept = if i == 0 { zk1.lock().unwrap().take() } else { None };   // the labels frame zpq_try made
-                kept.or_else(|| comp_frame(&ids, idc, lvl_id, pid)).unwrap_or_else(|| crate::bail("block compression failed"))
+                kept.or_else(|| comp_frame(ids, idc, lvl_id, pid)).unwrap_or_else(|| crate::bail("block compression failed"))
             };
             // Labels beside a lengths frame that takes one thread, as the C's: the rest of the threads, or 2 beside LZMA
             let nt = rayon::current_num_threads();
@@ -784,7 +785,7 @@ pub fn pick(all: &dyn Fn(usize) -> (Vec<u8>, Vec<u8>), nraw: usize, rawtot: usiz
     let usable = |c: i32| (!seekable || fast_enough(c))
                        && (!big || c & (ffi::CODEC_BZIP3 | ffi::CODEC_LZMA) != 0);
     // every bzip3 size at or above the stream gives the same bytes, so the smallest stands for them; hts_pack above 16 bytes is its plain sibling
-    let bz3dup = |c: i32, n: usize| bz3_dup(c, n, maxstream, &cand);
+    let bz3dup = |c: i32, n: usize| bz3_dup(c, n, maxstream, cand);
     let (mut zi, mut zl, mut z22i, mut z22l) = (0usize, 0usize, 0usize, 0usize);
     let mut ci = vec![0usize; nc];
     let mut cl = vec![0usize; nc];
@@ -832,7 +833,7 @@ pub fn pick(all: &dyn Fn(usize) -> (Vec<u8>, Vec<u8>), nraw: usize, rawtot: usiz
         // one block whose streams fit the sample: the sample's sizes are the file's
         let reuse = !whole || (nraw == 1 && scap >= maxstream);
         if reuse {
-            for k in 0..nc { ti[k] = ci[k]; tl[k] = cl[k]; }
+            ti[..nc].copy_from_slice(&ci[..nc]); tl[..nc].copy_from_slice(&cl[..nc]);
             ti[nc] = zi; tl[nc] = zl;
             ti[nc + 1] = z22i; tl[nc + 1] = z22l;
         }
@@ -954,7 +955,7 @@ fn splice_heads(lens: &[u8], ibx: &[u8]) -> Option<Vec<u8>> {
             out.extend_from_slice(&lens[p..n2]); p = n2;
         }
     }
-    if p != lens.len() { return None; } else { Some(out) }
+    if p != lens.len() { None } else { Some(out) }
 }
 
 /// hts_pack and its arith twin refuse above 16 distinct bytes, so such a candidate is its plain sibling
@@ -984,7 +985,8 @@ fn rank_all(src: &[&[u8]], n: &[usize], rs: &[Rspec], o: &Options) -> Vec<(i32, 
     use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
     let (next, zs): (AtomicUsize, Vec<AtomicUsize>) = (AtomicUsize::new(0), jobs.iter().map(|_| AtomicUsize::new(0)).collect());
     // each stream's best so far (size, rank, job, bytes), kept for the read-back
-    let best: Vec<std::sync::Mutex<Option<(usize, usize, usize, Vec<u8>)>>> = src.iter().map(|_| Default::default()).collect();
+    type Best = std::sync::Mutex<Option<(usize, usize, usize, Vec<u8>)>>;
+    let best: Vec<Best> = src.iter().map(|_| Default::default()).collect();
     let prof = crate::prof::ON.load(Relaxed);
     let jt: Vec<AtomicUsize> = jobs.iter().map(|_| AtomicUsize::new(0)).collect();   // ns, under --profile
     let tp = std::time::Instant::now();
@@ -1305,7 +1307,7 @@ fn tok_chunked(names: &mut [u8], chunk: usize) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// Smallest of zstd, integer deltas, the tokeniser and field deltas (':' fields, constant or zigzag integers, then bzip3)
+// Smallest of zstd, integer deltas, the tokeniser and field deltas (':' fields, constant or zigzag integers, then bzip3)
 
 const FLDMAX: usize = 16;
 /// ':' splits an Illumina name, '-' a UUID: try both, keep the smaller
@@ -1344,7 +1346,8 @@ fn fld_names1(names: &[u8], n: u64, sep: u8) -> Option<Vec<u8>> {
         cut.push(e.min(names.len()));
     }
     cut.push(names.len());
-    let scan = |a: usize, b: usize| -> Option<(Vec<bool>, Vec<bool>, Vec<bool>, u64)> {
+    type Scan = (Vec<bool>, Vec<bool>, Vec<bool>, u64);
+    let scan = |a: usize, b: usize| -> Option<Scan> {
         let (mut same, mut isnum) = (vec![true; nf], vec![true; nf]);
         let mut ishex: Vec<bool> = first.iter().map(|f| !f.is_empty() && f.len() % 2 == 0 && f.len() <= 64).collect();
         let mut seen = 0u64;

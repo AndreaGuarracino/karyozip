@@ -186,6 +186,7 @@ for s in $(head -1 "$D/db.features.tsv" | cut -f2-); do [ -s "$W/sod/$s.bed" ] |
 [ $sok = 1 ] && ok "--smooth --out-dir: every set, each as --set gives it" || no "--smooth --out-dir: WRONG"
 must_fail "--smooth of a -d track, no --set nor --out-dir" $KT --db "$D/db.features.tsv" decompress -i "$W/hv.kt" --hier "$W/hv.tsv" --smooth
 must_fail "--smooth --out-dir without --db" $KT decompress -i "$W/p.kt" --hier "$W/inf.tsv" --smooth --out-dir "$W/sod2"
+must_fail "query --smooth without -r" $KT query -i "$W/p.kt" --hier "$W/inf.tsv" --smooth --set acrocentric
 must_fail "query --smooth --out-dir" $KT --db "$D/db.features.tsv" query -i "$W/hv.kt" -r x --hier "$W/hv.tsv" --smooth --out-dir "$W/sod2"
 must_fail "--smooth with two sets" $KT --db "$D/db.features.tsv" decompress -i "$W/f.kt" --hier "$W/inf.tsv" --smooth --set gene,acrocentric
 must_fail "decompress an --aln track without --aln" $KT decompress -i "$W/d.kt" --hier "$W/inf.tsv" --smooth --set acrocentric

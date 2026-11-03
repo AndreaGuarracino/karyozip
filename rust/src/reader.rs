@@ -194,6 +194,10 @@ impl Reader {
             *v = u64::from_le_bytes(hb[i * 8..i * 8 + 8].try_into().unwrap());
         }
         let h1_raw = h[1];
+        // a bit above the 49-bit names length that no flag names: a newer writer, not a size
+        if (h[1] >> kst::NMLBITS) & !(FLAGS >> kst::NMLBITS) != 0 {
+            crate::bail("this track was written by a newer karyozip: unknown header flags");
+        }
         let fsz = rd(f.seek(SeekFrom::End(0)), "seek");
         // the name index, TRACK.kzi beside the track, as the C reads it
         let mut idx = None;

@@ -378,5 +378,46 @@ done
 if [ $rcC = 1 ] && [ $rcR = 1 ] && cmp -s "$W/C.berr" "$W/R.berr" && [ -z "$(ls -A "$W/btmp")" ]; then echo "full body temp file: both refuse alike, $(cat "$W/R.berr" | tail -1)"
 else echo "full body temp file: DIFFER (rc $rcC/$rcR)"; diff "$W/C.berr" "$W/R.berr" | head -4; ls "$W/btmp"; fail=1; fi
 
+# 17. forged inputs the readers once told apart: same words, or the same rows
+"$C" compress < "$D/s.bed" > "$W/pl.kst" 2>/dev/null
+"$C" aln-pack -a "$D/p.paf" --ref "$D/ref.bed" -o "$W/fg.pk" >/dev/null 2>&1
+head -2 "$D/p.paf" > "$W/p2.paf"   # one gapless block a query: the deltas stream is empty
+"$C" aln-pack -a "$W/p2.paf" --ref "$D/ref.bed" -o "$W/fg2.pk" >/dev/null 2>&1
+python3 - "$D" "$W" <<'PY'
+import sys
+sys.path.insert(0, sys.argv[1]); import kt
+W = sys.argv[2]
+for bit in (53, 54):   # a flag bit no reader knows
+    d = bytearray(open(W + "/pl.kst", "rb").read()); d[16 + bit // 8] |= 1 << (bit % 8)
+    open(W + "/fl%d.kst" % bit, "wb").write(d)
+def secs(p):
+    d = open(p, "rb").read(); body = d[14:]; i = 0; sec = []
+    for _ in range(10):
+        cd, i = kt.vget(body, i); rl, i = kt.vget(body, i); cl, i = kt.vget(body, i); sec.append((cd, rl, body[i:i + cl])); i += cl
+    return d[:14], sec
+pack = lambda hd, s: hd + b"".join(kt.vput(c) + kt.vput(r) + kt.vput(len(x)) + x for c, r, x in s)
+hd, sec = secs(W + "/fg.pk"); open(W + "/big.pk", "wb").write(pack(hd, [(1, 1 << 40, b"")] + sec[1:]))   # a 1 TB stream
+hd, sec = secs(W + "/fg2.pk"); k = [j for j, x in enumerate(sec) if x[0] == 0]
+if k: sec[k[0]] = (0, 0, b"junk")   # bytes behind an empty stream
+open(W + "/skip.pk", "wb").write(pack(hd, sec))
+PY
+"$C" compress --aln "$D/p.paf" --ref "$D/ref.bed" < "$D/s.bed" > "$W/fa.kst" 2>/dev/null
+"$C" compress --aln "$W/fg2.pk" --ref "$D/ref.bed" < "$D/s.bed" > "$W/fa2.kst" 2>/dev/null
+EXPECT=fail
+for bit in 53 54; do both "header flag bit $bit" decompress -i "$W/fl$bit.kst"; done
+both "a packed alignment claiming a 1 TB stream" decompress --aln "$W/big.pk" --ref "$D/ref.bed" -i "$W/fa.kst"
+EXPECT=ok
+both "a packed alignment with bytes behind an empty stream" decompress --aln "$W/skip.pk" --ref "$D/ref.bed" -i "$W/fa2.kst"
+python3 - "$W" <<'PY'
+import sys
+W = sys.argv[1]; n = 65
+open(W + "/f65.tsv", "w").write("featureID\t" + "\t".join("s%d" % k for k in range(n)) + "\n"
+                                 + "".join("%d\t" % i + "\t".join("L%d" % ((i + k) % 3) for k in range(n)) + "\n" for i in range(1, 4)))
+for k in range(n): open(W + "/f65.%d.bed" % k, "w").write("".join("c\t%d\t%d\tL%d\n" % (10 * j, 10 * j + 10, (j % 3 + k) % 3) for j in range(6)))
+PY
+in65=""; for k in $(seq 0 64); do in65="$in65 -i $W/f65.$k.bed"; done
+both "--db with 65 -i" --db "$W/f65.tsv" compress $in65
+tally "forged headers, packed alignments, 65 inputs"
+
 [ $fail = 0 ] && echo "DIFF_PASS" || echo "DIFF_FAIL"
 exit $fail

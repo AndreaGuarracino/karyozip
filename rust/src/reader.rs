@@ -1216,7 +1216,9 @@ impl Reader {
         let ip = format!("{path}.kzi");
         let (mut f, tp) = crate::ffi::mkstemp(ip.as_ref(), 0o666)
             .unwrap_or_else(|_| crate::bail("cannot create the index file beside the track"));
-        let ok = f.write_all(&t).and_then(|_| f.flush()).is_ok() && std::fs::rename(&tp, &ip).is_ok();
+        // synced and closed, checked, before the rename
+        let wrote = f.write_all(&t).is_ok();
+        let ok = crate::ffi::finish(f) && wrote && std::fs::rename(&tp, &ip).is_ok();
         if !ok { let _ = std::fs::remove_file(&tp); crate::bail("index write failed"); }
         eprintln!("index: {n} sequences, {} B in {ip}, {dup} fingerprint collisions", pay + 40);
     }

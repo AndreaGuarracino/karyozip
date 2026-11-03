@@ -334,6 +334,54 @@ unsafe extern "C" {
     fn unlink(p: *const c_char) -> i32;
     fn _exit(c: i32) -> !;
     fn signal(sig: c_int, handler: usize) -> usize;
+    fn fdatasync(fd: i32) -> i32;
+    fn raise(sig: c_int) -> c_int;
+    fn sigemptyset(set: *mut SigSet) -> c_int;
+    fn sigaddset(set: *mut SigSet, sig: c_int) -> c_int;
+    fn pthread_sigmask(how: c_int, set: *const SigSet, old: *mut SigSet) -> c_int;
+}
+/// glibc's sigset_t: 1024 bits
+#[repr(C)] pub struct SigSet([u64; 16]);
+const SIG_BLOCK: c_int = 0;
+const SIG_SETMASK: c_int = 2;
+
+/// A staged output finished before it is renamed over anything: synced, then closed, both checked, since NFS, a
+/// quota or a failing disk may report a lost write only at fsync or close (File's drop discards a close error). The
+/// rename that follows is not followed by a directory fsync: the replacement is atomic, not promised to survive a
+/// crash. As the C's fdfinish; true on success, fd closed either way
+pub fn finish_fd(fd: i32) -> bool {
+    // SAFETY: fd is owned by the caller and given up here
+    let synced = unsafe { fdatasync(fd) } == 0;
+    (unsafe { close(fd) } == 0) && synced
+}
+/// `finish_fd` on a File
+pub fn finish(f: std::fs::File) -> bool { use std::os::fd::IntoRawFd; finish_fd(f.into_raw_fd()) }
+
+/// Set through --out-dir's renames: a handler then only records the signal, raised once the renames are done
+static INCOMMIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static PENDSIG: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+/// The commit window opens: SIGINT, SIGTERM and SIGHUP blocked in this thread, deferred by a handler on any other
+/// (a rayon worker has them unblocked). Returns the mask to put back, as the C's stage_swap
+pub fn commit_begin() -> SigSet {
+    let (mut hs, mut was) = (SigSet([0; 16]), SigSet([0; 16]));
+    // SAFETY: both sets are owned, the size glibc's sigset_t is
+    unsafe {
+        sigemptyset(&mut hs);
+        for s in [1, 2, 15] { sigaddset(&mut hs, s); }
+        pthread_sigmask(SIG_BLOCK, &hs, &mut was);
+    }
+    INCOMMIT.store(true, std::sync::atomic::Ordering::SeqCst);
+    was
+}
+/// The window closes. A deferred signal is raised, pending until the mask is put back, then the handler runs with
+/// nothing staged left; unless `quiet`, when the caller refuses and exits anyway
+pub fn commit_end(was: SigSet, quiet: bool) {
+    use std::sync::atomic::Ordering::SeqCst;
+    INCOMMIT.store(false, SeqCst);
+    if quiet { return; }
+    let p = PENDSIG.load(SeqCst);
+    // SAFETY: raise and pthread_sigmask on a valid signal and the saved mask
+    unsafe { if p != 0 { raise(p); } pthread_sigmask(SIG_SETMASK, &was, std::ptr::null_mut()); }
 }
 
 /// -o's temporary name, where it is renamed to and the name given, as the C's OUTTMP, OUTDST and OUTFIN; the signal handler reads the leaked C string, never the mutex
@@ -342,8 +390,9 @@ static OUTSIG: std::sync::atomic::AtomicPtr<c_char> = std::sync::atomic::AtomicP
 /// --out-dir's staged BEDs for the handler: a leaked array of leaked C strings
 static STAGE: std::sync::atomic::AtomicPtr<*mut c_char> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
 static STAGEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-extern "C" fn outsig(_: c_int) {
+extern "C" fn outsig(sig: c_int) {
     use std::sync::atomic::Ordering::SeqCst;
+    if INCOMMIT.load(SeqCst) { PENDSIG.store(sig, SeqCst); return; }
     let (p, a, n) = (OUTSIG.load(SeqCst), STAGE.load(SeqCst), STAGEN.load(SeqCst));
     // SAFETY: unlink and _exit are async-signal-safe; every pointer is leaked
     unsafe {
@@ -404,7 +453,7 @@ pub fn commit_out() {
     sig_out_clear();
     let tp = std::path::PathBuf::from(std::ffi::OsStr::from_bytes(t.as_bytes()));
     // NFS reports some errors only at close
-    if std::io::stdout().flush().is_err() || unsafe { close(1) } != 0 {
+    if std::io::stdout().flush().is_err() || !finish_fd(1) {
         let _ = std::fs::remove_file(&tp); crate::bail("write failed");
     }
     if std::fs::rename(&tp, &dst).is_err() { let _ = std::fs::remove_file(&tp); crate::bail(&format!("cannot rename into {fin}")) }

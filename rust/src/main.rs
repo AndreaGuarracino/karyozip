@@ -133,7 +133,9 @@ fn main() {
                 for (s, f) in sr.iter().zip(fs) {
                     let mut o = BufWriter::new(f);
                     smooth::run(track, hier, Some(s), None, 0, 0, c.v1, maxgap, smchunk, &ro, Some(&feats), &mut o);
-                    o.flush().unwrap_or_else(|_| die("write failed"));
+                    // synced and closed, checked, before any BED is renamed in
+                    let f = o.into_inner().unwrap_or_else(|_| die("write failed"));
+                    if !ffi::finish(f) { die("write failed"); }
                 }
                 db::stage_done(dir, &sr, &tmps);
                 eprintln!("db: {} smoothed tracks under {dir}", sr.len());

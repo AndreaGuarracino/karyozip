@@ -344,12 +344,12 @@ pub fn decode(r: &mut crate::reader::Reader, feats: &Feats, dir: Option<&str>, c
     let sets: Vec<&[u8]> = cols.iter().map(|&k| feats.sets[k].as_slice()).collect();
     let mut tmps: Vec<std::path::PathBuf> = Vec::new();
     // each output its own 1 MB row buffer, written whole, as the C's ow
-    let mut out: Vec<(Box<dyn Write>, Vec<u8>)> = Vec::new();
+    let mut out: Vec<(Sink, Vec<u8>)> = Vec::new();
     if let Some(dir) = dir {
         let fs; (tmps, fs) = stage_open(dir, &sets);
-        out = fs.into_iter().map(|f| (Box::new(f) as Box<dyn Write>, Vec::with_capacity(OCAP))).collect();
+        out = fs.into_iter().map(|f| (Sink::Bed(f), Vec::with_capacity(OCAP))).collect();
     } else {
-        out.push((Box::new(std::io::stdout()), Vec::with_capacity(OCAP)));
+        out.push((Sink::Stdout(std::io::stdout()), Vec::with_capacity(OCAP)));
     }
     // One open run per output, extended while its label does not change
     let n = out.len();
@@ -394,7 +394,8 @@ pub fn decode(r: &mut crate::reader::Reader, feats: &Feats, dir: Option<&str>, c
         let (f, b) = &mut out[j];
         f.write_all(b).and_then(|_| f.flush()).unwrap_or_else(|_| crate::bail("write failed"));
     }
-    drop(out);
+    // each staged BED synced and closed, checked, before any is renamed in
+    for (f, _) in out { if let Sink::Bed(f) = f { if !crate::ffi::finish(f) { crate::bail("write failed"); } } }
     match dir {
         None => eprintln!("db: {rows} rows, {} sets on stdout", cols.len()),
         Some(dir) => {
@@ -405,8 +406,16 @@ pub fn decode(r: &mut crate::reader::Reader, feats: &Feats, dir: Option<&str>, c
 }
 
 const OCAP: usize = 1 << 20;
+/// Where decode's rows go: stdout, or a staged BED kept as its File, so `ffi::finish` can check its close
+enum Sink { Stdout(std::io::Stdout), Bed(std::fs::File) }
+impl Write for Sink {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        match self { Sink::Stdout(o) => o.write(b), Sink::Bed(f) => f.write(b) }
+    }
+    fn flush(&mut self) -> std::io::Result<()> { match self { Sink::Stdout(o) => o.flush(), Sink::Bed(f) => f.flush() } }
+}
 /// One row into its output's buffer, flushed when the row would not fit, as the C's owput
-fn wr(o: &mut (Box<dyn Write>, Vec<u8>), seq: &[u8], st: u64, en: u64, lab: &[u8]) {
+fn wr(o: &mut (Sink, Vec<u8>), seq: &[u8], st: u64, en: u64, lab: &[u8]) {
     let (f, v) = o;
     if v.len() + seq.len() + lab.len() + 48 > OCAP.max(v.capacity()) {
         f.write_all(v).unwrap_or_else(|_| crate::bail("write failed"));
@@ -445,34 +454,59 @@ pub fn stage_done(dir: &str, sets: &[&[u8]], tmps: &[std::path::PathBuf]) {
     TMP.lock().unwrap().clear();
 }
 
-/// Move every staged BED into place, or put back what was there
+/// KZ_TEST_SWAP_PAUSE_MS=N, for tests only: swap_in sleeps N ms after each of its renames, so a test can act inside
+/// the commit window. Read nowhere else. As the C's swap_pause
+fn swap_pause() {
+    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let ms = *MS.get_or_init(|| std::env::var("KZ_TEST_SWAP_PAUSE_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(0));
+    if ms > 0 { std::thread::sleep(std::time::Duration::from_millis(ms)); }
+}
+
+/// Move every staged BED into place, or put back what was there. The contract: --out-dir replaces the set of BEDs
+/// all or nothing with respect to SIGINT, SIGTERM and SIGHUP and to a failed rename. Either every BED is the new one,
+/// or every BED is the old one (or absent, if it was absent before). Each live BED is first renamed onto
+/// SET.bed.old.XXXXXX, an empty placeholder made exclusively (ffi::mkstemp), so a backup never takes a name in use, a
+/// stale backup of an earlier run included; then every staged BED is renamed in; then the backups are removed. On a
+/// failed rename every backup is renamed back and every new BED that had no old one removed; when even that fails,
+/// the refusal says old BEDs remain. The handled signals are blocked in this thread for all of it, and a handler on
+/// another thread only records the signal (ffi::commit_begin); either way the signal acts once the renames are done,
+/// when nothing staged is left. An uncatchable end (SIGKILL, OOM, power loss) inside the window can leave old BEDs as
+/// SET.bed.old.XXXXXX beside the outputs, and nothing reports them. No directory fsync follows. As the C's stage_swap
 fn swap_in(dir: &str, sets: &[Vec<u8>], tmps: &[std::path::PathBuf]) {
-    let pid = std::process::id();
     let live = |s: &[u8]| setpath(dir, s, ".bed");
-    let mut old: Vec<Option<std::path::PathBuf>> = vec![None; sets.len()];
-    let mut bad = false;
-    for (j, s) in sets.iter().enumerate() {
-        if bad { break; }
-        let o = setpath(dir, s, &format!(".bed.old.{pid}"));
+    let n = sets.len();
+    let mut had: Vec<Option<std::path::PathBuf>> = vec![None; n];
+    let mut inst = vec![false; n];
+    let (mut bad, mut lost) = (false, false);
+    let was = crate::ffi::commit_begin();
+    for (j, s) in sets.iter().enumerate() {   // every live BED onto its own backup name
+        let Ok((f, o)) = crate::ffi::mkstemp(&setpath(dir, s, ".bed.old"), 0o600) else { bad = true; break };
+        drop(f);
         match std::fs::rename(live(s), &o) {
-            Ok(()) => old[j] = Some(o),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => bad = true,
+            Ok(()) => had[j] = Some(o),
+            Err(e) => { let _ = std::fs::remove_file(&o); if e.kind() != std::io::ErrorKind::NotFound { bad = true; } }
         }
-    }
-    let mut moved = 0usize;
-    for (j, s) in sets.iter().enumerate() {
+        swap_pause();
         if bad { break; }
-        if std::fs::rename(&tmps[j], live(s)).is_err() { bad = true; } else { moved = j + 1; }
     }
-    if bad {
-        for (j, s) in sets.iter().enumerate().take(moved) {
-            let _ = std::fs::rename(live(s), &tmps[j]);
-        }
+    for (j, s) in sets.iter().enumerate() {   // every staged BED in
+        if bad { break; }
+        if std::fs::rename(&tmps[j], live(s)).is_err() { bad = true; } else { inst[j] = true; }
+        swap_pause();
+    }
+    if bad {   // every old one back, over the new one; a new one with no old one removed
         for (j, s) in sets.iter().enumerate() {
-            if let Some(o) = &old[j] { let _ = std::fs::rename(o, live(s)); }
+            if let Some(o) = &had[j] { if std::fs::rename(o, live(s)).is_err() { lost = true; } }
+            else if inst[j] && std::fs::remove_file(live(s)).is_err() { lost = true; }
+        }
+        crate::ffi::commit_end(was, true);
+        if lost {
+            crate::bail(&format!("cannot rename a derived BED into place, nor put every old one back: old BEDs remain as *.bed.old.* under {dir}"));
         }
         crate::bail("cannot rename a derived BED into place");
     }
-    for o in old.into_iter().flatten() { let _ = std::fs::remove_file(o); }
+    for o in had.into_iter().flatten() { let _ = std::fs::remove_file(o); }
+    crate::ffi::sig_stage(&[]);
+    TMP.lock().unwrap().clear();
+    crate::ffi::commit_end(was, false);
 }

@@ -7,26 +7,33 @@
 #   q5  no alignment at all
 #   run.sh BINARY LIBTEST [SANITIZER_BINARY]
 # LIBTEST: C library test, compared to BINARY
+# Every check prints one line, failures prefixed "FAIL: "; the last line is "run.sh: N passed, M failed".
+# CASE=REGEX: every command still runs (later checks reuse earlier files), but only checks whose description
+#   matches are printed and counted; fuzz.sh runs only when CASE is unset or matches "fuzz".
+# TEST_JOBS, TIMEOUT_SCALE: see lib.sh.
 set -eu
+. "$(dirname "$0")/lib.sh"
+need python3 zstd gzip awk sha256sum md5sum timeout realpath mktemp cmp diff dd stat tac cut sort uniq sed tr wc head tail seq xargs mkfifo
+need_gnu
 KT=$(realpath -m "$1"); LT=$(realpath -m "$2"); SAN=$(realpath -m "${3:-$1}")
 D=$(dirname "$0")
 W=$(mktemp -d); trap 'rm -rf "$W"' EXIT
 src=$D; D=$W/fx; mkdir -p "$D"; cp "$src"/fixtures.txt "$src"/*.py "$src"/*.sh "$D"/   # the fixtures, unpacked
 awk '/^@@ /{f=d"/"$2; next} {print > f}' d="$D" "$D/fixtures.txt"
-fail=0
-ok() { echo "$1"; }
-no() { echo "$1"; fail=1; }
+tscale "$SAN"
+ok() { tpass "$1"; }
+no() { tfail "$1"; }
 must_fail() {  # DESC CMD...: expect exit 1, message
   local what=$1 rc=0; shift
   "$@" >/dev/null 2>"$W/mf.err" || rc=$?
-  if [ $rc = 1 ] && grep -q '^karyozip: ' "$W/mf.err"; then echo "$what: refused ($(grep -m1 '^karyozip: ' "$W/mf.err" | cut -c11-90))"
-  else echo "$what: WRONG, exit $rc: $(head -c 200 "$W/mf.err")"; fail=1; fi
+  if [ $rc = 1 ] && grep -q '^karyozip: ' "$W/mf.err"; then ok "$what: refused ($(grep -m1 '^karyozip: ' "$W/mf.err" | cut -c11-90))"
+  else no "$what: WRONG, exit $rc: $(head -c 200 "$W/mf.err")"; fi
 }
 
 $KT compress --aln "$D/p.paf" --ref "$D/ref.bed" < "$D/s.bed" > "$W/d.kt" 2>/dev/null
 $KT decompress --raw -i "$W/d.kt" 2>/dev/null | cut -f2,3,4 > "$W/got"
 cut -f2,3,4 "$D/aln.expected" > "$W/want"
-cmp -s "$W/got" "$W/want" && echo "aln delta: correct" || { echo "aln delta: WRONG"; diff "$W/got" "$W/want" | head; fail=1; }
+cmp -s "$W/got" "$W/want" && ok "aln delta: correct" || { no "aln delta: WRONG"; diff "$W/got" "$W/want" | head; }
 
 $KT decompress --aln "$D/p.paf" --ref "$D/ref.bed" -i "$W/d.kt" 2>/dev/null > "$W/rt"
 cmp -s "$W/rt" "$D/s.bed" && ok "aln restore: byte-identical" || no "aln restore: WRONG"
@@ -41,23 +48,24 @@ $KT decompress --aln "$D/db.self.paf" --ref "$D/db.rall.bed" -i "$W/rall.aln.kst
 $KT decompress --aln "$D/db.self.paf" --ref "$W/rall.kst" -i "$W/rall.aln.kst" 2>/dev/null | cmp -s - "$W/rall.want" \
   && ok "a .kst reference read across contigs: same rows" || no "a .kst reference read across contigs: WRONG"
 must_fail "an --aln track as reference" $KT decompress --aln "$D/p.paf" --ref "$W/d.kt" -i "$W/d.kt"
-# eight readers at once share no state
+# several readers at once share no state: TEST_JOBS of them, at least 2 and at most 8
+NR=$TEST_JOBS; [ "$NR" -gt 8 ] && NR=8; [ "$NR" -lt 2 ] && NR=2
 $KT decompress -i "$W/rall.kst" > "$W/conc.want" 2>/dev/null
 seq=$(head -1 "$D/db.rall.bed" | cut -f1)
 $KT query -i "$W/rall.kst" -r "$seq" > "$W/conc.rwant" 2>/dev/null
-for i in 1 2 3 4 5 6 7 8; do
+for i in $(seq 1 $NR); do
   ( $KT decompress -i "$W/rall.kst" > "$W/c.d.$i" 2>/dev/null
     $KT query -i "$W/rall.kst" -r "$seq" > "$W/c.r.$i" 2>/dev/null
     $KT decompress --aln "$D/db.self.paf" --ref "$W/rall.kst" -i "$W/rall.aln.kst" > "$W/c.a.$i" 2>/dev/null ) &
 done
 wait
 bad=0
-for i in 1 2 3 4 5 6 7 8; do
+for i in $(seq 1 $NR); do
   cmp -s "$W/c.d.$i" "$W/conc.want" || bad=1
   cmp -s "$W/c.r.$i" "$W/conc.rwant" || bad=1
   cmp -s "$W/c.a.$i" "$W/rall.want" || bad=1
 done
-[ $bad = 0 ] && ok "eight readers at once: same bytes" || no "eight readers at once: WRONG"
+[ $bad = 0 ] && ok "$NR readers at once: same bytes" || no "$NR readers at once: WRONG"
 # review cases of 2026-09-07, one each
 python3 - "$W" <<'PY'
 import sys; W = sys.argv[1]; L = "L" * 2100000
@@ -66,6 +74,7 @@ open(W + "/rv1.bed", "w").write("s1\t0\t10\tx\ns1\t10\t20\t%s\n" % L); open(W + 
 open(W + "/rv.big", "w").write("1125899906842625\t0\t10\tx\n"); open(W + "/rv.names", "w").write("q1\n\nq2\n")
 PY
 $KT --db "$W/rv.tsv" compress -i "$W/rv1.bed" -i "$W/rv2.bed" > "$W/rv.kt" 2>/dev/null
+# 2100012 = "s1\t10\t20\t" (9 B) + the 2100000-byte label of set A + "\t" + set B's "z" + "\n"
 [ "$($KT --db "$W/rv.tsv" query -i "$W/rv.kt" -r s1:12-13 2>/dev/null | wc -c)" = 2100012 ] && ok "decompress --db, a 2100000-byte label: printed" || no "decompress --db, a 2100000-byte label: WRONG"
 $KT compress < "$W/rv.big" > "$W/rv.big.kt" 2>/dev/null; $KT decompress -i "$W/rv.big.kt" 2>/dev/null | cmp -s - "$W/rv.big" && ok "a name past 2^50: round trip" || no "a name past 2^50: WRONG"
 must_fail "a blank --aln-names line" $KT compress --aln "$D/p.paf" --ref "$D/ref.bed" --aln-names "$W/rv.names" < "$D/s.bed"
@@ -82,7 +91,7 @@ $KT decompress -i "$W/p.kt" 2>/dev/null | cmp -s - "$D/s.bed" && ok "plain: byte
 cut -f1 "$D/s.bed" | uniq > "$W/s.names"
 for f in "--names drop" "--block 262144" "--block 4"; do
   ofl=""; [ "$f" = "--names drop" ] && ofl="--names $W/s.names"
-  $KT compress $f < "$D/s.bed" > "$W/f.kt" 2>/dev/null || { echo "$f: ENCODE FAILED"; fail=1; continue; }
+  $KT compress $f < "$D/s.bed" > "$W/f.kt" 2>/dev/null || { no "$f: ENCODE FAILED"; continue; }
   $KT decompress $ofl -i "$W/f.kt" 2>/dev/null | cmp -s - "$D/s.bed" && ok "$f: byte-identical" || no "$f: WRONG"
 done
 # --db: 6 BEDs in, 6 out, byte-compared
@@ -301,7 +310,7 @@ must_fail "decompress --db a set not in features.tsv" $KT --db "$D/db.features.t
 $KT compress --block 32 < "$W/sm.bed" > "$W/sm.kt" 2>/dev/null
 $KT --threads 1 decompress -i "$W/sm.kt" --hier "$W/sm.tsv" --smooth --set acrocentric > "$W/sm.1" 2>/dev/null || no "decompress, serial: FAILED"
 for t in 2 4 8; do
-  $KT --threads $t decompress -i "$W/sm.kt" --hier "$W/sm.tsv" --smooth --set acrocentric > "$W/sm.$t" 2>/dev/null || { echo "decompress, $t threads: FAILED"; fail=1; continue; }
+  $KT --threads $t decompress -i "$W/sm.kt" --hier "$W/sm.tsv" --smooth --set acrocentric > "$W/sm.$t" 2>/dev/null || { no "decompress, $t threads: FAILED"; continue; }
   cmp -s "$W/sm.1" "$W/sm.$t" && ok "decompress, $t threads: identical to serial" || no "decompress, $t threads: DIFFERS from serial"
 done
 
@@ -343,7 +352,7 @@ must_fail "features.tsv row with a missing label" $KT compress --db "$W/short.ts
 printf 'read one\t0\t10\tA\nread two\t0\t10\tB\n' > "$W/sp.bed"; printf 'read one\nread two\n' > "$W/sp.names.txt"
 $KT compress --names drop < "$W/sp.bed" > "$W/sp.kt" 2>/dev/null
 $KT --names "$W/sp.names.txt" decompress -i "$W/sp.kt" 2>/dev/null | cmp -s - "$W/sp.bed" && ok "name list with spaces: restored" || no "name list with spaces: WRONG"
-cp "$D/s.bed" "$W/keep.bed"; $KT compress "$W/keep.bed" < /dev/null > /dev/null 2>&1 && { echo "compress FILE: ACCEPTED"; fail=1; }
+cp "$D/s.bed" "$W/keep.bed"; $KT compress "$W/keep.bed" < /dev/null > /dev/null 2>&1 && no "compress FILE: ACCEPTED"
 cmp -s "$W/keep.bed" "$D/s.bed" && ok "compress FILE: refused, input intact" || no "compress FILE: INPUT DESTROYED"
 
 # third audit: one case per finding
@@ -361,10 +370,10 @@ for i in range(70): print(f's{i}\t0\t100\tA'); print(f's{i}\t100\t{2**63+100}\tB
 $KT compress < "$W/t63.bed" > "$W/t63.kt" 2>/dev/null
 $KT decompress -i "$W/t63.kt" 2>/dev/null | cmp -s - "$W/t63.bed" && ok "total past 2^63: byte-identical" || no "total past 2^63: WRONG"
 printf 'feature_set\tchild\tparent\nacrocentric\tacro\tx\nacrocentric\tx\tacro\n' > "$W/cyc.tsv"
-rc=0; timeout 10 $KT decompress -i "$W/p.kt" --hier "$W/cyc.tsv" --smooth --set acrocentric >/dev/null 2>&1 || rc=$?
+rc=0; timeout "$(tmo 10)" $KT decompress -i "$W/p.kt" --hier "$W/cyc.tsv" --smooth --set acrocentric >/dev/null 2>&1 || rc=$?
 [ $rc = 1 ] && ok "cyclic hierarchy: refused" || no "cyclic hierarchy: rc=$rc"
 for c in "decompress -i $W/p.kt" "query -i $W/p.kt -r q1" "decompress -i $W/sm.kt --hier $W/sm.tsv --smooth --set acrocentric" "decompress --raw -i $W/p.kt"; do
-  $KT $c > /dev/full 2>/dev/null && { echo "$c to /dev/full: EXIT 0"; fail=1; } || echo "${c%% *} to /dev/full: exit 1"
+  $KT $c > /dev/full 2>/dev/null && no "$c to /dev/full: EXIT 0" || ok "${c%% *} to /dev/full: exit 1"
 done
 printf 'a\t0\t10\tA\0B\nc\t0\t10\tB\n' > "$W/nul.bed"
 must_fail "NUL inside a row" $KT compress < "$W/nul.bed"
@@ -459,8 +468,8 @@ awk 'BEGIN{for(i=0;i<80000;i++)printf "s%d\t0\t10\tA\n",i}' > "$W/long.bed"
 $KT compress --tmp-dir "$L" --names drop < "$W/long.bed" > "$W/long.kt" 2>/dev/null \
   && $KT decompress --names <(cut -f1 "$W/long.bed") -i "$W/long.kt" 2>/dev/null | cmp -s - "$W/long.bed" && [ "$(cat "${L:0:511}" 2>/dev/null)" = keep ] \
   && ok "long temp dir: round-trip, bystander intact" || no "long temp dir: WRONG"
-$KT compress < "$D/s.bed" >&- 2>/dev/null && { echo "compress with stdout closed: EXIT 0"; fail=1; } || echo "compress with stdout closed: refused"
-$KT compress < "$W" > "$W/dir.kt" 2>/dev/null && { echo "compress from a directory: EXIT 0"; fail=1; } || echo "compress from a directory: refused"
+$KT compress < "$D/s.bed" >&- 2>/dev/null && no "compress with stdout closed: EXIT 0" || ok "compress with stdout closed: refused"
+$KT compress < "$W" > "$W/dir.kt" 2>/dev/null && no "compress from a directory: EXIT 0" || ok "compress from a directory: refused"
 printf 'a\t0\t10\tA\nb\t0\t10\tB\na\t0\t10\tC\n' > "$W/dupname.bed"
 must_fail "a sequence name that repeats later" $KT compress < "$W/dupname.bed"
 N512=$(head -c 512 /dev/zero | tr '\0' n); printf '%s\t0\t10\tA\n' "$N512" > "$W/n512.bed"
@@ -596,6 +605,7 @@ must_fail "query region with end before start" $KT query -i "$W/sm.kt" --hier "$
 L309=$(head -c 300 /dev/zero | tr '\0' L)_specific
 printf 's\t0\t10\t%s\n' "$L309" > "$W/l309.bed"; $KT compress < "$W/l309.bed" > "$W/l309.kt" 2>/dev/null
 printf 'feature_set\tchild\tparent\nfs\t%s\tcategorized\n' "$L309" > "$W/l309.tsv"
+# 301 = the 300 L's left once --v1 strips "_specific", plus cut's newline
 [ "$($KT --v1 decompress -i "$W/l309.kt" --hier "$W/l309.tsv" --smooth --set fs 2>/dev/null | cut -f4 | wc -c)" = 301 ] && ok "V1 strip on a 309-byte label: stripped" || no "V1 strip on a 309-byte label: WRONG"
 
 printf 'feature_set\tchild\tparent\nfs\ta\tcategorized\n' > "$W/miss.tsv"
@@ -626,7 +636,7 @@ must_fail "--chunk on decompress" $KT decompress -i "$W/ch.kst" --chunk 64
 
 # round 22 findings, one case each
 mkdir -p "$W/keepdir"; printf 'PRECIOUS\n' > "$W/keepdir/acrocentric.bed"
-$KT decompress --db "$D/db.features.tsv" --out-dir "$W/keepdir" -i "$W/p.kt" >/dev/null 2>&1 && { echo "decompress --db of a plain track: EXIT 0"; fail=1; }
+$KT decompress --db "$D/db.features.tsv" --out-dir "$W/keepdir" -i "$W/p.kt" >/dev/null 2>&1 && no "decompress --db of a plain track: EXIT 0"
 [ "$(cat "$W/keepdir/acrocentric.bed")" = PRECIOUS ] && ok "refused decompress --db: old BEDs intact" || no "refused decompress --db: OLD BEDS DESTROYED"
 printf 'featureID\ts1\ts2\n1\tx\tp\n2\ty\tp\n' > "$W/two.tsv"
 printf 's\t0\t10\tx\ns\t10\t20\ty\n' > "$W/n1.s1.bed"; printf 's\t0\t10\tp\ns\t10\t20\tp\n' > "$W/n1.s2.bed"
@@ -657,6 +667,7 @@ must_fail "region with END before START" $KT query -i "$W/p.kt" -r q1:150-20
 # round 24 findings, one case each
 rc=0; (ulimit -f 1; $KT compress < "$W/pbig.bed" > "$W/lim.kt" 2> "$W/lim.err") || rc=$?
 [ $rc = 1 ] && ok "file-size limit: exit 1, not a signal" || no "file-size limit: rc=$rc"
+# ls.bed (a fixture) at each effort: a higher effort tries a superset of codecs, so it is never larger
 sz=""; for e in high medium low; do sz="$sz $($KT -e $e compress < "$D/ls.bed" 2>/dev/null | wc -c)"; done
 [ "$(echo $sz | tr ' ' '\n' | sort -n | tr '\n' ' ')" = "$(echo $sz) " ] && ok "effort high <= medium <= low:$sz B" || no "effort sizes out of order:$sz B"
 # -e high: zpaq on both frames
@@ -667,6 +678,7 @@ $KT -t 4 decompress -i "$W/zt.kt" 2>/dev/null | cmp -s - "$W/zt.bed" && ok "zpaq
 # -e high: interleaved zpaq model, short reads
 awk 'BEGIN { srand(7); for (r = 0; r < 60000; r++) { k = rand() < 0.4 ? 1 : 2 + int(rand() * rand() * 12); p = 0; g = int(rand() * 4); for (j = 0; j < k; j++) { l = j == k - 1 ? 120 - p : 1 + int(rand() * (120 - p - (k - j - 1)) / (k - j)); printf "r%d\t%d\t%d\t%s\n", r, p, p + l, "chr" (1 + (g + j) % 5); p += l } } }' > "$W/zi.bed"
 $KT -t 4 -e high compress -i "$W/zi.bed" -o "$W/zi.kt" 2> "$W/zi.err"
+# the layout line on stderr names the model the search picked; this input is built so the interleaved one wins
 grep -q "lengths zpaq-64MB+ilv" "$W/zi.err" && ok "high: the interleaved zpaq model on short reads" || no "high: interleaved model not picked: $(grep layout "$W/zi.err")"
 $KT -t 4 decompress -i "$W/zi.kt" 2>/dev/null | cmp -s - "$W/zi.bed" && ok "interleaved zpaq model: round-trip" || no "interleaved zpaq model: WRONG"
 must_fail "--tmp-dir that does not exist" $KT --tmp-dir /nonexistent/dir compress < "$D/s.bed"
@@ -689,7 +701,7 @@ cp "$W/A.txt" "$W/A2.txt"; $KT --names "$W/A2.txt" index -i "$W/nx.kt" >/dev/nul
 [ "$($KT --names "$W/A2.txt" query -i "$W/nx.kt" -r r0 2>/dev/null | cut -f4)" = D ] && ok "index built before a name file swap: ignored" || no "index built before a name file swap: WRONG"
 mkdir -p "$W/good"; $KT decompress --db "$D/db.features.tsv" --out-dir "$W/good" -i "$W/f.kt" >/dev/null 2>&1; m1=$(cat "$W/good"/*.bed | md5sum)
 cp "$W/f.kt" "$W/fbad.kt"; sz=$(stat -c%s "$W/fbad.kt"); printf '\xff' | dd of="$W/fbad.kt" bs=1 seek=$((sz-100)) conv=notrunc status=none
-$KT decompress --db "$D/db.features.tsv" --out-dir "$W/good" -i "$W/fbad.kt" >/dev/null 2>&1 && { echo "decompress of a damaged db track: EXIT 0"; fail=1; }
+$KT decompress --db "$D/db.features.tsv" --out-dir "$W/good" -i "$W/fbad.kt" >/dev/null 2>&1 && no "decompress of a damaged db track: EXIT 0"
 [ "$(cat "$W/good"/*.bed | md5sum)" = "$m1" ] && [ -z "$(ls "$W/good" | grep tmp)" ] && ok "failed decompress --db: previous output intact, no temporaries" || no "failed decompress --db: OUTPUT DAMAGED"
 mkdir -p "$W/oo"; echo old > "$W/oo/k.kt"; $KT compress -i "$W/nonexist" -o "$W/oo/k.kt" >/dev/null 2>&1 || :
 $KT decompress -i "$W/fbad.kt" -o "$W/oo/k.kt" >/dev/null 2>&1 || :; $KT compress -i "$W/nonexist" -o "$W/oo/n.kt" >/dev/null 2>&1 || :
@@ -728,7 +740,7 @@ must_fail "compress --names ordinal" $KT compress --names ordinal < "$D/s.bed"
 must_fail "decompress two tracks" $KT decompress -i "$W/side1.kt" -i "$W/side2.kt"
 
 # nothing from htscodecs reaches stderr
-$KT compress < "$D/s.bed" 2>&1 >/dev/null | grep -qi "htscodecs" && { echo "compress stderr: HTSCODECS COMPLAINED"; fail=1; } || echo "compress stderr: clean"
+$KT compress < "$D/s.bed" 2>&1 >/dev/null | grep -qi "htscodecs" && no "compress stderr: HTSCODECS COMPLAINED" || ok "compress stderr: clean"
 
 # library API: same bytes as the CLI
 if [ -x "$LT" ]; then
@@ -755,7 +767,7 @@ if [ -x "$LT" ]; then
   done
   [ $aok = 1 ] && ok "library API: every contract violation refused" || no "library API: A CONTRACT VIOLATION WAS ACCEPTED"
 else
-  echo "library API: FAILED, $LT not built"; fail=1
+  no "library API: FAILED, $LT not built"
 fi
 
 # label cache collisions, prefix names, chunk boundaries
@@ -783,8 +795,8 @@ $KT decompress -i "$W/chunk.kt" 2>/dev/null | cmp -s - "$W/chunk.bed" && ok "200
 mkdir -p "$W/tinytmp"
 awk 'BEGIN{p=0; for(k=0;k<400000;k++){printf "r1\t%d\t%d\tchr%d\n", p, p+20, k%22; p+=20}}' > "$W/stage.bed"
 # 256 KB cap, below the staging payload
-( ulimit -f 512; trap "" XFSZ; $KT --tmp-dir "$W/tinytmp" compress < "$W/stage.bed" >/dev/null 2>&1 ) && { echo "a full staging filesystem: ACCEPTED"; fail=1; } \
-  || echo "a full staging filesystem: refused"
+( ulimit -f 512; trap "" XFSZ; $KT --tmp-dir "$W/tinytmp" compress < "$W/stage.bed" >/dev/null 2>&1 ) && no "a full staging filesystem: ACCEPTED" \
+  || ok "a full staging filesystem: refused"
 [ -z "$(ls -A "$W/tinytmp" 2>/dev/null)" ] && ok "a full staging filesystem: no temp files left" || no "a full staging filesystem: TEMP FILES LEFT"
 
 # whole-read blocks: layouts, queries, --db, --aln, --smooth
@@ -821,15 +833,77 @@ for bl in "--read-blocks 70000" "--block 70000"; do
 done
 if [ "$SAN" != "$KT" ]; then ASAN_OPTIONS=detect_leaks=1 $SAN decompress -t 4 -i "$W/pf.kt" 2> "$W/pfs.err" | cmp -s - "$W/pf.bed" && ! grep -qE "Sanitizer|runtime error" "$W/pfs.err" && ok "decode ahead: sanitizer clean" || no "decode ahead: SANITIZER REPORT"; fi
 
-# pin the stored bytes to codec versions
+# tests/kt.py's flag mask is kst.rs's FLAGS: forged fixtures re-sign with it
+KST=$src/../rust/src/kst.rs
+if [ -f "$KST" ]; then
+  python3 - "$KST" "$D" <<'PY' && ok "kt.py FLAGS: same bits as rust/src/kst.rs" || no "kt.py FLAGS: DIFFERS from rust/src/kst.rs"
+import re, sys; sys.path.insert(0, sys.argv[2]); import kt
+s = open(sys.argv[1]).read()
+bit = {n: 1 << int(b) for n, b in re.findall(r'pub const (\w+): u64 = 1 << (\d+);', s)}
+expr = re.search(r'pub const FLAGS: u64 = ([^;]+);', s).group(1)
+mask = 0
+for n in re.findall(r'\w+', expr): mask |= bit[n]
+sys.exit(0 if mask == kt.FLAGS else 1)
+PY
+else echo "kt.py FLAGS: skipped, no $KST"; fi
+
+# existing behaviour with no test before: a name with ':', --max-gap 0, --tmp-dir on readers, -o to a FIFO, signals
+printf 'HLA:A*01\t0\t10\tA\nHLA:A*01\t10\t20\tB\nx:5-6\t0\t10\tC\n' > "$W/colon.bed"
+$KT compress < "$W/colon.bed" > "$W/colon.kt" 2>/dev/null
+$KT query -i "$W/colon.kt" -r 'HLA:A*01' 2>/dev/null | cmp -s - <(head -2 "$W/colon.bed") \
+  && $KT query -i "$W/colon.kt" -r 'HLA:A*01:12-13' 2>/dev/null | cmp -s - <(sed -n 2p "$W/colon.bed") \
+  && ok "-r with a name holding ':': the name, and a final :START-END a range" || no "-r with a name holding ':': WRONG"
+must_fail "-r NAME:5-6 is a range on NAME, not the name 'NAME:5-6'" $KT query -i "$W/colon.kt" -r x:5-6
+$KT query -i "$W/colon.kt" -r 'x:5-6:0-3' 2>/dev/null | cmp -s - <(sed -n 3p "$W/colon.bed") && ok "-r 'x:5-6:0-3': a range on the name x:5-6" || no "-r 'x:5-6:0-3': WRONG"
+# --max-gap 0: accepted, smooths less than the default, rows still tile the input
+$KT --max-gap 0 decompress -i "$W/ch.kst" --hier "$W/ch.tsv" --smooth --set fs > "$W/mg0" 2>/dev/null && rc=0 || rc=$?
+awk -F'\t' -v e="$(tail -1 "$W/ch.bed" | cut -f3)" 'NR == 1 && $2 != 0 {bad = 1} NR > 1 && $2 != p {bad = 1} {p = $3} END {exit bad || p != e}' "$W/mg0" \
+  && [ $rc = 0 ] && [ "$(wc -l < "$W/mg0")" -gt "$(wc -l < "$W/ch.whole")" ] && ! cmp -s "$W/mg0" "$W/ch.whole" \
+  && ok "--max-gap 0: accepted, $(wc -l < "$W/mg0") rows tiling the input, more than the default's $(wc -l < "$W/ch.whole")" || no "--max-gap 0: WRONG, rc=$rc"
+# readers make no temporary file: --tmp-dir is accepted and ignored, even a missing one
+mkdir -p "$W/rtd"; rok=1
+for c in "decompress -i $W/p.kt" "query -i $W/p.kt -r q1" "decompress -i $W/ch.kst --hier $W/ch.tsv --smooth --set fs"; do
+  $KT $c > "$W/rtd.want" 2>/dev/null
+  $KT --tmp-dir "$W/rtd" $c 2>/dev/null | cmp -s - "$W/rtd.want" || rok=0
+  $KT --tmp-dir /nonexistent $c 2>/dev/null | cmp -s - "$W/rtd.want" || rok=0
+done
+[ $rok = 1 ] && [ -z "$(ls -A "$W/rtd")" ] && ok "--tmp-dir on readers: same rows, nothing written, a missing directory ignored" || no "--tmp-dir on readers: WRONG"
+# -o to a FIFO: written in place, no temporary beside it
+mkdir -p "$W/ff"; mkfifo "$W/ff/o.bed" "$W/ff/o.kt"
+timeout "$(tmo 30)" cat "$W/ff/o.bed" > "$W/ff.got" & cpid=$!
+$KT decompress -i "$W/p.kt" -o "$W/ff/o.bed" 2>/dev/null && rc=0 || rc=$?; wait $cpid || :
+timeout "$(tmo 30)" cat "$W/ff/o.kt" > "$W/ff.kt" & cpid=$!
+$KT compress -i "$D/s.bed" -o "$W/ff/o.kt" 2>/dev/null && rc2=0 || rc2=$?; wait $cpid || :
+[ $rc = 0 ] && [ $rc2 = 0 ] && cmp -s "$W/ff.got" "$D/s.bed" && cmp -s "$W/ff.kt" "$W/p.kt" && [ "$(ls "$W/ff" | tr '\n' ' ')" = "o.bed o.kt " ] \
+  && ok "-o to a FIFO: decompress and compress write through it, no temporaries" || no "-o to a FIFO: WRONG, rc $rc/$rc2"
+# SIGTERM while blocked: the name file is a FIFO nobody writes, so the reader waits with its temporaries open
+# sigwait DIR GLOB PID: up to 30 s (scaled) for GLOB to show in DIR while PID lives
+sigwait() { local n=0 lim; lim=$(awk -v t="$(tmo 30)" 'BEGIN { print int(t * 20) }')
+  while [ $n -lt $lim ] && kill -0 "$3" 2>/dev/null; do compgen -G "$1/$2" >/dev/null && return 0; sleep 0.05; n=$((n+1)); done; return 1; }
+mkdir -p "$W/sg"; $KT compress --names drop < "$W/ch.bed" > "$W/sg.kt" 2>/dev/null; mkfifo "$W/sg.names"
+$KT --names "$W/sg.names" decompress -i "$W/sg.kt" -o "$W/sg/out.bed" 2>/dev/null & pid=$!
+if sigwait "$W/sg" 'out.bed.tmp.*' $pid; then kill -TERM $pid 2>/dev/null || :; wait $pid && rc=0 || rc=$?
+  [ $rc = 1 ] && [ -z "$(ls -A "$W/sg")" ] && ok "SIGTERM during decompress -o: exit 1, no temporary, no output" || no "SIGTERM during decompress -o: rc=$rc, left: $(ls "$W/sg")"
+else kill -KILL $pid 2>/dev/null; wait $pid 2>/dev/null; no "SIGTERM during decompress -o: no temporary appeared"; fi
+$KT compress --db "$D/db.features.tsv" --names drop $in > "$W/sgd.kt" 2>/dev/null
+$KT --db "$D/db.features.tsv" --hier "$W/full.tsv" --names "$W/sg.names" decompress -i "$W/sgd.kt" --smooth --out-dir "$W/sgd" 2>/dev/null & pid=$!
+if sigwait "$W/sgd" '*.bed.tmp.*' $pid; then kill -TERM $pid 2>/dev/null || :; wait $pid && rc=0 || rc=$?
+  [ $rc = 1 ] && [ -z "$(ls -A "$W/sgd")" ] && ok "SIGTERM during decompress --out-dir: exit 1, no temporaries, no BEDs" || no "SIGTERM during decompress --out-dir: rc=$rc, left: $(ls "$W/sgd")"
+else kill -KILL $pid 2>/dev/null; wait $pid 2>/dev/null; no "SIGTERM during decompress --out-dir: no temporary appeared"; fi
+
+# pin the stored bytes to codec versions: `karyozip --block 4 compress` of the fixture db.rall.bed
+# (tests/fixtures.txt), default effort (medium), default threads, no other flag. It moves when a vendored
+# codec, zstd or the format changes; then check diff.sh still passes and update the pin on purpose.
 want=55b6e9eadfe851a4374e094e045ee8ecb4ffac9a2fdd83de126ff076724e700b
 got=$($KT --block 4 compress < "$D/db.rall.bed" 2>/dev/null | sha256sum | cut -d' ' -f1)
-if [ "$got" = "$want" ]; then echo "codec versions: stored bytes unchanged"
+if [ "$got" = "$want" ]; then ok "codec versions: stored bytes unchanged"
 else
-  echo "codec versions: STORED BYTES MOVED"; fail=1
+  no "codec versions: STORED BYTES MOVED"
   echo "  want $want"; echo "  got  $got"; $KT --version | sed 's/^/  /'
 fi
 
-if bash "$D/fuzz.sh" "$KT" "$SAN"; then echo "fuzz: clean"; else echo "fuzz: FOUND SOMETHING"; fail=1; fi
+if [ -n "${CASE:-}" ] && ! [[ fuzz =~ $CASE ]]; then echo "fuzz: skipped (CASE=$CASE)"
+elif CASE= bash "$D/fuzz.sh" "$KT" "$SAN"; then ok "fuzz: clean"; else no "fuzz: FOUND SOMETHING"; fi
 
+summary run.sh
 exit $fail

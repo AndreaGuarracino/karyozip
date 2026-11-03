@@ -556,3 +556,25 @@ impl Cli {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::regparse;
+
+    #[test]
+    fn regparse_names_and_ranges() {
+        assert_eq!(regparse("chr1"), ("chr1", 0, 0));
+        assert_eq!(regparse("chr1:100-200"), ("chr1", 100, 200));
+        assert_eq!(regparse("chr1:0-1"), ("chr1", 0, 1));
+        // a name may hold ':'; only a final :START-END of digits is a range
+        assert_eq!(regparse("HLA:A*01"), ("HLA:A*01", 0, 0));
+        assert_eq!(regparse("a:b:5-10"), ("a:b", 5, 10));
+        assert_eq!(regparse("chr1:5-10:x"), ("chr1:5-10:x", 0, 0));
+        assert_eq!(regparse("chr1:1e2-3e2"), ("chr1:1e2-3e2", 0, 0));
+        assert_eq!(regparse("chr1:+1-5"), ("chr1:+1-5", 0, 0));
+        assert_eq!(regparse("chr1:-5"), ("chr1:-5", 0, 0));
+        assert_eq!(regparse("chr1:5-"), ("chr1:5-", 0, 0));
+        assert_eq!(regparse("chr1:"), ("chr1:", 0, 0));
+        assert_eq!(regparse("c:0-18446744073709551615"), ("c", 0, u64::MAX));
+    }
+}

@@ -1,0 +1,31 @@
+# cargo-fuzz targets; not built by `cargo build` in rust/ nor by `make test`. See README.md.
+[package]
+name    = "karyozip-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+karyozip      = { path = ".." }
+
+# its own workspace: rust/ stays a single package
+[workspace]
+members = ["."]
+
+[[bin]]
+name  = "reader_open"
+path  = "fuzz_targets/reader_open.rs"
+test  = false
+doc   = false
+bench = false
+
+[[bin]]
+name  = "unzip"
+path  = "fuzz_targets/unzip.rs"
+test  = false
+doc   = false
+bench = false

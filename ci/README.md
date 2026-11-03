@@ -1,0 +1,1 @@
+`github-actions.yml` is a ready GitHub Actions workflow (`make test` on ubuntu-latest with valgrind and zstd 1.5.7, plus a debug-build `cargo test`). Move it to `.github/workflows/` to enable it; it lives here because pushing under `.github/workflows/` needs a token with the `workflow` scope.

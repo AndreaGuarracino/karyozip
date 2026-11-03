@@ -185,3 +185,76 @@ impl Intern {
         id
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// a refusal as an Err, not an exit: bail panics on a thread with DEFER set
+    fn refused<T>(f: impl FnOnce() -> T + std::panic::UnwindSafe) -> Option<String> {
+        crate::DEFER.with(|d| d.set(true));
+        let r = std::panic::catch_unwind(f);
+        crate::DEFER.with(|d| d.set(false));
+        match r {
+            Ok(_) => None,
+            Err(e) => Some(e.downcast::<crate::Deferred>().expect("a refusal, not a bug").0),
+        }
+    }
+
+    #[test]
+    fn varint_round_trips() {
+        let mut vals = vec![0u64, 1, 0x7f, 0x80, 0x3fff, 0x4000, u32::MAX as u64, 1 << 49, 1 << 56, (1 << 63) - 1, 1 << 63, u64::MAX];
+        for k in 0..64 { vals.push(1 << k); vals.push((1u64 << k).wrapping_sub(1)); }
+        let mut buf = Vec::new();
+        for &v in &vals { put(&mut buf, v); }
+        let mut i = 0;
+        for &v in &vals { let (got, n) = vget(&buf, i); assert_eq!(got, v); i = n; }
+        assert_eq!(i, buf.len());
+        // the widths: 7 bits a byte, 10 bytes for the top bit
+        for (v, w) in [(0u64, 1usize), (127, 1), (128, 2), (u64::MAX >> 1, 9), (1 << 63, 10), (u64::MAX, 10)] {
+            let mut b = Vec::new(); put(&mut b, v); assert_eq!(b.len(), w, "width of {v:#x}");
+        }
+    }
+
+    #[test]
+    fn varint_refuses_corrupt_input() {
+        let msg = Some("corrupt varint".to_string());
+        assert_eq!(refused(|| vget(&[], 0)), msg);
+        assert_eq!(refused(|| vget(&[0x80], 0)), msg);            // a continuation and then nothing
+        assert_eq!(refused(|| vget(&[0x05], 1)), msg);            // past the end
+        assert_eq!(refused(|| vget(&[0xff; 11], 0)), msg);        // longer than 64 bits
+        assert_eq!(refused(|| vget(&[0xff, 0xff, 0x01], 0)), None);
+    }
+
+    #[test]
+    fn zigzag_round_trips() {
+        for v in [0i64, 1, -1, 2, -2, 63, -64, i32::MAX as i64, i32::MIN as i64, i64::MAX, i64::MIN] {
+            assert_eq!(unzz(zz(v)) as i64, v);
+        }
+        assert_eq!((zz(0), zz(-1), zz(1), zz(-2)), (0, 1, 2, 3));
+        assert_eq!(zz(i64::MIN), u64::MAX);
+    }
+
+    #[test]
+    fn putu64_at_every_digit_count() {
+        let mut vals = vec![0u64, u64::MAX];
+        let mut p = 1u64;
+        for _ in 0..20 {
+            vals.extend([p, p.saturating_sub(1), p.saturating_add(1), p.saturating_mul(5)]);
+            p = p.saturating_mul(10);
+        }
+        for v in vals {
+            let mut b = [0u8; 20];
+            let n = putu64_at(&mut b, v);
+            assert_eq!(&b[..n], v.to_string().as_bytes(), "{v}");
+            let mut o = Vec::new(); putu64(&mut o, v); assert_eq!(o, v.to_string().as_bytes());
+        }
+    }
+
+    #[test]
+    fn put_row_writes_one_bed_line() {
+        let mut b = b"x".to_vec();
+        put_row(&mut b, b"chr1", 0, u64::MAX, b"lab");
+        assert_eq!(b, format!("xchr1\t0\t{}\tlab\n", u64::MAX).as_bytes());
+    }
+}

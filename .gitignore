@@ -7,3 +7,5 @@ __pycache__/
 *.kst.names
 notes/
 build/lib/
+rust/fuzz/corpus/
+rust/fuzz/artifacts/

@@ -447,7 +447,6 @@ for q in "--max-gap 0" "--max-gap 0 --chunk 64" "--max-gap 0 --v1"; do both "dec
 tally edge
 fi
 
-summary diff.sh
 
 # 17. a body temp file that fills: the staging fits, the one-row blocks' frames do not; the Rust used to hang here
 if sec bodytmp; then
@@ -504,5 +503,6 @@ both "--db with 65 -i" --db "$W/f65.tsv" compress $in65
 tally "forged headers, packed alignments, 65 inputs"
 fi
 
+summary diff.sh
 [ $fail = 0 ] && echo "DIFF_PASS" || echo "DIFF_FAIL"
 exit $fail

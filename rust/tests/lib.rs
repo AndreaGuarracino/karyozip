@@ -339,6 +339,86 @@ fn a_bad_packed_names_section_is_an_error() {
     let _ = std::fs::remove_dir_all(&d);
 }
 
+/// Alignment coordinates that leave 64 bits: each an Err in the CLI's words, and the caller goes on (the sentinel
+/// after each call), where an overflow-checking build once panicked and a release build wrapped. Then the boundary
+/// cases, a block ending at 2^64 - 1, still accepted, from a PAF and from a packed alignment.
+#[test]
+fn alignment_coordinates_past_64_bits_are_errors() {
+    use karyozip::aln;
+    let d = scratch("alnovf");
+    let refp = d.join("ref.bed");
+    std::fs::write(&refp, "s\t0\t10\tA\n").unwrap();
+    let refs = refp.display().to_string();
+    let fresh = || { let mut a = aln::Aln::default(); a.load_ref(&refs, aln::Lazy::No).expect("reference"); a };
+    const M: u64 = u64::MAX;
+    let mut alive = 0;
+    // PAF: forward query end, target start, a deletion's target, a reverse CIGAR running before 0
+    let pafs: [(String, &str); 5] = [
+        (format!("q\t1\t{M}\t{M}\t+\ts\t10\t0\t1\t1\t1\t60\tcg:Z:1M"), "PAF coordinates overflow 64 bits"),
+        (format!("q\t9\t{}\t{M}\t+\ts\t10\t0\t2\t1\t1\t60\tcg:Z:1M1I", M - 1), "PAF coordinates overflow 64 bits"),
+        (format!("q\t1\t0\t1\t+\ts\t10\t{M}\t{M}\t1\t1\t60\tcg:Z:1M"), "PAF coordinates overflow 64 bits"),
+        (format!("q\t1\t0\t1\t+\ts\t10\t{}\t{M}\t1\t1\t60\tcg:Z:1M1D", M - 1), "PAF coordinates overflow 64 bits"),
+        ("q\t1\t0\t0\t-\ts\t10\t0\t1\t1\t1\t60\tcg:Z:1M".to_string(), "PAF CIGAR runs before the query start"),
+    ];
+    for (i, (line, want)) in pafs.iter().enumerate() {
+        let p = d.join(format!("o{i}.paf"));
+        std::fs::write(&p, format!("{line}\n")).unwrap();
+        let mut a = fresh();
+        let e = a.load_aln(&p.display().to_string()).expect_err(&format!("PAF case {i} was accepted"));
+        assert_eq!((e.message(), e.kind()), (*want, ErrorKind::Input), "PAF case {i}");
+        alive += 1;
+    }
+    // the boundary: blocks ending at 2^64 - 1 on both sides
+    let p = d.join("edge.paf");
+    std::fs::write(&p, format!("q\t9\t{}\t{M}\t+\ts\t10\t{}\t{M}\t1\t1\t60\tcg:Z:1M\n", M - 1, M - 1)).unwrap();
+    let mut a = fresh();
+    a.load_aln(&p.display().to_string()).expect("a block ending at 2^64 - 1");
+    assert_eq!(a.qs.len(), 1);
+    // packed: names, counts, deltas, lengths, targets, qstarts, four tpos planes; each stream zstd (codec 1)
+    let vput = |o: &mut Vec<u8>, mut v: u64| { while v >= 0x80 { o.push(v as u8 | 0x80); v >>= 7; } o.push(v as u8); };
+    let zz = |v: i64| ((v << 1) ^ (v >> 63)) as u64;
+    let packed = |cnt: u64, deltas: &[u8], tgt: u64, qs: u64| -> Vec<u8> {
+        let a = fresh();
+        let mut f = b"KSTAL1".to_vec();
+        f.extend_from_slice(&aln::refhash(&a).to_le_bytes());
+        let (mut c, mut l, mut t, mut q) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        vput(&mut c, cnt);
+        for _ in 0..cnt { vput(&mut l, 1); }
+        vput(&mut t, tgt); vput(&mut t, cnt);
+        vput(&mut q, qs);
+        for st in [&b"q\n"[..], &c, deltas, &l, &t, &q, &[0], &[0], &[0], &[0]] {
+            if st.is_empty() { vput(&mut f, 0); vput(&mut f, 0); vput(&mut f, 0); continue; }
+            let z = ffi::zstd(st, 3);
+            vput(&mut f, 1); vput(&mut f, st.len() as u64); vput(&mut f, z.len() as u64); f.extend_from_slice(&z);
+        }
+        f
+    };
+    let (mut fwd_back, mut zero) = (Vec::new(), Vec::new());
+    vput(&mut fwd_back, 3); vput(&mut fwd_back, zz(0)); vput(&mut fwd_back, zz(-2));   // tp = 1 - 2: wraps to 2^64 - 1
+    vput(&mut zero, 0);                                                                  // reverse: tp = 0 - 1
+    let pks: [(Vec<u8>, &str); 3] = [
+        (packed(1, &[], 0, M), "one block at query position 2^64 - 1"),
+        (packed(2, &fwd_back, 0, 0), "a forward target position wrapping below 0"),
+        (packed(2, &zero, 1, 5), "a reverse target position running below 0"),
+    ];
+    for (i, (f, what)) in pks.iter().enumerate() {
+        let p = d.join(format!("o{i}.pk"));
+        std::fs::write(&p, f).unwrap();
+        let mut a = fresh();
+        let e = a.load_aln(&p.display().to_string()).expect_err(&format!("packed case {i}, {what}, was accepted"));
+        assert_eq!((e.message(), e.kind()), ("corrupt packed alignment: a coordinate overflows", ErrorKind::Input), "packed case {i}: {what}");
+        alive += 1;
+    }
+    assert_eq!(alive, pafs.len() + pks.len(), "the caller is still running");
+    // the boundary, packed: one block at 2^64 - 2, ending at 2^64 - 1
+    let p = d.join("edge.pk");
+    std::fs::write(&p, packed(1, &[], 0, M - 1)).unwrap();
+    let mut a = fresh();
+    a.load_aln(&p.display().to_string()).expect("a packed block ending at 2^64 - 1");
+    assert_eq!((a.qs.len(), a.qs[0].1[0].q), (1, M - 1));
+    let _ = std::fs::remove_dir_all(&d);
+}
+
 /// A features table with its header alone: a novel row encodes as the CLI's bytes, any other label is the CLI's
 /// refusal, returned; neither panics
 #[test]

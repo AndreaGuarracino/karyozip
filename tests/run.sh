@@ -87,6 +87,27 @@ gzip -c "$D/ref.bed" | head -c 40 > "$W/rv.gz"
 must_fail "a cut .gz reference" $KT compress --aln "$D/p.paf" --ref "$W/rv.gz" < "$D/s.bed"
 $KT aln-pack -a "$D/p.paf" --ref "$D/ref.bed" -o "$W/rv.pk" >/dev/null 2>&1; printf '\0' >> "$W/rv.pk"
 must_fail "a packed alignment with a byte over" $KT decompress --aln "$W/rv.pk" --ref "$D/ref.bed" -i "$W/d.kt"
+# alignment coordinates past 64 bits (tests/kt.py alnovf): refused with these words, never wrapped; a block ending at
+# 2^64 - 1 still packs and loads (integration review 670f2ce, finding 1)
+mkdir -p "$W/ov"; python3 "$D/kt.py" alnovf "$W/ov"
+amf() {  # DESC WANT CMD...: must_fail, and the last line is karyozip: WANT
+  local what=$1 want=$2; shift 2
+  must_fail "$what" "$@"
+  [ "$(tail -1 "$W/mf.err")" = "karyozip: $want" ] || no "$what: said [$(tail -1 "$W/mf.err")], not [$want]"
+}
+k=0; for what in "a forward query end past 2^64" "an insertion past 2^64" "a target start past 2^64" "a deletion past 2^64"; do
+  amf "PAF: $what" "PAF coordinates overflow 64 bits" $KT aln-pack -a "$W/ov/ov$k.paf" --ref "$W/ov/ov.ref.bed" -o "$W/ov/o.pk"; k=$((k+1))
+done
+amf "PAF: a reverse CIGAR before 0" "PAF CIGAR runs before the query start" $KT aln-pack -a "$W/ov/ov4.paf" --ref "$W/ov/ov.ref.bed" -o "$W/ov/o.pk"
+k=0; for what in "a block at query 2^64 - 1" "a forward target wrapping below 0" "a reverse target running below 0"; do
+  amf "packed alignment: $what" "corrupt packed alignment: a coordinate overflows" \
+    $KT compress --aln "$W/ov/ov$k.pk" --ref "$W/ov/ov.ref.bed" < "$W/ov/ov.ref.bed"; k=$((k+1))
+done
+[ ! -e "$W/ov/o.pk" ] && ok "PAF past 2^64: no packed alignment left" || no "PAF past 2^64: a packed alignment WRITTEN"
+rc=0; $KT aln-pack -a "$W/ov/ovok.paf" --ref "$W/ov/ov.ref.bed" -o "$W/ov/ok.pk" >/dev/null 2>"$W/ov/e" || rc=$?
+rc2=0; $KT compress --aln "$W/ov/ovok.pk" --ref "$W/ov/ov.ref.bed" < "$W/ov/ov.ref.bed" > "$W/ov/ok.kt" 2>"$W/ov/e2" || rc2=$?
+[ $rc = 0 ] && [ $rc2 = 0 ] && [ -s "$W/ov/ok.pk" ] && [ -s "$W/ov/ok.kt" ] && ok "a block ending at 2^64 - 1: packs, and the forged pack loads" \
+  || no "a block ending at 2^64 - 1: rc $rc/$rc2 [$(tail -1 "$W/ov/e") / $(tail -1 "$W/ov/e2")]"
 
 $KT compress < "$D/s.bed" > "$W/p.kt" 2>/dev/null
 $KT compress < "$D/db.rall.bed" > "$W/omp.ref" 2>/dev/null

@@ -223,6 +223,8 @@ impl Aln {
             let qs = crate::bedcoord_r(fl[2], "PAF query start is not a number").map_err(Error::input)?;
             let qe = crate::bedcoord_r(fl[3], "PAF query end is not a number").map_err(Error::input)?;
             let mut tp = crate::bedcoord_r(fl[7], "PAF target start is not a number").map_err(Error::input)?;
+            // qp and tp only move by checked steps; qcons and tcons are no more than what they moved, so cannot overflow
+            let paf_ovf = || Error::input("PAF coordinates overflow 64 bits");
             if qe < qs { return Err(Error::input("PAF query end is before its start")); }
             let mut qp = if rev { qe } else { qs };
             let tix = match self.rcix.get(fl[5]) { Some(&i) => i, None => { noref += 1; continue; } };
@@ -247,17 +249,18 @@ impl Aln {
                     b'M' | b'=' | b'X' => {
                         if rev && qp < v { return Err(Error::input("PAF CIGAR runs before the query start")); }
                         if segs.len() == segs.capacity() { segs.reserve_exact(segs.len()); }   // doubling, as the C: Vec's own jumps 1 to 4
-                        segs.push(Seg { q: if rev { qp - v } else { qp }, t: tix,
+                        let nqp = if rev { qp - v } else { qp.checked_add(v).ok_or_else(paf_ovf)? };
+                        let ntp = tp.checked_add(v).ok_or_else(paf_ovf)?;
+                        segs.push(Seg { q: if rev { nqp } else { qp }, t: tix,
                                         n: v as u32, tp, rev });
-                        qp = if rev { qp - v } else { qp + v };
-                        tp += v; qcons += v; tcons += v; nblk += 1;
+                        qp = nqp; tp = ntp; qcons += v; tcons += v; nblk += 1;
                     }
                     b'I' | b'S' => {
                         if rev && qp < v { return Err(Error::input("PAF CIGAR runs before the query start")); }
-                        qp = if rev { qp - v } else { qp + v };
+                        qp = if rev { qp - v } else { qp.checked_add(v).ok_or_else(paf_ovf)? };
                         qcons += v;
                     }
-                    b'D' | b'N' => { tp += v; tcons += v; }
+                    b'D' | b'N' => { tp = tp.checked_add(v).ok_or_else(paf_ovf)?; tcons += v; }
                     b'H' | b'P' => {}
                     _ => return Err(Error::input("PAF CIGAR: unknown operation")),
                 }
@@ -399,8 +402,12 @@ impl Aln {
                     q = pq.wrapping_add(dq as u64);
                     tp = if rev { ps.wrapping_sub(n).wrapping_sub(dt as u64) } else { pt.wrapping_add(dt as u64) };
                 }
+                // the deltas are taken mod 2^64, as aln-pack writes them; a block must end inside 64 bits, as a PAF's does
+                let (Some(qe), Some(te)) = (q.checked_add(n), tp.checked_add(n)) else {
+                    return Err(Error::input("corrupt packed alignment: a coordinate overflows"))
+                };
                 segs.push(Seg { q, t: tx, n: n as u32, tp, rev });
-                pq = q + n; pt = tp + n; ps = tp; left -= 1;
+                pq = qe; pt = te; ps = tp; left -= 1;
             }
             if left != 0 { return Err(Error::input("corrupt packed alignment: a target run outlives its query")); }
             nb += segs.len();

@@ -1592,7 +1592,8 @@ static void loadpaf(const char *path) {
         if (!rc) { noref++; continue; }               /* target absent from ref */
         uint32_t tix = (uint32_t)(rc - RC);
         qseg *Q = NULL;
-        /* A CIGAR is checked, not trusted */
+        /* A CIGAR is checked, not trusted: qp and tp move only by checked steps, and qcons and tcons are no more
+           than they moved */
         uint64_t qcons = 0, tcons = 0;
         for (const char *c = cg; *c && *c != '\t'; ) {
             if (*c < '0' || *c > '9') die("PAF CIGAR: an operation has no length");
@@ -1609,12 +1610,16 @@ static void loadpaf(const char *path) {
                 /* one slot first: a short read carries 1.2 blocks */
                 if (Q->n == Q->cap) { Q->cap = Q->cap ? Q->cap * 2 : 1;
                                       Q->s = xrealloc(Q->s, Q->cap * sizeof *Q->s); }
+                if ((!rev && qp > UINT64_MAX - v) || tp > UINT64_MAX - v) die("PAF coordinates overflow 64 bits");
                 Q->s[Q->n++] = (seg){ rev ? qp - v : qp, tix, (uint32_t)v, tp, rev };
                 qp = rev ? qp - v : qp + v; tp += v; qcons += v; tcons += v; nblk++;
             } else if (op == 'I' || op == 'S') {
                 if (rev && qp < v) die("PAF CIGAR runs before the query start");
+                if (!rev && qp > UINT64_MAX - v) die("PAF coordinates overflow 64 bits");
                 qp = rev ? qp - v : qp + v; qcons += v;
-            } else if (op == 'D' || op == 'N') { tp += v; tcons += v; }
+            } else if (op == 'D' || op == 'N') {
+                if (tp > UINT64_MAX - v) die("PAF coordinates overflow 64 bits");
+                tp += v; tcons += v; }
             else if (op == 'H' || op == 'P') { }
             else die("PAF CIGAR: unknown operation");
         }
@@ -1826,6 +1831,8 @@ static int alnload(const char *path) {
                 q = pq + (uint64_t)dq;
                 tp = rev ? ps - ln - (uint64_t)dt : pt + (uint64_t)dt;
             }
+            /* the deltas are taken mod 2^64, as alnpack writes them; a block must end inside 64 bits, as a PAF's does */
+            if (q > UINT64_MAX - ln || tp > UINT64_MAX - ln) die("corrupt packed alignment: a coordinate overflows");
             Q->s[Q->n++] = (seg){ q, tx, (uint32_t)ln, tp, rev };
             pq = q + ln; pt = tp + ln; ps = tp; left--;
         }

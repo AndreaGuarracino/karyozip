@@ -666,6 +666,31 @@ else tfail "tests/failclose.c: does not build with ${CC:-cc}: $(head -c 200 "$W/
 tally "sync and close failures"
 fi
 
+# 21. alignment coordinates past 64 bits (tests/kt.py alnovf): the same refusal from both, never a wrap; a block ending
+# at 2^64 - 1: the same packed bytes and tracks (integration review 670f2ce, finding 1)
+if sec alnovf; then
+mkdir -p "$W/ov"; python3 "$D/kt.py" alnovf "$W/ov"
+EXPECT=fail
+for k in 0 1 2 3 4; do
+  both "a PAF past 64 bits [$k]" aln-pack -a "$W/ov/ov$k.paf" --ref "$W/ov/ov.ref.bed" -o "$W/ov/o.pk"
+  want="karyozip: PAF coordinates overflow 64 bits"; [ $k = 4 ] && want="karyozip: PAF CIGAR runs before the query start"
+  [ "$(tail -1 "$W/c.err")" = "$want" ] && tpass || tfail "a PAF past 64 bits [$k]: C says [$(tail -1 "$W/c.err")]"
+done
+for k in 0 1 2; do
+  IN=$W/ov/ov.ref.bed both "a packed alignment past 64 bits [$k]" compress --aln "$W/ov/ov$k.pk" --ref "$W/ov/ov.ref.bed"
+  [ "$(tail -1 "$W/c.err")" = "karyozip: corrupt packed alignment: a coordinate overflows" ] && tpass \
+    || tfail "a packed alignment past 64 bits [$k]: C says [$(tail -1 "$W/c.err")]"
+done
+EXPECT=ok
+"$C" aln-pack -a "$W/ov/ovok.paf" --ref "$W/ov/ov.ref.bed" -o "$W/ov/c.pk" >/dev/null 2>"$W/ov/c.e"; c1=$?
+"$R" aln-pack -a "$W/ov/ovok.paf" --ref "$W/ov/ov.ref.bed" -o "$W/ov/r.pk" >/dev/null 2>"$W/ov/r.e"; c2=$?
+[ $c1 = 0 ] && [ $c2 = 0 ] && cmp -s "$W/ov/c.pk" "$W/ov/r.pk" && cmp -s "$W/ov/c.e" "$W/ov/r.e" && tpass || tfail "aln-pack of a block ending at 2^64 - 1 differs (rc $c1/$c2)"
+for a in "$W/ov/ovok.paf" "$W/ov/ovok.pk" "$W/ov/c.pk"; do
+  IN=$W/ov/ov.ref.bed both "--aln, a block ending at 2^64 - 1 [$(basename "$a")]" compress --aln "$a" --ref "$W/ov/ov.ref.bed"
+done
+tally "alignment coordinates past 64 bits"
+fi
+
 summary diff.sh
 [ $fail = 0 ] && echo "DIFF_PASS" || echo "DIFF_FAIL"
 exit $fail

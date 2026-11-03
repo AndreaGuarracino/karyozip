@@ -93,12 +93,34 @@ def varint10(src, dst, top, W):   # chunk 0's row start in the index table (alwa
     z = zst(W, tab[:p] + b"\x80" * 9 + bytes([top]) + tab[q:])
     d[off:off + h[11]] = z; h[11] = len(z); sign(d, h); open(dst, "wb").write(d)
 
+def alnovf(W):   # alignments past 64 bits against ref "s 0 10 A" (W/ov.ref.bed): ovN.paf, ovN.pk refused; ovok.* the boundary
+    M = (1 << 64) - 1
+    open(W + "/ov.ref.bed", "w").write("s\t0\t10\tA\n")
+    paf = lambda qs, qe, st, ts, te, cg: "q\t9\t%d\t%d\t%s\ts\t10\t%d\t%d\t1\t1\t60\tcg:Z:%s\n" % (qs, qe, st, ts, te, cg)
+    for k, l in enumerate((paf(M, M, "+", 0, 1, "1M"), paf(M - 1, M, "+", 0, 2, "1M1I"), paf(0, 1, "+", M, M, "1M"),
+                           paf(0, 1, "+", M - 1, M, "1M1D"), paf(0, 0, "-", 0, 1, "1M"))):
+        open(W + "/ov%d.paf" % k, "w").write(l)
+    open(W + "/ovok.paf", "w").write(paf(M - 1, M, "+", 0, 1, "1M"))   # aln-pack takes a target position up to 32 bits
+    rh = fnv(fnv(FNV0, b"s"), b"\n")
+    def pk(cnt, deltas, tgt, qs):   # one query "q", cnt blocks of 1 in one target run, zstd streams
+        st = [b"q\n", vput(cnt), deltas, vput(1) * cnt, vput(tgt) + vput(cnt), vput(qs), b"\0", b"\0", b"\0", b"\0"]
+        o = b"KSTAL1" + struct.pack("<Q", rh)
+        for x in st:
+            if not x: o += b"\0\0\0"; continue
+            z = zst(W, x); o += vput(1) + vput(len(x)) + vput(len(z)) + z
+        return o
+    zz = lambda v: (v << 1) ^ (v >> 63) if v >= 0 else ((-v) << 1) - 1
+    for k, f in enumerate((pk(1, b"", 0, M), pk(2, vput(3) + vput(zz(0)) + vput(zz(-2)), 0, 0), pk(2, vput(0), 1, 5))):
+        open(W + "/ov%d.pk" % k, "wb").write(f)
+    open(W + "/ovok.pk", "wb").write(pk(1, b"", 0, M - 1))
+
 if __name__ == "__main__":   # kt.py IN OUT IDX VALUE ...   (IDX "lo9" keeps the high 32 bits)
     if sys.argv[1] == "gen": gen(sys.argv[2], int(sys.argv[3])); sys.exit(0)
     if sys.argv[1] == "varint10":   # kt.py varint10 IN OUT TOPBYTE WORKDIR
         varint10(sys.argv[2], sys.argv[3], int(sys.argv[4], 0), sys.argv[5]); sys.exit(0)
     if sys.argv[1] == "bgzf": bgzf(sys.argv[2], sys.argv[3]); sys.exit(0)
     if sys.argv[1] == "bgzfx": bgzfx(sys.argv[2]); sys.exit(0)
+    if sys.argv[1] == "alnovf": alnovf(sys.argv[2]); sys.exit(0)
     d, h = load(sys.argv[1])
     for i, v in zip(sys.argv[3::2], sys.argv[4::2]):
         v = int(v, 0)

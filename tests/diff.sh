@@ -160,6 +160,23 @@ rm -rf "$W/co" "$W/ro"; mkdir -p "$W/co" "$W/ro"
 "$R" decompress --db "$D/db.features.tsv" --out-dir "$W/ro" -i "$W/cdb.kst" >/dev/null 2>&1
 if diff -r "$W/co" "$W/ro" >/dev/null 2>&1; then tpass "--db decompress: identical"
 else tfail "--db decompress: DIFFERS"; fi
+# per-set .kst inputs, alone and mixed with BEDs: the C's and the Rust's bytes and words, and the BEDs' bytes
+KS=""; KM=""; j=0; KF=("-e low" "" "--block 4" "--read-blocks 3" "-e high" "")
+for s in acrocentric chromosome gene region repeat subtelomeric; do
+  "$C" compress ${KF[$j]} < "$D/db.$s.bed" > "$W/ks.$s.kst" 2>/dev/null; KS="$KS -i $W/ks.$s.kst"
+  if [ $((j % 2)) = 0 ]; then KM="$KM -i $W/ks.$s.kst"; else KM="$KM -i $D/db.$s.bed"; fi; j=$((j+1))
+done
+both "--db from per-set .kst" compress --db "$D/db.features.tsv" $KS
+if cmp -s "$W/c.out" "$W/cdb.kst"; then tpass "--db from per-set .kst: the BEDs' bytes"; else tfail "--db from per-set .kst: not the BEDs' bytes"; fi
+both "--db from .kst and BEDs mixed" compress --db "$D/db.features.tsv" $KM
+EXPECT=fail both "--db from per-set .kst, a set missing" compress --db "$D/db.features.tsv" ${KS% -i *}
+EXPECT=fail both "--db from per-set .kst, two sets swapped" compress --db "$D/db.features.tsv" $(echo "$KS" | awk '{t=$2; $2=$4; $4=t; print}')
+EXPECT=fail both "--db from a --db .kst" compress --db "$D/db.features.tsv" -i "$W/cdb.kst"
+"$C" compress --names drop < "$D/db.gene.bed" > "$W/ks.drop.kst" 2>/dev/null
+EXPECT=fail both "--db from a dropped-names .kst" compress --db "$D/db.features.tsv" ${KS/$W\/ks.gene.kst/$W\/ks.drop.kst}
+head -c 100 "$W/ks.gene.kst" > "$W/ks.cut.kst"
+EXPECT=fail both "--db from a .kst cut in its header" compress --db "$D/db.features.tsv" ${KS/$W\/ks.gene.kst/$W\/ks.cut.kst}
+EXPECT=ok; tally "--db .kst inputs"
 # outside tuple with --hier: 2^26 + rank
 { printf 'feature_set\tchild\tparent\nrepeat\trepeat\tcategorized\nrepeat\tLINE\trepeat\n'; } > "$W/hv.tsv"
 awk -F'\t' 'NR==5{$4="repeat"} {print}' OFS='\t' "$D/db.repeat.bed" > "$W/hv.repeat.bed"

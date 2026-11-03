@@ -449,6 +449,33 @@ impl Reader {
         }
     }
 
+    /// A pull, row by row, of what `for_each_row` walks, for a caller that merges several tracks in step
+    pub fn rows(&self) -> RowStream {
+        RowStream { c: Cursor { blk: usize::MAX, data: std::sync::Arc::new(Vec::new()), lp: 0, ip: 0, left: 0 },
+                    ri: u64::MAX, k: 0, nruns: 0, st: 0, emitted: 0 }
+    }
+    /// The next row of a plain track as (sequence, start, end, label id), None after the last; the label is
+    /// `label_at(id)`, or the id itself when the table is empty. The C's dump checks, and its words
+    pub fn next_row(&mut self, s: &mut RowStream) -> Option<(u64, u64, u64, u64)> {
+        while s.k == s.nruns {   // the next sequence with a run
+            s.ri = s.ri.wrapping_add(1);
+            if s.ri >= self.nreads {
+                if s.emitted != self.rows {
+                    eprintln!("karyozip: emitted {} rows, the header says {}", s.emitted, self.rows);
+                    crate::bail("file is truncated");
+                }
+                return None;
+            }
+            s.nruns = self.locate(s.ri).2;
+            s.k = 0; s.st = 0;
+        }
+        let (len, id) = self.step(&mut s.c, s.st, s.k + 1 == s.nruns && s.ri >= self.tailskip);
+        if !self.lab.is_empty() && id as usize >= self.lab.len() { crate::bail("corrupt block: a label id past the table"); }
+        let st = s.st;
+        s.st += len; s.k += 1; s.emitted += 1;
+        Some((s.ri, st, st + len, id))
+    }
+
     /// Every sequence, in order, in one forward pass over the blocks
     pub fn decode(&mut self, out: &mut impl std::io::Write) {
         let mut ocap = 1usize << 22;
@@ -1345,6 +1372,9 @@ impl Reader {
         self.sc = Some((c.blk, rows - c.left, c));
     }
 }
+
+/// Where `Reader::next_row` is: the block cursor, the sequence and its run, the rows so far
+pub struct RowStream { c: Cursor, ri: u64, k: u64, nruns: u64, st: u64, emitted: u64 }
 
 /// One sequence as arrays, reused across sequences
 #[derive(Default)]

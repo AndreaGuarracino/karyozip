@@ -135,6 +135,46 @@ mkdir -p "$W/dao"
 $KT decompress --db "$D/db.features.tsv" --aln "$D/db.self.paf" --ref "$D/db.rall.bed" --out-dir "$W/dao" -i "$W/da.kt" 2>/dev/null
 n=0; for f in $sets; do cmp -s "$W/dao/$f.bed" "$D/db.$f.bed" && n=$((n+1)); done
 [ "$n" = 6 ] && ok "db+aln: 6/6 identical" || no "db+aln: only $n/6"
+
+# --db from per-set .kst inputs, made by plain compress in any mode: the bytes the BEDs give, decoded in step
+fl=("-e low" "" "--block 4" "--read-blocks 3" "-e high" "--names drop"); j=0; kin=""; mix=""; kin2=""
+for f in $sets; do
+  m=${fl[$j]}; [ "$m" = "--names drop" ] && m="--block 1"   # a dropped-names track is refused, below
+  $KT compress $m < "$D/db.$f.bed" > "$W/set.$f.kst" 2>/dev/null; kin="$kin -i $W/set.$f.kst"
+  $KT compress < "$D/db2.$f.bed" > "$W/set2.$f.kst" 2>/dev/null; kin2="$kin2 -i $W/set2.$f.kst"
+  if [ $((j % 2)) = 0 ]; then mix="$mix -i $W/set.$f.kst"; else mix="$mix -i $D/db.$f.bed"; fi
+  j=$((j+1))
+done
+$KT compress --db "$D/db.features.tsv" $kin 2>/dev/null | cmp -s - "$W/f.kt" && ok "db from per-set .kst: the BEDs' bytes" || no "db from per-set .kst: DIFFERS from the BEDs'"
+$KT compress --db "$D/db.features.tsv" $mix 2>/dev/null | cmp -s - "$W/f.kt" && ok "db from .kst and BED inputs mixed: the BEDs' bytes" || no "db from mixed inputs: DIFFERS"
+$KT compress --db "$D/db2.features.tsv" $kin2 2>/dev/null | cmp -s - "$W/f2.kt" && ok "db from per-set .kst, mixed name lengths: the BEDs' bytes" || no "db2 from per-set .kst: DIFFERS"
+$KT compress --db "$D/db.features.tsv" --aln "$D/db.self.paf" --ref "$D/db.rall.bed" $kin 2>/dev/null | cmp -s - "$W/da.kt" && ok "db+aln from per-set .kst: the BEDs' bytes" || no "db+aln from per-set .kst: DIFFERS"
+for e in "-e low" "-e high"; do
+  $KT compress --db "$D/db.features.tsv" $e $in > "$W/fe.kt" 2>/dev/null
+  $KT compress --db "$D/db.features.tsv" $e $kin 2>/dev/null | cmp -s - "$W/fe.kt" && ok "db $e from per-set .kst: the BEDs' bytes" || no "db $e from per-set .kst: DIFFERS"
+done
+# the BED case's refusals, word for word: a set missing, two sets swapped
+refsame() {  # DESC BEDARGS -- KSTARGS: both refused, with the same last line
+  local what=$1; shift; local a=() k=()
+  while [ "$1" != -- ]; do a+=("$1"); shift; done; shift; k=("$@")
+  local ra=0 rk=0
+  $KT compress --db "$D/db.features.tsv" "${a[@]}" >/dev/null 2>"$W/rb.err" || ra=$?
+  $KT compress --db "$D/db.features.tsv" "${k[@]}" >/dev/null 2>"$W/rk.err" || rk=$?
+  if [ $ra = 1 ] && [ $rk = 1 ] && [ "$(tail -1 "$W/rb.err")" = "$(tail -1 "$W/rk.err")" ] && grep -q '^karyozip: ' "$W/rk.err"; then
+    ok "$what: refused as the BEDs are ($(tail -1 "$W/rk.err" | cut -c11-90))"
+  else no "$what: rc $ra/$rk, bed=[$(tail -1 "$W/rb.err")] kst=[$(tail -1 "$W/rk.err")]"; fi
+}
+refsame "per-set .kst, a set missing" ${in% -i *} -- ${kin% -i *}
+sw() { echo "$1" | awk '{t=$2; $2=$4; $4=t; print}'; }   # the first two sets swapped
+refsame "per-set .kst, two sets swapped" $(sw "$in") -- $(sw "$kin")
+$KT compress --names drop < "$D/db.gene.bed" > "$W/drop.kst" 2>/dev/null
+for t in "$W/f.kt" "$W/drop.kst" "$W/rall.aln.kst"; do
+  $KT compress --db "$D/db.features.tsv" ${kin/$W\/set.gene.kst/$t} >/dev/null 2>"$W/np.err" || true
+  grep -qx 'karyozip: --db: a .kst input must be a plain track of one set: not --aln, not --db, and its names in the file, not dropped' "$W/np.err" \
+    && ok "a .kst input that is not plain ($(basename "$t")): refused" || no "a .kst input that is not plain ($(basename "$t")): $(tail -1 "$W/np.err")"
+done
+head -c 100 "$W/set.gene.kst" > "$W/cut.kst"
+must_fail "a .kst input cut inside its header" $KT compress --db "$D/db.features.tsv" ${kin/$W\/set.gene.kst/$W\/cut.kst}
 # smooth and region on every informed form
 { printf 'feature_set\tchild\tparent\n'; for l in $(cut -f4 "$D/db.acrocentric.bed" "$D/s.bed" "$D/ref.bed" | sort -u); do printf 'acrocentric\t%s\tcategorized\n' "$l"; done; } > "$W/inf.tsv"
 $KT compress < "$D/db.acrocentric.bed" > "$W/pa.kt" 2>/dev/null

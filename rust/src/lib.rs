@@ -8,7 +8,7 @@
 //! as soon as they are made, so a failed or dropped `Writer` leaves none, and no thread of it outlives it.
 //!
 //! The reader path still exits through [`bail`] on a corrupt or refused file: `reader::Reader`, `smooth`, `query`,
-//! the index, `decompress --db`, `aln-pack`, and so a `.kst` given to `aln::Aln::load_ref`.
+//! the index, `decompress --db`, `aln-pack`, and so a `.kst` given to `aln::Aln::load_ref` or to `db::encode`.
 //!
 //! # Threads
 //! Writers may run one after another or at once on several threads: they share rayon's global pool and nothing

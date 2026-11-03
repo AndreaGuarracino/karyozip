@@ -1,6 +1,6 @@
 usage:
   karyozip compress   [-i IN.bed[.gz]] [-o OUT.kst] [-e low|medium|high] [-n drop]
-                      [-d features.tsv [--hier H] -i SET.bed ...] [-a P.paf --ref R.bed|R.kst]
+                      [-d features.tsv [--hier H] -i SET ...] [-a P.paf --ref R.bed|R.kst]
   karyozip decompress -i F [-o OUT.bed] [-n FILE] [-d features.tsv [--set A,B] [--out-dir DIR]]
   karyozip query      -i F -r NAME[:START-END] [-o OUT.bed] [-n FILE]
   karyozip index      -i F        writes F.kzi, which makes query fast on tracks with many reads
@@ -13,6 +13,8 @@ usage:
                --v1 for tracks of KaryoScope 1.x, --chunk 20000 for those before 2026-01-08
   readers take -n, -d, --hier, -a, --ref as compress was given; -n FILE takes the names
                from a FASTA, FASTQ or list
+  -d: compress takes one -i SET per feature set, in features.tsv column order: its BED, or its
+               plain .kst (compress of the BED), the same bytes either way
   -d: --set A,B picks feature sets, default all; without --out-dir they print as columns;
                with --smooth, one set on stdout, or every picked set under --out-dir
   any command: -t N, --threads N  --tmp-dir DIR  -h, --help  --version

@@ -198,21 +198,48 @@ fn num_r(b: &[u8], max: u32, what: &str) -> KzResult<u32> {
     Ok(v as u32)
 }
 
-/// One input BED, streamed a row at a time
-struct Brd { lines: crate::Lines, seq: Vec<u8>, st: u64, en: u64, lab: Vec<u8>, labid: u32,
+/// Where one input's rows come from: a BED, or a set's plain .kst decoded in step
+enum Src { Bed(crate::Lines), Kst(Box<(crate::reader::Reader, crate::reader::RowStream)>) }
+
+/// One input, streamed a row at a time
+struct Brd { src: Src, seq: Vec<u8>, st: u64, en: u64, lab: Vec<u8>, labid: u32,
              pseq: Vec<u8>, pen: u64, had: bool, eof: bool }
+
+/// A .kst by its magic; a file that cannot be read is left to the BED path's refusal
+fn is_kst(path: &str) -> bool {
+    let mut m = [0u8; 8];
+    std::fs::File::open(path).and_then(|mut f| std::io::Read::read_exact(&mut f, &mut m)).is_ok() && &m == crate::writer::MAGIC
+}
+
+/// A set's .kst in place of its BED: a plain track, as --ref takes one, opened as no companion, as the C's kopen
+fn kst_open(path: &str) -> KzResult<Src> {
+    let mut hb = [0u8; 136];
+    if std::fs::File::open(path).and_then(|mut f| std::io::Read::read_exact(&mut f, &mut hb)).is_err() {
+        return Err(Error::io("--db: cannot read a .kst input"));
+    }
+    let h1 = u64::from_le_bytes(hb[16..24].try_into().unwrap_or_default());
+    if h1 & (kst::ALNFLAG | kst::DBFLAG | kst::DROPPED) != 0 {
+        return Err(Error::input("--db: a .kst input must be a plain track of one set: not --aln, not --db, and its names in the file, not dropped"));
+    }
+    let r = crate::reader::Reader::open_with(path, &crate::reader::ReadOpts { index: true, ..Default::default() });
+    let s = r.rows();
+    Ok(Src::Kst(Box::new((r, s))))
+}
 
 impl Brd {
     fn open(path: &str) -> KzResult<Brd> {
-        let lines = if path == "-" { crate::Lines::new(std::io::stdin()) } else {
-            let f = std::fs::File::open(path).map_err(|e| {   // as the C: the path and why, then the refusal
-                eprintln!("cannot open {path}: {}", crate::ffi::strerror(&e));
-                Error::io("cannot open an input BED")
-            })?;
-            crate::Lines::new(f)
+        let src = if path != "-" && is_kst(path) { kst_open(path)? } else {
+            let lines = if path == "-" { crate::Lines::new(std::io::stdin()) } else {
+                let f = std::fs::File::open(path).map_err(|e| {   // as the C: the path and why, then the refusal
+                    eprintln!("cannot open {path}: {}", crate::ffi::strerror(&e));
+                    Error::io("cannot open an input BED")
+                })?;
+                crate::Lines::new(f)
+            };
+            let mut lines = lines; lines.err = "read error on an input BED";
+            Src::Bed(lines)
         };
-        let mut lines = lines; lines.err = "read error on an input BED";
-        let mut b = Brd { lines, seq: Vec::new(), st: 0, en: 0, lab: Vec::new(), labid: u32::MAX,
+        let mut b = Brd { src, seq: Vec::new(), st: 0, en: 0, lab: Vec::new(), labid: u32::MAX,
                           pseq: Vec::new(), pen: 0, had: false, eof: false };
         b.next()?;
         if b.eof { return Err(Error::input("an input BED is empty")); }
@@ -222,7 +249,32 @@ impl Brd {
     /// The row parsed in the reader's buffer, the previous label compared, not copied, as the C's bnext
     fn next(&mut self) -> KzResult<()> {
         let bad = |m: &str| Err(Error::input(m));
-        let Some((line, nl)) = self.lines.try_next_line_nl()? else { self.eof = true; return Ok(()); };
+        let lines = match &mut self.src {
+            Src::Bed(l) => l,
+            Src::Kst(k) => {   // a decoded row, checked as a BED line is, as the C's knext
+                let (r, s) = &mut **k;
+                let Some((ri, st, en, id)) = r.next_row(s) else { self.eof = true; return Ok(()); };
+                let mut idb = Vec::new();
+                let l: &[u8] = if r.nlabels() > 0 { r.label_at(id as usize) } else { kst::putu64(&mut idb, id); &idb };
+                let nm = r.name_at(ri);
+                if nm.len() >= 512 { return bad("name too long"); }
+                if nm.is_empty() { return bad("empty sequence name"); }
+                if self.had {
+                    std::mem::swap(&mut self.pseq, &mut self.seq);
+                    self.pen = self.en;
+                }
+                self.seq.clear(); self.seq.extend_from_slice(nm);
+                (self.st, self.en) = (st, en);
+                let samelab = l == self.lab.as_slice();
+                if !samelab { self.lab.clear(); self.lab.extend_from_slice(l); self.labid = u32::MAX - 1; }
+                if self.had && self.st == self.pen && self.seq == self.pseq && samelab {
+                    return bad("two touching runs carry the same label: merge them first");
+                }
+                self.had = true;
+                return Ok(());
+            }
+        };
+        let Some((line, nl)) = lines.try_next_line_nl()? else { self.eof = true; return Ok(()); };
         if line.is_empty() { return bad("bad line"); }   // as the C: a blank row is not skipped
         if !nl { return bad("input does not end with a newline"); }
         if crate::ffi::find(0, line).is_some() { return bad("a NUL byte inside a row"); }
@@ -255,7 +307,9 @@ impl Brd {
     }
 }
 
-/// One BED per feature set in header order, or one merged featureID track; true when a featureID came from the vocabulary
+/// One BED or plain .kst per feature set in header order (the two may be mixed: a .kst is known by its magic), or one
+/// merged featureID track; true when a featureID came from the vocabulary. A .kst input gives the bytes its BED would.
+/// Its refusals of a corrupt file are the reader's, which exit (see the crate's Errors)
 pub fn encode(files: &[String], feats: &Feats, w: &mut crate::writer::Writer) -> KzResult<bool> {
     let bad = |m: &str| Err(Error::input(m));
     let mut cart_used = false;

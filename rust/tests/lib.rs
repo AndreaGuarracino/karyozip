@@ -3,7 +3,6 @@ use karyozip::{ffi, writer::{self, Options, Writer}, Error, ErrorKind, KzResult}
 use std::io::Write;
 
 /// One BED through `Writer::row`, as an annotator would call it
-
 fn build(bed: &[u8], opt: Options) -> Vec<u8> {
     let dir = std::env::temp_dir();
     build_in(bed, opt, &dir)
@@ -258,4 +257,39 @@ fn every_codec_round_trips() {
             assert_eq!(ffi::tok_decode(&v).as_deref(), Some(&src[..]), "tokeniser on {f}");
         }
     }
+}
+
+/// db::encode over per-set .kst inputs the library wrote: the CLI's bytes from the BEDs; a set missing is an Err
+#[test]
+fn db_encode_from_per_set_kst() {
+    let d = scratch("dbkst");
+    let feats_path = d.join("features.tsv");
+    std::fs::write(&feats_path, fixfile("db.features.tsv")).unwrap();
+    let sets = ["acrocentric", "chromosome", "gene", "region", "repeat", "subtelomeric"];
+    let (mut beds, mut ksts) = (Vec::new(), Vec::new());
+    for (i, s) in sets.iter().enumerate() {
+        let bed = fixfile(&format!("db.{s}.bed"));
+        let (b, k) = (d.join(format!("{s}.bed")), d.join(format!("{s}.kst")));
+        std::fs::write(&b, &bed).unwrap();
+        std::fs::write(&k, build_in(&bed, Options { block: [u64::MAX, 4, 262144][i % 3], ..Options::default() }, &d)).unwrap();
+        beds.push(b.display().to_string()); ksts.push(k.display().to_string());
+    }
+    let mut c = std::process::Command::new(env!("CARGO_BIN_EXE_karyozip"));
+    c.arg("-t").arg(test_threads()).arg("compress").arg("--db").arg(&feats_path);
+    for b in &beds { c.arg("-i").arg(b); }
+    let want = c.stderr(std::process::Stdio::null()).output().expect("spawn").stdout;
+    assert!(!want.is_empty());
+    let feats = karyozip::db::Feats::load(&feats_path.display().to_string()).expect("features");
+    let mut w = Writer::new(Options::default(), &d).expect("temp file");
+    let used = karyozip::db::encode(&ksts, &feats, &mut w).expect("encode");
+    w.set_feathash(if used { feats.hierhash } else { feats.hash }, used);
+    let mut out = Vec::new();
+    w.close(&mut out).expect("close");
+    assert_eq!(out, want, "per-set .kst through the library");
+    // a set missing: the CLI's refusal, returned
+    let mut w = Writer::new(Options::default(), &d).expect("temp file");
+    let e = karyozip::db::encode(&ksts[..5], &feats, &mut w).expect_err("five sets of six were accepted");
+    assert!(e.message().starts_with("--db: give one BED per feature set"), "{}", e.message());
+    assert!(leftovers(&d).is_empty());
+    let _ = std::fs::remove_dir_all(&d);
 }

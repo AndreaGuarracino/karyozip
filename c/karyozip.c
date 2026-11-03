@@ -5077,7 +5077,9 @@ typedef struct { FILE *f; char *ln; size_t cap;
                  char seq[512]; uint64_t st, en; char *lab; size_t labcap; int eof;
                  size_t labn; uint32_t labid; int set;
                  char pseq[512]; uint64_t pen;   /* the run before */
-                 char *buf; size_t bp, bn, bcap; } brd;
+                 char *buf; size_t bp, bn, bcap;
+                 /* a per-set .kst instead of a BED: its rows decoded in step, as dump walks them */
+                 R *r; cur_t c; span sp; const uint8_t *lp, *ip; uint64_t ri, k, nr, kpos, emitted; } brd;
 static void sset(char **d, size_t *cap, const char *s, size_t n) {   /* a string on the heap */
     if (n + 1 > *cap) { *cap = n + 64; *d = xrealloc(*d, *cap); }
     memcpy(*d, s, n); (*d)[n] = 0;
@@ -5112,7 +5114,9 @@ static ssize_t brd_line(brd *b, char **lnp) {
     }
 }
 
+static void knext(brd *b);
 static void bnext(brd *b) {
+    if (b->r) { knext(b); return; }
     char *line = NULL;
     ssize_t n = brd_line(b, &line);
     if (n <= 0) { b->eof = 1; return; }
@@ -5140,6 +5144,67 @@ static void bnext(brd *b) {
     if (DBFAST && !same) b->labid = si_get(&SI[b->set], b->lab, 0);   /* the same label spans several rows */
 }
 
+/* A per-set .kst in place of its BED: a plain track, as --ref takes one, opened as no companion */
+static int iskst(const char *path) {
+    FILE *k = fopen(path, "rb"); char m[8];
+    int kst = k && fread(m, 1, 8, k) == 8 && !memcmp(m, MAGIC, 8);
+    if (k) fclose(k);
+    return kst;
+}
+static void kopen(brd *b, const char *path) {
+    uint64_t hh[16]; uint8_t hb[128];
+    {   FILE *f = fopen(path, "rb");
+        if (!f || fseek(f, 8, SEEK_SET) || fread(hb, 1, 128, f) != 128) die("--db: cannot read a .kst input");
+        fclose(f); ldwords(hh, hb, 16); }
+    if (hh[1] & (ALNFLAG | DBFLAG | DROPPED))
+        die("--db: a .kst input must be a plain track of one set: not --aln, not --db, and its names in the file, not dropped");
+    b->r = refopen(path);
+    ensurenames(b->r);
+    b->c = (cur_t){ UINT64_MAX, 0, NULL, NULL };
+    b->ri = UINT64_MAX; b->k = b->nr = 0;
+}
+/* The next row of a .kst input, checked as bnext checks a BED line; the reader's plain globals set for it and put back,
+   since every input interleaves, as reffill_r does */
+static void knext(brd *b) {
+    R *r = b->r;
+    int ld = LENDEC, td = TAILDEC; uint64_t tp = TAILPRED_R, ts = TAILSKIP_R; const uint8_t *pe = PAYEND;
+    TAILDEC = r->taildec; TAILPRED_R = r->tailpred; TAILSKIP_R = r->tailskip;
+    while (b->k == b->nr) {                       /* the next sequence with a run */
+        if (b->ri != UINT64_MAX) seqdone(r, b->ri, &b->c, b->lp, b->ip, &b->sp);
+        if (++b->ri >= r->nreads) {
+            if (b->emitted != r->rows) {
+                fprintf(stderr, "karyozip: emitted %llu rows, the header says %llu\n",
+                        (unsigned long long)b->emitted, (unsigned long long)r->rows);
+                die("file is truncated");
+            }
+            b->eof = 1; goto done;
+        }
+        rec q = seqptrs(r, b->ri, &b->c, &b->lp, &b->ip, &b->sp);
+        b->nr = q.nruns; b->k = 0; b->kpos = 0;
+    }
+    loadblk(r, b->sp.blk);                        /* this reader's block: PAYEND and LENDEC back */
+    spannext(r, &b->sp, &b->lp, &b->ip); b->sp.left--;
+    const char *nm = r->name[b->ri];
+    uint64_t s = b->kpos, e = s + rlen(&b->lp, nm, s, b->k + 1 == b->nr && b->ri >= TAILSKIP_R), f = vget(&b->ip);
+    if (r->lab && f >= r->nlab) die("corrupt block: a label id past the table");
+    b->k++; b->kpos = e; b->emitted++;
+    char idb[24]; const char *L = idb; size_t ll;
+    if (r->lab) { L = r->lab[f]; ll = strlen(L); } else ll = (size_t)(putu64(idb, f) - idb);
+    size_t sl = strlen(nm);
+    if (sl >= sizeof b->seq) die("name too long");
+    if (!sl) die("empty sequence name");
+    int had = b->lab != NULL, same = had && b->labn == ll && !memcmp(b->lab, L, ll);
+    if (had) { memcpy(b->pseq, b->seq, strlen(b->seq) + 1); b->pen = b->en; }
+    memcpy(b->seq, nm, sl); b->seq[sl] = 0;
+    if (!same) { sset(&b->lab, &b->labcap, L, ll); b->labn = ll; }
+    b->st = s; b->en = e;
+    if (same && b->st == b->pen && !strcmp(b->seq, b->pseq))
+        die("two touching runs carry the same label: merge them first");
+    if (DBFAST && !same) b->labid = si_get(&SI[b->set], b->lab, 0);
+done:
+    LENDEC = ld; TAILDEC = td; TAILPRED_R = tp; TAILSKIP_R = ts; PAYEND = pe;
+}
+
 static void encode_db(int nfiles, char **files) {
     if (HIERTAB && !DBFEATS) die("--hier does nothing without --db");
     loadfeatures(DBFEATS);
@@ -5154,9 +5219,12 @@ static void encode_db(int nfiles, char **files) {
     brd *b = xcalloc((size_t)nfiles, sizeof *b);
     for (int i = 0; i < nfiles; i++) {
         b[i].set = i;
-        b[i].f = zfopen(strcmp(files[i], "-") ? files[i] : NULL);
-        if (!b[i].f) { fprintf(stderr, "cannot open %s: %s\n", files[i], strerror(errno));
-                       die("cannot open an input BED"); }
+        if (strcmp(files[i], "-") && iskst(files[i])) kopen(&b[i], files[i]);   /* a per-set .kst, by its magic */
+        else {
+            b[i].f = zfopen(strcmp(files[i], "-") ? files[i] : NULL);
+            if (!b[i].f) { fprintf(stderr, "cannot open %s: %s\n", files[i], strerror(errno));
+                           die("cannot open an input BED"); }
+        }
         bnext(&b[i]);
         if (b[i].eof) die("an input BED is empty");
     }
@@ -5233,6 +5301,7 @@ static void encode_db(int nfiles, char **files) {
     }
     for (int i = 1; i < nfiles; i++)
         if (!b[i].eof) die("the input BEDs have different lengths");
+    for (int i = 0; i < nfiles; i++) { rclose(b[i].r); b[i].r = NULL; }   /* the .kst inputs go before the close */
     fprintf(stderr, "db: %llu rows from %d tracks, %llu all-novel\n",
             (unsigned long long)rows, nfiles, (unsigned long long)missing);
     if (ALNPAF)

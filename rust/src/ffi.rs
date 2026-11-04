@@ -362,6 +362,7 @@ unsafe extern "C" {
     fn sigaddset(set: *mut SigSet, sig: c_int) -> c_int;
     fn pthread_sigmask(how: c_int, set: *const SigSet, old: *mut SigSet) -> c_int;
     fn nanosleep(req: *const TimeSpec, rem: *mut TimeSpec) -> c_int;
+    fn write(fd: c_int, b: *const u8, n: usize) -> isize;
 }
 #[repr(C)] struct TimeSpec { s: i64, ns: i64 }
 /// glibc's sigset_t: 1024 bits
@@ -551,7 +552,11 @@ pub fn stage_begin() -> SigSet {
         pthread_sigmask(SIG_BLOCK, &hs, &mut was);
     }
     STAGING.store(true, SeqCst);
-    stage_pause(&STAGE_ENTRY_MS, "KZ_TEST_STAGE_ENTRY_PAUSE_MS");
+    if stage_ms(&STAGE_ENTRY_MS, "KZ_TEST_STAGE_ENTRY_PAUSE_MS") > 0 {   // told on stderr, so a test signals inside
+        // SAFETY: a static buffer of its length
+        unsafe { write(2, STAGE_ENTRY_ACK.as_ptr(), STAGE_ENTRY_ACK.len()); }
+        stage_pause(&STAGE_ENTRY_MS, "KZ_TEST_STAGE_ENTRY_PAUSE_MS");
+    }
     if SIGSTATE.load(SeqCst) == EXITING { STAGING.store(false, SeqCst); await_exit(); }
     was
 }
@@ -568,11 +573,16 @@ pub fn stage_abort() { STAGING.store(false, std::sync::atomic::Ordering::SeqCst)
 /// makes each staged BED and before it publishes it, so a test can signal in what was once a window where the file
 /// existed and no handler knew it. KZ_TEST_STAGE_ENTRY_PAUSE_MS=N (STAGE_ENTRY_MS): stage_begin sleeps N ms once
 /// STAGING is up and before it looks for EXITING, so a handler on another thread can claim EXITING and find STAGING
-/// up (once a mutual wait). As the C's stage_pause_ms
+/// up (once a mutual wait); as it starts that sleep it writes STAGE_ENTRY_ACK to stderr with one write(2), so the test
+/// signals once it is inside. As the C's stage_pause_ms
 pub static STAGE_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 static STAGE_ENTRY_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+const STAGE_ENTRY_ACK: &[u8] = b"karyozip: test: staging entry paused\n";
+fn stage_ms(ms: &std::sync::OnceLock<u64>, var: &str) -> u64 {
+    *ms.get_or_init(|| std::env::var(var).ok().and_then(|v| v.parse().ok()).unwrap_or(0))
+}
 pub fn stage_pause(ms: &std::sync::OnceLock<u64>, var: &str) {
-    let ms = *ms.get_or_init(|| std::env::var(var).ok().and_then(|v| v.parse().ok()).unwrap_or(0));
+    let ms = stage_ms(ms, var);
     if ms > 0 { std::thread::sleep(std::time::Duration::from_millis(ms)); }
 }
 

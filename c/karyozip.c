@@ -5475,8 +5475,10 @@ static void stale_warn(const char *dir) {
 /* For tests only, both read by stage_open, unset or 0 nothing sleeps. KZ_TEST_STAGE_PAUSE_MS=N: it sleeps N ms after
    it makes each staged BED and before it records it, so a test can signal in what was once a window where the file
    existed and no handler knew it. KZ_TEST_STAGE_ENTRY_PAUSE_MS=N: it sleeps N ms once STAGING is up and before it
-   looks for EXITING, so a handler on another thread can claim EXITING and find STAGING up (once a mutual wait). As
+   looks for EXITING, so a handler on another thread can claim EXITING and find STAGING up (once a mutual wait); as it
+   starts that sleep it writes STAGE_ENTRY_ACK to stderr with one write(2), so the test signals once it is inside. As
    the Rust's stage_pause */
+#define STAGE_ENTRY_ACK "karyozip: test: staging entry paused\n"
 static long stage_pause_ms(const char *var) {
     const char *e = getenv(var); long ms = e ? atol(e) : 0;
     return ms < 0 ? 0 : ms;
@@ -5519,7 +5521,7 @@ static int *stage_open(const char *dir) {
     sigemptyset(&hs); sigaddset(&hs, SIGINT); sigaddset(&hs, SIGTERM); sigaddset(&hs, SIGHUP);
     pthread_sigmask(SIG_BLOCK, &hs, &was);
     atomic_store(&STAGING, 1);
-    stage_sleep(ems);
+    if (ems) { (void)!write(2, STAGE_ENTRY_ACK, sizeof STAGE_ENTRY_ACK - 1); stage_sleep(ems); }   /* told, then slept */
     if (atomic_load(&SIGSTATE) == SIG_EXITING) {   /* a handler elsewhere is ending the process, and waits for STAGING */
         atomic_store(&STAGING, 0); await_exit();
     }

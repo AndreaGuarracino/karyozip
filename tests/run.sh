@@ -1386,23 +1386,39 @@ for at in before inside; do
 done
 
 # a handler claims the exit as --out-dir's staging starts: KZ_TEST_STAGE_ENTRY_PAUSE_MS holds stage_open with
-# STAGING up and before it looks for EXITING, and SIGTERM goes to a worker thread meanwhile (tgkill, once the
-# stale-backup warning, printed just before, shows). The handler waits for STAGING to drop; staging, seeing EXITING,
+# STAGING up and before it looks for EXITING, and SIGTERM goes to a worker thread meanwhile (tgkill, once the pause's
+# acknowledgement, written as it starts to sleep, shows: tgkrun, a few ms later, well inside the pause). The handler waits for STAGING to drop; staging, seeing EXITING,
 # once waited for the handler with STAGING still up, and both waited forever. Exit 1, all old, no staged file left;
-# bounded (dwait: killed after 30 s, scaled, and the case fails). decompress --db over a BGZF features table of
+# bounded (tgkrun: killed after 30 s, scaled, and the case fails). decompress --db over a BGZF features table of
 # 60000 rows, about 19 blocks, which the C inflates on its OpenMP team, so the C too has idle workers, signals
 # unblocked, before it stages. A stress case: -t 4, whatever the budget
+# tgkrun SECS LINE ERR CMD...: runs CMD, its stdout to /dev/null and its stderr to ERR; once ERR holds the line LINE
+# (polled every 5 ms, from before CMD starts), SIGTERM to CMD's first thread other than its main one (tgkill), so the
+# signal follows the line by milliseconds; then up to SECS for CMD to end. Its exit code: CMD's; 124 if CMD was still
+# running (killed); 125 if the line never showed in SECS, CMD ended first, or it had no other thread (killed)
+tgkrun() { python3 -c '
+import ctypes, os, subprocess, sys, time
+secs, line, err = float(sys.argv[1]), sys.argv[2].encode(), sys.argv[3]
+p = subprocess.Popen(sys.argv[4:], stdout=subprocess.DEVNULL, stderr=open(err, "wb"))
+def stop(rc): p.kill(); p.wait(); sys.exit(rc)
+end = time.monotonic() + secs
+while line not in open(err, "rb").read().splitlines():
+    if p.poll() is not None or time.monotonic() > end: stop(125)
+    time.sleep(0.005)
+tids = sorted(t for t in os.listdir("/proc/%d/task" % p.pid) if t != str(p.pid))
+if not tids or ctypes.CDLL(None).tgkill(p.pid, int(tids[0]), 15): stop(125)
+try: sys.exit(p.wait(timeout=secs))
+except subprocess.TimeoutExpired: stop(124)' "$@"; }
 if stress "SIGTERM on a worker as --out-dir's staging starts"; then
   { cat "$W/rc/f.tsv"; awk 'BEGIN { for (i = 5; i < 60000; i++) printf "%d\tg%d\tr%d\n", i, i, i }'; } > "$W/rc/fb.tsv"
   python3 "$D/kt.py" bgzf "$W/rc/fb.tsv" "$W/rc/fb.tsv.gz"
   $KT compress --db "$W/rc/fb.tsv.gz" -i "$W/rc/gene.bed" -i "$W/rc/repeat.bed" > "$W/rc/rb.kt" 2>/dev/null || :
-  swdir "$W/sw"; : > "$W/sw.err"; tid=
-  ( KZ_TEST_STAGE_ENTRY_PAUSE_MS=$PAUSE exec $KZ -t 4 decompress --db "$W/rc/fb.tsv.gz" --set gene,repeat --out-dir "$W/sw" -i "$W/rc/rb.kt" >/dev/null 2>"$W/sw.err" ) & pid=$!
-  swwait "$W/sw" 'grep -q "old BED" "$W/sw.err"' $pid && tid=$(ls /proc/$pid/task 2>/dev/null | grep -vx "$pid" | head -n1) || :
-  if [ -n "$tid" ] && tgk $pid "$tid" 15; then dwait $pid 30; g=$(rcgen "$W/sw")
-    [ $rc = 1 ] && [ $g = old ] && swclean "$W/sw" && ok "SIGTERM on a worker as --out-dir's staging starts: exit 1, all old, no staged file left" \
-      || no "SIGTERM on a worker as --out-dir's staging starts: rc=$rc (124: hung, killed), $g, left: $(ls -A "$W/sw" | tr '\n' ' ')"
-  else kill -KILL $pid 2>/dev/null || :; wait $pid 2>/dev/null || :; no "SIGTERM on a worker as --out-dir's staging starts: no warning, or no worker thread"; fi
+  swdir "$W/sw"; rc=0
+  KZ_TEST_STAGE_ENTRY_PAUSE_MS=$PAUSE tgkrun "$(tmo 30)" "karyozip: test: staging entry paused" "$W/sw.err" \
+    $KZ -t 4 decompress --db "$W/rc/fb.tsv.gz" --set gene,repeat --out-dir "$W/sw" -i "$W/rc/rb.kt" || rc=$?
+  g=$(rcgen "$W/sw")
+  [ $rc = 1 ] && [ $g = old ] && swclean "$W/sw" && ok "SIGTERM on a worker as --out-dir's staging starts: exit 1, all old, no staged file left" \
+    || no "SIGTERM on a worker as --out-dir's staging starts: rc=$rc (124: hung, killed; 125: no pause acknowledged, or no worker thread), $g, left: $(ls -A "$W/sw" | tr '\n' ' ')"
 fi
 
 # -o's rename under the same protocol: a worker's handler held, signalled once the temporary is synced and closed,

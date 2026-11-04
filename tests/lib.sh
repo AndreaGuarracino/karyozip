@@ -31,7 +31,9 @@
 #                            after each rename, so a case can signal just before and inside the window
 #   KZ_TEST_STAGE_PAUSE_MS=N --out-dir sleeps N ms after creating each staged BED, before recording its name
 #   KZ_TEST_STAGE_ENTRY_PAUSE_MS=N  --out-dir's staging sleeps N ms once STAGING is up, before it looks for EXITING
-#   Sleeps at those fixed points only: timing, never the bytes. Unset or 0, nothing sleeps. For the test suite only
+#                            and, as it starts, writes "karyozip: test: staging entry paused" to stderr (one write(2))
+#   Sleeps at those fixed points only (and that one stderr line): timing, never the bytes. Unset or 0, nothing
+#   sleeps. For the test suite only
 
 # need TOOL...: every missing tool named at once, then exit 1
 need() {

@@ -100,7 +100,7 @@ The segment hash is the wrapping sum, over the query names that have segments, o
 ### The features hash (under DBFLAG)
 
 The features hash is FNV-1a 64 over the raw bytes of `features.tsv`. Under `CARTFLAG` the hash is continued over the raw bytes of `hierarchy.tsv`. A reader given `-d` refuses a track whose stored hash differs.
-`compress -d` takes each feature set as its BED or as a plain `.kst` of that set (no `ALNFLAG`, `DBFLAG` or `DROPPED`; read only from a regular file, and known by its magic and a first line no BED row has: up to the first newline, a NUL, fewer than three tabs, or no newline at all, so a BED whose first sequence name begins with `KST00001` is a BED). Its rows are taken as the BED's would be, so the output is the same bytes either way, and nothing in the file records which was given.
+`compress -d` takes each feature set as its BED or as a plain `.kst` of that set (no `ALNFLAG`, `DBFLAG` or `DROPPED`; read only from a regular file, and known by its magic `KST00001` at the start of a first line that is not a BED row's start: a BED row there has, after its name, a tab, ASCII digits, a tab, digits and a tab, and no NUL before the first newline, so a BED whose first sequence name begins with `KST00001` is a BED). Its rows are taken as the BED's would be, so the output is the same bytes either way, and nothing in the file records which was given.
 
 ## The streams
 

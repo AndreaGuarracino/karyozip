@@ -720,8 +720,16 @@ for x in C R; do rc=0; timeout "$(tmo 30)" "${!x}" compress --db "$W/k10.tsv" -i
 # the same bytes and words from both
 printf 'KST00001\t0\t5\tx\n' > "$W/ke.bed"; ln -sf "$W/km.bed" "$W/km.lnk"; ln -sf "$W/ke.bed" "$W/ke.lnk"
 printf 'KST00001\001\002' > "$W/kt.kst"
+# a .kst whose count's low bytes are 09 09 09 0a (forged): the magic, three tabs and a newline, no NUL, yet no BED row,
+# so the .kst reader's refusal from a regular file and the pipe refusal through a pipe or stdin; rows that start with
+# the magic but not a tab, digits, a tab, digits and a tab after the name: refused as a .kst; and a one-row BED whose
+# first line passes the 4096-byte probe with no newline: the BED reader's refusal from every form, in the same words
+python3 "$D/kt.py" "$W/k10.kst" "$W/k9.kst" lo0 0x0a090909
+printf 'KST00001\t\t\t\n' > "$W/kr1.bed"; printf 'KST00001\tA\tB\tx\n' > "$W/kr2.bed"
+{ printf 'KST00001\t0\t5\t'; head -c 5000 /dev/zero | tr '\0' x; } > "$W/kl.bed"
 for c in "km.bed|file" "km.lnk|file" "km.bed|stdin" "km.bed|fifo" "ke.bed|file" "ke.lnk|file" "ke.bed|stdin" "ke.bed|fifo" "ke.bed|psub" \
-         "k10.kst|file" "kt.kst|file"; do
+         "k10.kst|file" "kt.kst|file" "k9.kst|file" "k9.kst|stdin" "k9.kst|fifo" "k9.kst|psub" "kr1.bed|file" "kr1.bed|stdin" \
+         "kr1.bed|fifo" "kr2.bed|file" "kr2.bed|psub" "kl.bed|file" "kl.bed|stdin" "kl.bed|fifo" "kl.bed|psub"; do
   IFS='|' read -r f form <<< "$c"
   for x in C R; do
     rc=0
@@ -732,9 +740,16 @@ for c in "km.bed|file" "km.lnk|file" "km.bed|stdin" "km.bed|fifo" "ke.bed|file" 
     esac
     eval "rc$x=$rc"
   done
-  case $f in kt.kst) want=1 ;; *) want=0 ;; esac
+  want=1
+  case $f/$form in
+    kt.kst/*|kr?.bed/file) msg="karyozip: --db: cannot read a .kst input" ;;
+    k9.kst/file) msg="karyozip: names stream does not match the track's sequence count" ;;
+    k9.kst/*|kr?.bed/*) msg=$kp ;;
+    kl.bed/*) msg="karyozip: input does not end with a newline" ;;
+    *) want=0 ;;
+  esac
   if [ $rcC = $want ] && [ $rcR = $want ] && cmp -s "$W/kC" "$W/kR" && cmp -s "$W/kC.err" "$W/kR.err" \
-     && { [ $want = 1 ] && [ "$(tail -1 "$W/kC.err")" = "karyozip: --db: cannot read a .kst input" ] \
+     && { [ $want = 1 ] && [ "$(tail -1 "$W/kC.err")" = "$msg" ] \
           || { [ -s "$W/kC" ] && "$C" --db "$W/k10.tsv" decompress -i "$W/kC" 2>/dev/null | cmp -s - "$W/${f%.*}.bed"; }; }; then ok=$((ok+1)); tpass
   else bad=$((bad+1)); tfail "--db input $f through a $form: rc $rcC/$rcR [$(tail -1 "$W/kC.err")] [$(tail -1 "$W/kR.err")]"; fi
 done

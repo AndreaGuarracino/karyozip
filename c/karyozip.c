@@ -5093,6 +5093,7 @@ typedef struct { FILE *f; char *ln; size_t cap;
                  size_t labn; uint32_t labid; int set;
                  char pseq[512]; uint64_t pen;   /* the run before */
                  char *buf; size_t bp, bn, bcap; uint64_t lines;   /* BED lines read */
+                 int probed;       /* a regular file iskst judged a BED: its first line not judged again */
                  /* a per-set .kst instead of a BED: its rows decoded in step, as dump walks them */
                  R *r; cur_t c; span sp; const uint8_t *lp, *ip; uint64_t ri, k, nr, kpos, emitted; } brd;
 static void sset(char **d, size_t *cap, const char *s, size_t n) {   /* a string on the heap */
@@ -5101,18 +5102,28 @@ static void sset(char **d, size_t *cap, const char *s, size_t n) {   /* a string
 }
 
 #define KSTPIPE "--db: a .kst input must be a regular file: it is read with random access, not through a pipe or stdin"
-/* An input's first line (its newline dropped) that is a .kst's start: the magic, then what no BED row has, a NUL,
-   fewer than three tabs or no newline at all. The byte after the magic may be a newline (a sequence count of 10,
-   266, ...), so a NUL alone is not enough; a BED row whose name begins with the magic has its three tabs and no NUL,
-   and is read. The one rule for a regular file (iskst) and for a pipe (kstpipe). As the Rust's kst_head */
-static int ksthead(const char *ln, size_t n, int nonl) {
+/* An input's first line (its newline dropped, or as much of it as was read) that is a .kst's start: the magic, and not
+   the start of a BED row. A BED row whose name begins with the magic goes on, after that name, to a tab, a run of ASCII
+   digits, a tab, a run of digits and a tab (its start and end), with no NUL; anything else after the magic is a .kst.
+   A .kst's first "line" ends at the first 0x0a of its header: its sequence count h[0] can be 09 09 09 0a (168,495,369
+   sequences: the magic, three tabs and a newline), but no count below 2^40 gives a tab, digits, a tab, digits and a
+   tab before a NUL or a newline. The one rule for a regular file (iskst) and for a pipe (kstpipe). As the Rust's
+   kst_head */
+static int ksthead(const char *ln, size_t n) {
     if (n < 8 || memcmp(ln, MAGIC, 8)) return 0;
-    size_t tabs = 0;
-    for (size_t i = 0; i < n && tabs < 3; i++) tabs += ln[i] == '\t';
-    return nonl || memchr(ln, 0, n) || tabs < 3;
+    if (memchr(ln, 0, n)) return 1;
+    const char *e = ln + n, *t = memchr(ln, '\t', n);
+    for (int k = 0; k < 2; k++) {               /* the start, then the end: digits between two tabs */
+        if (!t) return 1;
+        const char *d = ++t;
+        while (t < e && *t >= '0' && *t <= '9') t++;
+        if (t == d || t == e || *t != '\t') return 1;
+    }
+    return 0;
 }
-/* A BED reader's first line that is a .kst's start: refused, since a .kst through a pipe cannot be read */
-static void kstpipe(const char *ln, size_t n, int nonl) { if (ksthead(ln, n, nonl)) die(KSTPIPE); }
+/* A BED reader's first line that is a .kst's start: refused, since a .kst through a pipe cannot be read. Not asked of
+   a regular file, which iskst has judged already */
+static void kstpipe(const char *ln, size_t n) { if (ksthead(ln, n)) die(KSTPIPE); }
 
 #define BRDBUF (8u << 20)
 static ssize_t brd_line(brd *b, char **lnp) {
@@ -5137,7 +5148,7 @@ static ssize_t brd_line(brd *b, char **lnp) {
         if (!got) {
             if (ferror(b->f)) die("read error on an input BED");
             if (!b->bn) return -1;               /* real end of file */
-            if (!b->lines) kstpipe(b->buf, b->bn, 1);
+            if (!b->lines && !b->probed) kstpipe(b->buf, b->bn);
             die("input does not end with a newline");
         }
         b->bn += got;
@@ -5152,7 +5163,7 @@ static void bnext(brd *b) {
     if (n <= 0) { b->eof = 1; return; }
     b->ln = line;
     if (b->ln[n - 1] == '\n') b->ln[--n] = 0;
-    if (!b->lines++) kstpipe(b->ln, (size_t)n, 0);
+    if (!b->lines++ && !b->probed) kstpipe(b->ln, (size_t)n);
     if (memchr(b->ln, 0, (size_t)n)) die("a NUL byte inside a row");
     char *t1 = memchr(b->ln, '\t', (size_t)n);            if (!t1) die("bad line");
     char *t2 = memchr(t1 + 1, '\t', (size_t)(n - (t1 + 1 - b->ln))); if (!t2) die("bad line");
@@ -5178,15 +5189,16 @@ static void bnext(brd *b) {
 /* A per-set .kst in place of its BED: a plain track, as --ref takes one, opened as no companion.
    Known by its first line, as kstpipe knows one (ksthead): the magic, and no BED row, so a BED whose first name
    begins with the magic is a BED here too. Read with pread from the descriptor the BED reader would take, so nothing
-   is consumed, and at most KSTPROBE bytes: a .kst's header has a NUL within its first words, and a BED row its three
-   tabs within its name's 511 bytes and two coordinates; a first line longer than that is judged by what was read.
+   is consumed, and at most KSTPROBE bytes: a BED row's name (under 512 bytes), two coordinates and their tabs fit
+   in it, so a first line longer than that is judged by what was read.
    Only a regular file (a symlink followed) is probed, since a .kst is read with random access: a FIFO, a /dev/fd
    pipe or a device goes to the BED reader unprobed, opened once, and a .kst through one is refused by kstpipe.
-   1: fd is a .kst; 0: a BED. As the Rust's is_kst */
+   1: fd is a .kst; 0: a BED, *reg set if fd was probed, so kstpipe need not judge it again. As the Rust's is_kst */
 #define KSTPROBE 4096
-static int iskst(int fd) {
+static int iskst(int fd, int *reg) {
     struct stat st; char m[KSTPROBE]; size_t got = 0;
     if (fstat(fd, &st) || !S_ISREG(st.st_mode)) return 0;
+    *reg = 1;
     while (got < sizeof m) {
         ssize_t k = pread(fd, m + got, sizeof m - got, (off_t)got);
         if (k < 0 && errno == EINTR) continue;
@@ -5194,7 +5206,7 @@ static int iskst(int fd) {
         got += (size_t)k;
     }
     const char *nl = memchr(m, '\n', got);
-    return ksthead(m, nl ? (size_t)(nl - m) : got, !nl && got < sizeof m);
+    return ksthead(m, nl ? (size_t)(nl - m) : got);
 }
 static void kopen(brd *b, const char *path) {
     uint64_t hh[16]; uint8_t hb[128];
@@ -5266,7 +5278,7 @@ static void encode_db(int nfiles, char **files) {
         b[i].set = i;
         /* each input opened once: a regular file probed for a per-set .kst's magic, anything else a BED */
         int fd = strcmp(files[i], "-") ? open(files[i], O_RDONLY) : dup(0);
-        if (fd >= 0 && strcmp(files[i], "-") && iskst(fd)) { close(fd); kopen(&b[i], files[i]); }
+        if (fd >= 0 && strcmp(files[i], "-") && iskst(fd, &b[i].probed)) { close(fd); kopen(&b[i], files[i]); }
         else {
             b[i].f = fd < 0 ? NULL : zfdopen(fd);
             if (!b[i].f) { fprintf(stderr, "cannot open %s: %s\n", files[i], strerror(errno));

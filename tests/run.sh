@@ -287,6 +287,40 @@ printf 'KST00001\001\002' > "$W/pt.kst"
 rc=0; dbform file "$W/pg.kt" "$W/po.tsv" "$W/pt.kst" || rc=$?
 [ $rc = 1 ] && [ "$(tail -1 "$W/pg.kt.err")" = "karyozip: --db: cannot read a .kst input" ] && ok "-d, the magic and two bytes in a regular file: refused as a cut .kst" \
   || no "-d, the magic and two bytes in a regular file: rc $rc [$(tail -1 "$W/pg.kt.err")]"
+# a .kst's first "line" ends at the first 0x0a of its sequence count h[0]: a count whose low bytes are 09 09 09 0a
+# (168,495,369 sequences, forged on the ten-sequence .kst and re-signed) is the magic, three tabs and a newline, no
+# NUL; no BED row (after its name a tab, digits, a tab, digits and a tab), so a .kst from a regular file, refused by
+# the .kst reader, and the .kst's refusal through a pipe or stdin, never a BED's error. Rows starting with the magic
+# but without that shape are refused as a .kst too: a cut .kst from a regular file, the pipe refusal through a pipe
+python3 "$D/kt.py" "$W/p10.kst" "$W/p9.kst" lo0 0x0a090909
+[ "$(od -An -tx1 -j8 -N4 "$W/p9.kst" | tr -d ' ')" = 0909090a ] && ok "a .kst whose count's low bytes are 09 09 09 0a: forged" || no "a .kst whose count's low bytes are 09 09 09 0a: bytes WRONG"
+printf 'KST00001\t\t\t\n' > "$W/pr1.bed"; printf 'KST00001\tA\tB\tx\n' > "$W/pr2.bed"
+for c in "p9.kst|karyozip: names stream does not match the track's sequence count" "pr1.bed|karyozip: --db: cannot read a .kst input" \
+         "pr2.bed|karyozip: --db: cannot read a .kst input"; do
+  f=${c%%|*}; m=${c#*|}
+  rc=0; dbform file "$W/pg.kt" "$W/po.tsv" "$W/$f" || rc=$?
+  [ $rc = 1 ] && [ "$(tail -1 "$W/pg.kt.err")" = "$m" ] && ok "-d, $f from a regular file: refused as a .kst" || no "-d, $f from a regular file: rc $rc [$(tail -1 "$W/pg.kt.err")]"
+  for form in stdin fifo psub; do
+    rc=0
+    case $form in
+      stdin) timeout "$(tmo 30)" $KT compress --db "$W/po.tsv" -i - < "$W/$f" > /dev/null 2>"$W/pg.kt.err" || rc=$? ;;
+      *) dbform $form "$W/pg.kt" "$W/po.tsv" "$W/$f" || rc=$? ;;
+    esac
+    [ $rc = 1 ] && [ "$(tail -1 "$W/pg.kt.err")" = "$kp" ] && ok "-d, $f through a $form: refused as a .kst" || no "-d, $f through a $form: rc $rc [$(tail -1 "$W/pg.kt.err")]"
+  done
+done
+# a one-row BED named KST00001 whose first line is longer than the probe (4096 bytes) and has no newline: a regular
+# file probed as a BED is not judged again by the pipe check, so the BED reader's refusal, as through a pipe
+{ printf 'KST00001\t0\t5\t'; head -c 5000 /dev/zero | tr '\0' x; } > "$W/pl.bed"
+for form in file stdin fifo; do
+  rc=0
+  case $form in
+    stdin) timeout "$(tmo 30)" $KT compress --db "$W/po.tsv" -i - < "$W/pl.bed" > /dev/null 2>"$W/pg.kt.err" || rc=$? ;;
+    *) dbform $form "$W/pg.kt" "$W/po.tsv" "$W/pl.bed" || rc=$? ;;
+  esac
+  [ $rc = 1 ] && [ "$(tail -1 "$W/pg.kt.err")" = "karyozip: input does not end with a newline" ] \
+    && ok "-d, a long first line named KST00001 with no newline through a $form: the BED's refusal" || no "-d, a long first line with no newline through a $form: rc $rc [$(tail -1 "$W/pg.kt.err")]"
+done
 # a features table with its header alone: a novel row is featureID 0, any other label is refused (finding 4)
 printf 'featureID\tsetA\n' > "$W/ho.tsv"; printf 'chr1\t0\t5\tnovel\n' > "$W/hn.bed"; printf 'chr1\t0\t5\tx\n' > "$W/hx.bed"
 rc=0; $KT compress --db "$W/ho.tsv" -i "$W/hn.bed" > "$W/ho.kt" 2>"$W/ho.err" || rc=$?

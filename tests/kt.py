@@ -1,7 +1,8 @@
 """Forging helpers for the suite: parse a track, patch it, re-sign its hashes."""
 import struct, subprocess, sys, random, os
 FNV0 = 0xcbf29ce484222325; P = 0x100000001b3; M = (1 << 64) - 1
-FLAGS = sum(1 << b for b in (49, 50, 51, 52, 55, 56, 58, 59, 60, 61, 62, 63))   # flags; the rest: names length
+# the h[1] flag bits, as FLAGS in rust/src/kst.rs (run.sh checks the two agree); the rest: names length
+FLAGS = sum(1 << b for b in (49, 50, 51, 52, 55, 56, 57, 58, 59, 60, 61, 62, 63))
 def fnv(h, b):
     for x in b: h = ((h ^ x) * P) & M
     return h
@@ -61,9 +62,65 @@ def bgzf(src, dst):   # bgzip-style BGZF: 65280-byte blocks, empty EOF
         o += struct.pack("<II", zlib.crc32(c), len(c))
     open(dst, "wb").write(o)
 
+def blk(c, isz=None, crc=None, pre=b"", bsz=None):   # one BGZF block of c; pre: subfields before BC; the rest forged
+    import zlib
+    z = zlib.compressobj(6, zlib.DEFLATED, -15); x = z.compress(c) + z.flush(); xl = len(pre) + 6
+    bs = 12 + xl + len(x) + 8 if bsz is None else bsz
+    return (b"\x1f\x8b\x08\x04" + bytes(6) + struct.pack("<H", xl) + pre + struct.pack("<BBHH", 66, 67, 2, bs - 1) + x
+            + struct.pack("<II", zlib.crc32(c) if crc is None else crc, len(c) if isz is None else isz))
+
+def bgzfx(dst):   # forged BGZF: ISIZE bounds, subfields before BC, cuts inside the extra field
+    def bed(n):   # a BED of exactly n bytes
+        r = b"".join(b"r%d\t0\t1\tA\n" % i for i in range(n // 20)); pad = n - len(r) - 7
+        return r + b"z\t0\t1\t" + b"B" * pad + b"\n"
+    eof = blk(b""); w = lambda n, b: open(os.path.join(dst, n), "wb").write(b)
+    for n in (65535, 65536, 65537):
+        w("isz%d.bed" % n, bed(n)); w("isz%d.gz" % n, blk(bed(n)) + eof)
+    w("huge.gz", b"".join(blk(b"r\t0\t1\tA\n", isz=0xffffffff) for _ in range(8)) + eof)     # each claims 4 GiB
+    w("many.gz", blk(b"r\t0\t1\tA\n") * 1 + blk(b"", isz=65536, crc=0) * 300000 + eof)   # 20 GB claimed, each in bounds
+    w("bsize.gz", blk(b"r\t0\t1\tA\n", pre=b"XY\x04\x00abcd", bsz=30) + eof)              # BSIZE ends inside its own header
+    s = bed(1000); w("bc.bed", s)
+    one = blk(s, pre=b"XY\x04\x00abcd"); w("bcafter.gz", one + blk(s[:0], pre=b"XY\x00\x00") + eof)
+    for k in range(10, 12 + 14 + 3):
+        w("cut1.%d.gz" % k, one[:k]); w("cut2.%d.gz" % k, blk(s) + one[:k])
+    tail = b"\x1f\x8b\x08\x04" + bytes(6) + struct.pack("<H", 12) + b"XY\x02\x00ab" + b"BC\x02\x00"   # BC payload past the end
+    w("bcend1.gz", tail); w("bcend2.gz", blk(s) + tail)
+
+def varint10(src, dst, top, W):   # chunk 0's row start in the index table (always 0): nine 0x80, then byte top
+    d, h = load(src); off = 136 + h[6] + (h[1] & ~FLAGS) + h[2] + h[3]
+    tab = unzst(d[off:off + h[11]]); cl, p = vget(tab, 0); sp, q = vget(tab, p)
+    assert sp == 0, "chunk 0 starts at row 0"
+    z = zst(W, tab[:p] + b"\x80" * 9 + bytes([top]) + tab[q:])
+    d[off:off + h[11]] = z; h[11] = len(z); sign(d, h); open(dst, "wb").write(d)
+
+def alnovf(W):   # alignments past 64 bits against ref "s 0 10 A" (W/ov.ref.bed): ovN.paf, ovN.pk refused; ovok.* the boundary
+    M = (1 << 64) - 1
+    open(W + "/ov.ref.bed", "w").write("s\t0\t10\tA\n")
+    paf = lambda qs, qe, st, ts, te, cg: "q\t9\t%d\t%d\t%s\ts\t10\t%d\t%d\t1\t1\t60\tcg:Z:%s\n" % (qs, qe, st, ts, te, cg)
+    for k, l in enumerate((paf(M, M, "+", 0, 1, "1M"), paf(M - 1, M, "+", 0, 2, "1M1I"), paf(0, 1, "+", M, M, "1M"),
+                           paf(0, 1, "+", M - 1, M, "1M1D"), paf(0, 0, "-", 0, 1, "1M"))):
+        open(W + "/ov%d.paf" % k, "w").write(l)
+    open(W + "/ovok.paf", "w").write(paf(M - 1, M, "+", 0, 1, "1M"))   # aln-pack takes a target position up to 32 bits
+    rh = fnv(fnv(FNV0, b"s"), b"\n")
+    def pk(cnt, deltas, tgt, qs):   # one query "q", cnt blocks of 1 in one target run, zstd streams
+        st = [b"q\n", vput(cnt), deltas, vput(1) * cnt, vput(tgt) + vput(cnt), vput(qs), b"\0", b"\0", b"\0", b"\0"]
+        o = b"KSTAL1" + struct.pack("<Q", rh)
+        for x in st:
+            if not x: o += b"\0\0\0"; continue
+            z = zst(W, x); o += vput(1) + vput(len(x)) + vput(len(z)) + z
+        return o
+    zz = lambda v: (v << 1) ^ (v >> 63) if v >= 0 else ((-v) << 1) - 1
+    for k, f in enumerate((pk(1, b"", 0, M), pk(2, vput(3) + vput(zz(0)) + vput(zz(-2)), 0, 0), pk(2, vput(0), 1, 5))):
+        open(W + "/ov%d.pk" % k, "wb").write(f)
+    open(W + "/ovok.pk", "wb").write(pk(1, b"", 0, M - 1))
+
 if __name__ == "__main__":   # kt.py IN OUT IDX VALUE ...   (IDX "lo9" keeps the high 32 bits)
     if sys.argv[1] == "gen": gen(sys.argv[2], int(sys.argv[3])); sys.exit(0)
+    if sys.argv[1] == "varint10":   # kt.py varint10 IN OUT TOPBYTE WORKDIR
+        varint10(sys.argv[2], sys.argv[3], int(sys.argv[4], 0), sys.argv[5]); sys.exit(0)
     if sys.argv[1] == "bgzf": bgzf(sys.argv[2], sys.argv[3]); sys.exit(0)
+    if sys.argv[1] == "bgzfx": bgzfx(sys.argv[2]); sys.exit(0)
+    if sys.argv[1] == "alnovf": alnovf(sys.argv[2]); sys.exit(0)
     d, h = load(sys.argv[1])
     for i, v in zip(sys.argv[3::2], sys.argv[4::2]):
         v = int(v, 0)

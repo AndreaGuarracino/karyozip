@@ -1,8 +1,12 @@
 [package]
 name         = "karyozip"
-version      = "0.2.0"
+version      = "0.3.0"
 edition      = "2024"
 rust-version = "1.85"
+description  = "Compresses KaryoScope BED annotation tracks losslessly, with random access by region"
+repository   = "https://github.com/AndreaGuarracino/karyozip"
+# build.rs compiles the codecs from ../c, outside the package: it builds from a clone only
+publish      = false
 
 [[bin]]
 name = "karyozip"

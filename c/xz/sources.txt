@@ -1,0 +1,21 @@
+# The vendored liblzma 5.8.4 files karyozip builds, relative to c/.
+# Read by c/Makefile and rust/build.rs; one path per line, # starts a comment.
+xz/src/liblzma/common/common.c
+xz/src/liblzma/common/filter_buffer_decoder.c
+xz/src/liblzma/common/filter_buffer_encoder.c
+xz/src/liblzma/common/filter_common.c
+xz/src/liblzma/common/filter_decoder.c
+xz/src/liblzma/common/filter_encoder.c
+xz/src/liblzma/check/crc32_fast.c
+xz/src/liblzma/lz/lz_decoder.c
+xz/src/liblzma/lz/lz_encoder.c
+xz/src/liblzma/lz/lz_encoder_mf.c
+xz/src/liblzma/lzma/fastpos_table.c
+xz/src/liblzma/lzma/lzma2_decoder.c
+xz/src/liblzma/lzma/lzma2_encoder.c
+xz/src/liblzma/lzma/lzma_decoder.c
+xz/src/liblzma/lzma/lzma_encoder.c
+xz/src/liblzma/lzma/lzma_encoder_optimum_fast.c
+xz/src/liblzma/lzma/lzma_encoder_optimum_normal.c
+xz/src/liblzma/lzma/lzma_encoder_presets.c
+xz/src/liblzma/rangecoder/price_table.c

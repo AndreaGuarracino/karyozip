@@ -1,14 +1,20 @@
 // The codecs are the C ones from ../c: no Rust htscodecs, one BGZF inflate for both, and bzip3 with the fixes in c/bzip3/PROVENANCE
 fn main() {
+    // mallopt(M_MMAP_THRESHOLD) is glibc's and OpenMP is libgomp: Linux with glibc only, said here rather than at link time
+    let os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let env = std::env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
+    if os != "linux" || env != "gnu" {
+        panic!("karyozip builds for Linux with glibc only (GCC or a compiler with -fopenmp and libgomp); this target is {os}-{env}");
+    }
     let c = std::path::Path::new("../c");
-    println!("cargo:rerun-if-changed=../c");
+    // The C sources and c/Makefile (BZIP3_VERSION), not c/build; usage.txt is include_str!'d, which cargo tracks itself
+    for d in ["Makefile", "htscodecs", "bzip3", "libdeflate", "xz", "zpaq"] {
+        println!("cargo:rerun-if-changed=../c/{d}");
+    }
     // The two vendored versions come from the vendored trees, never a copy
     println!("cargo:rustc-env=HTSCODECS_VERSION={}", grab(&c.join("htscodecs/version.h"), "HTSCODECS_VERSION_TEXT"));
     println!("cargo:rustc-env=LIBDEFLATE_VERSION={}", grab(&c.join("libdeflate/libdeflate.h"), "LIBDEFLATE_VERSION_STRING"));
     let bz3 = grab(&c.join("Makefile"), "BZIP3_VERSION ?=");
-    // The usage text is the C's own, so the two cannot drift apart
-    let out = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap());
-    std::fs::write(out.join("usage.txt"), usage(&c.join("karyozip.c"))).unwrap();
     cc::Build::new()
         .files([
             c.join("htscodecs/tokenise_name3.c"),
@@ -32,13 +38,12 @@ fn main() {
         .flag("-fno-semantic-interposition")     // cc builds -fPIC: let calls inline, as the C's -fPIE
         .warnings(false)
         .compile("kzcodecs");
-    // liblzma 5.8.4 on its own: its config.h, common.h and version.h share names with htscodecs' and bzip3's; the C Makefile's file list
-    let mk = std::fs::read_to_string(c.join("Makefile")).unwrap();
-    let key = "$(addprefix xz/src/liblzma/,";
-    let i = mk.find(key).expect("no liblzma list in c/Makefile") + key.len();
+    // liblzma 5.8.4 on its own: its config.h, common.h and version.h share names with htscodecs' and bzip3's; the C Makefile's file list, c/xz/sources.txt
+    let list = c.join("xz/sources.txt");
+    let list = std::fs::read_to_string(&list).unwrap_or_else(|e| panic!("{}: {e}", list.display()));
     let mut xz = cc::Build::new();
-    for f in mk[i..i + mk[i..].find(')').unwrap()].split_whitespace().filter(|w| *w != "\\") {
-        xz.file(c.join("xz/src/liblzma").join(f));
+    for f in list.lines().map(|l| l.split('#').next().unwrap().trim()).filter(|l| !l.is_empty()) {
+        xz.file(c.join(f));
     }
     xz.file(c.join("xz/kzlzma.c"));
     xz.define("HAVE_CONFIG_H", None).include(c.join("xz")).include(c.join("xz/src/common"));
@@ -69,17 +74,4 @@ fn grab(path: &std::path::Path, key: &str) -> String {
         Some(v) => v.to_string(),
         None => line.split_whitespace().last().unwrap().to_string(),
     }
-}
-
-/// The C's USAGE string literal, unescaped back into plain text
-fn usage(path: &std::path::Path) -> String {
-    let t = std::fs::read_to_string(path).unwrap();
-    let i = t.find("static const char *const USAGE =").expect("no USAGE in karyozip.c");
-    let j = t[i..].find(";\n").expect("unterminated USAGE") + i;
-    let mut s = String::new();
-    for part in t[i..j].split('"').skip(1).step_by(2) {
-        s.push_str(&part.replace("\\n", "\n"));
-    }
-    assert!(s.starts_with("usage:\n"), "USAGE did not parse");
-    s
 }

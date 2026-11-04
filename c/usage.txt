@@ -1,0 +1,25 @@
+usage:
+  karyozip compress   [-i IN.bed[.gz]] [-o OUT.kst] [-e low|medium|high] [-n drop]
+                      [-d features.tsv [--hier H] -i SET ...] [-a P.paf --ref R.bed|R.kst]
+  karyozip decompress -i F [-o OUT.bed] [-n FILE] [-d features.tsv [--set A,B] [--out-dir DIR]]
+  karyozip query      -i F -r NAME[:START-END] [-o OUT.bed] [-n FILE]
+  karyozip index      -i F        writes F.kzi, which makes query fast on tracks with many reads
+  compress reads stdin without -i; decompress and query write stdout without -o
+  -e, --effort: low is quickest to compress and query; medium, the default, is smaller and a query
+               decodes one block of whole reads; high is smallest and a query decodes the whole file
+  -r NAME:START-END is BED, 0-based, END excluded; -r NAME alone is the whole sequence
+  --smooth --hier H [--set SET]: decompress and query give KaryoScope's smoothed track; the
+               set is the one whose tree holds the track's labels, or --set when two do
+               --v1 for tracks of KaryoScope 1.x, --chunk 20000 for those before 2026-01-08
+  readers take -n, -d, --hier, -a, --ref as compress was given; -n FILE takes the names
+               from a FASTA, FASTQ or list
+  -d: compress takes one -i SET per feature set, in features.tsv column order: its BED, or its
+               plain .kst (compress of the BED), the same bytes either way
+  -d: --set A,B picks feature sets, default all; without --out-dir they print as columns;
+               with --smooth, one set on stdout, or every picked set under --out-dir
+  any command: -t N, --threads N  --tmp-dir DIR  -h, --help  --version
+  long forms:  -i --input  -o --output  -r --region  -e --effort  -n --names  -d --db  -a --aln
+advanced:
+  karyozip aln-pack -a P.paf --ref REF.bed|REF.kst -o OUT   cuts a PAF to what -a reads
+  -a with --aln-names F: the track names rows by ordinal, F names them
+  --smooth --max-gap N: KaryoScope's gap bound, 1000 by default

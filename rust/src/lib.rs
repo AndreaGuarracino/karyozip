@@ -1,4 +1,21 @@
 //! The KaryoScope Track (KST) format: writer and reader, the same bytes as the C in `../c`
+//!
+//! # Errors
+//! The write path returns every failure as a [`KzResult`], never exiting or panicking for anything a caller can
+//! cause: [`writer::Writer`] (`new`, `row`, `push`, `close`), `db::Feats::load` and `load_hier`, `db::encode`, and
+//! the `aln::Aln` loaders for a BED reference, a PAF, a packed alignment and an ordinal list. An [`Error`]'s message
+//! is the C's wording; the CLI prints it after `karyozip: ` and exits 1, as before. The staging files are unlinked
+//! as soon as they are made, so a failed or dropped `Writer` leaves none, and no thread of it outlives it.
+//!
+//! The reader path still exits through [`bail`] on a corrupt or refused file: `reader::Reader`, `smooth`, `query`,
+//! the index, `decompress --db`, `aln-pack`, and so a `.kst` given to `aln::Aln::load_ref` or to `db::encode`.
+//!
+//! # Threads
+//! Writers may run one after another or at once on several threads: they share rayon's global pool and nothing
+//! else that changes their bytes. Two process-wide settings remain: the OpenMP team size the codecs use, which a
+//! close sets and puts back (it changes the speed of a writer beside it, never its bytes), and the allocation cap,
+//! on once any file has been read (`Reader::open_with`, a packed alignment), as the C's. The writer prints its
+//! decisions (`codec:`, `layout:`, `names:`) on stderr, as the CLI does.
 
 pub mod aln;
 pub mod db;
@@ -15,7 +32,43 @@ thread_local! {
 /// A decode-ahead thread's refusal, carried to the walk
 pub struct Deferred(pub String);
 
-/// Every refusal is the C's own wording, and exits 1 as the C does
+/// What kind of failure an [`Error`] is; the message is what tells them apart for a person
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorKind {
+    /// a row, a companion file or an option the format cannot take: the caller's input
+    Input,
+    /// a file or the output could not be read, written or created
+    Io,
+    /// a codec or a thread failed: not the caller's input
+    Internal,
+}
+
+/// A refusal on the write path, returned instead of exiting. Its message is the C's wording, without the
+/// `karyozip: ` prefix the CLI prints before it
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Error { kind: ErrorKind, msg: String }
+
+impl Error {
+    pub fn new(kind: ErrorKind, msg: impl Into<String>) -> Error { Error { kind, msg: msg.into() } }
+    pub fn input(msg: impl Into<String>) -> Error { Error::new(ErrorKind::Input, msg) }
+    pub fn io(msg: impl Into<String>) -> Error { Error::new(ErrorKind::Io, msg) }
+    pub fn internal(msg: impl Into<String>) -> Error { Error::new(ErrorKind::Internal, msg) }
+    pub fn kind(&self) -> ErrorKind { self.kind }
+    /// The words the CLI prints after `karyozip: `
+    pub fn message(&self) -> &str { &self.msg }
+}
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(&self.msg) }
+}
+impl std::error::Error for Error {}
+
+/// The write path's result: `Writer`, `db::encode`, `db::Feats::load` and the `aln` loaders return it
+pub type KzResult<T> = Result<T, Error>;
+
+/// The CLI's end for a returned error: the same line and cleanup as `bail`
+pub fn die(e: &Error) -> ! { bail(e.message()) }
+
+/// Every refusal of the reader path is the C's own wording, and exits 1 as the C does; the write path returns an [`Error`] instead
 pub fn bail(msg: &str) -> ! {
     if DEFER.with(|d| d.get()) { std::panic::panic_any(Deferred(msg.to_string())); }
     eprintln!("karyozip: {msg}");
@@ -25,11 +78,18 @@ pub fn bail(msg: &str) -> ! {
     std::process::exit(1);
 }
 
-/// The C's ALLOCMAX: a forged length is a refusal, not an allocator panic
+/// The C's ALLOCMAX, process wide from the first file read on (`Reader::open_with`, a packed alignment); a writer
+/// that has read nothing is not capped, as the C's, so the cap never refuses on the write path alone
+static READCAP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub fn readcap() { READCAP.store(true, std::sync::atomic::Ordering::Relaxed); }
+
+/// A forged length is a refusal, not an allocator panic
 pub fn ckalloc(n: usize) -> usize {
-    if n > 1 << 38 { bail("corrupt file: an impossible allocation size"); }
+    if n > 1 << 38 && readcap_on() { bail("corrupt file: an impossible allocation size"); }
     n
 }
+/// Whether `ckalloc` refuses a forged length: `readcap` was called
+pub fn readcap_on() -> bool { READCAP.load(std::sync::atomic::Ordering::Relaxed) }
 
 /// A BED coordinate: digits only, and it must fit in 64 bits
 pub fn bedcoord_r(b: &[u8], what: &'static str) -> Result<u64, &'static str> {
@@ -51,28 +111,34 @@ pub fn bedcoord(b: &[u8], what: &'static str) -> u64 {
 
 /// A whole text input, plain or gzipped, through the same reader as a stream
 pub fn slurp(path: &str, what: &'static str) -> Vec<u8> {
-    let f = std::fs::File::open(path).unwrap_or_else(|_| bail(what));
+    slurp_r(path, what).unwrap_or_else(|e| die(&e))
+}
+/// `slurp`, the refusal returned
+pub fn slurp_r(path: &str, what: &'static str) -> KzResult<Vec<u8>> {
+    let f = std::fs::File::open(path).map_err(|_| Error::io(what))?;
     let mut v = Vec::new();
-    std::io::Read::read_to_end(&mut unzip(f), &mut v).unwrap_or_else(|_| bail("read error on a companion file"));
-    v
+    std::io::Read::read_to_end(&mut unzip(f), &mut v).map_err(|_| Error::io("read error on a companion file"))?;
+    Ok(v)
 }
 
 /// Every text input, as the C's zfopen: plain, BGZF blocks inflated side by side and CRC-checked, or any gzip
 pub fn unzip(r: impl std::io::Read + Send + 'static) -> Box<dyn std::io::Read + Send> {
-    Box::new(Zr { r: Box::new(r), mode: 0, reof: false, raw: Vec::new(), rp: 0, out: Vec::new(), op: 0, gz: None })
+    Box::new(Zr { r: Box::new(r), mode: 0, reof: false, raw: Vec::new(), rb: Vec::new(), rp: 0, out: Vec::new(), op: 0, gz: None })
 }
 
 const ZCHUNK: usize = 8 << 20;
+const BGZFOUT: usize = 64 << 20;   // most inflated bytes one batch of BGZF blocks holds
 type Gz = flate2::read::MultiGzDecoder<std::io::Chain<std::io::Cursor<Vec<u8>>, Box<dyn std::io::Read + Send>>>;
-struct Zr { r: Box<dyn std::io::Read + Send>, mode: u8, reof: bool, raw: Vec<u8>, rp: usize, out: Vec<u8>, op: usize, gz: Option<Gz> }
+struct Zr { r: Box<dyn std::io::Read + Send>, mode: u8, reof: bool, raw: Vec<u8>, rb: Vec<u8>, rp: usize, out: Vec<u8>, op: usize, gz: Option<Gz> }
 
 /// One BGZF block's size, 0 if it is not one
 fn bgzf_size(p: &[u8]) -> usize {
     if p.len() < 18 || p[0] != 0x1f || p[1] != 0x8b || p[2] != 8 || p[3] & 4 == 0 { return 0; }
     let xl = p[10] as usize | (p[11] as usize) << 8;
-    let mut i = 12;
-    while i + 4 <= 12 + xl && i + 4 <= p.len() {
+    let (mut i, e) = (12, (12 + xl).min(p.len()));   // each subfield whole, inside XLEN and p
+    while i + 4 <= e {
         let sl = p[i + 2] as usize | (p[i + 3] as usize) << 8;
+        if i + 4 + sl > e { break; }
         if p[i] == b'B' && p[i + 1] == b'C' && sl == 2 { return (p[i + 4] as usize | (p[i + 5] as usize) << 8) + 1; }
         i += 4 + sl;
     }
@@ -85,11 +151,11 @@ impl Zr {
     /// At least `want` unused bytes in raw, or the end
     fn fill(&mut self, want: usize) -> std::io::Result<()> {
         self.raw.drain(..self.rp); self.rp = 0;
-        let mut b = vec![0u8; 1 << 20];
+        if self.rb.is_empty() { self.rb = vec![0u8; 1 << 20]; }
         while self.raw.len() < want && !self.reof {
-            match self.r.read(&mut b) {
+            match self.r.read(&mut self.rb) {
                 Ok(0) => self.reof = true,
-                Ok(k) => self.raw.extend_from_slice(&b[..k]),
+                Ok(k) => self.raw.extend_from_slice(&self.rb[..k]),
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
                 Err(e) => return Err(e),
             }
@@ -100,16 +166,19 @@ impl Zr {
     fn bgzf(&mut self) -> std::io::Result<u8> {
         use rayon::prelude::*;
         self.fill(ZCHUNK)?;
-        let (mut bo, mut q) = (Vec::new(), self.rp);
+        let (mut bo, mut oo, mut q) = (Vec::new(), vec![0usize], self.rp);
         while q < self.raw.len() {
             let bs = bgzf_size(&self.raw[q..]);
             if bs < 26 || q + bs > self.raw.len() { break; }
-            bo.push(q); q += bs;
+            // checked before anything is summed or allocated
+            let (b, tot) = (&self.raw[q..q + bs], *oo.last().unwrap());
+            let isz = le32(&b[bs - 4..]);
+            if isz > 65536 || 12 + (b[10] as usize | (b[11] as usize) << 8) + 8 > bs { return Err(zbad()); }
+            if tot + isz > BGZFOUT { break; }   // a batch's output is capped
+            bo.push(q); oo.push(tot + isz); q += bs;
         }
         bo.push(q);
         if bo.len() == 1 { return Ok(if self.rp < self.raw.len() { 2 } else { 0 }); }
-        let mut oo = vec![0usize];
-        for w in bo.windows(2) { oo.push(oo.last().unwrap() + le32(&self.raw[w[1] - 4..])); }
         self.out = vec![0u8; *oo.last().unwrap()]; self.op = 0;
         let mut slots: Vec<&mut [u8]> = Vec::with_capacity(bo.len() - 1);
         let mut rest = self.out.as_mut_slice();
@@ -119,13 +188,12 @@ impl Zr {
         let ok = slots.into_par_iter().enumerate().with_min_len(16).map_init(ffi::Inflater::new, |d, (i, o)| {
             let b = &raw[bo[i]..bo[i + 1]];
             let xl = b[10] as usize | (b[11] as usize) << 8;
-            if o.len() > 65536 || 12 + xl + 8 > b.len() { return false; }
             d.inflate(&b[12 + xl..b.len() - 8], o) && ffi::crc32(o) as usize == le32(&b[b.len() - 8..])
         }).all(|x| x);
         self.rp = q;
         if ok { Ok(1) } else { Err(zbad()) }
     }
-    fn to_stream(&mut self) {
+    fn switch_to_stream(&mut self) {
         let rest = std::io::Cursor::new(self.raw.split_off(self.rp));
         let r = std::mem::replace(&mut self.r, Box::new(std::io::empty()));
         self.gz = Some(flate2::read::MultiGzDecoder::new(std::io::Read::chain(rest, r)));
@@ -137,9 +205,11 @@ impl std::io::Read for Zr {
     fn read(&mut self, b: &mut [u8]) -> std::io::Result<usize> {
         if self.mode == 0 {
             self.fill(18)?;
+            let p = &self.raw[self.rp..];   // the whole extra field, to find BC
+            if p.len() >= 18 && p[0] == 0x1f && p[1] == 0x8b && p[3] & 4 != 0 { let x = 12 + (p[10] as usize | (p[11] as usize) << 8); self.fill(x)?; }
             let p = &self.raw[self.rp..];
             self.mode = if p.len() < 2 || p[0] != 0x1f || p[1] != 0x8b { 1 } else if bgzf_size(p) > 0 { 2 } else { 3 };
-            if self.mode == 3 { self.to_stream(); }
+            if self.mode == 3 { self.switch_to_stream(); }
         }
         if self.mode == 1 {                        // plain: what was peeked, then the reader
             if self.rp < self.raw.len() {
@@ -152,7 +222,7 @@ impl std::io::Read for Zr {
         while self.mode == 2 && self.op == self.out.len() {
             match self.bgzf()? {
                 0 => return Ok(0),
-                2 => { if self.reof && self.raw.len() - self.rp < 18 { return Err(zbad()); } self.to_stream(); }
+                2 => { if self.reof && self.raw.len() - self.rp < 18 { return Err(zbad()); } self.switch_to_stream(); }
                 _ => {}
             }
         }
@@ -169,8 +239,12 @@ impl std::io::Read for Zr {
 pub struct Lines { r: std::io::BufReader<Box<dyn std::io::Read + Send>>, buf: Vec<u8>, pend: usize, pub nl: bool, pub err: &'static str }
 impl Lines {
     pub fn open(path: &str, what: &'static str) -> Lines {
-        let f = std::fs::File::open(path).unwrap_or_else(|_| bail(what));
-        Lines::new(f)
+        Lines::try_open(path, what).unwrap_or_else(|e| die(&e))
+    }
+    /// `open`, the refusal returned
+    pub fn try_open(path: &str, what: &'static str) -> KzResult<Lines> {
+        let f = std::fs::File::open(path).map_err(|_| Error::io(what))?;
+        Ok(Lines::new(f))
     }
     pub fn new(r: impl std::io::Read + Send + 'static) -> Lines {
         Lines { r: std::io::BufReader::with_capacity(1 << 20, unzip(r)), buf: Vec::new(), pend: 0, nl: true, err: "read error" }
@@ -179,18 +253,25 @@ impl Lines {
     pub fn next_line(&mut self) -> Option<&[u8]> { self.next_line_nl().map(|(l, _)| l) }
     /// The line and whether a newline ended it, in place when it lies inside the buffer
     pub fn next_line_nl(&mut self) -> Option<(&[u8], bool)> {
+        let err = self.err;
+        self.try_next_line_nl().unwrap_or_else(|_| bail(err))
+    }
+    /// `next_line`, a read error returned as `err`
+    pub fn try_next_line(&mut self) -> KzResult<Option<&[u8]>> { Ok(self.try_next_line_nl()?.map(|(l, _)| l)) }
+    /// `next_line_nl`, a read error returned as `err`
+    pub fn try_next_line_nl(&mut self) -> KzResult<Option<(&[u8], bool)>> {
         use std::io::BufRead;
         self.r.consume(std::mem::take(&mut self.pend));
-        let hit = crate::ffi::find(b'\n', self.r.fill_buf().unwrap_or_else(|_| bail(self.err)));
+        let hit = crate::ffi::find(b'\n', self.r.fill_buf().map_err(|_| Error::io(self.err))?);
         if let Some(i) = hit {
             self.pend = i + 1; self.nl = true;
-            return Some((&self.r.buffer()[..i], true));
+            return Ok(Some((&self.r.buffer()[..i], true)));
         }
         self.buf.clear();
         match self.r.read_until(b'\n', &mut self.buf) {
-            Ok(0) => None,
-            Ok(_) => { self.nl = self.buf.last() == Some(&b'\n'); if self.nl { self.buf.pop(); } Some((&self.buf, self.nl)) }
-            Err(_) => bail(self.err),
+            Ok(0) => Ok(None),
+            Ok(_) => { self.nl = self.buf.last() == Some(&b'\n'); if self.nl { self.buf.pop(); } Ok(Some((&self.buf, self.nl))) }
+            Err(_) => Err(Error::io(self.err)),
         }
     }
 }
@@ -226,7 +307,7 @@ pub mod prof {
         fn drop(&mut self) {
             NS[self.0].fetch_add(self.1.elapsed().as_nanos() as u64, Relaxed);
             let now = T0.get().map_or(0, |t| t.elapsed().as_nanos() as u64);
-            if now - LAST.load(Relaxed) > 10_000_000 {
+            if now.saturating_sub(LAST.load(Relaxed)) > 10_000_000 {   // another thread may have stored a later now
                 LAST.store(now, Relaxed);
                 HW[self.0].store(field("/proc/self/status", "VmHWM:"), Relaxed);
             }

@@ -1,6 +1,9 @@
 //! --aln: labels and run ends the reference implies are not stored; the PAF gives only its collinear M/=/X segments
 
-use crate::kst::{self, unzz, vget, FNV0};
+use crate::kst::{self, unzz, FNV0};
+use crate::{Error, KzResult};
+/// The packed alignment is read, not written here: its varints are checked, a cut one returned
+fn vget(b: &[u8], i: usize) -> KzResult<(u64, usize)> { kst::vget_r(b, i) }
 use crate::kst::FnvMap as HashMap;   // FNV, as the C's intern: SipHash was a tenth of aln-pack
 
 /// How a .kst reference is read: whole, per contig on demand, or a block at a time for one sequence
@@ -93,7 +96,8 @@ impl Aln {
     }
 
     /// The reference track: one contig's rows together, sorted, gapless; `lazy` leaves a .kst's contigs until asked
-    pub fn load_ref(&mut self, path: &str, lazy: Lazy) {
+    /// A `.kst` reference is read through `Reader`, whose refusals still exit (the reader path); a BED one returns them
+    pub fn load_ref(&mut self, path: &str, lazy: Lazy) -> KzResult<()> {
         if let Ok(mut f) = std::fs::File::open(path) {
             let mut m = [0u8; 8];
             if std::io::Read::read_exact(&mut f, &mut m).is_ok() && &m == crate::writer::MAGIC {
@@ -101,13 +105,13 @@ impl Aln {
                 return self.load_ref_kst(path, lazy);
             }
         }
-        let mut lines = crate::Lines::open(path, "cannot open the reference track");
+        let mut lines = crate::Lines::try_open(path, "cannot open the reference track")?;
         lines.err = "read error on the reference track";
         let mut rh = FNV0;
         let (mut badln, mut cur) = (0u64, usize::MAX);
         let (mut st, mut lab, mut end): (Vec<u64>, Vec<u32>, u64) = (Vec::new(), Vec::new(), 0);
         let mut nh = 0u64;
-        while let Some(raw) = lines.next_line() {
+        while let Some(raw) = lines.try_next_line()? {
             let mut line = raw;
             if line.last() == Some(&b'\r') { line = &line[..line.len() - 1]; }
             let mut it = line.splitn(4, |&x| x == b'\t');   // no Vec a line
@@ -115,10 +119,10 @@ impl Aln {
                 (Some(a), Some(b), Some(d), Some(e)) => [a, b, d, e],
                 _ => { if !line.is_empty() { badln += 1; } continue; }
             };
-            if c[0].is_empty() { crate::bail("reference track: empty contig name"); }
+            if c[0].is_empty() { return Err(Error::input("reference track: empty contig name")); }
             if cur == usize::MAX || self.rc[cur].name != c[0] {
                 if self.rcix.contains_key(c[0]) {
-                    crate::bail("reference track: a contig's rows are not together");
+                    return Err(Error::input("reference track: a contig's rows are not together"));
                 }
                 if cur != usize::MAX {
                     let _ = self.rc[cur].rows.set((Starts::from(std::mem::take(&mut st), end), std::mem::take(&mut lab), end));
@@ -128,11 +132,11 @@ impl Aln {
                 cur = self.rc.len() - 1;
                 nh = kst::fnv(FNV0, c[0]);
             }
-            let s = crate::bedcoord(c[1], "reference start is not a number");
-            let en = crate::bedcoord(c[2], "reference end is not a number");
+            let s = crate::bedcoord_r(c[1], "reference start is not a number").map_err(Error::input)?;
+            let en = crate::bedcoord_r(c[2], "reference end is not a number").map_err(Error::input)?;
             let want = if st.is_empty() { 0 } else { end };
-            if s != want { crate::bail("reference track: rows are not sorted and gapless from 0"); }
-            if en <= s { crate::bail("reference track: a run of no length"); }
+            if s != want { return Err(Error::input("reference track: rows are not sorted and gapless from 0")); }
+            if en <= s { return Err(Error::input("reference track: a run of no length")); }
             let l = self.lab(c[3]);
             rh = kst::rowmix(rh, nh, s, en, self.lt.h[l as usize]);
             st.push(s);
@@ -144,22 +148,23 @@ impl Aln {
         if badln > 0 { eprintln!("reference: {badln} lines without four columns skipped"); }
         let tot: usize = self.rc.iter().map(|x| x.rows.get().map_or(0, |r| r.0.len())).sum();
         eprintln!("reference: {} contigs, {tot} runs", self.rc.len());
+        Ok(())
     }
 
     /// The labels are interned in table order, the order the text would have given, so the ids the reference answers with are the track's
-    fn load_ref_kst(&mut self, path: &str, lazy: Lazy) {
+    fn load_ref_kst(&mut self, path: &str, lazy: Lazy) -> KzResult<()> {
         let ro = crate::reader::ReadOpts { index: true, ..Default::default() };
         let mut r = crate::reader::Reader::open_with(path, &ro);
         if !r.plainref {
-            crate::bail("the reference .kst must be a plain track: not --aln, not --db, and its names in the file, not dropped");
+            return Err(Error::input("the reference .kst must be a plain track: not --aln, not --db, and its names in the file, not dropped"));
         }
-        if r.rowhash == 0 { crate::bail("the reference .kst carries no row hash"); }
+        if r.rowhash == 0 { return Err(Error::input("the reference .kst carries no row hash")); }
         let taildec = r.taildec();
         self.reflab = r.labels().to_vec().iter().map(|l| self.lab(l)).collect();
         let mut tot = 0u64;
         for i in 0..r.nreads {
             let name = r.name_at(i).to_vec();
-            if self.rcix.contains_key(&name) { crate::bail("reference track: a contig's rows are not together"); }
+            if self.rcix.contains_key(&name) { return Err(Error::input("reference track: a contig's rows are not together")); }
             self.rcix.insert(name.clone(), self.rc.len() as u32);
             self.rc.push(Rcon { name, ri: i, rows: std::sync::OnceLock::new(), pb: Default::default() });
             tot += r.nruns_of(i);
@@ -168,7 +173,7 @@ impl Aln {
         eprintln!("reference: {} contigs, {tot} runs", self.rc.len());
         self.perblk = lazy == Lazy::OneSeq && !taildec;
         self.refkst = Some(std::sync::Arc::new(std::sync::Mutex::new(r)));
-        if lazy != Lazy::No { return; }
+        if lazy != Lazy::No { return Ok(()); }
         // every contig at once: a reader per chunk of contigs, on the pool
         use rayon::prelude::*;
         let n = self.rc.len();
@@ -183,6 +188,7 @@ impl Aln {
             }).collect::<Vec<_>>()
         }).collect();
         for (t, rows) in filled { let _ = self.rc[t].rows.set(rows); }
+        Ok(())
     }
 
     /// A contig's rows, decoded from the .kst on first use
@@ -196,11 +202,11 @@ impl Aln {
     }
 
     /// The PAF, read for its cg:Z: CIGARs only
-    pub fn load_paf(&mut self, path: &str) {
-        let mut lines = crate::Lines::open(path, "cannot open the PAF");
+    pub fn load_paf(&mut self, path: &str) -> KzResult<()> {
+        let mut lines = crate::Lines::try_open(path, "cannot open the PAF")?;
         lines.err = "read error on the PAF";
         let (mut nblk, mut badpaf, mut nocg, mut noref) = (0usize, 0u64, 0u64, 0u64);
-        while let Some(raw) = lines.next_line() {
+        while let Some(raw) = lines.try_next_line()? {
             let mut line = raw;
             if line.last() == Some(&b'\r') { line = &line[..line.len() - 1]; }
             if line.is_empty() { continue; }
@@ -211,13 +217,15 @@ impl Aln {
                 None => { nocg += 1; continue; }
             };
             if fl[4].len() != 1 || (fl[4][0] != b'+' && fl[4][0] != b'-') {
-                crate::bail("PAF strand is not + or -");
+                return Err(Error::input("PAF strand is not + or -"));
             }
             let rev = fl[4][0] == b'-';
-            let qs = crate::bedcoord(fl[2], "PAF query start is not a number");
-            let qe = crate::bedcoord(fl[3], "PAF query end is not a number");
-            let mut tp = crate::bedcoord(fl[7], "PAF target start is not a number");
-            if qe < qs { crate::bail("PAF query end is before its start"); }
+            let qs = crate::bedcoord_r(fl[2], "PAF query start is not a number").map_err(Error::input)?;
+            let qe = crate::bedcoord_r(fl[3], "PAF query end is not a number").map_err(Error::input)?;
+            let mut tp = crate::bedcoord_r(fl[7], "PAF target start is not a number").map_err(Error::input)?;
+            // qp and tp only move by checked steps; qcons and tcons are no more than what they moved, so cannot overflow
+            let paf_ovf = || Error::input("PAF coordinates overflow 64 bits");
+            if qe < qs { return Err(Error::input("PAF query end is before its start")); }
             let mut qp = if rev { qe } else { qs };
             let tix = match self.rcix.get(fl[5]) { Some(&i) => i, None => { noref += 1; continue; } };
             // one slot first: a short read carries 1.2 blocks
@@ -225,44 +233,45 @@ impl Aln {
             let (mut qcons, mut tcons) = (0u64, 0u64);
             let mut i = 0usize;
             while i < cg.len() {
-                if !cg[i].is_ascii_digit() { crate::bail("PAF CIGAR: an operation has no length"); }
+                if !cg[i].is_ascii_digit() { return Err(Error::input("PAF CIGAR: an operation has no length")); }
                 let mut v: u64 = 0;
                 while i < cg.len() && cg[i].is_ascii_digit() {
-                    if v > (u64::MAX - 9) / 10 { crate::bail("PAF CIGAR: a length overflows"); }
+                    if v > (u64::MAX - 9) / 10 { return Err(Error::input("PAF CIGAR: a length overflows")); }
                     v = v * 10 + (cg[i] - b'0') as u64;
                     i += 1;
                 }
-                if v == 0 { crate::bail("PAF CIGAR: a zero-length operation"); }
-                if v > 0xffff_ffff { crate::bail("PAF CIGAR: an operation longer than 4 GB"); }
-                if i >= cg.len() { crate::bail("PAF CIGAR: an operation has no length"); }
+                if v == 0 { return Err(Error::input("PAF CIGAR: a zero-length operation")); }
+                if v > 0xffff_ffff { return Err(Error::input("PAF CIGAR: an operation longer than 4 GB")); }
+                if i >= cg.len() { return Err(Error::input("PAF CIGAR: an operation has no length")); }
                 let op = cg[i];
                 i += 1;
                 match op {
                     b'M' | b'=' | b'X' => {
-                        if rev && qp < v { crate::bail("PAF CIGAR runs before the query start"); }
+                        if rev && qp < v { return Err(Error::input("PAF CIGAR runs before the query start")); }
                         if segs.len() == segs.capacity() { segs.reserve_exact(segs.len()); }   // doubling, as the C: Vec's own jumps 1 to 4
-                        segs.push(Seg { q: if rev { qp - v } else { qp }, t: tix,
+                        let nqp = if rev { qp - v } else { qp.checked_add(v).ok_or_else(paf_ovf)? };
+                        let ntp = tp.checked_add(v).ok_or_else(paf_ovf)?;
+                        segs.push(Seg { q: if rev { nqp } else { qp }, t: tix,
                                         n: v as u32, tp, rev });
-                        qp = if rev { qp - v } else { qp + v };
-                        tp += v; qcons += v; tcons += v; nblk += 1;
+                        qp = nqp; tp = ntp; qcons += v; tcons += v; nblk += 1;
                     }
                     b'I' | b'S' => {
-                        if rev && qp < v { crate::bail("PAF CIGAR runs before the query start"); }
-                        qp = if rev { qp - v } else { qp + v };
+                        if rev && qp < v { return Err(Error::input("PAF CIGAR runs before the query start")); }
+                        qp = if rev { qp - v } else { qp.checked_add(v).ok_or_else(paf_ovf)? };
                         qcons += v;
                     }
-                    b'D' | b'N' => { tp += v; tcons += v; }
+                    b'D' | b'N' => { tp = tp.checked_add(v).ok_or_else(paf_ovf)?; tcons += v; }
                     b'H' | b'P' => {}
-                    _ => crate::bail("PAF CIGAR: unknown operation"),
+                    _ => return Err(Error::input("PAF CIGAR: unknown operation")),
                 }
             }
             if qcons != qe - qs {
-                crate::bail("PAF CIGAR consumes a different query length than the record says");
+                return Err(Error::input("PAF CIGAR consumes a different query length than the record says"));
             }
-            let te = crate::bedcoord(fl[8], "PAF target end is not a number");
+            let te = crate::bedcoord_r(fl[8], "PAF target end is not a number").map_err(Error::input)?;
             let ts = tp - tcons;
             if te < ts || tcons != te - ts {
-                crate::bail("PAF CIGAR consumes a different target length than the record says");
+                return Err(Error::input("PAF CIGAR consumes a different target length than the record says"));
             }
             if segs.is_empty() { continue; }
             match self.qget(fl[0]) {
@@ -279,10 +288,11 @@ impl Aln {
             eprintln!("alignment: skipped {badpaf} malformed PAF lines, {nocg} without a cg:Z: tag, {noref} whose target is not in the reference");
         }
         if nblk == 0 {
-            if noref > 0 { crate::bail("alignment: no PAF record maps to a contig of the reference track"); }
-            crate::bail("alignment: no usable PAF record, so --aln would silently do nothing. Check the PAF carries cg:Z: CIGAR tags");
+            if noref > 0 { return Err(Error::input("alignment: no PAF record maps to a contig of the reference track")); }
+            return Err(Error::input("alignment: no usable PAF record, so --aln would silently do nothing. Check the PAF carries cg:Z: CIGAR tags"));
         }
         eprintln!("alignment: {} query contigs, {nblk} collinear blocks", self.qs.len());
+        Ok(())
     }
 
     /// The alignment's own hash, which binds a track to its PAF.
@@ -304,55 +314,63 @@ impl Aln {
     }
 
     /// A packed alignment if the file is one, else a PAF, as the C does
-    pub fn load_aln(&mut self, path: &str) {
-        if !self.load_packed(path) { self.load_paf(path); }
+    pub fn load_aln(&mut self, path: &str) -> KzResult<()> {
+        if !self.load_packed(path)? { self.load_paf(path)?; }
+        Ok(())
     }
 
     /// aln-pack's own format: five coded streams behind a magic and the reference's contig-order hash; false when not one
-    fn load_packed(&mut self, path: &str) -> bool {
-        let Ok(d) = std::fs::read(path) else { return false };
-        if d.len() < 6 || &d[..6] != b"KSTAL1" { return false; }
-        if d.len() < 14 { crate::bail("truncated packed alignment"); }
+    fn load_packed(&mut self, path: &str) -> KzResult<bool> {
+        use std::io::Read;
+        let Ok(mut f) = std::fs::File::open(path) else { return Ok(false) };
+        // the magic first, as the C peeks: a PAF is not read whole to learn it is not one
+        let mut d = Vec::new();
+        if f.by_ref().take(6).read_to_end(&mut d).is_err() || d != b"KSTAL1" { return Ok(false); }
+        crate::readcap();   // its stream lengths are forgeable
+        if f.read_to_end(&mut d).is_err() { return Ok(false); }
+        if d.len() < 14 { return Err(Error::input("truncated packed alignment")); }
         let rh = u64::from_le_bytes(d[6..14].try_into().unwrap());
         if rh != refhash(self) {
-            crate::bail("this packed alignment was made against another reference, or another contig order");
+            return Err(Error::input("this packed alignment was made against another reference, or another contig order"));
         }
         let body = &d[14..];
         let mut i = 0usize;
         let mut sec: Vec<Vec<u8>> = Vec::with_capacity(10);
         for _ in 0..10 {
-            let (cd, j) = vget(body, i);
-            let (rl, j) = vget(body, j);
-            let (cl, j) = vget(body, j);
+            let (cd, j) = vget(body, i)?;
+            let (rl, j) = vget(body, j)?;
+            let (cl, j) = vget(body, j)?;
             let cl = cl as usize;
-            if cl > body.len() - j { crate::bail("corrupt packed alignment: a stream overruns the file"); }
+            if cl > body.len() - j { return Err(Error::input("corrupt packed alignment: a stream overruns the file")); }
             let src = &body[j..j + cl];
             i = j + cl;
+            // the cap ckalloc would refuse in the decompressors, returned
+            if (cd == 1 || cd >= 3) && rl > 1 << 38 { return Err(Error::input("corrupt file: an impossible allocation size")); }
             sec.push(match cd {
                 0 => Vec::new(),
-                2 => crate::reader::tok_d(src),
+                2 => crate::reader::tok_d_r(src)?,
                 1 => crate::ffi::zstd_decompress(src, rl as usize)
-                        .unwrap_or_else(|| crate::bail("corrupt packed alignment: a stream does not decompress")),
+                        .ok_or_else(|| Error::input("corrupt packed alignment: a stream does not decompress"))?,
                 _ => crate::ffi::paydecomp(src, (cd - 3) as i32, rl as usize)
-                        .unwrap_or_else(|| crate::bail("corrupt packed alignment: a stream does not decompress")),
+                        .ok_or_else(|| Error::input("corrupt packed alignment: a stream does not decompress"))?,
             });
         }
         let (nms, cnt, pos, len, tgt, fq) = (&sec[0], &sec[1], &sec[2], &sec[3], &sec[4], &sec[5]);
         let (mut ci, mut pi, mut li, mut si, mut fi, mut m) = (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
         let nabs = sec[6].len();
-        if (7..10).any(|k| sec[k].len() != nabs) { crate::bail("corrupt packed alignment: the position planes differ in length"); }
+        if (7..10).any(|k| sec[k].len() != nabs) { return Err(Error::input("corrupt packed alignment: the position planes differ in length")); }
         let nrc = self.rc.len() as u64;
         let mut nb = 0usize;
         let mut at = 0usize;
         while at < nms.len() {
             let Some(k) = crate::ffi::find(b'\n', &nms[at..]) else {
-                crate::bail("corrupt packed alignment: a name has no newline")
+                return Err(Error::input("corrupt packed alignment: a name has no newline"))
             };
             let name = nms[at..at + k].to_vec();
             at += k + 1;
-            let (cn, j) = vget(cnt, ci); ci = j;
-            if cn == 0 || cn as usize > len.len() - li { crate::bail("corrupt packed alignment: more blocks than lengths"); }
-            if self.qget(&name).is_some() { crate::bail("corrupt packed alignment: a query name repeats"); }
+            let (cn, j) = vget(cnt, ci)?; ci = j;
+            if cn == 0 || cn as usize > len.len() - li { return Err(Error::input("corrupt packed alignment: more blocks than lengths")); }
+            if self.qget(&name).is_some() { return Err(Error::input("corrupt packed alignment: a query name repeats")); }
             let qi = self.qput(name, Vec::new());
             let segs = &mut self.qs[qi].1;
             segs.clear();
@@ -360,42 +378,46 @@ impl Aln {
             let (mut pq, mut pt, mut ps, mut tx) = (0u64, 0u64, 0u64, 0u32);
             let (mut rev, mut fresh, mut left) = (false, true, 0u64);
             for _ in 0..cn {
-                let (n, j) = vget(len, li); li = j;
-                if n == 0 || n > u32::MAX as u64 { crate::bail("corrupt packed alignment: a block of no length, or past 32 bits"); }
+                let (n, j) = vget(len, li)?; li = j;
+                if n == 0 || n > u32::MAX as u64 { return Err(Error::input("corrupt packed alignment: a block of no length, or past 32 bits")); }
                 if left == 0 {
-                    let (xr, j) = vget(tgt, si);
+                    let (xr, j) = vget(tgt, si)?;
                     rev = xr & 1 != 0;
-                    if xr >> 1 >= nrc { crate::bail("corrupt packed alignment: a target is not in the reference"); }
+                    if xr >> 1 >= nrc { return Err(Error::input("corrupt packed alignment: a target is not in the reference")); }
                     tx = (xr >> 1) as u32;
-                    let (l, j2) = vget(tgt, j); si = j2;
-                    if l == 0 { crate::bail("corrupt packed alignment: an empty target run"); }
+                    let (l, j2) = vget(tgt, j)?; si = j2;
+                    if l == 0 { return Err(Error::input("corrupt packed alignment: an empty target run")); }
                     left = l;
                     fresh = true;
                 }
                 let (q, tp);
                 if fresh {
-                    if m >= nabs { crate::bail("corrupt packed alignment: more target runs than positions"); }
-                    let (a, j) = vget(fq, fi); fi = j;
+                    if m >= nabs { return Err(Error::input("corrupt packed alignment: more target runs than positions")); }
+                    let (a, j) = vget(fq, fi)?; fi = j;
                     q = a;
                     tp = sec[6][m] as u64 | (sec[7][m] as u64) << 8 | (sec[8][m] as u64) << 16 | (sec[9][m] as u64) << 24;
                     m += 1; fresh = false;
                 } else {
-                    let (dq, dt, j) = gap_get(pos, pi); pi = j;
+                    let (dq, dt, j) = gap_get(pos, pi)?; pi = j;
                     q = pq.wrapping_add(dq as u64);
                     tp = if rev { ps.wrapping_sub(n).wrapping_sub(dt as u64) } else { pt.wrapping_add(dt as u64) };
                 }
+                // the deltas are taken mod 2^64, as aln-pack writes them; a block must end inside 64 bits, as a PAF's does
+                let (Some(qe), Some(te)) = (q.checked_add(n), tp.checked_add(n)) else {
+                    return Err(Error::input("corrupt packed alignment: a coordinate overflows"))
+                };
                 segs.push(Seg { q, t: tx, n: n as u32, tp, rev });
-                pq = q + n; pt = tp + n; ps = tp; left -= 1;
+                pq = qe; pt = te; ps = tp; left -= 1;
             }
-            if left != 0 { crate::bail("corrupt packed alignment: a target run outlives its query"); }
+            if left != 0 { return Err(Error::input("corrupt packed alignment: a target run outlives its query")); }
             nb += segs.len();
         }
         if ci != cnt.len() || pi != pos.len() || li != len.len() || si != tgt.len() || fi != fq.len() || m != nabs || i != body.len() {
-            crate::bail("corrupt packed alignment: bytes left over");
+            return Err(Error::input("corrupt packed alignment: bytes left over"));
         }
         eprintln!("packed alignment: {} query contigs, {nb} collinear blocks", self.qs.len());
         self.seghash();
-        true
+        Ok(true)
     }
 
     /// A bare ordinal resolves through the map when one was given
@@ -409,23 +431,24 @@ impl Aln {
     }
 
     /// One name a line, in the order the annotator produced them
-    pub fn load_ordinals(&mut self, path: &str) {
-        let data = crate::slurp(path, "cannot open the file given to --aln-names");
+    pub fn load_ordinals(&mut self, path: &str) -> KzResult<()> {
+        let data = crate::slurp_r(path, "cannot open the file given to --aln-names")?;
         let mut h = FNV0;
         let body = if data.last() == Some(&b'\n') { &data[..data.len() - 1] } else { &data[..] };
         for line in body.split(|&c| c == b'\n') {
             let mut l = line;
             if l.last() == Some(&b'\r') { l = &l[..l.len() - 1]; }
             if self.ord.is_empty() && (l.first() == Some(&b'>') || l.first() == Some(&b'@')) {
-                crate::bail("--aln-names takes a plain list, one name a line");
+                return Err(Error::input("--aln-names takes a plain list, one name a line"));
             }
-            if l.is_empty() { crate::bail("--aln-names: an empty line: every line is one name"); }
+            if l.is_empty() { return Err(Error::input("--aln-names: an empty line: every line is one name")); }
             self.ord.push(l.to_vec());
             h = kst::fnv(h, l);
             h = kst::fnv(h, &[0]);
         }
         self.hash ^= h;
         eprintln!("ordinal map: {} names", self.ord.len());
+        Ok(())
     }
 
     /// The last segment whose query start is at or before `pos`
@@ -552,18 +575,18 @@ fn gap_put(b: &mut Vec<u8>, dq: i64, dt: i64) {
         _ => { kst::put(b, 3); kst::put(b, kst::zz(dq)); kst::put(b, kst::zz(dt)); }
     }
 }
-fn gap_get(b: &[u8], i: usize) -> (i64, i64, usize) {
-    let (v, i) = vget(b, i);
-    match v {
+fn gap_get(b: &[u8], i: usize) -> KzResult<(i64, i64, usize)> {
+    let (v, i) = vget(b, i)?;
+    Ok(match v {
         0 => (0, 0, i),
-        3 => { let (a, i) = vget(b, i); let (c, i) = vget(b, i); (unzz(a) as i64, unzz(c) as i64, i) }
+        3 => { let (a, i) = vget(b, i)?; let (c, i) = vget(b, i)?; (unzz(a) as i64, unzz(c) as i64, i) }
         _ if v % 3 == 1 => ((v / 3) as i64 + 1, 0, i),
         _ if v % 3 == 2 => (0, (v / 3) as i64 + 1, i),
-        _ => crate::bail("corrupt packed alignment: a bad gap code"),
-    }
+        _ => return Err(Error::input("corrupt packed alignment: a bad gap code")),
+    })
 }
 
-pub fn pack(a: &Aln, out: &str, refhash: u64) {
+pub fn pack(a: &Aln, refhash: u64) {
     use crate::ffi;
     // A block starting a target run has an absolute position, query offset varint and target in four byte planes; others zigzag deltas
     let (mut names, mut cnt, mut pos, mut len, mut seg_, mut fq) =
@@ -635,7 +658,9 @@ pub fn pack(a: &Aln, out: &str, refhash: u64) {
     f.extend_from_slice(b"KSTAL1");
     f.extend_from_slice(&refhash.to_le_bytes());
     f.extend_from_slice(&all);
-    std::fs::write(out, &f).unwrap_or_else(|_| crate::bail("cannot write the packed alignment"));
+    // -o OUT, staged by redirect and renamed in by commit_out
+    { use std::io::Write; let mut o = std::io::stdout().lock();
+      o.write_all(&f).and_then(|_| o.flush()).unwrap_or_else(|_| crate::bail("packed alignment write failed")); }
     let nq = a.qs.iter().filter(|(_, s)| !s.is_empty()).count();
     eprintln!("packed alignment: {nq} queries, {nb} blocks, {} B ({:.2} B/query)",
               f.len(), if nq > 0 { f.len() as f64 / nq as f64 } else { 0.0 });

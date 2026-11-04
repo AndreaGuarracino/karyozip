@@ -3,7 +3,7 @@ target/
 __pycache__/
 *.pyc
 *.kst
-*.kst.idx
-*.kst.names
+*.kzi
 notes/
-build/lib/
+rust/fuzz/corpus/
+rust/fuzz/artifacts/

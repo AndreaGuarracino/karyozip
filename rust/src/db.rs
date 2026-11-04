@@ -1,6 +1,7 @@
 //! --db: featureID labels, so one merged track replaces the per-set BEDs and the mapping stays in features.tsv
 
 use crate::kst::{self, FNV0, FnvMap as HashMap};
+use crate::{Error, KzResult};
 use std::io::Write;
 
 pub struct Feats {
@@ -25,8 +26,8 @@ pub struct Feats {
 pub const CARTBASE: u32 = 1 << 26;
 
 impl Feats {
-    pub fn load(path: &str) -> Feats {
-        let data = crate::slurp(path, "cannot open the features table");
+    pub fn load(path: &str) -> KzResult<Feats> {
+        let data = crate::slurp_r(path, "cannot open the features table")?;
         let mut f = Feats { sets: Vec::new(), idpos: Vec::new(), labs: Vec::new(), nids: 0,
                             tup: HashMap::default(), intern: Vec::new(), tupint: HashMap::default(), hash: FNV0, voc: Vec::new(), stride: Vec::new(),
                             prod: 0, cart: false, hierhash: 0 };
@@ -38,46 +39,47 @@ impl Feats {
             let cols: Vec<&[u8]> = line.split(|&c| c == b'\t').collect();
             if first {
                 if cols.len() < 2 {
-                    crate::bail("features.tsv: the first line must be the tab-separated header");
+                    return Err(Error::input("features.tsv: the first line must be the tab-separated header"));
                 }
                 for s in &cols[1..] {
                     if s.is_empty() || s.contains(&b'/') {
-                        crate::bail("features.tsv: a set name is empty or has a slash");
+                        return Err(Error::input("features.tsv: a set name is empty or has a slash"));
                     }
                     if f.sets.iter().any(|x| x == s) {
-                        crate::bail("features.tsv names a set twice");
+                        return Err(Error::input("features.tsv names a set twice"));
                     }
                     f.sets.push(s.to_vec());
                 }
+                // one intern map a set from the header on, so a table with no rows still answers labid (novel)
+                f.intern = vec![HashMap::default(); f.sets.len()];
                 first = false;
                 continue;
             }
-            if cols.len() < 2 { if !line.is_empty() { crate::bail("features.tsv: a row without a tab"); } continue; }
+            if cols.len() < 2 { if !line.is_empty() { return Err(Error::input("features.tsv: a row without a tab")); } continue; }
             if cols[0].first() == Some(&b'0') && cols[0].len() > 1 {
-                crate::bail("features.tsv: a featureID with a leading zero");
+                return Err(Error::input("features.tsv: a featureID with a leading zero"));
             }
-            let id = num(cols[0], (1u32 << 26) - 1,
-                         "features.tsv: a featureID is not a number below 2^26");
-            if id == 0 { crate::bail("features.tsv defines featureID 0, which is reserved for novel"); }
-            if cols.len() - 1 < f.sets.len() { crate::bail("a features.tsv row has fewer labels than sets"); }
-            if cols.len() - 1 > f.sets.len() { crate::bail("a features.tsv row has more labels than sets"); }
-            if f.has(id) { crate::bail("features.tsv defines a featureID twice"); }
+            let id = num_r(cols[0], (1u32 << 26) - 1,
+                         "features.tsv: a featureID is not a number below 2^26")?;
+            if id == 0 { return Err(Error::input("features.tsv defines featureID 0, which is reserved for novel")); }
+            if cols.len() - 1 < f.sets.len() { return Err(Error::input("a features.tsv row has fewer labels than sets")); }
+            if cols.len() - 1 > f.sets.len() { return Err(Error::input("a features.tsv row has more labels than sets")); }
+            if f.has(id) { return Err(Error::input("features.tsv defines a featureID twice")); }
             f.tup.insert(cols[1..].join(&b'\t'), id);
             if f.idpos.len() <= id as usize {
                 let n = id as usize + 1024 - f.idpos.len();
-                f.idpos.try_reserve(n).unwrap_or_else(|_| crate::bail("oom"));
+                f.idpos.try_reserve(n).map_err(|_| Error::internal("oom"))?;
                 f.idpos.resize(id as usize + 1024, u32::MAX);
             }
             f.idpos[id as usize] = f.labs.len() as u32;
             f.labs.push(cols[1..].iter().map(|c| c.to_vec()).collect());
             f.nids += 1;
-            if f.intern.is_empty() { f.intern = vec![HashMap::default(); f.sets.len()]; }
             let key = kst::Tup(cols[1..].iter().enumerate().map(|(k, c)| {
                 let n = f.intern[k].len() as u32; *f.intern[k].entry(c.to_vec()).or_insert(n) }).collect());
             f.tupint.entry(key).or_insert(id);
         }
-        if f.sets.is_empty() { crate::bail("features table has no header"); }
-        f
+        if f.sets.is_empty() { return Err(Error::input("features table has no header")); }
+        Ok(f)
     }
     fn has(&self, id: u32) -> bool { self.idpos.get(id as usize).is_some_and(|&p| p != u32::MAX) }
     /// A label's interned id in set k, or MAX when no table tuple has it
@@ -102,8 +104,8 @@ impl Feats {
     }
 
     /// The vocabulary of every set, and the hash continued over the file
-    pub fn load_hier(&mut self, path: &str) {
-        let data = crate::slurp(path, "cannot open the hierarchy file");
+    pub fn load_hier(&mut self, path: &str) -> KzResult<()> {
+        let data = crate::slurp_r(path, "cannot open the hierarchy file")?;
         let n = self.sets.len();
         let mut voc: Vec<Vec<Vec<u8>>> = (0..n).map(|k| {
             let mut v = vec![b"novel".to_vec()];
@@ -118,7 +120,7 @@ impl Feats {
             if line.is_empty() { continue; }
             let cols: Vec<&[u8]> = line.split(|&c| c == b'\t').collect();
             if cols.len() < 3 { continue; }
-            if cols.len() > 3 { crate::bail("hierarchy: a row has more than three columns"); }
+            if cols.len() > 3 { return Err(Error::input("hierarchy: a row has more than three columns")); }
             if cols[0] == b"feature_set" { continue; }
             if let Some(k) = self.sets.iter().position(|s| s == cols[0]) {
                 voc[k].push(cols[1].to_vec()); voc[k].push(cols[2].to_vec());
@@ -130,23 +132,24 @@ impl Feats {
             voc[k].sort(); voc[k].dedup();
             self.stride[k] = self.prod;
             let u = voc[k].len() as u64;
-            if self.prod > (u32::MAX - CARTBASE) as u64 / u { crate::bail("the label vocabulary is too large for featureIDs"); }
+            if self.prod > (u32::MAX - CARTBASE) as u64 / u { return Err(Error::input("the label vocabulary is too large for featureIDs")); }
             self.prod *= u;
         }
         self.voc = voc;
         self.cart = true;
         eprintln!("hierarchy: {} label tuples possible", self.prod);
+        Ok(())
     }
 
     /// 2^26 + the mixed-radix rank of a tuple outside features.tsv
-    fn cart_id(&self, labs: &[&[u8]]) -> u32 {
+    fn cart_id(&self, labs: &[&[u8]]) -> KzResult<u32> {
         let mut rank = 0u64;
         for (k, l) in labs.iter().enumerate() {
             let x = self.voc[k].binary_search_by(|v| v.as_slice().cmp(l))
-                .unwrap_or_else(|_| crate::bail("a label is neither in features.tsv nor in the hierarchy of its set"));
+                .map_err(|_| Error::input("a label is neither in features.tsv nor in the hierarchy of its set"))?;
             rank += x as u64 * self.stride[k];
         }
-        CARTBASE + rank as u32
+        Ok(CARTBASE + rank as u32)
     }
 
     /// --set A,B as columns of features.tsv; None or all is every set
@@ -183,78 +186,198 @@ impl Feats {
 }
 
 /// Digits, in 64 bits, at most `max`: the C's num_arg, same words in the same order
-fn num(b: &[u8], max: u32, what: &str) -> u32 {
-    if b.is_empty() { crate::bail(what); }
+fn num(b: &[u8], max: u32, what: &str) -> u32 { num_r(b, max, what).unwrap_or_else(|e| crate::die(&e)) }
+fn num_r(b: &[u8], max: u32, what: &str) -> KzResult<u32> {
+    if b.is_empty() { return Err(Error::input(what)); }
     let mut v: u64 = 0;
     for &c in b {
-        if !c.is_ascii_digit() { crate::bail(what); }
-        if v > (u64::MAX - (c - b'0') as u64) / 10 { crate::bail("a coordinate does not fit in 64 bits"); }
+        if !c.is_ascii_digit() { return Err(Error::input(what)); }
+        if v > (u64::MAX - (c - b'0') as u64) / 10 { return Err(Error::input("a coordinate does not fit in 64 bits")); }
         v = v * 10 + (c - b'0') as u64;
     }
-    if v > max as u64 { crate::bail(what); }
-    v as u32
+    if v > max as u64 { return Err(Error::input(what)); }
+    Ok(v as u32)
 }
 
-/// One input BED, streamed a row at a time
-struct Brd { lines: crate::Lines, seq: Vec<u8>, st: u64, en: u64, lab: Vec<u8>, labid: u32,
-             pseq: Vec<u8>, pen: u64, had: bool, eof: bool }
+/// Where one input's rows come from: a BED, or a set's plain .kst decoded in step
+enum Src { Bed(crate::Lines), Kst(Box<(crate::reader::Reader, crate::reader::RowStream)>) }
+
+/// One input, streamed a row at a time
+struct Brd { src: Src, seq: Vec<u8>, st: u64, en: u64, lab: Vec<u8>, labid: u32,
+             pseq: Vec<u8>, pen: u64, had: bool, eof: bool,
+             /// BED lines read
+             lines: u64,
+             /// a regular file is_kst judged a BED: its first line not judged again
+             probed: bool }
+
+/// A set's .kst in place of its BED, known by its first line, as `kst_pipe` knows one (kst_head): the magic, and no
+/// BED row, so a BED whose first name begins with the magic is a BED here too. Read at offset 0 from the file the BED
+/// reader would take, so nothing is consumed, and at most KSTPROBE bytes: a BED row's name (under 512 bytes), two
+/// coordinates and their tabs fit in it, so a first line longer than that is judged by what was read. Only a regular
+/// file (a symlink followed) is probed, since a .kst is read with random access: a FIFO, a /dev/fd pipe or a device
+/// goes to the BED reader unprobed, opened once, and a .kst through one is refused by `kst_pipe`. None: not probed;
+/// Some(true): a .kst; Some(false): a BED, so `kst_pipe` need not judge it again. As the C's iskst
+const KSTPROBE: usize = 4096;
+fn is_kst(f: &std::fs::File) -> Option<bool> {
+    use std::os::unix::fs::FileExt;
+    if !f.metadata().is_ok_and(|md| md.is_file()) { return None; }
+    let mut m = [0u8; KSTPROBE];
+    let mut got = 0;
+    while got < KSTPROBE {
+        match f.read_at(&mut m[got..], got as u64) {
+            Ok(0) => break,
+            Ok(k) => got += k,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => break,
+        }
+    }
+    let nl = crate::ffi::find(b'\n', &m[..got]);
+    Some(kst_head(&m[..nl.unwrap_or(got)]))
+}
+
+const KSTPIPE: &str = "--db: a .kst input must be a regular file: it is read with random access, not through a pipe or stdin";
+/// An input's first line (its newline dropped, or as much of it as was read) that is a .kst's start: the magic, and
+/// not the start of a BED row. A BED row whose name begins with the magic goes on, after that name, to a tab, a run of
+/// ASCII digits, a tab, a run of digits and a tab (its start and end), with no NUL; anything else after the magic is a
+/// .kst. A .kst's first "line" ends at the first 0x0a of its header: its sequence count h[0] can be 09 09 09 0a
+/// (168,495,369 sequences: the magic, three tabs and a newline), but no count below 2^40 gives a tab, digits, a tab,
+/// digits and a tab before a NUL or a newline. The one rule for a regular file (is_kst) and for a pipe (kst_pipe). As
+/// the C's ksthead
+fn kst_head(line: &[u8]) -> bool {
+    if !line.starts_with(crate::writer::MAGIC) { return false; }
+    if crate::ffi::find(0, line).is_some() { return true; }
+    let Some(t) = crate::ffi::find(b'\t', line) else { return true; };
+    let mut rest = &line[t + 1..];
+    for _ in 0..2 {   // the start, then the end: digits between two tabs
+        let d = rest.iter().take_while(|c| c.is_ascii_digit()).count();
+        if d == 0 || rest.get(d) != Some(&b'\t') { return true; }
+        rest = &rest[d + 1..];
+    }
+    false
+}
+/// A BED reader's first line that is a .kst's start: refused, since a .kst through a pipe cannot be read. Not asked of
+/// a regular file, which is_kst has judged already
+fn kst_pipe(line: &[u8]) -> KzResult<()> {
+    if kst_head(line) { return Err(Error::input(KSTPIPE)); }
+    Ok(())
+}
+
+/// A set's .kst in place of its BED: a plain track, as --ref takes one, opened as no companion, as the C's kopen
+fn kst_open(path: &str) -> KzResult<Src> {
+    let mut hb = [0u8; 136];
+    if std::fs::File::open(path).and_then(|mut f| std::io::Read::read_exact(&mut f, &mut hb)).is_err() {
+        return Err(Error::io("--db: cannot read a .kst input"));
+    }
+    let h1 = u64::from_le_bytes(hb[16..24].try_into().unwrap_or_default());
+    if h1 & (kst::ALNFLAG | kst::DBFLAG | kst::DROPPED) != 0 {
+        return Err(Error::input("--db: a .kst input must be a plain track of one set: not --aln, not --db, and its names in the file, not dropped"));
+    }
+    let r = crate::reader::Reader::open_with(path, &crate::reader::ReadOpts { index: true, ..Default::default() });
+    r.names_shared();   // decoded, and checked against h[0], at open, as the C's ensurenames in kopen
+    let s = r.rows();
+    Ok(Src::Kst(Box::new((r, s))))
+}
 
 impl Brd {
-    fn open(path: &str) -> Brd {
-        let lines = if path == "-" { crate::Lines::new(std::io::stdin()) } else {
-            if std::fs::metadata(path).is_err() { eprintln!("cannot open {path}"); }
-            crate::Lines::open(path, "cannot open an input BED")
+    fn open(path: &str) -> KzResult<Brd> {
+        // each input opened once: a regular file probed for a per-set .kst's magic, anything else a BED
+        let f = if path == "-" { None } else {
+            Some(std::fs::File::open(path).map_err(|e| {   // as the C: the path and why, then the refusal
+                eprintln!("cannot open {path}: {}", crate::ffi::strerror(&e));
+                Error::io("cannot open an input BED")
+            })?)
         };
-        let mut lines = lines; lines.err = "read error on an input BED";
-        let mut b = Brd { lines, seq: Vec::new(), st: 0, en: 0, lab: Vec::new(), labid: u32::MAX,
-                          pseq: Vec::new(), pen: 0, had: false, eof: false };
-        b.next();
-        if b.eof { crate::bail("an input BED is empty"); }
-        b
+        let probe = f.as_ref().and_then(is_kst);
+        let src = match f {
+            Some(f) if probe == Some(true) => { drop(f); kst_open(path)? }
+            f => {
+                let mut lines = match f { Some(f) => crate::Lines::new(f), None => crate::Lines::new(std::io::stdin()) };
+                lines.err = "read error on an input BED";
+                Src::Bed(lines)
+            }
+        };
+        let mut b = Brd { src, seq: Vec::new(), st: 0, en: 0, lab: Vec::new(), labid: u32::MAX,
+                          pseq: Vec::new(), pen: 0, had: false, eof: false, lines: 0,
+                          probed: probe == Some(false) };
+        b.next()?;
+        if b.eof { return Err(Error::input("an input BED is empty")); }
+        Ok(b)
     }
 
     /// The row parsed in the reader's buffer, the previous label compared, not copied, as the C's bnext
-    fn next(&mut self) {
-        let Some((line, nl)) = self.lines.next_line_nl() else { self.eof = true; return; };
-        if line.is_empty() { crate::bail("bad line"); }   // as the C: a blank row is not skipped
-        if !nl { crate::bail("input does not end with a newline"); }
-        if crate::ffi::find(0, line).is_some() { crate::bail("a NUL byte inside a row"); }
+    fn next(&mut self) -> KzResult<()> {
+        let bad = |m: &str| Err(Error::input(m));
+        let lines = match &mut self.src {
+            Src::Bed(l) => l,
+            Src::Kst(k) => {   // a decoded row, checked as a BED line is, as the C's knext
+                let (r, s) = &mut **k;
+                let Some((ri, st, en, id)) = r.next_row(s) else { self.eof = true; return Ok(()); };
+                let mut idb = Vec::new();
+                let l: &[u8] = if r.nlabels() > 0 { r.label_at(id as usize) } else { kst::putu64(&mut idb, id); &idb };
+                let nm = r.name_at(ri);
+                if nm.len() >= 512 { return bad("name too long"); }
+                if nm.is_empty() { return bad("empty sequence name"); }
+                if self.had {
+                    std::mem::swap(&mut self.pseq, &mut self.seq);
+                    self.pen = self.en;
+                }
+                self.seq.clear(); self.seq.extend_from_slice(nm);
+                (self.st, self.en) = (st, en);
+                let samelab = l == self.lab.as_slice();
+                if !samelab { self.lab.clear(); self.lab.extend_from_slice(l); self.labid = u32::MAX - 1; }
+                if self.had && self.st == self.pen && self.seq == self.pseq && samelab {
+                    return bad("two touching runs carry the same label: merge them first");
+                }
+                self.had = true;
+                return Ok(());
+            }
+        };
+        let Some((line, nl)) = lines.try_next_line_nl()? else { self.eof = true; return Ok(()); };
+        self.lines += 1;
+        if self.lines == 1 && !self.probed { kst_pipe(line)?; }
+        if line.is_empty() { return bad("bad line"); }   // as the C: a blank row is not skipped
+        if !nl { return bad("input does not end with a newline"); }
+        if crate::ffi::find(0, line).is_some() { return bad("a NUL byte inside a row"); }
         let mut it = line.splitn(4, |&x| x == b'\t');
         let mut c = [&line[..0]; 4];
-        for (i, s) in c.iter_mut().enumerate() { *s = it.next().unwrap_or_else(|| { if i < 4 { crate::bail("bad line") } else { &[] } }); }
-        if c[0].len() >= 512 { crate::bail("name too long"); }
-        if c[0].is_empty() { crate::bail("empty sequence name"); }
+        for s in c.iter_mut() { *s = match it.next() { Some(f) => f, None => return bad("bad line") }; }
+        if c[0].len() >= 512 { return bad("name too long"); }
+        if c[0].is_empty() { return bad("empty sequence name"); }
         if self.had {
             std::mem::swap(&mut self.pseq, &mut self.seq);
             self.pen = self.en;
         }
         self.seq.clear(); self.seq.extend_from_slice(c[0]);
-        self.st = crate::bedcoord(c[1], "start is not a number");
-        self.en = crate::bedcoord(c[2], "end is not a number");
+        self.st = crate::bedcoord_r(c[1], "start is not a number").map_err(Error::input)?;
+        self.en = crate::bedcoord_r(c[2], "end is not a number").map_err(Error::input)?;
         if c[1..3].iter().any(|v| v.len() > 1 && v[0] == b'0') {
-            crate::bail("a coordinate has a leading zero: it would not decode to the same bytes");
+            return bad("a coordinate has a leading zero: it would not decode to the same bytes");
         }
-        if self.en < self.st { crate::bail("end is before start"); }
+        if self.en < self.st { return bad("end is before start"); }
         if self.en == self.st {
-            crate::bail("end equals start: a run must cover at least one base");
+            return bad("end equals start: a run must cover at least one base");
         }
         let samelab = c[3] == self.lab.as_slice();
         if !samelab { self.lab.clear(); self.lab.extend_from_slice(c[3]); self.labid = u32::MAX - 1; }
         if self.had && self.st == self.pen && self.seq == self.pseq && samelab {
-            crate::bail("two touching runs carry the same label: merge them first");
+            return bad("two touching runs carry the same label: merge them first");
         }
         self.had = true;
+        Ok(())
     }
 }
 
-/// One BED per feature set in header order, or one merged featureID track; true when a featureID came from the vocabulary
-pub fn encode(files: &[String], feats: &Feats, w: &mut crate::writer::Writer) -> bool {
+/// One BED or plain .kst per feature set in header order (the two may be mixed: a .kst is known by its magic), or one
+/// merged featureID track; true when a featureID came from the vocabulary. A .kst input gives the bytes its BED would.
+/// Its refusals of a corrupt file are the reader's, which exit (see the crate's Errors)
+pub fn encode(files: &[String], feats: &Feats, w: &mut crate::writer::Writer) -> KzResult<bool> {
+    let bad = |m: &str| Err(Error::input(m));
     let mut cart_used = false;
     let dbids = files.len() != feats.sets.len();
     if dbids && files.len() != 1 {
-        crate::bail("--db: give one BED per feature set in features.tsv column order, or one merged featureID track");
+        return bad("--db: give one BED per feature set in features.tsv column order, or one merged featureID track");
     }
-    let mut b: Vec<Brd> = files.iter().map(|f| Brd::open(f)).collect();
+    let mut b: Vec<Brd> = files.iter().map(|f| Brd::open(f)).collect::<KzResult<_>>()?;
     let (mut rows, mut missing) = (0u64, 0u64);
     let (mut prevfid, mut lastend) = (u32::MAX, 0u64);
     let mut lastseq: Vec<u8> = Vec::new();
@@ -264,13 +387,13 @@ pub fn encode(files: &[String], feats: &Feats, w: &mut crate::writer::Writer) ->
     while !b[0].eof {
         for i in 1..b.len() {
             if b[i].eof || b[i].seq != b[0].seq {
-                crate::bail("the input BEDs disagree on sequence order");
+                return bad("the input BEDs disagree on sequence order");
             }
         }
         let lo = b[0].st;
         let mut hi = b[0].en;
         for x in &b[1..] {
-            if x.st != lo { crate::bail("the input BEDs disagree on a run start"); }
+            if x.st != lo { return bad("the input BEDs disagree on a run start"); }
             if x.en < hi { hi = x.en; }              // cut at the first change
         }
         if !haveseq || lastseq != b[0].seq {
@@ -281,12 +404,12 @@ pub fn encode(files: &[String], feats: &Feats, w: &mut crate::writer::Writer) ->
         for (k, x) in b.iter_mut().enumerate() { if x.labid == u32::MAX - 1 { x.labid = feats.labid(k, &x.lab); } }
         let id = if dbids {
             if b[0].lab.first() == Some(&b'0') && b[0].lab.len() > 1 {
-                crate::bail("--db: a featureID with a leading zero");
+                return bad("--db: a featureID with a leading zero");
             }
-            let v = num(&b[0].lab, feats.idmax(),
-                        "--db: a label is not a featureID; give one BED per feature set instead");
+            let v = num_r(&b[0].lab, feats.idmax(),
+                          "--db: a label is not a featureID; give one BED per feature set instead")?;
             if v != 0 && v < CARTBASE && !feats.has(v) {
-                crate::bail("--db: featureID not in the features table");
+                return bad("--db: featureID not in the features table");
             }
             if v >= CARTBASE { cart_used = true; }
             v
@@ -296,28 +419,27 @@ pub fn encode(files: &[String], feats: &Feats, w: &mut crate::writer::Writer) ->
             match hit.or_else(|| feats.tup.get(&b.iter().map(|x| x.lab.clone()).collect::<Vec<_>>().join(&b'\t')).copied()) {
                 Some(v) => v,
                 None if b.iter().all(|x| x.lab == b"novel") => { missing += 1; 0 }
-                None if !feats.cart => crate::bail("a label tuple is not in the features table"),
-                None => { cart_used = true; feats.cart_id(&b.iter().map(|x| x.lab.as_slice()).collect::<Vec<_>>()) }
+                None if !feats.cart => return bad("a label tuple is not in the features table"),
+                None => { cart_used = true; feats.cart_id(&b.iter().map(|x| x.lab.as_slice()).collect::<Vec<_>>())? }
             }
         };
         if prevfid != u32::MAX && id == prevfid && lastend == lo {
-            crate::bail("two touching runs carry the same featureID: merge them first");
+            return bad("two touching runs carry the same featureID: merge them first");
         }
         prevfid = id;
         lastend = hi;
         lab.clear();
         kst::putu64(&mut lab, id as u64);
-        w.push(&b[0].seq, hi - lo, &lab, lo, false)
-            .unwrap_or_else(|m| crate::bail(&m));
+        w.push(&b[0].seq, hi - lo, &lab, lo, false)?;
         rows += 1;
         for x in b.iter_mut() {
             x.st = hi;
-            if x.st == x.en { x.next(); }
+            if x.st == x.en { x.next()?; }
         }
     }
-    if b[1..].iter().any(|x| !x.eof) { crate::bail("the input BEDs have different lengths"); }
+    if b[1..].iter().any(|x| !x.eof) { return bad("the input BEDs have different lengths"); }
     eprintln!("db: {rows} rows from {} tracks, {missing} all-novel", b.len());
-    cart_used
+    Ok(cart_used)
 }
 
 /// decode --db --out-dir DIR: staged BEDs, removed by `die` and on the way out, so a failure leaves no half output
@@ -341,13 +463,12 @@ pub fn decode(r: &mut crate::reader::Reader, feats: &Feats, dir: Option<&str>, c
     let sets: Vec<&[u8]> = cols.iter().map(|&k| feats.sets[k].as_slice()).collect();
     let mut tmps: Vec<std::path::PathBuf> = Vec::new();
     // each output its own 1 MB row buffer, written whole, as the C's ow
-    let mut out: Vec<(Box<dyn Write>, Vec<u8>)> = Vec::new();
+    let mut out: Vec<(Sink, Vec<u8>)> = Vec::new();
     if let Some(dir) = dir {
-        tmps = stage_open(dir, &sets);
-        out = tmps.iter().map(|p| (Box::new(std::fs::File::create(p)
-                .unwrap_or_else(|_| crate::bail("cannot write a derived BED"))) as Box<dyn Write>, Vec::with_capacity(OCAP))).collect();
+        let fs; (tmps, fs) = stage_open(dir, &sets);
+        out = fs.into_iter().map(|f| (Sink::Bed(f), Vec::with_capacity(OCAP))).collect();
     } else {
-        out.push((Box::new(std::io::stdout()), Vec::with_capacity(OCAP)));
+        out.push((Sink::Stdout(std::io::stdout()), Vec::with_capacity(OCAP)));
     }
     // One open run per output, extended while its label does not change
     let n = out.len();
@@ -392,7 +513,8 @@ pub fn decode(r: &mut crate::reader::Reader, feats: &Feats, dir: Option<&str>, c
         let (f, b) = &mut out[j];
         f.write_all(b).and_then(|_| f.flush()).unwrap_or_else(|_| crate::bail("write failed"));
     }
-    drop(out);
+    // each staged BED synced and closed, checked, before any is renamed in
+    for (f, _) in out { if let Sink::Bed(f) = f { if !crate::ffi::finish(f) { crate::bail("write failed"); } } }
     match dir {
         None => eprintln!("db: {rows} rows, {} sets on stdout", cols.len()),
         Some(dir) => {
@@ -403,8 +525,16 @@ pub fn decode(r: &mut crate::reader::Reader, feats: &Feats, dir: Option<&str>, c
 }
 
 const OCAP: usize = 1 << 20;
+/// Where decode's rows go: stdout, or a staged BED kept as its File, so `ffi::finish` can check its close
+enum Sink { Stdout(std::io::Stdout), Bed(std::fs::File) }
+impl Write for Sink {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        match self { Sink::Stdout(o) => o.write(b), Sink::Bed(f) => f.write(b) }
+    }
+    fn flush(&mut self) -> std::io::Result<()> { match self { Sink::Stdout(o) => o.flush(), Sink::Bed(f) => f.flush() } }
+}
 /// One row into its output's buffer, flushed when the row would not fit, as the C's owput
-fn wr(o: &mut (Box<dyn Write>, Vec<u8>), seq: &[u8], st: u64, en: u64, lab: &[u8]) {
+fn wr(o: &mut (Sink, Vec<u8>), seq: &[u8], st: u64, en: u64, lab: &[u8]) {
     let (f, v) = o;
     if v.len() + seq.len() + lab.len() + 48 > OCAP.max(v.capacity()) {
         f.write_all(v).unwrap_or_else(|_| crate::bail("write failed"));
@@ -413,8 +543,18 @@ fn wr(o: &mut (Box<dyn Write>, Vec<u8>), seq: &[u8], st: u64, en: u64, lab: &[u8
     crate::kst::put_row(v, seq, st, en, lab);
 }
 
-/// --out-dir DIR: one staged BED a set, beside the old ones, as the C's stage_open
-pub fn stage_open(dir: &str, sets: &[&[u8]]) -> Vec<std::path::PathBuf> {
+/// SET.bed.old.* in DIR for a set about to be written: what an uncatchable end inside an earlier commit left (swap_in).
+/// Counted, said once, never touched; a name counts once however many sets it could belong to. As the C's stale_warn
+fn stale_warn(dir: &str, sets: &[&[u8]]) {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let n = rd.flatten().filter(|e| { let f = e.file_name(); let b = f.as_bytes();
+        sets.iter().any(|s| b.starts_with(s) && b[s.len()..].starts_with(b".bed.old.")) }).count();
+    if n > 0 { eprintln!("karyozip: warning: {dir} holds {n} old BED(s) from an interrupted run (*.bed.old.*); they are left in place"); }
+}
+/// --out-dir DIR: one staged BED a set, beside the old ones, each a new random name made exclusively, so never
+/// through a symlink, returned open; as the C's stage_open
+pub fn stage_open(dir: &str, sets: &[&[u8]]) -> (Vec<std::path::PathBuf>, Vec<std::fs::File>) {
     std::fs::create_dir_all(dir).unwrap_or_else(|_| crate::bail("cannot create the output directory"));
     for s in sets {
         let p = setpath(dir, s, ".bed");
@@ -423,11 +563,23 @@ pub fn stage_open(dir: &str, sets: &[&[u8]]) -> Vec<std::path::PathBuf> {
             if !m.is_file() { crate::bail("--out-dir: a set's BED exists and is not a regular file"); }
         }
     }
-    let pid = std::process::id();
-    let tmps: Vec<std::path::PathBuf> = sets.iter().map(|s| setpath(dir, s, &format!(".bed.tmp.{pid}"))).collect();
-    *TMP.lock().unwrap() = tmps.clone();
-    crate::ffi::sig_stage(&tmps);
-    tmps
+    stale_warn(dir, sets);
+    let mut fs = Vec::new();
+    // each file made and published with the handled signals blocked here (ffi::stage_begin), so no handler runs
+    // between the two: one on this thread waits, pending, until every name is published; one on another thread that
+    // claimed EXITING waits for staging to end (ffi::staging_wait). Every way out drops STAGING first (ffi::STAGING)
+    let was = crate::ffi::stage_begin();
+    for s in sets {
+        let (f, p) = crate::ffi::mkstemp(&setpath(dir, s, ".bed.tmp"), 0o666)
+            .unwrap_or_else(|_| { crate::ffi::stage_abort(); crate::bail("cannot write a derived BED") });
+        crate::ffi::stage_pause(&crate::ffi::STAGE_MS, "KZ_TEST_STAGE_PAUSE_MS");
+        let mut t = TMP.lock().unwrap();
+        t.push(p); fs.push(f);
+        crate::ffi::sig_stage(&t);
+    }
+    crate::ffi::stage_end(was);
+    let tmps = TMP.lock().unwrap().clone();
+    (tmps, fs)
 }
 
 /// The staged BEDs swapped in together, as the C's stage_swap
@@ -438,34 +590,55 @@ pub fn stage_done(dir: &str, sets: &[&[u8]], tmps: &[std::path::PathBuf]) {
     TMP.lock().unwrap().clear();
 }
 
-/// Move every staged BED into place, or put back what was there
+/// Move every staged BED into place, or put back what was there. The contract: --out-dir replaces the set of BEDs
+/// all or nothing with respect to SIGINT, SIGTERM and SIGHUP and to a failed rename. Either every BED is the new one,
+/// or every BED is the old one (or absent, if it was absent before). Each live BED is first renamed onto
+/// SET.bed.old.XXXXXX, an empty placeholder made exclusively (ffi::mkstemp), so a backup never takes a name in use, a
+/// stale backup of an earlier run included; then every staged BED is renamed in; then the backups are removed. On a
+/// failed rename every backup is renamed back and every new BED that had no old one removed; when even that fails,
+/// the refusal says old BEDs remain. The handled signals are blocked in this thread for all of it, and the window
+/// opens only by one compare-and-swap of ffi's SIGSTATE, IDLE to COMMITTING, the same one a handler on another thread
+/// races, IDLE to EXITING (ffi::commit_begin, ffi::outsig). A handler that won exits before any rename, the commit
+/// waiting for it; one that lost only records the signal, raised once the renames are done, when nothing staged is
+/// left. So a signal leaves every old BED or every new one. An uncatchable end (SIGKILL, OOM, power loss) inside the
+/// window can leave old BEDs as SET.bed.old.XXXXXX beside the outputs, and nothing reports them. No directory fsync
+/// follows. As the C's stage_swap
 fn swap_in(dir: &str, sets: &[Vec<u8>], tmps: &[std::path::PathBuf]) {
-    let pid = std::process::id();
     let live = |s: &[u8]| setpath(dir, s, ".bed");
-    let mut old: Vec<Option<std::path::PathBuf>> = vec![None; sets.len()];
-    let mut bad = false;
-    for (j, s) in sets.iter().enumerate() {
-        if bad { break; }
-        let o = setpath(dir, s, &format!(".bed.old.{pid}"));
+    let n = sets.len();
+    let mut had: Vec<Option<std::path::PathBuf>> = vec![None; n];
+    let mut inst = vec![false; n];
+    let (mut bad, mut lost) = (false, false);
+    crate::ffi::swap_pause();
+    let was = crate::ffi::commit_begin();
+    for (j, s) in sets.iter().enumerate() {   // every live BED onto its own backup name
+        let Ok((f, o)) = crate::ffi::mkstemp(&setpath(dir, s, ".bed.old"), 0o600) else { bad = true; break };
+        drop(f);
         match std::fs::rename(live(s), &o) {
-            Ok(()) => old[j] = Some(o),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => bad = true,
+            Ok(()) => had[j] = Some(o),
+            Err(e) => { let _ = std::fs::remove_file(&o); if e.kind() != std::io::ErrorKind::NotFound { bad = true; } }
         }
-    }
-    let mut moved = 0usize;
-    for (j, s) in sets.iter().enumerate() {
+        crate::ffi::swap_pause();
         if bad { break; }
-        if std::fs::rename(&tmps[j], live(s)).is_err() { bad = true; } else { moved = j + 1; }
     }
-    if bad {
-        for (j, s) in sets.iter().enumerate().take(moved) {
-            let _ = std::fs::rename(live(s), &tmps[j]);
-        }
+    for (j, s) in sets.iter().enumerate() {   // every staged BED in
+        if bad { break; }
+        if std::fs::rename(&tmps[j], live(s)).is_err() { bad = true; } else { inst[j] = true; }
+        crate::ffi::swap_pause();
+    }
+    if bad {   // every old one back, over the new one; a new one with no old one removed
         for (j, s) in sets.iter().enumerate() {
-            if let Some(o) = &old[j] { let _ = std::fs::rename(o, live(s)); }
+            if let Some(o) = &had[j] { if std::fs::rename(o, live(s)).is_err() { lost = true; } }
+            else if inst[j] && std::fs::remove_file(live(s)).is_err() { lost = true; }
+        }
+        crate::ffi::commit_end(was, true);
+        if lost {
+            crate::bail(&format!("cannot rename a derived BED into place, nor put every old one back: old BEDs remain as *.bed.old.* under {dir}"));
         }
         crate::bail("cannot rename a derived BED into place");
     }
-    for o in old.into_iter().flatten() { let _ = std::fs::remove_file(o); }
+    for o in had.into_iter().flatten() { let _ = std::fs::remove_file(o); }
+    crate::ffi::sig_stage(&[]);
+    TMP.lock().unwrap().clear();
+    crate::ffi::commit_end(was, false);
 }

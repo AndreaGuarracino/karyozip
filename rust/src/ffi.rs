@@ -1,6 +1,8 @@
-//! The only unsafe in the crate: raw pointers and length checks live here; the codecs are the C ones from ../c
+//! The FFI: raw pointers and length checks for the codecs, which are the C ones from ../c.
+//! The only other unsafe is unchecked indexing in kst.rs (put_row, putu64_at) and smooth.rs (smooth_one, emit).
 
 use std::os::raw::{c_char, c_int, c_uchar, c_uint, c_void};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 
 pub const CODEC_ARITH: i32 = 0x10000;
 pub const CODEC_BZIP3: i32 = 0x20000;
@@ -54,11 +56,32 @@ pub fn ignore_sigxfsz() {
     unsafe { signal(25, 1); }
 }
 
+/// SIGPIPE back to the default the C runs under: Rust's runtime ignores it, so a write to a closed pipe was an
+/// EPIPE error (and println! a panic); now `karyozip ... | head` ends quietly, killed by the signal, as the C
+pub fn default_sigpipe() {
+    // SAFETY: SIG_DFL is 0, and signal takes no argument we own
+    unsafe { signal(13, 0); }
+}
+
 /// glibc's mmap threshold pinned at the default, so big buffers are mapped and unmapped as the C's; OpenMP's team is -t
 pub fn omp_threads(n: usize) {
     unsafe extern "C" { fn omp_set_num_threads(n: c_int); }
     // SAFETY: takes one int and only sets libgomp's default team size
     unsafe { omp_set_num_threads(n as c_int); }
+}
+
+/// The CPUs this process may run on: its affinity mask counted (sched_getaffinity over a 1024-bit cpu_set_t, glibc's
+/// CPU_COUNT), a Slurm or taskset allocation, not the machine, and never a cgroup quota (cpu.max), which
+/// available_parallelism also honours. That only when the call fails, as the C falls back to omp_get_num_procs. As
+/// the C's nthreads
+pub fn affinity_cpus() -> usize {
+    unsafe extern "C" { fn sched_getaffinity(pid: c_int, size: usize, mask: *mut u64) -> c_int; }
+    let mut m = [0u64; 16];
+    // SAFETY: the mask is owned, 1024 bits, its size in bytes passed
+    if unsafe { sched_getaffinity(0, std::mem::size_of_val(&m), m.as_mut_ptr()) } != 0 {
+        return std::thread::available_parallelism().map_or(1, |p| p.get());
+    }
+    m.iter().map(|w| w.count_ones() as usize).sum::<usize>().max(1)
 }
 
 pub fn pin_mmap_threshold() {
@@ -164,6 +187,14 @@ pub fn lzma_version() -> String {
 pub fn zstd_version() -> String {
     // SAFETY: a static string from the linked libzstd
     unsafe { std::ffi::CStr::from_ptr(zstd_sys::ZSTD_versionString()).to_string_lossy().into_owned() }
+}
+
+/// The C's strerror(errno) words, without Rust's " (os error N)"
+pub fn strerror(e: &std::io::Error) -> String {
+    unsafe extern "C" { fn strerror(n: c_int) -> *const c_char; }
+    let Some(n) = e.raw_os_error() else { return e.to_string() };
+    // SAFETY: strerror returns a NUL-terminated string, read before any other call can reuse it
+    unsafe { std::ffi::CStr::from_ptr(strerror(n)).to_string_lossy().into_owned() }
 }
 
 /// bzip3 with the pieces' sizes given, each at most the block size, summing to the source: the C's bz3_compress_cuts
@@ -324,53 +355,239 @@ unsafe extern "C" {
     fn unlink(p: *const c_char) -> i32;
     fn _exit(c: i32) -> !;
     fn signal(sig: c_int, handler: usize) -> usize;
+    fn sigaction(sig: c_int, act: *const SigAction, old: *mut SigAction) -> c_int;
+    fn fdatasync(fd: i32) -> i32;
+    fn raise(sig: c_int) -> c_int;
+    fn sigemptyset(set: *mut SigSet) -> c_int;
+    fn sigaddset(set: *mut SigSet, sig: c_int) -> c_int;
+    fn pthread_sigmask(how: c_int, set: *const SigSet, old: *mut SigSet) -> c_int;
+    fn nanosleep(req: *const TimeSpec, rem: *mut TimeSpec) -> c_int;
+    fn write(fd: c_int, b: *const u8, n: usize) -> isize;
+}
+#[repr(C)] struct TimeSpec { s: i64, ns: i64 }
+/// glibc's sigset_t: 1024 bits
+#[repr(C)] pub struct SigSet([u64; 16]);
+/// glibc's struct sigaction on Linux x86-64 and aarch64 (the generic <bits/sigaction.h>): the handler (a union with
+/// sa_sigaction, one pointer), sa_mask, sa_flags, then sa_restorer after 4 bytes of padding; 152 bytes. glibc's
+/// sigaction wrapper takes this, not the kernel's struct, and fills in the restorer itself
+#[repr(C)] struct SigAction { handler: usize, mask: SigSet, flags: c_int, restorer: usize }
+#[cfg(all(target_os = "linux", not(any(target_arch = "x86_64", target_arch = "aarch64"))))]
+compile_error!("ffi::SigAction is laid out for glibc on x86-64 and aarch64: check it against <bits/sigaction.h>");
+const _: () = {
+    use std::mem::{offset_of, size_of};
+    assert!(size_of::<SigSet>() == 128 && size_of::<SigAction>() == 152);
+    assert!(offset_of!(SigAction, mask) == 8 && offset_of!(SigAction, flags) == 136 && offset_of!(SigAction, restorer) == 144);
+};
+/// what glibc's signal() sets: an interrupted read or write restarts
+const SA_RESTART: c_int = 0x1000_0000;
+const SIG_BLOCK: c_int = 0;
+const SIG_SETMASK: c_int = 2;
+
+/// A staged output finished before it is renamed over anything: synced, then closed, both checked, since NFS, a
+/// quota or a failing disk may report a lost write only at fsync or close (File's drop discards a close error). The
+/// rename that follows is not followed by a directory fsync: the replacement is atomic, not promised to survive a
+/// crash. As the C's fdfinish; true on success, fd closed either way
+pub fn finish_fd(fd: i32) -> bool {
+    // SAFETY: fd is owned by the caller and given up here
+    let synced = unsafe { fdatasync(fd) } == 0;
+    (unsafe { close(fd) } == 0) && synced
+}
+/// `finish_fd` on a File
+pub fn finish(f: std::fs::File) -> bool { use std::os::fd::IntoRawFd; finish_fd(f.into_raw_fd()) }
+
+/// The one state the handler and the commit agree through, so that a signal either ends the process before a commit
+/// starts or waits for it to finish, never cuts it in two. IDLE: a handler may claim EXITING, then removes the
+/// temporaries and exits. COMMITTING: --out-dir's renames are under way; a handler only records the signal in
+/// PENDSIG, raised once the renames are done. EXITING: a handler has claimed the exit; the commit never starts, and
+/// any other handler waits for the process to end. Both sides move it by compare-and-swap from IDLE, so a handler that
+/// has decided to exit and is then descheduled cannot have a commit start under it. AtomicI32 exists only where it is
+/// lock-free, so the handler may use it. As the C's SIGSTATE
+const IDLE: i32 = 0;
+const COMMITTING: i32 = 1;
+const EXITING: i32 = 2;
+static SIGSTATE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(IDLE);
+/// Stored before the handler's compare-and-swap, so a commit that ended after it saw COMMITTING still reads the signal
+static PENDSIG: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+/// Sleeps until the process ends: a handler has claimed EXITING and is on its way to _exit. nanosleep only, so a
+/// handler may call it too
+fn await_exit() -> ! {
+    let t = TimeSpec { s: 1, ns: 0 };
+    // SAFETY: a valid timespec, no remainder wanted
+    loop { unsafe { nanosleep(&t, std::ptr::null_mut()); } }
+}
+/// The commit window opens: SIGINT, SIGTERM and SIGHUP blocked in this thread, then IDLE to COMMITTING, after which
+/// a handler on any other thread (a rayon worker has them unblocked) only records the signal. When a handler has
+/// already claimed EXITING, no rename starts: this waits for that handler to end the process. That handler is on
+/// another thread: this one has the three blocked and is in no handler (one that claims EXITING never returns), and
+/// catch_signals' mask keeps any of them from nesting under it there, so it reaches _exit. Returns the mask to put
+/// back, as the C's stage_swap
+pub fn commit_begin() -> SigSet {
+    use std::sync::atomic::Ordering::SeqCst;
+    let (mut hs, mut was) = (SigSet([0; 16]), SigSet([0; 16]));
+    // SAFETY: both sets are owned, the size glibc's sigset_t is
+    unsafe {
+        sigemptyset(&mut hs);
+        for s in [1, 2, 15] { sigaddset(&mut hs, s); }
+        pthread_sigmask(SIG_BLOCK, &hs, &mut was);
+    }
+    if SIGSTATE.compare_exchange(IDLE, COMMITTING, SeqCst, SeqCst).is_err() { await_exit(); }
+    was
+}
+/// The window closes, back to IDLE. A deferred signal is raised, pending until the mask is put back, then the handler
+/// runs with nothing staged left; unless `quiet`, when the caller refuses and exits anyway
+pub fn commit_end(was: SigSet, quiet: bool) {
+    use std::sync::atomic::Ordering::SeqCst;
+    SIGSTATE.store(IDLE, SeqCst);
+    if quiet { return; }
+    let p = PENDSIG.load(SeqCst);
+    // SAFETY: raise and pthread_sigmask on a valid signal and the saved mask
+    unsafe { if p != 0 { raise(p); } pthread_sigmask(SIG_SETMASK, &was, std::ptr::null_mut()); }
 }
 
-/// -o's temporary and final names, as the C's OUTTMP and OUTFIN; the signal handler reads the leaked C string, never the mutex
-static OUT: std::sync::Mutex<Option<(std::ffi::CString, String)>> = std::sync::Mutex::new(None);
+/// -o's temporary name, where it is renamed to and the name given, as the C's OUTTMP, OUTDST and OUTFIN; the signal handler reads the leaked C string, never the mutex
+static OUT: std::sync::Mutex<Option<(std::ffi::CString, std::path::PathBuf, String)>> = std::sync::Mutex::new(None);
+/// The handler's strings, OUTSIG's and STAGE's, are leaked and never freed: a handler that claimed EXITING may hold
+/// one it loaded before the main thread cleared the pointer, and nothing tells the main thread when that handler is
+/// done with it. Clearing only stores null; a handler holding an old string at worst unlinks a name already gone.
+/// A few bytes, once or twice a run, kept in RETIRED, reachable, so a leak checker does not count them. As the C's
+/// OUTTMP and OUTKEPT
 static OUTSIG: std::sync::atomic::AtomicPtr<c_char> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
-/// --out-dir's staged BEDs for the handler: a leaked array of leaked C strings
+/// --out-dir's staged BEDs for the handler: a leaked, null-terminated array of leaked C strings, one pointer, so the
+/// handler never pairs one array with another's length
 static STAGE: std::sync::atomic::AtomicPtr<*mut c_char> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
-static STAGEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-extern "C" fn outsig(_: c_int) {
+/// OUTSIG's and STAGE's old pointers, as addresses; the handler never touches it
+static RETIRED: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+/// try_lock: a panic hook may retire one too (drop_tmp, drop_out)
+fn retire(p: usize) { if p != 0 { if let Ok(mut v) = RETIRED.try_lock() { v.push(p); } } }
+/// KZ_TEST_SIG_PAUSE_MS=N, for tests only: the handler sleeps N ms right after it decides, to exit or to defer, so
+/// a test can move the main thread on meanwhile (KZ_TEST_SWAP_PAUSE_MS, swap_pause, holds it before and inside a commit
+/// window). Read once by sig_test_init at startup, before any handler is installed (getenv is not async-signal-safe);
+/// unset or 0, nothing sleeps. As the C's SIGPAUSE_MS
+static SIGPAUSE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub fn sig_test_init() {
+    let ms = std::env::var("KZ_TEST_SIG_PAUSE_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    SIGPAUSE_MS.store(ms, std::sync::atomic::Ordering::SeqCst);
+}
+/// nanosleep, async-signal-safe, through EINTR
+fn sig_pause() {
+    let ms = SIGPAUSE_MS.load(std::sync::atomic::Ordering::SeqCst);
+    if ms == 0 { return; }
+    let mut t = TimeSpec { s: (ms / 1000) as i64, ns: (ms % 1000) as i64 * 1_000_000 };
+    // SAFETY: both pointers are to the one owned timespec, which nanosleep may rewrite with what is left
+    while unsafe { nanosleep(&t, &mut t) } != 0 {}
+}
+/// IDLE to EXITING, then the temporaries removed and _exit; COMMITTING, the signal recorded for commit_end; EXITING,
+/// another handler is ending the process, so this one waits for it
+extern "C" fn outsig(sig: c_int) {
     use std::sync::atomic::Ordering::SeqCst;
-    let (p, a, n) = (OUTSIG.load(SeqCst), STAGE.load(SeqCst), STAGEN.load(SeqCst));
-    // SAFETY: unlink and _exit are async-signal-safe; every pointer is leaked
+    PENDSIG.store(sig, SeqCst);
+    match SIGSTATE.compare_exchange(IDLE, EXITING, SeqCst, SeqCst) {
+        Ok(_) => { sig_pause(); staging_wait(); }
+        Err(COMMITTING) => { sig_pause(); return; }
+        Err(_) => { sig_pause(); await_exit() }
+    }
+    let (p, a) = (OUTSIG.load(SeqCst), STAGE.load(SeqCst));
+    // SAFETY: unlink and _exit are async-signal-safe; every pointer is leaked, never freed, and a is null-terminated
     unsafe {
         if !p.is_null() { unlink(p); }
-        if !a.is_null() { for i in 0..n { unlink(*a.add(i)); } }
+        if !a.is_null() { let mut i = 0; while !(*a.add(i)).is_null() { unlink(*a.add(i)); i += 1; } }
         _exit(1)
     }
 }
 
-/// SIGINT, SIGTERM and SIGHUP remove -o's and --out-dir's temporaries, as the C.
+/// SIGINT, SIGTERM and SIGHUP remove -o's and --out-dir's temporaries, as the C. Installed by sigaction with all
+/// three in sa_mask, so while any one's handler runs on a thread, none of them can interrupt it there: one that
+/// claimed EXITING is never suspended under a nested handler, which would see EXITING and wait for it forever
+/// (await_exit). A second signal to that thread stays pending until _exit; one to another thread runs its handler
+/// there. SA_RESTART, as signal() gave. As the C's catchsig
 fn catch_signals() {
-    // SAFETY: outsig only unlinks and exits
-    unsafe { for s in [1, 2, 15] { signal(s, outsig as extern "C" fn(c_int) as usize); } }
+    // SAFETY: the action and its set are owned and laid out as glibc's (SigAction); outsig only unlinks and exits
+    unsafe {
+        let mut a = SigAction { handler: outsig as extern "C" fn(c_int) as usize, mask: SigSet([0; 16]), flags: SA_RESTART, restorer: 0 };
+        sigemptyset(&mut a.mask);
+        for s in [1, 2, 15] { sigaddset(&mut a.mask, s); }
+        for s in [1, 2, 15] { sigaction(s, &a, std::ptr::null_mut()); }
+    }
 }
 
-/// The staged BEDs a signal removes; empty once they are swapped in
+/// The staged BEDs a signal removes; empty once they are swapped in. The new list replaces the old in one swap, so a
+/// handler sees one or the other, never neither; the old is retired, not freed (OUTSIG)
 pub fn sig_stage(paths: &[std::path::PathBuf]) {
     use std::{os::unix::ffi::OsStrExt, sync::atomic::Ordering::SeqCst};
-    let n = STAGEN.swap(0, SeqCst);
-    let a = STAGE.swap(std::ptr::null_mut(), SeqCst);
-    // SAFETY: a and its strings came from the leaks below, n long
-    if !a.is_null() { unsafe { for c in Box::from_raw(std::ptr::slice_from_raw_parts_mut(a, n)) { drop(std::ffi::CString::from_raw(c)); } } }
-    if paths.is_empty() { return; }
-    let v: Vec<*mut c_char> = paths.iter().filter_map(|p| std::ffi::CString::new(p.as_os_str().as_bytes()).ok())
-        .map(|c| c.into_raw()).collect();
-    let n = v.len();
-    STAGE.store(Box::leak(v.into_boxed_slice()).as_mut_ptr(), SeqCst);
-    STAGEN.store(n, SeqCst);
-    catch_signals();
+    let new = if paths.is_empty() { std::ptr::null_mut() } else {
+        let mut v: Vec<*mut c_char> = paths.iter().filter_map(|p| std::ffi::CString::new(p.as_os_str().as_bytes()).ok())
+            .map(|c| c.into_raw()).collect();
+        v.push(std::ptr::null_mut());
+        Box::leak(v.into_boxed_slice()).as_mut_ptr()
+    };
+    retire(STAGE.swap(new, SeqCst) as usize);
+    if !new.is_null() { catch_signals(); }
 }
 
-/// Frees the handler's copy of -o's temporary name
-fn sig_out_clear() {
-    let p = OUTSIG.swap(std::ptr::null_mut(), std::sync::atomic::Ordering::SeqCst);
-    // SAFETY: p came from CString::into_raw in redirect
-    if !p.is_null() { unsafe { drop(std::ffi::CString::from_raw(p)); } }
+/// True while stage_open makes and publishes the staged BEDs, with the handled signals blocked in its thread
+/// (stage_begin): a handler on another thread that claimed EXITING waits for it to drop, so it never unlinks the list
+/// while a file being made is not yet on it. stage_begin sets it, then looks for EXITING; the handler claims EXITING,
+/// then looks at it; both SeqCst, so one of the two sees the other. Never a mutual wait: the handler waits only for
+/// STAGING to drop, and staging never waits for a handler, nor exits, with STAGING up. Seeing EXITING, stage_begin
+/// drops it first, nothing yet staged, then waits for that handler to end the process (await_exit); a refusal drops
+/// it (stage_abort) before it exits. As the C's STAGING
+static STAGING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// nanosleep only, so the handler may call it
+fn staging_wait() {
+    let t = TimeSpec { s: 0, ns: 1_000_000 };
+    // SAFETY: a valid timespec, no remainder wanted
+    while STAGING.load(std::sync::atomic::Ordering::SeqCst) { unsafe { nanosleep(&t, std::ptr::null_mut()); } }
 }
+/// Staging opens: the handler installed, SIGINT, SIGTERM and SIGHUP blocked in this thread, STAGING up. A handler that
+/// already claimed EXITING is on another thread ending the process, waiting for STAGING to drop: this drops it, then
+/// waits for that handler. Returns the mask to put back
+pub fn stage_begin() -> SigSet {
+    use std::sync::atomic::Ordering::SeqCst;
+    catch_signals();
+    let (mut hs, mut was) = (SigSet([0; 16]), SigSet([0; 16]));
+    // SAFETY: both sets are owned, the size glibc's sigset_t is
+    unsafe {
+        sigemptyset(&mut hs);
+        for s in [1, 2, 15] { sigaddset(&mut hs, s); }
+        pthread_sigmask(SIG_BLOCK, &hs, &mut was);
+    }
+    STAGING.store(true, SeqCst);
+    if stage_ms(&STAGE_ENTRY_MS, "KZ_TEST_STAGE_ENTRY_PAUSE_MS") > 0 {   // told on stderr, so a test signals inside
+        // SAFETY: a static buffer of its length
+        unsafe { write(2, STAGE_ENTRY_ACK.as_ptr(), STAGE_ENTRY_ACK.len()); }
+        stage_pause(&STAGE_ENTRY_MS, "KZ_TEST_STAGE_ENTRY_PAUSE_MS");
+    }
+    if SIGSTATE.load(SeqCst) == EXITING { STAGING.store(false, SeqCst); await_exit(); }
+    was
+}
+/// Staging closes: STAGING down, the mask put back, so a signal held pending here runs its handler now, with every
+/// staged BED on the list
+pub fn stage_end(was: SigSet) {
+    STAGING.store(false, std::sync::atomic::Ordering::SeqCst);
+    // SAFETY: the mask stage_begin saved
+    unsafe { pthread_sigmask(SIG_SETMASK, &was, std::ptr::null_mut()); }
+}
+/// STAGING down without the mask put back: a refusal on its way out
+pub fn stage_abort() { STAGING.store(false, std::sync::atomic::Ordering::SeqCst); }
+/// For tests only, unset or 0 nothing sleeps. KZ_TEST_STAGE_PAUSE_MS=N (STAGE_MS): stage_open sleeps N ms after it
+/// makes each staged BED and before it publishes it, so a test can signal in what was once a window where the file
+/// existed and no handler knew it. KZ_TEST_STAGE_ENTRY_PAUSE_MS=N (STAGE_ENTRY_MS): stage_begin sleeps N ms once
+/// STAGING is up and before it looks for EXITING, so a handler on another thread can claim EXITING and find STAGING
+/// up (once a mutual wait); as it starts that sleep it writes STAGE_ENTRY_ACK to stderr with one write(2), so the test
+/// signals once it is inside. As the C's stage_pause_ms
+pub static STAGE_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+static STAGE_ENTRY_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+const STAGE_ENTRY_ACK: &[u8] = b"karyozip: test: staging entry paused\n";
+fn stage_ms(ms: &std::sync::OnceLock<u64>, var: &str) -> u64 {
+    *ms.get_or_init(|| std::env::var(var).ok().and_then(|v| v.parse().ok()).unwrap_or(0))
+}
+pub fn stage_pause(ms: &std::sync::OnceLock<u64>, var: &str) {
+    let ms = stage_ms(ms, var);
+    if ms > 0 { std::thread::sleep(std::time::Duration::from_millis(ms)); }
+}
+
+/// Retires the handler's copy of -o's temporary name, never freed (OUTSIG)
+fn sig_out_clear() { retire(OUTSIG.swap(std::ptr::null_mut(), std::sync::atomic::Ordering::SeqCst) as usize); }
 
 /// A panic is a bug, yet leaves no temporaries behind either
 pub fn panic_clean() {
@@ -384,41 +601,85 @@ pub fn panic_clean() {
 /// Removes -o's temporary file on any failure; try_lock, since a panic hook may run with the lock held
 pub fn drop_out() {
     sig_out_clear();
-    if let Ok(mut o) = OUT.try_lock() { if let Some((t, _)) = o.take() { unsafe { unlink(t.as_ptr()); } } }
+    if let Ok(mut o) = OUT.try_lock() { if let Some((t, ..)) = o.take() { unsafe { unlink(t.as_ptr()); } } }
 }
 
-/// On success: -o's temporary file renamed into place
+/// KZ_TEST_SWAP_PAUSE_MS=N, for tests only: a commit, --out-dir's (db.rs swap_in) or -o's (commit_out), sleeps N ms
+/// before its window opens and after each of its renames, so a test can act just before and inside the window (with
+/// KZ_TEST_SIG_PAUSE_MS). Read nowhere else; unset, nothing sleeps. As the C's swap_pause
+pub fn swap_pause() {
+    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let ms = *MS.get_or_init(|| std::env::var("KZ_TEST_SWAP_PAUSE_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(0));
+    if ms > 0 { std::thread::sleep(std::time::Duration::from_millis(ms)); }
+}
+
+/// On success: -o's temporary file renamed into place, the rename inside the same window as --out-dir's (commit_begin):
+/// a handler that claimed EXITING first removes the temporary and exits, the old file kept, and no rename starts; a
+/// signal during the rename is raised once it is done, exit 1 with the new file in place. Until the window the
+/// handler still sees the temporary, so a signal while it is synced removes it. As the C's outcommit
 pub fn commit_out() {
     use std::io::Write;
-    let Some((t, fin)) = OUT.lock().ok().and_then(|mut o| o.take()) else { return };
-    sig_out_clear();
-    let tp = t.to_string_lossy().into_owned();   // made from a &str
+    let Some((t, dst, fin)) = OUT.lock().ok().and_then(|mut o| o.take()) else { return };
+    let tp = std::path::PathBuf::from(std::ffi::OsStr::from_bytes(t.as_bytes()));
     // NFS reports some errors only at close
-    if std::io::stdout().flush().is_err() || unsafe { close(1) } != 0 {
-        let _ = std::fs::remove_file(&tp); crate::bail("write failed");
+    if std::io::stdout().flush().is_err() || !finish_fd(1) {
+        sig_out_clear(); let _ = std::fs::remove_file(&tp); crate::bail("write failed");
     }
-    if std::fs::rename(&tp, &fin).is_err() { let _ = std::fs::remove_file(&tp); crate::bail(&format!("cannot rename into {fin}")) }
+    swap_pause();
+    let was = commit_begin();
+    let moved = std::fs::rename(&tp, &dst).is_ok();
+    sig_out_clear();
+    swap_pause();
+    if !moved { commit_end(was, true); let _ = std::fs::remove_file(&tp); crate::bail(&format!("cannot rename into {fin}")) }
+    commit_end(was, false);
 }
 
-/// -i and -o in place of stdin and stdout; -o to a regular file goes under a temporary name, renamed in by `commit_out`
-pub fn redirect(path: &str, fd: i32) {
-    use std::os::{fd::AsRawFd, unix::fs::{OpenOptionsExt, PermissionsExt}};
-    let old = std::fs::symlink_metadata(path).ok();
-    let mut f = None;
-    if fd == 1 && old.as_ref().is_none_or(|m| m.file_type().is_file()) {
-        let t = format!("{path}.tmp.{}", std::process::id());
-        if let Ok(h) = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o644).open(&t) {
-            if let Some(m) = &old { let _ = h.set_permissions(std::fs::Permissions::from_mode(m.permissions().mode() & 0o7777)); }
-            let c = std::ffi::CString::new(t).unwrap_or_else(|_| crate::bail("cannot open the output"));
-            OUTSIG.store(c.clone().into_raw(), std::sync::atomic::Ordering::SeqCst);
-            *OUT.lock().unwrap() = Some((c, path.to_string()));
-            catch_signals();
-            f = Some(Ok(h));
+/// A new file PREFIX.XXXXXX, as mkstemp: created exclusively, so never through a symlink, and a taken name retried
+pub fn mkstemp(prefix: &std::path::Path, mode: u32) -> std::io::Result<(std::fs::File, std::path::PathBuf)> {
+    use std::{hash::{BuildHasher, Hasher}, os::unix::fs::OpenOptionsExt};
+    const A: &[u8; 62] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    let mut n = prefix.as_os_str().as_bytes().to_vec(); n.extend_from_slice(b".XXXXXX");
+    let at = n.len() - 6;
+    for i in 0..1000u64 {
+        // RandomState: random keys a process, moved on at every call
+        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+        h.write_u64(i); h.write_u128(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos()));
+        let mut r = h.finish();
+        for c in &mut n[at..] { *c = A[(r % 62) as usize]; r /= 62; }
+        let p = std::path::PathBuf::from(std::ffi::OsStr::from_bytes(&n));
+        match std::fs::OpenOptions::new().write(true).create_new(true).mode(mode).open(&p) {
+            Ok(f) => return Ok((f, p)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e),
         }
     }
-    let f = f.unwrap_or_else(|| if fd == 0 { std::fs::File::open(path) }
-            else { std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o644).open(path) });
-    if !f.is_ok_and(|f| unsafe { dup2(f.as_raw_fd(), fd) } >= 0) { crate::bail(&format!("cannot open {path}")) }
+    Err(std::io::ErrorKind::AlreadyExists.into())
+}
+
+/// -i and -o in place of stdin and stdout. -o to a regular file, or to none yet, is staged in a new random name
+/// beside it, renamed in by `commit_out`, so a failure to stage is fatal and never truncates the old file. A symlink
+/// is resolved and its target staged and replaced, the link kept; a dangling one is refused. As the C's redirect
+pub fn redirect(path: &str, fd: i32) {
+    use std::os::{fd::AsRawFd, unix::fs::PermissionsExt};
+    fn refuse(p: &str) -> ! { crate::bail(&format!("cannot open {p}")) }
+    let mut old = std::fs::symlink_metadata(path).ok();
+    let mut dst = std::path::PathBuf::from(path);
+    if fd == 1 && old.as_ref().is_some_and(|m| m.file_type().is_symlink()) {
+        dst = std::fs::canonicalize(path).unwrap_or_else(|_| refuse(path));
+        old = Some(std::fs::metadata(&dst).unwrap_or_else(|_| refuse(path)));
+    }
+    let f = if fd == 1 && old.as_ref().is_none_or(|m| m.file_type().is_file()) {
+        let mut pre = dst.clone().into_os_string(); pre.push(".tmp");
+        let (h, t) = mkstemp(pre.as_ref(), 0o644)
+            .unwrap_or_else(|_| crate::bail(&format!("cannot create a temporary file beside {path}")));
+        if let Some(m) = &old { let _ = h.set_permissions(std::fs::Permissions::from_mode(m.permissions().mode() & 0o7777)); }
+        let c = std::ffi::CString::new(t.into_os_string().into_vec()).unwrap_or_else(|_| refuse(path));
+        OUTSIG.store(c.clone().into_raw(), std::sync::atomic::Ordering::SeqCst);
+        *OUT.lock().unwrap() = Some((c, dst, path.to_string()));
+        catch_signals();
+        Ok(h)
+    } else if fd == 0 { std::fs::File::open(path) } else { std::fs::OpenOptions::new().write(true).open(&dst) };
+    if !f.is_ok_and(|f| unsafe { dup2(f.as_raw_fd(), fd) } >= 0) { refuse(path) }
 }
 
 // glibc's byte search: fewer instructions than the memchr crate on short fields, the code the C calls
@@ -448,6 +709,7 @@ unsafe extern "C" {
 }
 pub struct Inflater(*mut LdDec);
 unsafe impl Send for Inflater {}
+impl Default for Inflater { fn default() -> Self { Inflater::new() } }
 impl Inflater {
     pub fn new() -> Inflater { let d = unsafe { libdeflate_alloc_decompressor() }; assert!(!d.is_null(), "out of memory"); Inflater(d) }
     /// Inflates raw deflate `i` into all of `o`: true when it fills `o` exactly

@@ -1,6 +1,7 @@
 //! Reading a KST track; every refusal is the C's, so the two are interchangeable
 
 use crate::ffi;
+use crate::{Error, KzResult};
 use crate::kst::{self, FNV0, TOKFLAG, INTFLAG, FLDFLAG, DROPPED, ALNFLAG, DBFLAG, LENFLAG,
                  TAILFLAG, RUNFLAG, ILVFLAG, GRPFLAG, CARTFLAG, VARFLAG, ICHUNK, FLAGS};
 use std::io::{Read, Seek, SeekFrom};
@@ -121,8 +122,11 @@ pub struct Reader {
 #[derive(Clone)]
 struct Dec { b: Vec<Blk>, data0: u64, rows: u64, lencodec: i32, idcodec: i32, ilv: bool, runhead: bool, grp: bool }
 
+/// A decoded block: its two regions back to back, the split, its rows, the run-count prefix sums
+type Decoded = (Vec<u8>, usize, u64, Option<Vec<u32>>);
+
 /// One block's frames, its two regions back to back, the split, its rows, and its run-count prefix sums when counts head the lengths
-fn block_dec(f: &mut std::fs::File, d: &Dec, b: usize) -> (Vec<u8>, usize, u64, Option<Vec<u32>>) {
+fn block_dec(f: &mut std::fs::File, d: &Dec, b: usize) -> Decoded {
     if b >= d.b.len() { crate::bail("corrupt index: a block number is past the end"); }
     let m = d.b[b];
     let mut cb = ffi::raw_buf(crate::ckalloc(m.size as usize));
@@ -156,7 +160,7 @@ fn block_dec(f: &mut std::fs::File, d: &Dec, b: usize) -> (Vec<u8>, usize, u64, 
     (data, split, m.rows, tab)
 }
 
-type Got = Result<(Vec<u8>, usize, u64, Option<Vec<u32>>), String>;
+type Got = Result<Decoded, String>;
 struct PfSt { used: usize, next: usize, stop: bool, got: std::collections::HashMap<usize, Got>, spare: Vec<Vec<u8>> }
 /// Decode ahead, as the C's: threads decode the next blocks on their own file handles; a refusal waits for its block
 struct Pf { st: std::sync::Arc<(std::sync::Mutex<PfSt>, std::sync::Condvar)>, th: Vec<std::thread::JoinHandle<()>> }
@@ -178,6 +182,7 @@ impl Reader {
     pub fn cart(&self) -> bool { self.cart }
 
     pub fn open_with(path: &str, o: &ReadOpts) -> Reader {
+        crate::readcap();   // its stream lengths are forgeable, as the C's ropen
         let mut f = rd(std::fs::File::open(path), "open");
         let mut m = [0u8; 8];
         rd(f.read_exact(&mut m), "not a KST file: shorter than the magic");
@@ -194,6 +199,10 @@ impl Reader {
             *v = u64::from_le_bytes(hb[i * 8..i * 8 + 8].try_into().unwrap());
         }
         let h1_raw = h[1];
+        // a bit above the 49-bit names length that no flag names: a newer writer, not a size
+        if (h[1] >> kst::NMLBITS) & !(FLAGS >> kst::NMLBITS) != 0 {
+            crate::bail("this track was written by a newer karyozip: unknown header flags");
+        }
         let fsz = rd(f.seek(SeekFrom::End(0)), "seek");
         // the name index, TRACK.kzi beside the track, as the C reads it
         let mut idx = None;
@@ -441,6 +450,33 @@ impl Reader {
         }
     }
 
+    /// A pull, row by row, of what `for_each_row` walks, for a caller that merges several tracks in step
+    pub fn rows(&self) -> RowStream {
+        RowStream { c: Cursor { blk: usize::MAX, data: std::sync::Arc::new(Vec::new()), lp: 0, ip: 0, left: 0 },
+                    ri: u64::MAX, k: 0, nruns: 0, st: 0, emitted: 0 }
+    }
+    /// The next row of a plain track as (sequence, start, end, label id), None after the last; the label is
+    /// `label_at(id)`, or the id itself when the table is empty. The C's dump checks, and its words
+    pub fn next_row(&mut self, s: &mut RowStream) -> Option<(u64, u64, u64, u64)> {
+        while s.k == s.nruns {   // the next sequence with a run
+            s.ri = s.ri.wrapping_add(1);
+            if s.ri >= self.nreads {
+                if s.emitted != self.rows {
+                    eprintln!("karyozip: emitted {} rows, the header says {}", s.emitted, self.rows);
+                    crate::bail("file is truncated");
+                }
+                return None;
+            }
+            s.nruns = self.locate(s.ri).2;
+            s.k = 0; s.st = 0;
+        }
+        let (len, id) = self.step(&mut s.c, s.st, s.k + 1 == s.nruns && s.ri >= self.tailskip);
+        if !self.lab.is_empty() && id as usize >= self.lab.len() { crate::bail("corrupt block: a label id past the table"); }
+        let st = s.st;
+        s.st += len; s.k += 1; s.emitted += 1;
+        Some((s.ri, st, st + len, id))
+    }
+
     /// Every sequence, in order, in one forward pass over the blocks
     pub fn decode(&mut self, out: &mut impl std::io::Write) {
         let mut ocap = 1usize << 22;
@@ -554,7 +590,7 @@ impl Reader {
     }
 
     /// The walk's next block, decoded ahead
-    fn pf_take(&mut self, b: usize) -> Option<(Vec<u8>, usize, u64, Option<Vec<u32>>)> {
+    fn pf_take(&mut self, b: usize) -> Option<Decoded> {
         let pf = self.pf.as_ref()?;
         let (m, cv) = &*pf.st;
         let mut g = m.lock().unwrap();
@@ -570,7 +606,7 @@ impl Reader {
 }
 
 /// One stream a read, its run count then a label beside its own length, split back into the two regions
-fn ilv_split(v: Vec<u8>, nl: usize, ni: usize, rows: u64) -> Vec<u8> {
+pub(crate) fn ilv_split(v: Vec<u8>, nl: usize, ni: usize, rows: u64) -> Vec<u8> {
     let (mut lens, mut ids) = (Vec::with_capacity(nl + ni), Vec::with_capacity(ni));   // the ids join lens: no regrowth
     let (mut i, mut seen) = (0usize, 0u64);
     while i < v.len() {
@@ -603,13 +639,13 @@ fn rmheads(lens: &mut [u8], total: u64, rows: u64, nrd: u64) -> (usize, Vec<u32>
     tab.push(0);
     while i < lens.len() {
         if tab.len() as u64 > nrd { crate::bail("corrupt block: more reads than the header claims"); }
-        let (k, n) = vget(&lens, i); i = n;
+        let (k, n) = vget(lens, i); i = n;
         if k == 0 || k > rows - seen { crate::bail("corrupt block: a run count is out of range"); }
         seen += k; tab.push(seen as u32);
         let s0 = i;   // the read's lengths sit together: one move a read
         for _ in 0..k {
             if i >= lens.len() { crate::bail("corrupt block: a read runs past its lengths"); }
-            i = skip(&lens, i);
+            i = skip(lens, i);
             if i > lens.len() { crate::bail("corrupt block: a length runs past the lengths"); }
         }
         lens.copy_within(s0..i, w); w += i - s0;
@@ -621,7 +657,7 @@ fn rmheads(lens: &mut [u8], total: u64, rows: u64, nrd: u64) -> (usize, Vec<u32>
 }
 
 /// Undo grp_pack: the labels, in their own order, say which group each length came from; rtab holds the counts
-fn grp_unpack(lens: &[u8], ids: &[u8], rtab: &[u32]) -> Vec<u8> {
+pub(crate) fn grp_unpack(lens: &[u8], ids: &[u8], rtab: &[u32]) -> Vec<u8> {
     let mut out = Vec::with_capacity(lens.len() + ids.len());   // the ids join it next: no regrowth
     let (mut p, mut q) = (0usize, 0usize);
     // 8 B a run in each, as the C's
@@ -742,12 +778,17 @@ fn int_names_d(b: &[u8], cnt: u64) -> Vec<u8> {
     o
 }
 
-pub fn tok_d(b: &[u8]) -> Vec<u8> {
-    if b.len() < 8 { crate::bail("truncated tokenised names"); }
+/// Tokenised names, the reader path's form: a refusal exits, as the C's tokd
+pub fn tok_d(b: &[u8]) -> Vec<u8> { tok_d_r(b).unwrap_or_else(|e| crate::die(&e)) }
+
+/// Tokenised names decoded, a refusal returned in the C's words: the packed-alignment loader's form
+pub fn tok_d_r(b: &[u8]) -> KzResult<Vec<u8>> {
+    let bad = |m: &str| Err(Error::input(m));
+    if b.len() < 8 { return bad("truncated tokenised names"); }
     let nchunk = u32::from_le_bytes(b[4..8].try_into().unwrap()) as usize;
     let hdr = 8 + 8 * nchunk;
     if nchunk > (b.len() - 8) / 8 || hdr > b.len() {
-        crate::bail("corrupt tokenised names header");
+        return bad("corrupt tokenised names header");
     }
     // raw and coded length per chunk, as the C's tokd
     let (mut woff, mut coff) = (vec![0usize], vec![0usize]);
@@ -757,17 +798,21 @@ pub fn tok_d(b: &[u8]) -> Vec<u8> {
         coff.push(coff[i] + at(8 + 4 * (nchunk + i)));
     }
     if coff[nchunk] > b.len() - hdr {
-        crate::bail("corrupt tokenised names: chunks overrun the stream");
+        return bad("corrupt tokenised names: chunks overrun the stream");
     }
     // One chunk per thread into one preallocated buffer, so the peak is the names once; NUL separators become newlines
     use rayon::prelude::*;
-    let mut out = vec![0u8; crate::ckalloc(woff[nchunk])];
+    // the cap ckalloc would refuse, and an allocation that fails, returned
+    if woff[nchunk] > 1 << 38 && crate::readcap_on() { return bad("corrupt file: an impossible allocation size"); }
+    let mut out: Vec<u8> = Vec::new();
+    out.try_reserve_exact(woff[nchunk]).map_err(|_| Error::internal("oom"))?;
+    out.resize(woff[nchunk], 0);
     let mut slots: Vec<&mut [u8]> = Vec::with_capacity(nchunk);
     let mut rest = out.as_mut_slice();
     for i in 0..nchunk { let (a, r) = rest.split_at_mut(woff[i + 1] - woff[i]); slots.push(a); rest = r; }
     // At most TOKDEC chunks at once, as the C: each costs 127 MB in the decoder
     let pool = rayon::ThreadPoolBuilder::new().num_threads(rayon::current_num_threads().min(TOKDEC)).build()
-        .unwrap_or_else(|_| crate::bail("cannot start the name decode threads"));
+        .map_err(|_| Error::internal("cannot start the name decode threads"))?;
     let ok = pool.install(|| slots.into_par_iter().enumerate().all(|(i, slot)| {
         match ffi::tok_decode(&b[hdr + coff[i]..hdr + coff[i + 1]]) {
             Some(d) if d.len() == slot.len() => {
@@ -777,8 +822,8 @@ pub fn tok_d(b: &[u8]) -> Vec<u8> {
             _ => false,
         }
     }));
-    if !ok { crate::bail("name tokeniser decode failed"); }
-    out
+    if !ok { return bad("name tokeniser decode failed"); }
+    Ok(out)
 }
 
 pub use crate::kst::{unzz, vget};
@@ -1012,7 +1057,7 @@ impl Reader {
         for &c in &cnt[..cnt.len() - 1] { at += c as u64; }
         let (e0, e1) = (at, (at + cnt[cnt.len() - 1] as u64).min(n));
         let byte0 = (e0 * (32 + w)) >> 3;
-        let ent = if e1 > e0 { get(nb + ns * 8 + byte0, ((e1 - e0) * (32 + w) + 7) / 8 + 8) } else { Vec::new() };
+        let ent = if e1 > e0 { get(nb + ns * 8 + byte0, ((e1 - e0) * (32 + w)).div_ceil(8) + 8) } else { Vec::new() };
         let hits: Vec<u64> = (e0..e1).filter_map(|e| {
             let bit = e * (32 + w) - byte0 * 8;
             let o = ixget(&ent, bit + 32, w);
@@ -1139,9 +1184,12 @@ impl Reader {
     }
 }
 
-pub(crate) fn skip(b: &[u8], mut i: usize) -> usize {
-    while i < b.len() && b[i] >= 0x80 { i += 1; }
-    i + 1
+/// past one varint, refusing the ones vget refuses past 63 bits (the C skips with its vget); a cut is the caller's to see
+pub(crate) fn skip(b: &[u8], i: usize) -> usize {
+    let mut j = i;
+    while j < b.len() && b[j] >= 0x80 { j += 1; }
+    if j - i >= 9 && (j - i > 9 || b.get(j).is_some_and(|&c| c > 1)) { crate::bail("corrupt varint"); }
+    j + 1
 }
 
 /* ------------------------------------------------------------ the index */
@@ -1202,9 +1250,13 @@ impl Reader {
         for v in [n, k as u64, self.mhash ^ self.namesrc(), pay, IDXMAGIC] { t.extend_from_slice(&v.to_le_bytes()); }
         // beside the track in TRACK.kzi, written whole, then renamed into place
         use std::io::Write;
-        let (ip, tp) = (format!("{path}.kzi"), format!("{path}.kzi.{}", std::process::id()));
-        let ok = std::fs::File::create(&tp).and_then(|mut f| { f.write_all(&t)?; f.flush() }).is_ok()
-            && std::fs::rename(&tp, &ip).is_ok();
+        // a new random name, made exclusively, as the C's mkstemp
+        let ip = format!("{path}.kzi");
+        let (mut f, tp) = crate::ffi::mkstemp(ip.as_ref(), 0o666)
+            .unwrap_or_else(|_| crate::bail("cannot create the index file beside the track"));
+        // synced and closed, checked, before the rename
+        let wrote = f.write_all(&t).is_ok();
+        let ok = crate::ffi::finish(f) && wrote && std::fs::rename(&tp, &ip).is_ok();
         if !ok { let _ = std::fs::remove_file(&tp); crate::bail("index write failed"); }
         eprintln!("index: {n} sequences, {} B in {ip}, {dup} fingerprint collisions", pay + 40);
     }
@@ -1330,6 +1382,9 @@ impl Reader {
         self.sc = Some((c.blk, rows - c.left, c));
     }
 }
+
+/// Where `Reader::next_row` is: the block cursor, the sequence and its run, the rows so far
+pub struct RowStream { c: Cursor, ri: u64, k: u64, nruns: u64, st: u64, emitted: u64 }
 
 /// One sequence as arrays, reused across sequences
 #[derive(Default)]

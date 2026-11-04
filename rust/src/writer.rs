@@ -1,6 +1,6 @@
 //! The KST writer: rows grouped by sequence, gapless, from 0; every layout decision is c/karyozip.c's, for the same bytes
 
-use crate::ffi;
+use crate::{ffi, Error, KzResult};
 use crate::kst::{self, FNV0, TOKFLAG, INTFLAG, FLDFLAG, DROPPED, ALNFLAG, DBFLAG, LENFLAG,
                  TAILFLAG, RUNFLAG, ILVFLAG, GRPFLAG, CARTFLAG, VARFLAG, ICHUNK};
 use rayon::prelude::*;
@@ -62,7 +62,7 @@ pub struct Writer {
     tailpred: u64,
     tailon: Option<bool>,
     /// The names sample, ranked during the parse: the winner, the sample's bytes
-    early: Option<std::thread::JoinHandle<(BestNames, usize)>>,
+    early: Joined<KzResult<(BestNames, usize)>>,
     feathash: Option<u64>,
     /// the input rows as text, stored so the track can serve as --ref
     rowhash: u64,
@@ -80,14 +80,26 @@ pub struct Writer {
     bm: Vec<BlkMeta>,
 }
 
-fn tmpfile(dir: &std::path::Path) -> std::io::Result<std::fs::File> {
-    // An unlinked file: it disappears when the handle closes, however we exit
+/// A thread joined when its handle drops, so neither a failed close nor a dropped Writer leaves one running
+struct Joined<T>(Option<std::thread::JoinHandle<T>>);
+impl<T> Joined<T> {
+    fn none() -> Self { Joined(None) }
+    fn is_none(&self) -> bool { self.0.is_none() }
+    fn take(&mut self) -> Joined<T> { Joined(self.0.take()) }
+    /// The thread's value; None when there was none, Err when it panicked
+    fn join(mut self) -> Option<std::thread::Result<T>> { self.0.take().map(|h| h.join()) }
+}
+impl<T> Drop for Joined<T> { fn drop(&mut self) { if let Some(h) = self.0.take() { let _ = h.join(); } } }
+
+/// The staging and body files: unlinked at once, so they disappear when the handle closes, however we end
+fn tmpfile(dir: &std::path::Path) -> KzResult<std::fs::File> {
     static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);   // two writers in one process never share a name
-    let p = dir.join(format!("karyozip.{}.{}.{:x}", std::process::id(), N.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-                             std::time::SystemTime::now()
-                                 .duration_since(std::time::UNIX_EPOCH).unwrap().subsec_nanos()));
-    let f = std::fs::OpenOptions::new().read(true).write(true).create_new(true).open(&p)?;
-    std::fs::remove_file(&p)?;
+    let ns = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.subsec_nanos());
+    let p = dir.join(format!("karyozip.{}.{}.{ns:x}", std::process::id(), N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
+    // the C's words, for either file
+    let bad = || Error::io(format!("cannot create a temp file under {} (see --tmp-dir)", dir.display()));
+    let f = std::fs::OpenOptions::new().read(true).write(true).create_new(true).open(&p).map_err(|_| bad())?;
+    if std::fs::remove_file(&p).is_err() { return Err(bad()); }   // the handle closes on the way out
     Ok(f)
 }
 
@@ -102,9 +114,11 @@ impl Writer {
     }
     pub fn aln_hash(&self) -> u64 { self.aln.as_ref().map_or(0, |a| a.hash) }
 
-    pub fn new(opt: Options, tmpdir: &std::path::Path) -> std::io::Result<Self> {
+    /// A writer staging its blocks in an unlinked file under `tmpdir`; the error is the CLI's
+    /// "cannot create a temp file under DIR (see --tmp-dir)"
+    pub fn new(opt: Options, tmpdir: &std::path::Path) -> KzResult<Self> {
         Ok(Writer {
-            early: None, opt, lens: Vec::new(), ids: Vec::new(), names: Vec::new(), ibx: Vec::new(),
+            early: Joined::none(), opt, lens: Vec::new(), ids: Vec::new(), names: Vec::new(), ibx: Vec::new(),
             nidx: 0, ordok: true, lt: kst::Intern::default(),
             cur: Vec::new(), currun: 0, curbp: 0, blkbp0: 0, pend: 0, nblk: 0, curblk: 0, curoff: 0, rows: 0,
             plen: 0, pval: 0, phas: false, tailsamp: Vec::new(), tailpred: 0, tailon: None,
@@ -162,16 +176,17 @@ impl Writer {
         self.phas = false;
     }
 
-    fn pushread(&mut self) -> Result<(), String> {
+    fn pushread(&mut self) -> KzResult<()> {
         if self.cur.is_empty() { return Ok(()); }
         // as the C: the reader keeps these in 32 bits
         if self.curblk > u32::MAX as u64 || self.curoff > u32::MAX as u64 || self.currun > u32::MAX as u64 {
-            return Err("sequence index does not fit 32 bits".into());
+            return Err(Error::input("sequence index does not fit 32 bits"));
         }
         kst::put(&mut self.ibx, self.currun);
         if self.ordok {
-            let want = self.nidx.to_string();
-            if self.cur == want.as_bytes() {
+            let mut b = [0u8; 20];
+            let n = kst::putu64_at(&mut b, self.nidx);
+            if self.cur == b[..n] {
                 self.nidx += 1;
                 return Ok(());
             }
@@ -193,17 +208,21 @@ impl Writer {
             let (mut q, mut sn) = (0usize, 0u64);
             while q < ncap { q += crate::ffi::find(b'\n', &self.names[q..]).map_or(self.names.len() - q, |k| k + 1); sn += 1; }
             let (copy, level, slow, t) = (self.names[..q].to_vec(), self.opt.level, self.opt.slow, rayon::current_num_threads());
-            self.early = Some(std::thread::spawn(move || {
-                let pool = rayon::ThreadPoolBuilder::new().num_threads(t).build().unwrap_or_else(|_| crate::bail("cannot start the names threads"));
+            self.early = Joined(Some(std::thread::spawn(move || {
+                let pool = names_pool(t)?;
                 let mut copy = copy;
                 let q = copy.len();
-                (pool.install(|| best_names(&mut copy, q, sn, None, level, slow)), q)
-            }));
+                Ok((pool.install(|| best_names(&mut copy, q, sn, None, level, slow)), q))
+            })));
         }
         Ok(())
     }
 
-    fn flush(&mut self) -> std::io::Result<()> {
+    /// The block staged; the C's words when the temp filesystem refuses it
+    fn flush(&mut self) -> KzResult<()> {
+        self.stage().map_err(|_| Error::io("cannot stage a block: is the temp filesystem full?"))
+    }
+    fn stage(&mut self) -> std::io::Result<()> {
         if self.pend == 0 { return Ok(()); }
         let mut aoff = [0usize; 2];
         let mut alen = [0usize; 2];
@@ -229,14 +248,13 @@ impl Writer {
     }
 
     /// A library caller can send a tab, a newline or a zero-length run, which the CLI's parser cannot: refuse them, to stay lossless
-    pub fn row(&mut self, name: &[u8], run_len: u64, label: &[u8], start: u64)
-        -> Result<(), String> {
+    pub fn row(&mut self, name: &[u8], run_len: u64, label: &[u8], start: u64) -> KzResult<()> {
         let bad = name.iter().find(|&&c| matches!(c, 0 | b'\n' | b'\t'))
             .or_else(|| label.iter().find(|&&c| matches!(c, 0 | b'\n')));
         match bad {
-            Some(0) => return Err("a NUL byte inside a row".into()),
-            Some(b'\n') => return Err("a newline inside a name or label".into()),
-            Some(_) => return Err("a tab inside a sequence name".into()),
+            Some(0) => return Err(Error::input("a NUL byte inside a row")),
+            Some(b'\n') => return Err(Error::input("a newline inside a name or label")),
+            Some(_) => return Err(Error::input("a tab inside a sequence name")),
             None => {}
         }
         self.push(name, run_len, label, start, false)
@@ -244,18 +262,17 @@ impl Writer {
 
     /// The same row without those checks, the CLI's path as the C's; `same`: the name equals the row before
     #[inline(always)]
-    pub fn push(&mut self, name: &[u8], run_len: u64, label: &[u8], start: u64, same: bool)
-        -> Result<(), String> {
-        if name.is_empty() { return Err("empty sequence name".into()); }
+    pub fn push(&mut self, name: &[u8], run_len: u64, label: &[u8], start: u64, same: bool) -> KzResult<()> {
+        if name.is_empty() { return Err(Error::input("empty sequence name")); }
         if run_len == 0 {
-            return Err("end equals start: a run must cover at least one base".into());
+            return Err(Error::input("end equals start: a run must cover at least one base"));
         }
         if start > u64::MAX - run_len {
-            return Err("a coordinate does not fit in 64 bits".into());
+            return Err(Error::input("a coordinate does not fit in 64 bits"));
         }
         if !same && name != self.cur.as_slice() {
-            if start != 0 { return Err("a sequence does not start at 0".into()); }
-            if name.len() >= 512 { return Err("name too long".into()); }
+            if start != 0 { return Err(Error::input("a sequence does not start at 0")); }
+            if name.len() >= 512 { return Err(Error::input("name too long")); }
             self.tail();
             self.pushread()?;
             self.cur.clear();
@@ -264,17 +281,17 @@ impl Writer {
             self.alnq = self.aln.as_ref().and_then(|a| a.find(name));
             self.currun = 0;
             self.curbp = 0;
-            if self.pend > 0 && self.pend >= self.opt.block { self.flush().map_err(io)?; }
+            if self.pend > 0 && self.pend >= self.opt.block { self.flush()?; }
             self.curblk = self.nblk; self.curoff = self.pend;
         }
         if start != self.curbp {
-            return Err("gap or overlap: start is not the previous end".into());
+            return Err(Error::input("gap or overlap: start is not the previous end"));
         }
         // The C interns first and then decides, so the label joins the table even when the reference answers for it
         let mut id = self.intern(label);
         self.rowhash = kst::rowmix(self.rowhash, self.curnh, start, start + run_len, self.lt.h[id as usize]);
         if self.aln.is_some() {
-            if label == b"=" { return Err("a label \"=\" is reserved under --aln".into()); }
+            if label == b"=" { return Err(Error::input("a label \"=\" is reserved under --aln")); }
             // borrowed, not taken: taking moved the whole Aln out and back per row
             let hit = self.alnq.is_some_and(|q| {
                 let rl = self.aln.as_ref().unwrap().row(q, start, run_len);
@@ -284,7 +301,7 @@ impl Writer {
         }
         let id = id as u64;
         if self.phas { self.lensput(self.pval); self.phas = false; }
-        if !self.opt.varblk && self.pend >= self.opt.block { self.flush().map_err(io)?; }   // mid-sequence is fine
+        if !self.opt.varblk && self.pend >= self.opt.block { self.flush()?; }   // mid-sequence is fine
         if self.pend == 0 { self.blkbp0 = self.curbp; }
         self.plen = run_len;
         self.phas = true;
@@ -302,34 +319,34 @@ impl Writer {
         Ok(())
     }
 
-    pub fn close(mut self, out: &mut impl Write) -> Result<Stats, String> {
+    /// The file onto `out`: every failure returned, the CLI's words, and the staging files gone with the Writer
+    pub fn close(mut self, out: &mut impl Write) -> KzResult<Stats> {
         self.tail();
         self.pushread()?;
-        self.flush().map_err(io)?;
+        self.flush()?;
         let level = self.opt.level;
         let mut early = self.early.take();   // joined by the names job
         // The names rank beside the searches when nothing below changes them, as the C's, in their own pool
-        let bg = (!(self.ordok && self.nidx > 0) && !self.opt.drop_names
-                  && !self.names.is_empty() && self.names.len() <= 64 << 20).then(|| {
+        let bg = if !(self.ordok && self.nidx > 0 || self.opt.drop_names
+                      || self.names.is_empty() || self.names.len() > 64 << 20) {
             let (mut nm, n, whole, slow, e) = (std::mem::take(&mut self.names), self.nidx, self.opt.whole, self.opt.slow, early.take());
             let t = rayon::current_num_threads();
-            std::thread::spawn(move || {
-                let pool = rayon::ThreadPoolBuilder::new().num_threads(t).build().unwrap_or_else(|_| crate::bail("cannot start the names threads"));
-                let r = pool.install(|| names_pick(&mut nm, n, level, whole, slow, e));
+            Joined(Some(std::thread::spawn(move || {
+                let r = names_pool(t).and_then(|pool| pool.install(|| names_pick(&mut nm, n, level, whole, slow, e)));
                 (nm, r)
-            })
-        });
+            })))
+        } else { Joined::none() };
 
         // The codec search samples the first, middle and last block, so it waits for every row; -e high reads them all
         let rawtot: usize = self.bm.iter().map(|b| b.len).sum();
-        let get = |i: usize| self.read_block(i).unwrap_or_else(|_| crate::bail("cannot read back a staged block"));
+        let get = |i: usize| self.read_block(i);
         let _s = crate::prof::span(8);
         let maxstream = self.bm.iter().map(|m| m.lens.max(m.len - m.lens)).max().unwrap_or(0);
         let aln_on = self.aln.is_some();
         let varon = self.opt.varblk && self.bm.len() > 1;
         // one block, or whole-read blocks: the layout search ranks it all
         let onelay = (self.bm.len() == 1 || (varon && !aln_on)) && !self.ibx.is_empty();
-        let p = pick(&get, self.bm.len(), rawtot, maxstream, level, &self.opt, onelay);
+        let p = pick(&get, self.bm.len(), rawtot, maxstream, level, &self.opt, onelay)?;
         drop(_s);
         let level = p.level;
         let (mut lvl_id, mut lvl_len) = (if p.lvl_id < 0 { level } else { p.lvl_id },
@@ -347,7 +364,7 @@ impl Writer {
         let mut zk: [Option<Vec<u8>>; 2] = [None, None];      // the kept zpaq lengths and labels frames
         let _l = crate::prof::span(9);
         if onelay {
-            let (lens0, ids0) = self.read_block(0).unwrap_or_else(|_| crate::bail("cannot read back a staged block"));
+            let (lens0, ids0) = self.read_block(0)?;
             let ib0 = &self.ibx[..if varon { self.bm[0].ibe } else { self.ibx.len() }];
             // The layout is decided on the mode's sample, as the codec is; only the winner is built whole, compressed once and read back
             let (slow, whole) = (self.opt.slow, self.opt.whole);
@@ -357,7 +374,7 @@ impl Writer {
                 let (k, n) = vget(ib0, z); z = n;
                 let mut j = 0;
                 while j < k && x < lens0.len() && y < ids0.len() {
-                    x = crate::reader::skip(&lens0, x); y = crate::reader::skip(&ids0, y); j += 1;
+                    x = kst::skip_w(&lens0, x); y = kst::skip_w(&ids0, y); j += 1;
                 }
                 if x > cap && pl > 0 { break; }         // at least one read
                 pl = x; pi = y; pb = z;
@@ -441,24 +458,30 @@ impl Writer {
 
         let _s = crate::prof::span(1);
         let mut sizes = Vec::new();
-        let mut body = tmpfile(&self.tmpdir).map_err(io)?;
+        let mut body = tmpfile(&self.tmpdir)?;
         let (mut byt_lens, mut byt_labs) = (0u64, 0u64);
         // As the C's ordered loop: pool threads take the next block, this thread writes them in order
         let (nb, win) = (self.bm.len(), 4 * rayon::current_num_threads());
         let next = std::sync::atomic::AtomicUsize::new(0);
-        let st = (std::sync::Mutex::new((0usize, std::collections::BTreeMap::<usize, Done>::new())), std::sync::Condvar::new());
-        let work = |i: usize, lens: &mut Vec<u8>, ids: &mut Vec<u8>| -> Done {
-            self.read_into(i, lens, ids).unwrap_or_else(|_| crate::bail("cannot read back a staged block"));
+        // (next to write, done blocks, cancelled, a producer's refusal): every wait also wakes on a cancel, so a failed side never strands the other
+        let st = (std::sync::Mutex::new((0usize, std::collections::BTreeMap::<usize, Done>::new(), false, None::<Error>)), std::sync::Condvar::new());
+        let lock = || st.0.lock().unwrap_or_else(|e| e.into_inner());
+        let cancel = || { lock().2 = true; st.1.notify_all(); };
+        struct OnPanic<F: Fn()>(F);   // a producer that unwinds releases the writer
+        impl<F: Fn()> Drop for OnPanic<F> { fn drop(&mut self) { if std::thread::panicking() { (self.0)(); } } }
+        let failed = || Error::internal("block compression failed");
+        let work = |i: usize, lens: &mut Vec<u8>, ids: &mut Vec<u8>| -> KzResult<Done> {
+            self.read_into(i, lens, ids)?;
             let (lens, ids): (&Vec<u8>, &Vec<u8>) = (lens, ids);
             // Under --aln a block keeps the smallest of three length spellings: every sentinel, plus-strand only, or plain
             let m = &self.bm[i];
             // past the first whole-read block, this block's own spelling
-            let own = ((runhead || ilv) && varon && i > 0).then(|| {
+            let own = match ((runhead || ilv) && varon && i > 0).then(|| {
                 let ib = &self.ibx[self.bm[i - 1].ibe..m.ibe];
                 let o = if grp { grp_pack(lens, ids, ib) } else if ilv { ilv_pack(lens, ids, ib) } else { splice_heads(lens, ib) };
-                (o.unwrap_or_else(|| crate::bail("block compression failed")), lens.len() + ib.len())
-            });
-            let mut vs: [Option<&[u8]>; 3] = [Some(&lens), None, None];
+                o.map(|o| (o, lens.len() + ib.len()))
+            }) { Some(None) => return Err(failed()), Some(o) => o, None => None };
+            let mut vs: [Option<&[u8]>; 3] = [Some(lens), None, None];
             if aln_on {
                 for v in 0..2 {
                     let alt = &self.rawalt[v][m.aoff[v]..m.aoff[v] + m.alen[v]];
@@ -485,51 +508,62 @@ impl Writer {
             let rid = if ibs.is_none() && vs[0].is_some() { Rspec { ib: vs[0], mult: 1, cs: 1, rows: cutrows_i, zm: false } } else { Rspec { ib: ibs, mult: 1, cs: 0, rows: cutrows_i, zm: false } };   // one headed block: its heads are the index
             let (pid, pln) = (onelay.then_some(&rid), onelay.then_some(&rln));
             const ORDER: [usize; 3] = [1, 2, 0];
-            let lens_job = || {
+            let lens_job = || -> KzResult<(usize, Vec<u8>)> {
                 let (mut best, mut bv, mut fa) = (0usize, usize::MAX, Vec::new());
                 for &v in &ORDER {
                     let Some(src) = vs[v] else { continue };
-                    let kept = if v == 0 && i == 0 { lz.lock().unwrap().take() } else { None };   // the one lens_ok made
-                    let f = kept.or_else(|| comp_frame(src, lencodec, lvl_len, pln)).unwrap_or_else(|| crate::bail("block compression failed"));
+                    let kept = if v == 0 && i == 0 { lz.lock().unwrap_or_else(|e| e.into_inner()).take() } else { None };   // the one lens_ok made
+                    let f = kept.or_else(|| comp_frame(src, lencodec, lvl_len, pln)).ok_or_else(failed)?;
                     if bv == usize::MAX || f.len() < best { best = f.len(); bv = v; fa = f; }
                 }
-                (bv, fa)
+                Ok((bv, fa))
             };
-            let ids_job = || if ilv { Vec::new() } else {
-                let kept = if i == 0 { zk1.lock().unwrap().take() } else { None };   // the labels frame zpq_try made
-                kept.or_else(|| comp_frame(&ids, idc, lvl_id, pid)).unwrap_or_else(|| crate::bail("block compression failed"))
-            };
+            let ids_job = || -> KzResult<Vec<u8>> { if ilv { Ok(Vec::new()) } else {
+                let kept = if i == 0 { zk1.lock().unwrap_or_else(|e| e.into_inner()).take() } else { None };   // the labels frame zpq_try made
+                kept.or_else(|| comp_frame(ids, idc, lvl_id, pid)).ok_or_else(failed)
+            } };
             // Labels beside a lengths frame that takes one thread, as the C's: the rest of the threads, or 2 beside LZMA
             let nt = rayon::current_num_threads();
             let lone = lencodec & ffi::CODEC_BZIP3 == 0 || lens.len() <= ((lencodec & 0xffff) as usize) << 20;
             let lt = if lencodec & ffi::CODEC_LZMA != 0 { 2 } else { (nt - 1).max(1) };
-            let ((bv, fa), b) = if nb == 1 && !ilv && lone {
+            let (lr, b) = if nb == 1 && !ilv && lone {
                 rayon::join(lens_job, || { ffi::omp_threads(lt); let b = ids_job(); ffi::omp_threads(nt); b })
             } else { (lens_job(), ids_job()) };
-            let nl = if ilv { own.as_ref().map_or_else(|| altv[bv].as_ref().unwrap().1, |o| o.1) } else { vs[bv].unwrap().len() };
-            (fa, b, nl, ids.len(), m.rows, m.bp, bv as u64)
+            let ((bv, fa), b) = (lr?, b?);
+            // bv names a spelling that was there: altv under ilv, vs otherwise
+            let nl = if ilv { own.as_ref().map(|o| o.1).or_else(|| altv.get(bv)?.as_ref().map(|a| a.1)) } else { vs.get(bv).copied().flatten().map(|v| v.len()) };
+            Ok((fa, b, nl.ok_or_else(failed)?, ids.len(), m.rows, m.bp, bv as u64))
         };
-        std::thread::scope(|ts| -> Result<(), String> {
+        std::thread::scope(|ts| -> KzResult<()> {
             // a buffer pair a thread, kept, as the C's rb: fresh ones faulted their pages in again
-            ts.spawn(|| rayon::broadcast(|_| { let (mut lb, mut ib) = (Vec::new(), Vec::new()); loop {
+            ts.spawn(|| rayon::broadcast(|_| { let _g = OnPanic(cancel); let (mut lb, mut ib) = (Vec::new(), Vec::new()); loop {
                 let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if i >= nb { break; }
-                let mut g = st.0.lock().unwrap();
-                while i >= g.0 + win { g = st.1.wait(g).unwrap(); }
+                let mut g = lock();
+                while i >= g.0 + win && !g.2 { g = st.1.wait(g).unwrap_or_else(|e| e.into_inner()); }
+                if g.2 { break; }
                 drop(g);
                 let d = work(i, &mut lb, &mut ib);
-                st.0.lock().unwrap().1.insert(i, d);
+                let mut g = lock();
+                if g.2 { break; }
+                match d {
+                    Ok(d) => { g.1.insert(i, d); }
+                    Err(e) => { g.2 = true; g.3 = Some(e); }   // the writer returns it; the others stop at their next wait
+                }
+                drop(g);
                 st.1.notify_all();
             } }));
-            for i in 0..nb {
+            let r = (0..nb).try_for_each(|i| -> KzResult<()> {
                 let (a, b, nl, ni, rows, bp, nosent) = {
-                    let mut g = st.0.lock().unwrap();
-                    loop { if let Some(d) = g.1.remove(&i) { g.0 = i + 1; break d; } g = st.1.wait(g).unwrap(); }
+                    let mut g = lock();
+                    loop { if let Some(d) = g.1.remove(&i) { g.0 = i + 1; break d; }
+                           if g.2 { return Err(g.3.take().unwrap_or_else(failed)); }
+                           g = st.1.wait(g).unwrap_or_else(|e| e.into_inner()); }
                 };
                 st.1.notify_all();
                 let (a, b, nl, ni, rows, bp, nosent) = (&a, &b, &nl, &ni, &rows, &bp, &nosent);
-                body.write_all(a).map_err(io)?;
-                body.write_all(b).map_err(io)?;
+                body.write_all(a).map_err(|_| Error::io("tmp write"))?;
+                body.write_all(b).map_err(|_| Error::io("tmp write"))?;
                 byt_lens += a.len() as u64;
                 byt_labs += b.len() as u64;
                 kst::put(&mut sizes, a.len() as u64);
@@ -540,8 +574,10 @@ impl Writer {
                 kst::put(&mut sizes, *bp);
                 kst::put(&mut sizes, kst::fnv(kst::fnv(FNV0, a), b));
                 if varon { kst::put(&mut sizes, self.bm[i].nrd - if i > 0 { self.bm[i - 1].nrd } else { 0 }); }
-            }
-            Ok(())
+                Ok(())
+            });
+            if r.is_err() { cancel(); }   // the producers stop at their next wait, then the scope joins them
+            r
         })?;
         if runhead { self.ibx.clear(); }
 
@@ -553,9 +589,9 @@ impl Writer {
         // The C's decision, step for step: which names are stored, as text or as ordinals
         let mut ordinal = self.ordok && self.nidx > 0;
         let mut pre = None;
-        if let Some(h) = bg {   // before check_unique, as the C's join
-            let (nm, r) = h.join().unwrap_or_else(|_| crate::bail("the names thread failed"));
-            self.names = nm; pre = Some(r);
+        if let Some(j) = bg.join() {   // before check_unique, as the C's join
+            let (nm, r) = j.map_err(|_| Error::internal("the names thread failed"))?;
+            self.names = nm; pre = Some(r?);
         }
         if !self.opt.drop_names && self.nidx > 1 {
             check_unique(&self.names)?;
@@ -576,7 +612,7 @@ impl Writer {
             (Vec::new(), false, false, false)
         } else {
             // the names are unchanged when ranked early
-            let (b, q) = pre.take().unwrap_or_else(|| names_pick(&mut self.names, self.nidx, level, self.opt.whole, self.opt.slow, early.take()));
+            let (b, q) = match pre.take() { Some(p) => p, None => names_pick(&mut self.names, self.nidx, level, self.opt.whole, self.opt.slow, early.take())? };
             let r = if !b.bytes.is_empty() { (b.bytes, b.kind == 2, b.kind == 1, b.kind == 3) }
                     else { (ffi::zstd(&self.names, level), false, false, false) };   // refused
             let k = if r.2 { "integers" } else if r.1 { "tokeniser" } else if r.3 { "fields" } else { "zstd" };
@@ -653,16 +689,22 @@ impl Writer {
 
         drop(_s);
         let _s = crate::prof::span(7);
-        out.write_all(MAGIC).map_err(io)?;
-        out.write_all(&hb).map_err(io)?;
-        out.write_all(&lz).map_err(io)?;
-        out.write_all(&nz).map_err(io)?;
-        out.write_all(&ichunks).map_err(io)?;
-        out.write_all(&sz).map_err(io)?;
-        out.write_all(&itz).map_err(io)?;
-        body.seek(SeekFrom::Start(0)).map_err(io)?;
-        std::io::copy(&mut body, out).map_err(io)?;
-        out.flush().map_err(io)?;
+        // the C's words: any failure of `out` is "write failed", of the body file a read error
+        let wf = |_| Error::io("write failed");
+        for part in [&MAGIC[..], &hb, &lz, &nz, &ichunks, &sz, &itz] { out.write_all(part).map_err(wf)?; }
+        let rf = |_| Error::io("read error on the temporary file");
+        body.seek(SeekFrom::Start(0)).map_err(rf)?;
+        let mut cp = vec![0u8; 1 << 20];
+        loop {
+            let k = match std::io::Read::read(&mut body, &mut cp) {
+                Ok(0) => break,
+                Ok(k) => k,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(rf(e)),
+            };
+            out.write_all(&cp[..k]).map_err(wf)?;
+        }
+        out.flush().map_err(wf)?;
         drop(_s);
 
         Ok(Stats {
@@ -673,18 +715,19 @@ impl Writer {
         })
     }
 
-    fn read_block(&self, i: usize) -> std::io::Result<(Vec<u8>, Vec<u8>)> {
+    fn read_block(&self, i: usize) -> KzResult<(Vec<u8>, Vec<u8>)> {
         let (mut lens, mut ids) = (Vec::new(), Vec::new());
         self.read_into(i, &mut lens, &mut ids)?;
         Ok((lens, ids))
     }
-    /// Into two buffers the caller keeps, not one read then split_off
-    fn read_into(&self, i: usize, lens: &mut Vec<u8>, ids: &mut Vec<u8>) -> std::io::Result<()> {
+    /// Into two buffers the caller keeps, not one read then split_off; the C's words when the staging file fails
+    fn read_into(&self, i: usize, lens: &mut Vec<u8>, ids: &mut Vec<u8>) -> KzResult<()> {
         use std::os::unix::fs::FileExt;
         let m = &self.bm[i];
         lens.resize(m.lens, 0); ids.resize(m.len - m.lens, 0);
-        self.raw.read_exact_at(lens, m.off)?;
-        self.raw.read_exact_at(ids, m.off + m.lens as u64)
+        self.raw.read_exact_at(lens, m.off)
+            .and_then(|_| self.raw.read_exact_at(ids, m.off + m.lens as u64))
+            .map_err(|_| Error::io("cannot read back a staged block"))
     }
 }
 
@@ -696,9 +739,12 @@ pub struct Stats {
     pub alnhit: u64,
 }
 
-use crate::kst::vget;
+use crate::kst::vget_w as vget;
 
-fn io(e: std::io::Error) -> String { e.to_string() }
+/// The names job's own pool, beside the codec searches
+fn names_pool(t: usize) -> KzResult<rayon::ThreadPool> {
+    rayon::ThreadPoolBuilder::new().num_threads(t).build().map_err(|_| Error::internal("cannot start the names threads"))
+}
 
 
 /* ------------------------------------------------- choosing a codec */
@@ -762,12 +808,12 @@ fn fast_enough(codec: i32) -> bool {
 pub struct Pick { pub id: i32, pub len: i32, pub lvl_id: i32, pub lvl_len: i32, pub level: i32 }
 
 /// `blocks` yields every block as (lens, ids); the default reads three, -e high all, twice
-pub fn pick(all: &dyn Fn(usize) -> (Vec<u8>, Vec<u8>), nraw: usize, rawtot: usize,
-            maxstream: usize, level: i32, o: &Options, onelay: bool) -> Pick {
+pub fn pick(all: &dyn Fn(usize) -> KzResult<(Vec<u8>, Vec<u8>)>, nraw: usize, rawtot: usize,
+            maxstream: usize, level: i32, o: &Options, onelay: bool) -> KzResult<Pick> {
     let (block, slow, whole, levelset) = (o.block, o.slow, o.whole, o.levelset);
     let cv = candlist(slow); let cand: &[i32] = &cv;
     let nc = cand.len();
-    if onelay { return Pick { id: 0, len: 0, lvl_id: -1, lvl_len: -1, level }; }   // the layout search ranks it all
+    if onelay { return Ok(Pick { id: 0, len: 0, lvl_id: -1, lvl_len: -1, level }); }   // the layout search ranks it all
     let seekable = nraw > 1 || rawtot as u64 > block;
     let mut picks: Vec<usize> = Vec::new();
     if nraw > 0 {
@@ -784,13 +830,13 @@ pub fn pick(all: &dyn Fn(usize) -> (Vec<u8>, Vec<u8>), nraw: usize, rawtot: usiz
     let usable = |c: i32| (!seekable || fast_enough(c))
                        && (!big || c & (ffi::CODEC_BZIP3 | ffi::CODEC_LZMA) != 0);
     // every bzip3 size at or above the stream gives the same bytes, so the smallest stands for them; hts_pack above 16 bytes is its plain sibling
-    let bz3dup = |c: i32, n: usize| bz3_dup(c, n, maxstream, &cand);
+    let bz3dup = |c: i32, n: usize| bz3_dup(c, n, maxstream, cand);
     let (mut zi, mut zl, mut z22i, mut z22l) = (0usize, 0usize, 0usize, 0usize);
     let mut ci = vec![0usize; nc];
     let mut cl = vec![0usize; nc];
     const BAD: usize = usize::MAX / 2;
     for &j in &picks {
-        let (lens, ids) = all(j);
+        let (lens, ids) = all(j)?;
         let nl = lens.len().min(scap);
         let ni = ids.len().min(scap);
         let z22 = slow && !levelset;
@@ -832,12 +878,12 @@ pub fn pick(all: &dyn Fn(usize) -> (Vec<u8>, Vec<u8>), nraw: usize, rawtot: usiz
         // one block whose streams fit the sample: the sample's sizes are the file's
         let reuse = !whole || (nraw == 1 && scap >= maxstream);
         if reuse {
-            for k in 0..nc { ti[k] = ci[k]; tl[k] = cl[k]; }
+            ti[..nc].copy_from_slice(&ci[..nc]); tl[..nc].copy_from_slice(&cl[..nc]);
             ti[nc] = zi; tl[nc] = zl;
             ti[nc + 1] = z22i; tl[nc + 1] = z22l;
         }
         for b in (0..nraw).take_while(|_| !reuse) {
-            let (lens, ids) = all(b);
+            let (lens, ids) = all(b)?;
             let step: Vec<(usize, usize)> = (0..nc + 2).into_par_iter().map(|k| {
                 if !live_i[k] && !live_l[k] { return (0, 0); }
                 // An empty stream costs nothing and is not compressed, as the C's `if (ni)` and `if (nl)`
@@ -853,7 +899,8 @@ pub fn pick(all: &dyn Fn(usize) -> (Vec<u8>, Vec<u8>), nraw: usize, rawtot: usiz
                      each(&lens, &|s| ffi::zstd(s, lv).len()))
                 }
             }).collect();
-            for k in 0..nc + 2 { ti[k] += step[k].0; tl[k] += step[k].1; }
+            // a dead candidate's sentinel summed over blocks must not wrap back to a winner, as the C's satadd
+            for k in 0..nc + 2 { ti[k] = ti[k].saturating_add(step[k].0); tl[k] = tl[k].saturating_add(step[k].1); }
         }
         let (mut qi, mut ql);
         loop {
@@ -866,7 +913,7 @@ pub fn pick(all: &dyn Fn(usize) -> (Vec<u8>, Vec<u8>), nraw: usize, rawtot: usiz
             let over: Vec<usize> = if whole { (0..nraw).collect() } else { picks.clone() };
             for &b in &over {
                 if bad_i && bad_l { break; }
-                let (lens, ids) = all(b);
+                let (lens, ids) = all(b)?;
                 let cap = if whole { usize::MAX } else { scap };   // the sample it was ranked on
                 let (lens, ids) = (&lens[..lens.len().min(cap)], &ids[..ids.len().min(cap)]);
                 if qi < nc && !ids.is_empty() && !bad_i && !verifies(ids, cand[qi], None) { bad_i = true; }
@@ -886,7 +933,7 @@ pub fn pick(all: &dyn Fn(usize) -> (Vec<u8>, Vec<u8>), nraw: usize, rawtot: usiz
     eprintln!("codec: len=0x{:x} id=0x{:x} from {} sample blocks, {}",
               wl, wi, picks.len(),
               if seekable { "seekable" } else { "one block" });
-    Pick { id: wi, len: wl, lvl_id, lvl_len, level }
+    Ok(Pick { id: wi, len: wl, lvl_id, lvl_len, level })
 }
 
 fn sz(v: Option<Vec<u8>>) -> usize { v.map_or(usize::MAX / 4, |x| x.len()) }
@@ -911,7 +958,7 @@ fn ilv_pack(lens: &[u8], ids: &[u8], ibx: &[u8]) -> Option<Vec<u8>> {
         for _ in 0..k {
             if q >= ids.len() || p >= lens.len() { return None; }
             let (lb, n2) = vget(ids, q); kst::put(&mut out, ilv_flip(lb)); q = n2;
-            let n2 = crate::reader::skip(lens, p); out.extend_from_slice(&lens[p..n2]); p = n2;
+            let n2 = kst::skip_w(lens, p); out.extend_from_slice(&lens[p..n2]); p = n2;
         }
     }
     if p != lens.len() || q != ids.len() { None } else { Some(out) }
@@ -930,7 +977,7 @@ fn grp_pack(lens: &[u8], ids: &[u8], ibx: &[u8]) -> Option<Vec<u8>> {
         kv.clear(); lv.clear();
         for j in 0..k {
             if p >= lens.len() || q >= ids.len() { return None; }
-            let n2 = crate::reader::skip(lens, p); lv.push((p, n2)); p = n2;
+            let n2 = kst::skip_w(lens, p); lv.push((p, n2)); p = n2;
             let (id, n3) = vget(ids, q); q = n3;
             if id >> 32 != 0 { return None; }
             kv.push((id << 32) | j);
@@ -950,11 +997,11 @@ fn splice_heads(lens: &[u8], ibx: &[u8]) -> Option<Vec<u8>> {
         kst::put(&mut out, k);
         for _ in 0..k {
             if p >= lens.len() { return None; }
-            let n2 = crate::reader::skip(lens, p);
+            let n2 = kst::skip_w(lens, p);
             out.extend_from_slice(&lens[p..n2]); p = n2;
         }
     }
-    if p != lens.len() { return None; } else { Some(out) }
+    if p != lens.len() { None } else { Some(out) }
 }
 
 /// hts_pack and its arith twin refuse above 16 distinct bytes, so such a candidate is its plain sibling
@@ -984,7 +1031,8 @@ fn rank_all(src: &[&[u8]], n: &[usize], rs: &[Rspec], o: &Options) -> Vec<(i32, 
     use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
     let (next, zs): (AtomicUsize, Vec<AtomicUsize>) = (AtomicUsize::new(0), jobs.iter().map(|_| AtomicUsize::new(0)).collect());
     // each stream's best so far (size, rank, job, bytes), kept for the read-back
-    let best: Vec<std::sync::Mutex<Option<(usize, usize, usize, Vec<u8>)>>> = src.iter().map(|_| Default::default()).collect();
+    type Best = std::sync::Mutex<Option<(usize, usize, usize, Vec<u8>)>>;
+    let best: Vec<Best> = src.iter().map(|_| Default::default()).collect();
     let prof = crate::prof::ON.load(Relaxed);
     let jt: Vec<AtomicUsize> = jobs.iter().map(|_| AtomicUsize::new(0)).collect();   // ns, under --profile
     let tp = std::time::Instant::now();
@@ -1305,7 +1353,7 @@ fn tok_chunked(names: &mut [u8], chunk: usize) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// Smallest of zstd, integer deltas, the tokeniser and field deltas (':' fields, constant or zigzag integers, then bzip3)
+// Smallest of zstd, integer deltas, the tokeniser and field deltas (':' fields, constant or zigzag integers, then bzip3)
 
 const FLDMAX: usize = 16;
 /// ':' splits an Illumina name, '-' a UUID: try both, keep the smaller
@@ -1344,7 +1392,8 @@ fn fld_names1(names: &[u8], n: u64, sep: u8) -> Option<Vec<u8>> {
         cut.push(e.min(names.len()));
     }
     cut.push(names.len());
-    let scan = |a: usize, b: usize| -> Option<(Vec<bool>, Vec<bool>, Vec<bool>, u64)> {
+    type Scan = (Vec<bool>, Vec<bool>, Vec<bool>, u64);
+    let scan = |a: usize, b: usize| -> Option<Scan> {
         let (mut same, mut isnum) = (vec![true; nf], vec![true; nf]);
         let mut ishex: Vec<bool> = first.iter().map(|f| !f.is_empty() && f.len() % 2 == 0 && f.len() <= 64).collect();
         let mut seen = 0u64;
@@ -1419,11 +1468,11 @@ fn fld_names1(names: &[u8], n: u64, sep: u8) -> Option<Vec<u8>> {
 
 /// Ranked on the mode's sample of whole names, the winner run on all; empty bytes: zstd, by the caller
 fn names_pick(names: &mut [u8], n: u64, level: i32, whole: bool, slow: bool,
-              early: Option<std::thread::JoinHandle<(BestNames, usize)>>) -> (BestNames, usize) {
-    if let Some(h) = early {   // ranked during the parse, on the sample
-        let (mut b, sn) = h.join().unwrap_or_else(|_| crate::bail("the names thread failed"));
+              early: Joined<KzResult<(BestNames, usize)>>) -> KzResult<(BestNames, usize)> {
+    if let Some(j) = early.join() {   // ranked during the parse, on the sample
+        let (mut b, sn) = j.map_err(|_| Error::internal("the names thread failed"))??;
         if sn < names.len() { b.bytes = names_run(b.kind, b.chunk, names, n, level); }
-        return (b, sn);
+        return Ok((b, sn));
     }
     let (mut q, mut smpn) = (0usize, 0u64);
     let ncap = if whole { usize::MAX } else { (if slow { DEFSAMPLE } else { 4 }) << 20 };
@@ -1435,7 +1484,7 @@ fn names_pick(names: &mut [u8], n: u64, level: i32, whole: bool, slow: bool,
     }
     // the sample was all of it: the winner is done
     let full = (q < names.len()).then_some(n);
-    (best_names(names, q, smpn, full, level, slow), q)
+    Ok((best_names(names, q, smpn, full, level, slow), q))
 }
 
 /// Ranked on the first q bytes of w; with full, the winner then runs on all of w
@@ -1491,7 +1540,7 @@ fn names_run(kind: u8, chunk: usize, w: &mut [u8], wn: u64, level: i32) -> Vec<u
 }
 
 /// A repeated sequence name would make the index ambiguous, so it is refused
-pub fn check_unique(names: &[u8]) -> Result<(), String> {
+pub fn check_unique(names: &[u8]) -> KzResult<()> {
     // As the C: hash every name, sort, and compare text only where two hashes collide
     let lines = names.split(|&c| c == b'\n').filter(|l| !l.is_empty());
     let mut hs: Vec<u64> = lines.clone().map(|l| kst::fnv(FNV0, l)).collect();
@@ -1503,8 +1552,74 @@ pub fn check_unique(names: &[u8]) -> Result<(), String> {
         if rep.contains(&kst::fnv(FNV0, line)) && !exact.insert(line) {
             let mut e = std::io::stderr().lock();
             let _ = e.write_all(b"karyozip: sequence ").and_then(|_| e.write_all(line)).and_then(|_| e.write_all(b" appears twice\n"));
-            return Err("a sequence name repeats".into());
+            return Err(Error::input("a sequence name repeats"));
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// reads of 1, 2, 5, 40 and 300 runs (300 takes grp_unpack's counting path), lengths up to 3 bytes, ids up to 2
+    fn reads() -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<(u64, u64)>) {
+        let (mut lens, mut ids, mut ibx, mut runs) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let mut x = 7u64;
+        for &k in &[1u64, 2, 5, 40, 1, 300, 3] {
+            kst::put(&mut ibx, k);
+            for _ in 0..k {
+                x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                let (l, id) = ((x >> 33) % 70000 + 1, (x >> 20) % 7);
+                kst::put(&mut lens, l); kst::put(&mut ids, id); runs.push((l, id));
+            }
+        }
+        (lens, ids, ibx, runs)
+    }
+
+    #[test]
+    fn ilv_pack_splits_back() {
+        let (lens, ids, ibx, runs) = reads();
+        let packed = ilv_pack(&lens, &ids, &ibx).expect("packs");
+        let heads = splice_heads(&lens, &ibx).expect("heads");
+        let mut want = heads.clone(); want.extend_from_slice(&ids);
+        let got = crate::reader::ilv_split(packed, heads.len(), ids.len(), runs.len() as u64);
+        assert_eq!(got, want);
+        // a run count past the rows is no packing
+        let mut more = ibx.clone(); kst::put(&mut more, 1);
+        assert!(ilv_pack(&lens, &ids, &more).is_none());
+        assert!(ilv_pack(&lens, &ids[..ids.len() - 1], &ibx).is_none());
+    }
+
+    #[test]
+    fn grp_pack_unpacks_back() {
+        let (lens, ids, ibx, runs) = reads();
+        let packed = grp_pack(&lens, &ids, &ibx).expect("packs");
+        // lift the run counts out, as rmheads does, and note each read's runs
+        let (mut grouped, mut rtab, mut i, mut seen) = (Vec::new(), vec![0u32], 0usize, 0u64);
+        let mut r = 0usize;
+        while i < packed.len() {
+            let (k, n) = vget(&packed, i); i = n;
+            let (kk, _) = vget(&ibx, r); r = crate::reader::skip(&ibx, r); assert_eq!(k, kk);
+            // within a read, the lengths come in label order, stable
+            let mut want: Vec<(u64, usize, u64)> = runs[seen as usize..(seen + k) as usize].iter().enumerate()
+                .map(|(j, &(l, id))| (id, j, l)).collect();
+            want.sort();
+            for &(_, _, l) in &want {
+                let (v, n) = vget(&packed, i); assert_eq!(v, l);
+                grouped.extend_from_slice(&packed[i..n]); i = n;
+            }
+            seen += k; rtab.push(seen as u32);
+        }
+        assert_eq!(seen, runs.len() as u64);
+        assert_eq!(crate::reader::grp_unpack(&grouped, &ids, &rtab), lens);
+        let mut more = ibx.clone(); kst::put(&mut more, 1);
+        assert!(grp_pack(&lens, &ids, &more).is_none());
+    }
+
+    #[test]
+    fn ilv_flip_is_its_own_inverse() {
+        for v in [0u64, 1, 63, 64, 126, 127, 128, 1000, u64::MAX] { assert_eq!(ilv_flip(ilv_flip(v)), v); }
+        assert_eq!((ilv_flip(0), ilv_flip(127), ilv_flip(128)), (127, 0, 128));
+    }
 }

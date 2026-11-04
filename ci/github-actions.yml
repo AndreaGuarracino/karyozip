@@ -1,0 +1,41 @@
+# Copy to .github/workflows/test.yml to enable. Kept outside .github/ because pushing a workflow
+# file needs a token with the `workflow` scope.
+name: test
+on:
+  push:
+  pull_request:
+jobs:
+  make-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tools
+        run: sudo apt-get update && sudo apt-get install -y valgrind zlib1g-dev pkg-config
+      # the C must link the zstd the Rust bundles (zstd-sys =2.1.2 is zstd 1.5.7): zstd does not
+      # promise the same bytes across releases, and ubuntu-latest ships an older one
+      - name: zstd 1.5.7
+        run: |
+          curl -fsSL https://github.com/facebook/zstd/releases/download/v1.5.7/zstd-1.5.7.tar.gz | tar xz
+          make -C zstd-1.5.7 -j"$(nproc)" lib-release zstd-release
+          sudo make -C zstd-1.5.7 install PREFIX=/usr/local
+          sudo ldconfig
+          zstd --version
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - name: make test
+        env:
+          REQUIRE_VALGRIND: "1"   # the Rust leak stage must run, not skip
+          TIMEOUT_SCALE: "2"      # shared runners are slow under valgrind and ASan
+        run: make test
+  rust-debug:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - name: cargo test, debug build
+        run: make test-rust-debug

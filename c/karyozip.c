@@ -23,6 +23,8 @@
 #include <setjmp.h>
 #include <sched.h>
 #include <math.h>
+#include <stdatomic.h>
+#include <dirent.h>
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -41,7 +43,7 @@ static int LEVEL_L = -1, LEVEL_I = -1;   /* per stream, chosen by the search */
 
 static const char MAGIC[8] = "KST00001";   /* KaryoScope Track, format version 1 */
 #define IDXMAGIC 0x313058444954534bULL   /* "KSTIDX01", the index trailer */
-#define KARYOZIP_VERSION "0.2.0"
+#define KARYOZIP_VERSION "0.3.0"
 
 static int PROF = 0;
 static double PH[10];
@@ -56,12 +58,19 @@ static inline double nowsec(void) {
     if (_n - PHLAST > 0.01) { PHRSS[i] = rss_now(); PHLAST = _n; } } } while (0)
 static size_t PHRSS[10]; static double PHLAST;
 static double WALL0 = 0;
-/* --threads, else one per core capped at 8: encode is half serial, so more threads only spin; no environment variable changes it */
+/* --threads, else one per allowed CPU capped at 8: encode is half serial, so more threads only spin; no environment variable changes it */
 #define THRCAP 8
 static int nthreads(void) {
     if (NTHREADS > 0) return NTHREADS;
 #ifdef _OPENMP
-    int m = omp_get_num_procs();
+    /* the CPUs this process may run on, its affinity mask, as the Rust's affinity_cpus: a Slurm or taskset allocation,
+       not the machine, nor a cgroup quota */
+    static _Atomic int ncpu;
+    int m = ncpu;
+    if (!m) { cpu_set_t cs;
+              m = sched_getaffinity(0, sizeof cs, &cs) ? omp_get_num_procs() : CPU_COUNT(&cs);
+              if (m < 1) m = 1;
+              ncpu = m; }
     return m < THRCAP ? m : THRCAP;
 #else
     return 1;
@@ -110,9 +119,28 @@ static void die2(const char *a, const char *b) {
 }
 static void die(const char *m) { die2(m, ""); }
 
-static __thread size_t ALLOCMAX = 0;
+/* A staged output finished before it is renamed over anything: synced, then closed, both checked, since NFS, a
+   quota or a failing disk may report a lost write only at fsync or close. The rename that follows is not followed by
+   a directory fsync: the replacement is atomic, not promised to survive a crash. As the Rust's ffi::finish_fd. 0 on
+   success; fd is closed either way */
+static int fdfinish(int fd) { int bad = fdatasync(fd) != 0; return (close(fd) != 0) | bad; }
+/* n bytes to fd, past short writes and EINTR; 0 on success */
+static int fdput(int fd, const void *p, size_t n) {
+    while (n) {
+        ssize_t k = write(fd, p, n);
+        if (k < 0) { if (errno == EINTR) continue; return -1; }
+        if (!k) return -1;
+        p = (const char *)p + k; n -= (size_t)k;
+    }
+    return 0;
+}
+
+/* process wide, from the first file read on: decode-ahead workers and alnload are capped too, a writer reading nothing is not */
+static _Atomic size_t ALLOCMAX = 0;
+static void readcap(void) { atomic_store_explicit(&ALLOCMAX, (size_t)1 << 38, memory_order_relaxed); }
 static void ckalloc(size_t n) {
-    if (ALLOCMAX && n > ALLOCMAX) die("corrupt file: an impossible allocation size");
+    size_t m = atomic_load_explicit(&ALLOCMAX, memory_order_relaxed);
+    if (m && n > m) die("corrupt file: an impossible allocation size");
 }
 
 /* the reporting form: a thread inside a parallel region must not exit */
@@ -170,7 +198,20 @@ static inline uint64_t rowmix(uint64_t h, uint64_t nh, uint64_t st, uint64_t en,
     h = (h ^ en) * 0x100000001b3ULL; return (h ^ lh) * 0x100000001b3ULL;
 }
 static uint64_t fnvstr(const char *s) { return fnvbuf(FNV0, s, strlen(s)); }
-static uint64_t ld64(const void *p) { uint64_t v; memcpy(&v, p, 8); return v; }
+/* the format is little-endian on every host, as the Rust's to_le_bytes */
+static uint64_t ld64(const void *p) {
+    const uint8_t *b = p; uint64_t v = 0;
+    for (int i = 7; i >= 0; i--) v = v << 8 | b[i];
+    return v;
+}
+static uint32_t ld32(const void *p) { const uint8_t *b = p; return b[0] | b[1] << 8 | b[2] << 16 | (uint32_t)b[3] << 24; }
+static void st64(void *p, uint64_t v) { uint8_t *b = p; for (int i = 0; i < 8; i++) b[i] = (uint8_t)(v >> 8 * i); }
+static void st32(void *p, uint32_t v) { uint8_t *b = p; for (int i = 0; i < 4; i++) b[i] = (uint8_t)(v >> 8 * i); }
+static uint64_t fnv64(uint64_t h, uint64_t v) { uint8_t b[8]; st64(b, v); return fnvbuf(h, b, 8); }
+static uint64_t fnv32(uint64_t h, uint32_t v) { uint8_t b[4]; st32(b, v); return fnvbuf(h, b, 4); }
+/* n words to and from their file bytes */
+static void stwords(uint8_t *b, const uint64_t *w, size_t n) { for (size_t i = 0; i < n; i++) st64(b + 8 * i, w[i]); }
+static void ldwords(uint64_t *w, const uint8_t *b, size_t n) { for (size_t i = 0; i < n; i++) w[i] = ld64(b + 8 * i); }
 
 static long int_arg(const char *p, long lo, long hi, const char *what) {   /* digits only, in range */
     if (!p || !*p || strspn(p, "0123456789") != strlen(p) || strlen(p) > 18) die(what);
@@ -187,15 +228,19 @@ static uint64_t num_arg(const char *p, uint64_t max, const char *what) {
 
 static void *xmalloc(size_t n) { ckalloc(n); void *p = malloc(n); if (!p) die("oom"); return p; }
 
+/* a dead candidate's sentinel, summed over blocks, must not wrap back to a winner */
+static size_t satadd(size_t a, size_t b) { return a > SIZE_MAX - b ? SIZE_MAX : a + b; }
 static size_t mul(size_t n, size_t sz) { if (sz && n > SIZE_MAX / sz) die("allocation size overflows"); return n * sz; }
 static void *xcalloc(size_t n, size_t sz) {
     if (sz && n > SIZE_MAX / sz) die("allocation size overflows");
     ckalloc(n * sz); void *p = calloc(n, sz); if (!p) die("oom"); return p; }
 static void *xrealloc(void *p, size_t n) { ckalloc(n); void *q = realloc(p, n); if (!q) die("oom"); return q; }
 static char *xstrdup(const char *s) { char *p = strdup(s); if (!p) die("oom"); return p; }
+static char *xstrndup(const char *s, size_t n) { char *p = strndup(s, n); if (!p) die("oom"); return p; }
 
 /* Every text input through one fopencookie FILE*, NULL for stdin: plain, BGZF inflated side by side and CRC-checked, or any gzip; a cut file is refused */
 #define ZCHUNK (8u << 20)
+#define BGZFOUT ((size_t)64 << 20)   /* most inflated bytes one batch of BGZF blocks holds */
 typedef struct {
     int fd, mode, reof, zend;           /* mode: 0 undecided, 1 plain, 2 BGZF, 3 gzip stream */
     uint8_t *raw; size_t rn, rp, rc;    /* compressed bytes read, [rp, rn) not yet used */
@@ -214,10 +259,9 @@ static int rawfill(zrd *z, size_t want) {   /* at least want unused bytes, or th
 }
 static size_t bgzfsize(const uint8_t *p, size_t n) {   /* one BGZF block's size, 0 if it is not one */
     if (n < 18 || p[0] != 0x1f || p[1] != 0x8b || p[2] != 8 || !(p[3] & 4)) return 0;
-    size_t xl = p[10] | (size_t)p[11] << 8, i = 12;
-    for (; i + 4 <= 12 + xl && i + 4 <= n; i += 4 + (p[i + 2] | (size_t)p[i + 3] << 8))
-        if (p[i] == 'B' && p[i + 1] == 'C' && p[i + 2] == 2 && p[i + 3] == 0)
-            return (p[i + 4] | (size_t)p[i + 5] << 8) + 1;
+    size_t xl = p[10] | (size_t)p[11] << 8, e = 12 + xl < n ? 12 + xl : n, sl;   /* each subfield whole, inside XLEN and p */
+    for (size_t i = 12; i + 4 <= e && (sl = p[i + 2] | (size_t)p[i + 3] << 8, i + 4 + sl <= e); i += 4 + sl)
+        if (p[i] == 'B' && p[i + 1] == 'C' && sl == 2) return (p[i + 4] | (size_t)p[i + 5] << 8) + 1;
     return 0;
 }
 static int bgzfread(zrd *z) {   /* the next run of whole blocks into out; -1 on a bad or cut one */
@@ -226,9 +270,12 @@ static int bgzfread(zrd *z) {   /* the next run of whole blocks into out; -1 on 
     while (q < z->rn) {
         size_t bs = bgzfsize(z->raw + q, z->rn - q);
         if (!bs || bs < 26 || q + bs > z->rn) break;
+        const uint8_t *b = z->raw + q, *t = b + bs - 4;   /* checked before anything is summed or allocated */
+        size_t isz = t[0] | (size_t)t[1] << 8 | (size_t)t[2] << 16 | (size_t)t[3] << 24;
+        if (isz > 65536 || 12 + (b[10] | (size_t)b[11] << 8) + 8 > bs) { free(bo); return -1; }
+        if (tot + isz > BGZFOUT) break;                   /* a batch's output is capped */
         if (nb + 1 >= cap) { cap *= 2; bo = xrealloc(bo, cap * sizeof *bo); }
-        bo[nb++] = q; q += bs;
-        tot += z->raw[q - 4] | (size_t)z->raw[q - 3] << 8 | (size_t)z->raw[q - 2] << 16 | (size_t)z->raw[q - 1] << 24;
+        bo[nb++] = q; q += bs; tot += isz;
     }
     bo[nb] = q;
     if (!nb) { free(bo); return z->rp < z->rn ? -2 : 0; }   /* -2: not a whole BGZF block here */
@@ -243,7 +290,6 @@ static int bgzfread(zrd *z) {   /* the next run of whole blocks into out; -1 on 
     for (size_t i = 0; i < nb; i++) {
         const uint8_t *b = z->raw + bo[i]; size_t bs = bo[i + 1] - bo[i], xl = b[10] | (size_t)b[11] << 8;
         size_t isz = oo[i + 1] - oo[i];
-        if (isz > 65536 || 12 + xl + 8 > bs) { bad = 1; continue; }
         static __thread struct libdeflate_decompressor *ld;   /* one a thread, kept */
         if (!ld && !(ld = libdeflate_alloc_decompressor())) { bad = 1; continue; }
         size_t got = 0;
@@ -259,6 +305,8 @@ static ssize_t zread_(void *c, char *b, size_t n) {
     zrd *z = c;
     if (!z->mode) {
         if (rawfill(z, 18) < 0) return -1;
+        if (z->rn >= 18 && z->raw[0] == 0x1f && z->raw[1] == 0x8b && z->raw[3] & 4   /* the whole extra field, to find BC */
+            && rawfill(z, 12 + (z->raw[10] | (size_t)z->raw[11] << 8)) < 0) return -1;
         const uint8_t *p = z->raw;
         z->mode = z->rn < 2 || p[0] != 0x1f || p[1] != 0x8b ? 1 : bgzfsize(p, z->rn) ? 2 : 3;
         if (z->mode == 3 && inflateInit2(&z->zs, 15 + 16) != Z_OK) return -1;
@@ -303,9 +351,14 @@ static int zclose_(void *c) {
     if (z->mode == 3) inflateEnd(&z->zs);
     free(z->raw); free(z->out); free(z); return r ? -1 : 0;
 }
+static FILE *zfdopen(int fd);
 static FILE *zfopen(const char *path) {
     int fd = path ? open(path, O_RDONLY) : dup(0);
     if (fd < 0) return NULL;
+    return zfdopen(fd);
+}
+/* an open descriptor as zfopen's stream, plain or .gz by its bytes; it owns fd, closed on failure too */
+static FILE *zfdopen(int fd) {
     zrd *z = xcalloc(1, sizeof *z); z->fd = fd;
     cookie_io_functions_t io = { zread_, NULL, NULL, zclose_ };
     FILE *f = fopencookie(z, "r", io);
@@ -348,9 +401,9 @@ static inline uint64_t vget(const uint8_t **p) {
     const uint8_t *q = *p;      /* VGUARD bytes spare: bound once, not per byte */
     uint64_t v = 0; int s = 0; uint8_t b;
     do { b = *q++;
-         if (s < 64) v |= (uint64_t)(b & 0x7f) << s;
+         if (s == 63 && b > 1) die("corrupt varint");   /* the tenth byte holds bit 63 alone and ends it */
+         v |= (uint64_t)(b & 0x7f) << s;
          s += 7;
-         if (s > 70) die("corrupt stream: a varint does not terminate");
     } while (b & 0x80);
     if (PAYEND && q > PAYEND) die("corrupt block: a run reads past the payload");
     *p = q;
@@ -360,8 +413,9 @@ static inline uint64_t vget(const uint8_t **p) {
 static uint64_t vgetb(const uint8_t **p, const uint8_t *end) {
     uint64_t v = 0; int s = 0;
     for (;;) {
-        if (*p >= end || s > 63) die("corrupt varint in metadata");
+        if (*p >= end) die("corrupt varint");
         uint8_t b = *(*p)++;
+        if (s == 63 && b > 1) die("corrupt varint");   /* the tenth byte holds bit 63 alone and ends it */
         v |= (uint64_t)(b & 0x7f) << s;
         if (!(b & 0x80)) return v;
         s += 7;
@@ -435,7 +489,7 @@ static int intern(const char *s, size_t n) {
         labnlen = xrealloc(labnlen, labcap * sizeof(size_t));
         labh = xrealloc(labh, labcap * sizeof(uint64_t));
     }
-    labtab[nlabtab] = strndup(s, n);
+    labtab[nlabtab] = xstrndup(s, n);
     labnlen[nlabtab] = n;
     labh[nlabtab] = fnvbuf(FNV0, s, n);
     labhash[k] = nlabtab;
@@ -520,6 +574,10 @@ static uint64_t BYT_LENS = 0, BYT_LABS = 0;
 static int IDCODEC = -1, LENCODEC = -1;   /* the search sets them */
 #define INTFLAG (1ULL << 62)
 #define FLDFLAG (1ULL << 50)   /* names as field deltas */
+/* every flag a reader knows; any other bit above the 49-bit names length is from a newer writer */
+#define KNOWNFLAGS (TOKFLAG | INTFLAG | FLDFLAG | DROPPED | ALNFLAG | DBFLAG | LENFLAG \
+                    | TAILFLAG | CARTFLAG | RUNFLAG | ILVFLAG | GRPFLAG | VARFLAG)
+#define NMLBITS 49
 
 static size_t intnames(buf *names, uint64_t n, uint8_t **out) {
     const char *p = (const char *)names->d, *end = p + names->n;
@@ -832,10 +890,12 @@ static size_t tokc(buf *in, uint8_t **out, uint32_t chunk) {
 #endif
     for (size_t i = 0; i < nchunk; i++) {
         if (failed) continue;
+        /* the tokeniser takes an int: a longer chunk falls back to zstd, as the Rust tok_encode */
+        if (off[i + 1] - off[i] > INT_MAX) { failed = 1; continue; }
         int ol = 0;
         uint8_t *o = tok3_encode_names((char *)base + off[i],
                                        (int)(off[i + 1] - off[i]), 9, 0, &ol, NULL);
-        if (!o) { failed = 1; continue; }
+        if (!o || ol <= 0) { free(o); failed = 1; continue; }
         blob[i] = o; clen[i] = (uint32_t)ol;
     }
 
@@ -850,11 +910,9 @@ static size_t tokc(buf *in, uint8_t **out, uint32_t chunk) {
     for (size_t i = 0; i < nchunk; i++) total += clen[i];
     uint8_t *b = xmalloc(hdr + total);
     *out = b;
-    uint32_t h0 = chunk, h1 = (uint32_t)nchunk;
-    memcpy(b, &h0, 4); memcpy(b + 4, &h1, 4);
-    uint32_t *rl = (uint32_t *)(b + 8);
-    for (size_t i = 0; i < nchunk; i++) rl[i] = (uint32_t)(off[i + 1] - off[i]);
-    memcpy(b + 8 + 4 * nchunk, clen, 4 * nchunk);
+    st32(b, chunk); st32(b + 4, (uint32_t)nchunk);
+    for (size_t i = 0; i < nchunk; i++) { st32(b + 8 + 4 * i, (uint32_t)(off[i + 1] - off[i]));
+                                          st32(b + 8 + 4 * (nchunk + i), clen[i]); }
     uint8_t *q = b + hdr;
     for (size_t i = 0; i < nchunk; i++) { memcpy(q, blob[i], clen[i]); q += clen[i]; free(blob[i]); }
     free(blob); free(clen); free(off);
@@ -863,7 +921,7 @@ static size_t tokc(buf *in, uint8_t **out, uint32_t chunk) {
 
 static char *tokd(const uint8_t *b, size_t n, size_t *outn) {
     if (n < 8) die("truncated tokenised names");
-    uint32_t nchunk; memcpy(&nchunk, b + 4, 4);
+    uint32_t nchunk = ld32(b + 4);
 
     size_t hdr = 8 + 8 * (size_t)nchunk, raw = 0;
     if (nchunk > (n - 8) / 8 || hdr > n) die("corrupt tokenised names header");
@@ -871,7 +929,7 @@ static char *tokd(const uint8_t *b, size_t n, size_t *outn) {
     size_t *coff = xmalloc(((size_t)nchunk + 1) * sizeof *coff);
     woff[0] = coff[0] = 0;
     for (uint32_t i = 0; i < nchunk; i++) {   /* unaligned in a packed alignment */
-        uint32_t rl, cl; memcpy(&rl, b + 8 + 4 * (size_t)i, 4); memcpy(&cl, b + 8 + 4 * ((size_t)nchunk + i), 4);
+        uint32_t rl = ld32(b + 8 + 4 * (size_t)i), cl = ld32(b + 8 + 4 * ((size_t)nchunk + i));
         raw += rl;
         woff[i + 1] = woff[i] + rl;
         coff[i + 1] = coff[i] + cl;
@@ -1385,7 +1443,8 @@ typedef struct { char *name; uint64_t *st, end; uint32_t *lab, *st32; size_t n, 
                  _Atomic int filled;              /* every run is in st and lab */
                  uint64_t bp0, row0, *bend;       /* .kst per block: bases and row before the contig */
                  uint32_t firstblk, lastblk;      /* its block range, and the position after each */
-                 uint8_t *blkin; uint32_t nblkin; } rcon;
+                 /* a block's flag is released after its rows, the array after refprep: refwin acquires both outside the lock */
+                 _Atomic uint8_t *_Atomic blkin; uint32_t nblkin; } rcon;
 
 static qseg *QS; static size_t nqs, cqs;
 static rcon *RC; static size_t nrc, crc;
@@ -1497,7 +1556,7 @@ static void seghash(void) {
         uint64_t h = FNV0;
         h = fnvbuf(h, QS[i].name, strlen(QS[i].name) + 1);
         for (size_t k = 0; k < QS[i].n; k++) { const seg *g = QS[i].s + k;
-            h = fnvbuf(h, &g->q, 8); h = fnvbuf(h, &g->t, 4); h = fnvbuf(h, &g->n, 4); h = fnvbuf(h, &g->tp, 8); h = fnvbuf(h, &g->rev, 4); }
+            h = fnv64(h, g->q); h = fnv32(h, g->t); h = fnv32(h, g->n); h = fnv64(h, g->tp); h = fnv32(h, (uint32_t)g->rev); }
         if (QS[i].n) sum += h;
     }
     ALNHASH ^= sum;
@@ -1534,7 +1593,8 @@ static void loadpaf(const char *path) {
         if (!rc) { noref++; continue; }               /* target absent from ref */
         uint32_t tix = (uint32_t)(rc - RC);
         qseg *Q = NULL;
-        /* A CIGAR is checked, not trusted */
+        /* A CIGAR is checked, not trusted: qp and tp move only by checked steps, and qcons and tcons are no more
+           than they moved */
         uint64_t qcons = 0, tcons = 0;
         for (const char *c = cg; *c && *c != '\t'; ) {
             if (*c < '0' || *c > '9') die("PAF CIGAR: an operation has no length");
@@ -1551,12 +1611,16 @@ static void loadpaf(const char *path) {
                 /* one slot first: a short read carries 1.2 blocks */
                 if (Q->n == Q->cap) { Q->cap = Q->cap ? Q->cap * 2 : 1;
                                       Q->s = xrealloc(Q->s, Q->cap * sizeof *Q->s); }
+                if ((!rev && qp > UINT64_MAX - v) || tp > UINT64_MAX - v) die("PAF coordinates overflow 64 bits");
                 Q->s[Q->n++] = (seg){ rev ? qp - v : qp, tix, (uint32_t)v, tp, rev };
                 qp = rev ? qp - v : qp + v; tp += v; qcons += v; tcons += v; nblk++;
             } else if (op == 'I' || op == 'S') {
                 if (rev && qp < v) die("PAF CIGAR runs before the query start");
+                if (!rev && qp > UINT64_MAX - v) die("PAF coordinates overflow 64 bits");
                 qp = rev ? qp - v : qp + v; qcons += v;
-            } else if (op == 'D' || op == 'N') { tp += v; tcons += v; }
+            } else if (op == 'D' || op == 'N') {
+                if (tp > UINT64_MAX - v) die("PAF coordinates overflow 64 bits");
+                tp += v; tcons += v; }
             else if (op == 'H' || op == 'P') { }
             else die("PAF CIGAR: unknown operation");
         }
@@ -1609,7 +1673,7 @@ static void gapget(const uint8_t **p, const uint8_t *e, int64_t *dq, int64_t *dt
     else if (v) die("corrupt packed alignment: a bad gap code");
 }
 
-static void alnpack(const char *inpaf, const char *out) {
+static void alnpack(const char *inpaf) {
     loadpaf(inpaf);
     /* A block starting a target run has an absolute position, query offset varint and target in four byte planes; others the gaps since the last */
     buf names = {0}, cnt = {0}, pos = {0}, len = {0}, seg_ = {0}, fq = {0}, pl[4] = {{0}, {0}, {0}, {0}};
@@ -1674,11 +1738,10 @@ static void alnpack(const char *inpaf, const char *out) {
         if (bn) bput(&all, best, bn);
         free(best);
     }
-    FILE *f = fopen(out, "wb");
-    if (!f) die("cannot write the packed alignment");
-    uint64_t rh = refhash();
-    if (fwrite(ALNMAGIC, 1, ALNMAGLEN, f) != ALNMAGLEN || fwrite(&rh, 8, 1, f) != 1 ||
-        (all.n && fwrite(all.d, 1, all.n, f) != all.n) || fclose(f)) die("packed alignment write failed");
+    FILE *f = stdout;   /* -o OUT, staged by redirect and renamed in by outcommit */
+    uint8_t rh[8]; st64(rh, refhash());
+    if (fwrite(ALNMAGIC, 1, ALNMAGLEN, f) != ALNMAGLEN || fwrite(rh, 1, 8, f) != 8 ||
+        (all.n && fwrite(all.d, 1, all.n, f) != all.n) || fflush(f)) die("packed alignment write failed");
     size_t nb = 0; for (size_t i = 0; i < nqs; i++) nb += QS[i].n;
     fprintf(stderr, "packed alignment: %zu queries, %zu blocks, %zu B (%.2f B/query)\n",
             nqs, nb, all.n + ALNMAGLEN + 8, nqs ? (double)(all.n + ALNMAGLEN + 8) / (double)nqs : 0.0);
@@ -1693,9 +1756,10 @@ static int alnload(const char *path) {
     if (fread(mg, 1, ALNMAGLEN, f) != ALNMAGLEN || memcmp(mg, ALNMAGIC, ALNMAGLEN)) {
         fclose(f); return 0;                       /* not packed: it is a PAF */
     }
-    uint64_t rh;
-    if (fread(&rh, 8, 1, f) != 1) die("truncated packed alignment");
-    if (rh != refhash()) die("this packed alignment was made against another reference, or another contig order");
+    readcap();                                     /* its stream lengths are forgeable */
+    uint8_t rh[8];
+    if (fread(rh, 1, 8, f) != 8) die("truncated packed alignment");
+    if (ld64(rh) != refhash()) die("this packed alignment was made against another reference, or another contig order");
     if (fseek(f, 0, SEEK_END)) die("cannot seek the packed alignment");
     long fsz = ftell(f);
     if (fsz < ALNMAGLEN + 8) die("truncated packed alignment");
@@ -1710,7 +1774,7 @@ static int alnload(const char *path) {
     for (int k = 0; k < 10; k++) {
         uint64_t cd = vgetb(&p, e), rl = vgetb(&p, e), cl2 = vgetb(&p, e);
         if (cl2 > (size_t)(e - p)) die("corrupt packed alignment: a stream overruns the file");
-        if (!cd) { sec[k] = p; slen[k] = 0; continue; }
+        if (!cd) { sec[k] = p; slen[k] = 0; p += cl2; continue; }   /* skipped, as the Rust */
         if (cd == 2) {                                   /* tokenised names */
             size_t on = 0;
             raw[k] = (uint8_t *)tokd(p, (size_t)cl2, &on);
@@ -1768,6 +1832,8 @@ static int alnload(const char *path) {
                 q = pq + (uint64_t)dq;
                 tp = rev ? ps - ln - (uint64_t)dt : pt + (uint64_t)dt;
             }
+            /* the deltas are taken mod 2^64, as alnpack writes them; a block must end inside 64 bits, as a PAF's does */
+            if (q > UINT64_MAX - ln || tp > UINT64_MAX - ln) die("corrupt packed alignment: a coordinate overflows");
             Q->s[Q->n++] = (seg){ q, tx, (uint32_t)ln, tp, rev };
             pq = q + ln; pt = tp + ln; ps = tp; left--;
         }
@@ -2106,7 +2172,7 @@ static int CARTON, CARTUSED;
 static int cmpstr(const void *a, const void *b) { return strcmp(*(char *const *)a, *(char *const *)b); }
 static void vocadd(size_t k, const char *w, size_t n) {
     if (NVOC[k] % 1024 == 0) VOC[k] = xrealloc(VOC[k], (NVOC[k] + 1024) * sizeof **VOC);
-    VOC[k][NVOC[k]++] = strndup(w, n);
+    VOC[k][NVOC[k]++] = xstrndup(w, n);
 }
 static void loadvocab(const char *path) {
     FILE *f = zfopen(path);
@@ -2198,7 +2264,9 @@ static void *slabfill(void *a) {
     const char *perr[33] = {0};   /* a worker records, the first one wins */
     char *slab = S->b; prow **pr = S->pr; size_t *prc = S->prc;
     double _tpar = nowsec();
+#ifdef _OPENMP
 #pragma omp parallel for schedule(static) num_threads(T)
+#endif
     for (int t = 0; t < T; t++) {
         size_t n = 0;
         const char *e = NULL;
@@ -2446,16 +2514,16 @@ static void pickcodecs(int rawfd, const blkmeta *bm, size_t nraw) {
                     if (!live_i[k] && !live_l[k]) continue;
                     uint8_t *t = NULL; size_t g;
                     if (k < NCAND) {
-                        if (ni && live_i[k]) { g = paycomp(src + nl, ni, CAND[k], &t); ti[k] += g ? g : (size_t)-1 / 4; free(t); t = NULL; }
-                        if (nl && live_l[k]) { g = paycomp(src, nl, CAND[k], &t); tl[k] += g ? g : (size_t)-1 / 4; free(t); }
+                        if (ni && live_i[k]) { g = paycomp(src + nl, ni, CAND[k], &t); ti[k] = satadd(ti[k], g ? g : (size_t)-1 / 4); free(t); t = NULL; }
+                        if (nl && live_l[k]) { g = paycomp(src, nl, CAND[k], &t); tl[k] = satadd(tl[k], g ? g : (size_t)-1 / 4); free(t); }
                     } else {
                         int lv = k == NCAND ? LEVEL : 22;
                         if (ni) { t = malloc(ZSTD_compressBound(ni));
                                   g = t ? ZSTD_compress(t, ZSTD_compressBound(ni), src + nl, ni, lv) : (size_t)-1;
-                                  ti[k] += (!t || ZSTD_isError(g)) ? (size_t)-1 / 4 : g; free(t); t = NULL; }
+                                  ti[k] = satadd(ti[k], (!t || ZSTD_isError(g)) ? (size_t)-1 / 4 : g); free(t); t = NULL; }
                         if (nl) { t = malloc(ZSTD_compressBound(nl));
                                   g = t ? ZSTD_compress(t, ZSTD_compressBound(nl), src, nl, lv) : (size_t)-1;
-                                  tl[k] += (!t || ZSTD_isError(g)) ? (size_t)-1 / 4 : g; free(t); }
+                                  tl[k] = satadd(tl[k], (!t || ZSTD_isError(g)) ? (size_t)-1 / 4 : g); free(t); }
                     }
                 }
             }
@@ -2797,7 +2865,9 @@ static uint64_t idxbuild(const buf *ib, buf *ichunks, buf *itab) {
     }
     uint8_t **cz = xcalloc(nichunk ? nichunk : 1, sizeof *cz);
     size_t *cl = xcalloc(nichunk ? nichunk : 1, sizeof *cl);
+#ifdef _OPENMP
 #pragma omp parallel for schedule(dynamic, 1) num_threads(nthreads())
+#endif
     for (uint64_t i = 0; i < nichunk; i++) {
         buf one = { (uint8_t *)cb[i], (size_t)(cb[i + 1] - cb[i]), 0 };
         cl[i] = zcl(&one, &cz[i], METALEVEL);
@@ -2990,8 +3060,8 @@ static void ktw_close(ktw *w) {
             if (!tc || !rb) failed = 1;
             for (;;) {
                 size_t i = nextb++;
-                if (i >= nraw || failed) break;
-                while (i >= wrote + win && !failed)   /* a waiting thread writes, or none might */
+                if (i >= nraw || failed || wfail) break;   /* a failed tmp write stops the rest, as the Rust's cancel */
+                while (i >= wrote + win && !failed && !wfail)   /* a waiting thread writes, or none might */
                     if (!pthread_mutex_trylock(&cwm)) { cflush(cs, nraw, &wrote, bm, tmp, &sizes, &wfail); pthread_mutex_unlock(&cwm); }
                     else sched_yield();
                 rawget(w->rawfd, (off_t)bm[i].off, rb, bm[i].len);
@@ -3148,12 +3218,14 @@ static void ktw_close(ktw *w) {
                       (uint64_t)(uint32_t)IDCODEC | (DBFEATS ? (fh >> 32) << 32 : 0), nichunk, itl,
                       TAILPRED, (uint64_t)TAILSKIP | ((ALNPAF ? ALNHASH : ROWHASH) << 8), 0, 0 };
 
-    {   uint64_t mh = fnvbuf(FNV0, h, 128); mh = fnvbuf(mh, lz, lzl);
+    uint8_t hb[128]; stwords(hb, h, 16);
+    {   uint64_t mh = fnvbuf(FNV0, hb, 128); mh = fnvbuf(mh, lz, lzl);
         mh = fnvbuf(mh, nz, nzl);
         mh = fnvbuf(mh, iz, izl); mh = fnvbuf(mh, sz, szl);
         h[15] = fnvbuf(mh, itz, itl);
     }
-    if (fwrite(h, 8, 16, w->out) != 16) die("write failed");
+    st64(hb + 120, h[15]);
+    WR(hb, 128);
     WR(lz, lzl);
     WR(nz, nzl);
     WR(iz, izl);
@@ -3190,15 +3262,25 @@ static void ktw_close(ktw *w) {
 
 /* ------------------------------------------------------- the library API */
 /* karyozip.h documents the contract; the CLI and a library caller go through the same writer, so the bytes are the same */
-kt_writer *kt_open(FILE *out) {
-    /* the encoder keeps global state: a second writer starts from nothing; the CLI interns the reference's labels before it opens the writer */
-    static int idc0 = -2, lenc0, lvl0, lvlset0, blkset0; static uint64_t blk0;
-    if (idc0 == -2) { idc0 = IDCODEC; lenc0 = LENCODEC; lvl0 = LEVEL; lvlset0 = LEVELSET; blk0 = BLOCK; blkset0 = BLOCKSET; }
-    IDCODEC = idc0; LENCODEC = lenc0; LEVEL = lvl0; LEVELSET = lvlset0; BLOCK = blk0; BLOCKSET = blkset0;
-    for (int i = 0; i < nlabtab; i++) free(labtab[i]);
-    free(labhash); labhash = NULL;
+/* Every file-scope static a writer changes, back to its initializer, so a second writer in one process writes what a fresh process would.
+   A new encoder global must be added here. Left out: options only main sets (SLOW, FASTMODE, VARBLK, NAMEMODE, NTHREADS, PROF, ...),
+   the --aln, --ref and --db state, and the reader's thread-locals, none of which a library writer reaches or changes */
+static void encoder_reset(void) {
+    BLOCK = UINT64_MAX; BLOCKSET = 0; LEVEL = 17; LEVELSET = 0;      /* kt_block, kt_level */
+    IDCODEC = LENCODEC = -1; LEVEL_I = LEVEL_L = -1;                  /* pickcodecs, the layout search */
+    VARON = RUNHEAD = ILV = GRP = 0;
+    RCUT = 0; CUTROWS_L = CUTROWS_I = 0; ZPQM_L = 0;
+    for (int t = 0; t < 2; t++) { free(ZK[t]); ZK[t] = NULL; ZKN[t] = 0; }
+    TOKPICK = 250000; FLDSEP = ':';                                   /* the names coders */
+    TAILSEEN = 0; TAILON = -1; TAILPRED = 0; memset(TAILSAMP, 0, sizeof TAILSAMP);
+    ROWHASH = 0; ALNHIT = 0; RAWHELD = 0; BYT_LENS = BYT_LABS = 0;
+    for (int i = 0; i < nlabtab; i++) free(labtab[i]);              /* the label table; its arrays are kept for reuse */
+    free(labhash); labhash = NULL; LABHASH = 0;
     nlabtab = 0; lastid = -1; labhash_init = 0; lcache_init = 0;
-    TAILSEEN = 0; TAILON = -1; TAILPRED = 0; ALNHIT = 0; RUNHEAD = ILV = GRP = VARON = 0;
+}
+/* The CLI calls ktw_open directly: it interns the reference's labels before it opens the writer */
+kt_writer *kt_open(FILE *out) {
+    encoder_reset();
     return ktw_open(out);
 }
 void kt_block(kt_writer *w, uint64_t rows) { (void)w; BLOCK = rows ? rows : UINT64_MAX; BLOCKSET = 1; }
@@ -3366,16 +3448,18 @@ static R *ropen(const char *path) {
         fprintf(stderr, "karyozip: file starts with \"%s\", not \"%.8s\"\n", sh, MAGIC);
         die("not a KST file");
     }
-    uint64_t h[16]; if (fread(h, 8, 16, r->f) != 16) die("short header");
-    uint64_t h1_raw = h[1];             /* flags included, for the hash */
+    uint8_t hb[128]; uint64_t h[16];
+    if (fread(hb, 1, 128, r->f) != 128) die("short header");
+    ldwords(h, hb, 16);
+    if (h[1] >> NMLBITS & ~(KNOWNFLAGS >> NMLBITS))
+        die("this track was written by a newer karyozip: unknown header flags");
 
     if (fseeko(r->f, 0, SEEK_END)) die("seek");
     uint64_t fsz = (uint64_t)ftello(r->f);
     r->fsz = fsz;
-    ALLOCMAX = (size_t)1 << 38;
+    readcap();
     if (fseeko(r->f, 8 + 128, SEEK_SET)) die("seek");
-    uint64_t nml = h[1] & ~(TOKFLAG | INTFLAG | FLDFLAG | DROPPED | ALNFLAG | DBFLAG
-                            | LENFLAG | TAILFLAG | CARTFLAG | RUNFLAG | ILVFLAG | GRPFLAG | VARFLAG);   /* h[1] also holds flags */
+    uint64_t nml = h[1] & ~KNOWNFLAGS;   /* h[1] also holds flags */
 
     if (nml > fsz || h[2] > fsz || h[3] > fsz || h[6] > fsz || h[11] > fsz
         || 8 + 128 + nml + h[2] + h[3] + h[6] + h[11] > fsz)
@@ -3437,8 +3521,7 @@ static R *ropen(const char *path) {
     r->runhead = runhead; r->ilv = ilv; r->grp = (h[1] & GRPFLAG) != 0; r->varblk = (h[1] & VARFLAG) != 0;
     if (r->grp && (ilv || !runhead)) die("corrupt file: grouped lengths without their run counts");
     if (r->cart && !was_db) die("corrupt file: vocabulary featureIDs without --db");
-    h[1] &= ~(TOKFLAG | INTFLAG | DROPPED | ALNFLAG | DBFLAG | LENFLAG
-              | TAILFLAG | CARTFLAG | RUNFLAG | ILVFLAG | FLDFLAG | GRPFLAG | VARFLAG);
+    h[1] &= ~KNOWNFLAGS;
     uint8_t *iz = xmalloc(h[2]), *sz = xmalloc(h[3]);
     uint8_t *nz = NULL;
     r->nz_off = ftello(r->f);
@@ -3446,11 +3529,9 @@ static R *ropen(const char *path) {
     if (fread(iz, 1, h[2], r->f) != h[2]) die("short index");
     if (fread(sz, 1, h[3], r->f) != h[3]) die("short sizes");
     {
-        uint64_t want = h[15], mh = FNV0, hz[16];
-        memcpy(hz, h, 128); hz[15] = 0;
-
-        hz[1] = h1_raw;
-        mh = fnvbuf(mh, hz, 128); mh = fnvbuf(mh, lzraw, lzl);
+        uint64_t want = h[15], mh = FNV0;
+        memset(hb + 120, 0, 8);   /* the file's own bytes, flags included, the hash word zero */
+        mh = fnvbuf(mh, hb, 128); mh = fnvbuf(mh, lzraw, lzl);
         if (h[1]) { off_t keep = ftello(r->f);
             uint8_t *nb = xmalloc(h[1]);
             if (fseeko(r->f, (off_t)r->nz_off, SEEK_SET) || fread(nb, 1, h[1], r->f) != h[1])
@@ -3562,6 +3643,8 @@ static void ensurenames(R *r);
 
 static void buildhash(R *r) {
     if (r->htab) return;
+    /* before the names are decoded, as the Rust's find */
+    if (r->nreads > UINT32_MAX) die("more than 2^32 sequences: the name table stores the ordinal in 32 bits");
     ensurenames(r);
     uint64_t cap = 1; while (cap < r->nreads * 2) cap <<= 1;
     r->hmask = cap - 1;
@@ -3580,9 +3663,12 @@ static void buildhash(R *r) {
 static uint64_t NAMESRC_H;
 static uint64_t stathash(const struct stat *st) {
     uint64_t h = fnvbuf(FNV0, NAMEFILE, strlen(NAMEFILE));
-    h = fnvbuf(h, &st->st_size, sizeof st->st_size); h = fnvbuf(h, &st->st_ino, sizeof st->st_ino);
-    h = fnvbuf(h, &st->st_dev, sizeof st->st_dev); h = fnvbuf(h, &st->st_mtim, sizeof st->st_mtim);
-    return fnvbuf(h, &st->st_ctim, sizeof st->st_ctim);
+    /* the fields as the Rust's namesrc: seven little-endian words */
+    uint64_t v[7] = { (uint64_t)st->st_size, (uint64_t)st->st_ino, (uint64_t)st->st_dev,
+                      (uint64_t)st->st_mtim.tv_sec, (uint64_t)st->st_mtim.tv_nsec,
+                      (uint64_t)st->st_ctim.tv_sec, (uint64_t)st->st_ctim.tv_nsec };
+    for (int i = 0; i < 7; i++) h = fnv64(h, v[i]);
+    return h;
 }
 static char *readnamefile(uint64_t nreads) {
     char *names;
@@ -3592,7 +3678,7 @@ static char *readnamefile(uint64_t nreads) {
         struct stat st0; if (stat(NAMEFILE, &st0)) die("cannot stat the file given to --names");
         size_t cap = 1 << 20, w = 0;
         names = xmalloc(cap);
-        char *ln = NULL; size_t lcap = 0; uint64_t got = 0; int fq = 2, lineno = 0;
+        char *ln = NULL; size_t lcap = 0; uint64_t got = 0, lineno = 0; int fq = 2;
 
         char *hd[3] = { NULL, NULL, NULL }; size_t hc[3] = { 0, 0, 0 }; int nhd = 0;
         while (nhd < 3 && getline(&hd[nhd], &hc[nhd], nf) > 0) nhd++;
@@ -3600,8 +3686,8 @@ static char *readnamefile(uint64_t nreads) {
             if (hd[0][0] == '@' && nhd >= 3 && hd[2][0] == '+') fq = 1;
             else if (hd[0][0] == '>' && hd[1][0] != '>') fq = 0;
         }
-        for (int h = 0; ; h++) {
-            if (h < nhd) { free(ln); ln = hd[h]; lcap = hc[h]; hd[h] = NULL; }
+        for (uint64_t h = 0; ; h++) {   /* past 2^31 lines on a large FASTQ */
+            if (h < (uint64_t)nhd) { free(ln); ln = hd[h]; lcap = hc[h]; hd[h] = NULL; }
             else if (getline(&ln, &lcap, nf) <= 0) break;
             lineno++;
             char *q = ln;
@@ -3725,8 +3811,7 @@ static void rclose(R *r);
 #define IXFP(h, o) ((uint32_t)((h) ^ (o) * 0x9e3779b97f4a7c15ULL))
 static int ixw(uint64_t n) { int w = 1; while (w < 32 && (n - 1) >> w) w++; return w; }
 static uint64_t ixget(const uint8_t *p, uint64_t bit, int nb) {
-    uint64_t v; memcpy(&v, p + (bit >> 3), 8);
-    return (v >> (bit & 7)) & ((1ULL << nb) - 1);
+    return (ld64(p + (bit >> 3)) >> (bit & 7)) & ((1ULL << nb) - 1);
 }
 
 static void buildindex(const char *path) {
@@ -3761,7 +3846,7 @@ static void buildindex(const char *path) {
         }
     }
     for (uint64_t g = 0, sum = 0; g < ns; g++) {
-        memcpy(t + nb + g * 8, &sum, 8);
+        st64(t + nb + g * 8, sum);
         for (uint64_t b = g * 1024; b < nb && b < (g + 1) * 1024; b++) sum += cnt[b];
     }
     free(key);
@@ -3770,12 +3855,12 @@ static void buildindex(const char *path) {
     if (asprintf(&ip, "%s.kzi", path) < 0 || asprintf(&tp, "%s.kzi.XXXXXX", path) < 0) die("oom");
     int fd = mkstemp(tp);
     mode_t um = umask(0); umask(um);   /* as a plain create: mkstemp's 0600 would hide it */
-    if (fd >= 0) (void)!fchmod(fd, 0666 & ~um);
-    FILE *f = fd < 0 ? NULL : fdopen(fd, "wb");
-    if (!f) die("cannot create the index file beside the track");
-    uint64_t tail[5] = { n, (uint64_t)k, r->mhash ^ namesrc(), pay, IDXMAGIC };
-    int bad = fwrite(t, 1, pay, f) != pay || fwrite(tail, 8, 5, f) != 5 || fflush(f);
-    if (fclose(f) || bad || rename(tp, ip)) { unlink(tp); die("index write failed"); }
+    if (fd < 0) die("cannot create the index file beside the track");
+    (void)!fchmod(fd, 0666 & ~um);
+    uint64_t tw[5] = { n, (uint64_t)k, r->mhash ^ namesrc(), pay, IDXMAGIC }; uint8_t tail[40];
+    stwords(tail, tw, 5);
+    int bad = fdput(fd, t, pay) || fdput(fd, tail, 40);
+    if ((fdfinish(fd) | bad) || rename(tp, ip)) { unlink(tp); die("index write failed"); }
     free(t); free(tp);
     fprintf(stderr, "index: %llu sequences, %llu B in %s, %llu fingerprint collisions\n",
             (unsigned long long)n, (unsigned long long)(pay + 40), ip, (unsigned long long)dup);
@@ -3785,8 +3870,9 @@ static void buildindex(const char *path) {
 
 /* Returns the ordinal, or -1 when absent */
 static int64_t idxlookup(R *r, const char *path, const char *nm) {
-    char ip[4096]; snprintf(ip, sizeof ip, "%s.kzi", path);
+    char *ip; if (asprintf(&ip, "%s.kzi", path) < 0) die("oom");
     int fd = open(ip, O_RDONLY);
+    free(ip);
     if (fd < 0) return -1;
     struct stat st;
     if (fstat(fd, &st) || (size_t)st.st_size < 40) { close(fd); return -1; }
@@ -4393,7 +4479,7 @@ static int nodeid(const char *nm, size_t n) {
     for (int i = 0; i < NNODE; i++)
         if (strlen(NODE[i]) == n && !memcmp(NODE[i], nm, n)) return i;
     if (NNODE >= MAXNODE) die("too many hierarchy nodes");
-    NODE[NNODE] = strndup(nm, n);
+    NODE[NNODE] = xstrndup(nm, n);
     NPAR[NNODE] = -1;
     return NNODE++;
 }
@@ -4619,10 +4705,10 @@ static R *refopen(const char *path) {   /* a plain track, opened as no companion
     return r;
 }
 static void loadref_kst(const char *path) {
-    uint64_t hh[16];
+    uint64_t hh[16]; uint8_t hb[128];
     {   FILE *f = fopen(path, "rb");
-        if (!f || fseek(f, 8, SEEK_SET) || fread(hh, 8, 16, f) != 16) die("cannot read the reference track");
-        fclose(f); }
+        if (!f || fseek(f, 8, SEEK_SET) || fread(hb, 1, 128, f) != 128) die("cannot read the reference track");
+        fclose(f); ldwords(hh, hb, 16); }
     if (hh[1] & (ALNFLAG | DBFLAG | DROPPED))
         die("the reference .kst must be a plain track: not --aln, not --db, and its names in the file, not dropped");
     R *r = refopen(path);
@@ -4706,7 +4792,7 @@ static void refprep(R *r, rcon *rc) {
     rc->bend = xcalloc(r->nblk, 8);
     rc->firstblk = q.blk;
     rc->lastblk = (uint32_t)blkat(r, rc->row0 + (rc->n ? rc->n - 1 : 0), 0);
-    rc->blkin = xcalloc(r->nblk, 1);            /* last: it is the ready flag */
+    atomic_store_explicit(&rc->blkin, xcalloc(r->nblk, 1), memory_order_release);   /* last: it is the ready flag */
 }
 static void refblk(R *r, rcon *rc, uint64_t b) {
     loadblk(r, b);
@@ -4726,7 +4812,7 @@ static void refblk(R *r, rcon *rc, uint64_t b) {
         pos += len;
     }
     rc->bend[b] = pos;
-    rc->blkin[b] = 1;
+    atomic_store_explicit(&rc->blkin[b], 1, memory_order_release);
     /* every block in: the contig is whole, and the window checks stop */
     if (++rc->nblkin == rc->lastblk - rc->firstblk + 1) {
         rc->end = rc->bend[rc->lastblk];
@@ -4753,20 +4839,21 @@ static void refwin(rcon *rc, uint64_t tpos, size_t *lo, size_t *hi, uint64_t *we
         return;
     }
     R *r = REFR;
-    if (!rc->blkin) {
+    _Atomic uint8_t *in = atomic_load_explicit(&rc->blkin, memory_order_acquire);
+    if (!in) {
 #ifdef _OPENMP
 #pragma omp critical(reffill)
 #endif
-        if (!rc->blkin) refload(rc, 0, 1);
+        if (!(in = atomic_load_explicit(&rc->blkin, memory_order_acquire))) { refload(rc, 0, 1); in = rc->blkin; }
     }
     uint64_t b = rc->firstblk, e = rc->lastblk;      /* the block holding tpos */
     while (b < e) { uint64_t m = (b + e + 1) / 2;
                     if (r->b[m].bp <= tpos) b = m; else e = m - 1; }
-    if (!rc->blkin[b]) {
+    if (!atomic_load_explicit(&in[b], memory_order_acquire)) {
 #ifdef _OPENMP
 #pragma omp critical(reffill)
 #endif
-        if (!rc->blkin[b]) refload(rc, b, 0);
+        if (!atomic_load_explicit(&in[b], memory_order_acquire)) refload(rc, b, 0);
     }
     uint64_t be = r->b[b].row0 + r->b[b].rows;
     *lo = b == rc->firstblk ? 0 : (size_t)(r->b[b].row0 - rc->row0);
@@ -4777,13 +4864,18 @@ static void refwin(rcon *rc, uint64_t tpos, size_t *lo, size_t *hi, uint64_t *we
 
 static char out[1 << 22];
 static size_t eo = 0;
-/* -o's temporary name, set by redirect */
-static char *OUTTMP; static const char *OUTFIN;
+/* -o's temporary name, set by redirect; OUTDST is OUTFIN with a symlink resolved */
+static char *OUTTMP; static const char *OUTFIN, *OUTDST;
+/* OUTTMP, the handler's too, is never freed once a handler is installed: one that claimed EXITING may hold it, at
+   worst unlinking a name already renamed. Kept here, reachable, so a leak checker does not count it. As the Rust's
+   OUTSIG */
+static char *volatile OUTKEPT;   /* volatile: written, never read, else the store is optimised away */
 static void outclean(void) { if (OUTTMP) { unlink(OUTTMP); OUTTMP = NULL; } }
+static void dbtmpclean(void);
 static void emitflush(void) {   /* runs from atexit: die would recurse */
-    if (eo && fwrite(out, 1, eo, stdout) != eo) { fprintf(stderr, "karyozip: write failed\n"); outclean(); _exit(1); }
+    if (eo && fwrite(out, 1, eo, stdout) != eo) { fprintf(stderr, "karyozip: write failed\n"); outclean(); dbtmpclean(); _exit(1); }
     eo = 0;
-    if (fflush(stdout)) { fprintf(stderr, "karyozip: write failed\n"); outclean(); _exit(1); }
+    if (fflush(stdout)) { fprintf(stderr, "karyozip: write failed\n"); outclean(); dbtmpclean(); _exit(1); }
 }
 
 /* One row emitter, to a FILE through a fixed buffer or into the caller's growing buffer, with one merging rule */
@@ -5000,11 +5092,38 @@ typedef struct { FILE *f; char *ln; size_t cap;
                  char seq[512]; uint64_t st, en; char *lab; size_t labcap; int eof;
                  size_t labn; uint32_t labid; int set;
                  char pseq[512]; uint64_t pen;   /* the run before */
-                 char *buf; size_t bp, bn, bcap; } brd;
+                 char *buf; size_t bp, bn, bcap; uint64_t lines;   /* BED lines read */
+                 int probed;       /* a regular file iskst judged a BED: its first line not judged again */
+                 /* a per-set .kst instead of a BED: its rows decoded in step, as dump walks them */
+                 R *r; cur_t c; span sp; const uint8_t *lp, *ip; uint64_t ri, k, nr, kpos, emitted; } brd;
 static void sset(char **d, size_t *cap, const char *s, size_t n) {   /* a string on the heap */
     if (n + 1 > *cap) { *cap = n + 64; *d = xrealloc(*d, *cap); }
     memcpy(*d, s, n); (*d)[n] = 0;
 }
+
+#define KSTPIPE "--db: a .kst input must be a regular file: it is read with random access, not through a pipe or stdin"
+/* An input's first line (its newline dropped, or as much of it as was read) that is a .kst's start: the magic, and not
+   the start of a BED row. A BED row whose name begins with the magic goes on, after that name, to a tab, a run of ASCII
+   digits, a tab, a run of digits and a tab (its start and end), with no NUL; anything else after the magic is a .kst.
+   A .kst's first "line" ends at the first 0x0a of its header: its sequence count h[0] can be 09 09 09 0a (168,495,369
+   sequences: the magic, three tabs and a newline), but no count below 2^40 gives a tab, digits, a tab, digits and a
+   tab before a NUL or a newline. The one rule for a regular file (iskst) and for a pipe (kstpipe). As the Rust's
+   kst_head */
+static int ksthead(const char *ln, size_t n) {
+    if (n < 8 || memcmp(ln, MAGIC, 8)) return 0;
+    if (memchr(ln, 0, n)) return 1;
+    const char *e = ln + n, *t = memchr(ln, '\t', n);
+    for (int k = 0; k < 2; k++) {               /* the start, then the end: digits between two tabs */
+        if (!t) return 1;
+        const char *d = ++t;
+        while (t < e && *t >= '0' && *t <= '9') t++;
+        if (t == d || t == e || *t != '\t') return 1;
+    }
+    return 0;
+}
+/* A BED reader's first line that is a .kst's start: refused, since a .kst through a pipe cannot be read. Not asked of
+   a regular file, which iskst has judged already */
+static void kstpipe(const char *ln, size_t n) { if (ksthead(ln, n)) die(KSTPIPE); }
 
 #define BRDBUF (8u << 20)
 static ssize_t brd_line(brd *b, char **lnp) {
@@ -5029,18 +5148,22 @@ static ssize_t brd_line(brd *b, char **lnp) {
         if (!got) {
             if (ferror(b->f)) die("read error on an input BED");
             if (!b->bn) return -1;               /* real end of file */
+            if (!b->lines && !b->probed) kstpipe(b->buf, b->bn);
             die("input does not end with a newline");
         }
         b->bn += got;
     }
 }
 
+static void knext(brd *b);
 static void bnext(brd *b) {
+    if (b->r) { knext(b); return; }
     char *line = NULL;
     ssize_t n = brd_line(b, &line);
     if (n <= 0) { b->eof = 1; return; }
     b->ln = line;
     if (b->ln[n - 1] == '\n') b->ln[--n] = 0;
+    if (!b->lines++ && !b->probed) kstpipe(b->ln, (size_t)n);
     if (memchr(b->ln, 0, (size_t)n)) die("a NUL byte inside a row");
     char *t1 = memchr(b->ln, '\t', (size_t)n);            if (!t1) die("bad line");
     char *t2 = memchr(t1 + 1, '\t', (size_t)(n - (t1 + 1 - b->ln))); if (!t2) die("bad line");
@@ -5063,6 +5186,82 @@ static void bnext(brd *b) {
     if (DBFAST && !same) b->labid = si_get(&SI[b->set], b->lab, 0);   /* the same label spans several rows */
 }
 
+/* A per-set .kst in place of its BED: a plain track, as --ref takes one, opened as no companion.
+   Known by its first line, as kstpipe knows one (ksthead): the magic, and no BED row, so a BED whose first name
+   begins with the magic is a BED here too. Read with pread from the descriptor the BED reader would take, so nothing
+   is consumed, and at most KSTPROBE bytes: a BED row's name (under 512 bytes), two coordinates and their tabs fit
+   in it, so a first line longer than that is judged by what was read.
+   Only a regular file (a symlink followed) is probed, since a .kst is read with random access: a FIFO, a /dev/fd
+   pipe or a device goes to the BED reader unprobed, opened once, and a .kst through one is refused by kstpipe.
+   1: fd is a .kst; 0: a BED, *reg set if fd was probed, so kstpipe need not judge it again. As the Rust's is_kst */
+#define KSTPROBE 4096
+static int iskst(int fd, int *reg) {
+    struct stat st; char m[KSTPROBE]; size_t got = 0;
+    if (fstat(fd, &st) || !S_ISREG(st.st_mode)) return 0;
+    *reg = 1;
+    while (got < sizeof m) {
+        ssize_t k = pread(fd, m + got, sizeof m - got, (off_t)got);
+        if (k < 0 && errno == EINTR) continue;
+        if (k <= 0) break;
+        got += (size_t)k;
+    }
+    const char *nl = memchr(m, '\n', got);
+    return ksthead(m, nl ? (size_t)(nl - m) : got);
+}
+static void kopen(brd *b, const char *path) {
+    uint64_t hh[16]; uint8_t hb[128];
+    {   FILE *f = fopen(path, "rb");
+        if (!f || fseek(f, 8, SEEK_SET) || fread(hb, 1, 128, f) != 128) die("--db: cannot read a .kst input");
+        fclose(f); ldwords(hh, hb, 16); }
+    if (hh[1] & (ALNFLAG | DBFLAG | DROPPED))
+        die("--db: a .kst input must be a plain track of one set: not --aln, not --db, and its names in the file, not dropped");
+    b->r = refopen(path);
+    ensurenames(b->r);
+    b->c = (cur_t){ UINT64_MAX, 0, NULL, NULL };
+    b->ri = UINT64_MAX; b->k = b->nr = 0;
+}
+/* The next row of a .kst input, checked as bnext checks a BED line; the reader's plain globals set for it and put back,
+   since every input interleaves, as reffill_r does */
+static void knext(brd *b) {
+    R *r = b->r;
+    int ld = LENDEC, td = TAILDEC; uint64_t tp = TAILPRED_R, ts = TAILSKIP_R; const uint8_t *pe = PAYEND;
+    TAILDEC = r->taildec; TAILPRED_R = r->tailpred; TAILSKIP_R = r->tailskip;
+    while (b->k == b->nr) {                       /* the next sequence with a run */
+        if (b->ri != UINT64_MAX) seqdone(r, b->ri, &b->c, b->lp, b->ip, &b->sp);
+        if (++b->ri >= r->nreads) {
+            if (b->emitted != r->rows) {
+                fprintf(stderr, "karyozip: emitted %llu rows, the header says %llu\n",
+                        (unsigned long long)b->emitted, (unsigned long long)r->rows);
+                die("file is truncated");
+            }
+            b->eof = 1; goto done;
+        }
+        rec q = seqptrs(r, b->ri, &b->c, &b->lp, &b->ip, &b->sp);
+        b->nr = q.nruns; b->k = 0; b->kpos = 0;
+    }
+    loadblk(r, b->sp.blk);                        /* this reader's block: PAYEND and LENDEC back */
+    spannext(r, &b->sp, &b->lp, &b->ip); b->sp.left--;
+    const char *nm = r->name[b->ri];
+    uint64_t s = b->kpos, e = s + rlen(&b->lp, nm, s, b->k + 1 == b->nr && b->ri >= TAILSKIP_R), f = vget(&b->ip);
+    if (r->lab && f >= r->nlab) die("corrupt block: a label id past the table");
+    b->k++; b->kpos = e; b->emitted++;
+    char idb[24]; const char *L = idb; size_t ll;
+    if (r->lab) { L = r->lab[f]; ll = strlen(L); } else ll = (size_t)(putu64(idb, f) - idb);
+    size_t sl = strlen(nm);
+    if (sl >= sizeof b->seq) die("name too long");
+    if (!sl) die("empty sequence name");
+    int had = b->lab != NULL, same = had && b->labn == ll && !memcmp(b->lab, L, ll);
+    if (had) { memcpy(b->pseq, b->seq, strlen(b->seq) + 1); b->pen = b->en; }
+    memcpy(b->seq, nm, sl); b->seq[sl] = 0;
+    if (!same) { sset(&b->lab, &b->labcap, L, ll); b->labn = ll; }
+    b->st = s; b->en = e;
+    if (same && b->st == b->pen && !strcmp(b->seq, b->pseq))
+        die("two touching runs carry the same label: merge them first");
+    if (DBFAST && !same) b->labid = si_get(&SI[b->set], b->lab, 0);
+done:
+    LENDEC = ld; TAILDEC = td; TAILPRED_R = tp; TAILSKIP_R = ts; PAYEND = pe;
+}
+
 static void encode_db(int nfiles, char **files) {
     if (HIERTAB && !DBFEATS) die("--hier does nothing without --db");
     loadfeatures(DBFEATS);
@@ -5077,9 +5276,14 @@ static void encode_db(int nfiles, char **files) {
     brd *b = xcalloc((size_t)nfiles, sizeof *b);
     for (int i = 0; i < nfiles; i++) {
         b[i].set = i;
-        b[i].f = zfopen(strcmp(files[i], "-") ? files[i] : NULL);
-        if (!b[i].f) { fprintf(stderr, "cannot open %s: %s\n", files[i], strerror(errno));
-                       die("cannot open an input BED"); }
+        /* each input opened once: a regular file probed for a per-set .kst's magic, anything else a BED */
+        int fd = strcmp(files[i], "-") ? open(files[i], O_RDONLY) : dup(0);
+        if (fd >= 0 && strcmp(files[i], "-") && iskst(fd, &b[i].probed)) { close(fd); kopen(&b[i], files[i]); }
+        else {
+            b[i].f = fd < 0 ? NULL : zfdopen(fd);
+            if (!b[i].f) { fprintf(stderr, "cannot open %s: %s\n", files[i], strerror(errno));
+                           die("cannot open an input BED"); }
+        }
         bnext(&b[i]);
         if (b[i].eof) die("an input BED is empty");
     }
@@ -5156,6 +5360,7 @@ static void encode_db(int nfiles, char **files) {
     }
     for (int i = 1; i < nfiles; i++)
         if (!b[i].eof) die("the input BEDs have different lengths");
+    for (int i = 0; i < nfiles; i++) { rclose(b[i].r); b[i].r = NULL; }   /* the .kst inputs go before the close */
     fprintf(stderr, "db: %llu rows from %d tracks, %llu all-novel\n",
             (unsigned long long)rows, nfiles, (unsigned long long)missing);
     if (ALNPAF)
@@ -5173,12 +5378,14 @@ static void encode_db(int nfiles, char **files) {
     free(b);
 }
 
-typedef struct { FILE *f; char *b; size_t n, cap; } ow;
+typedef struct { FILE *f; int fd; char *b; size_t n, cap; } ow;   /* stdout through f, a staged BED through fd */
+/* the buffered rows out; 0 on success */
+static int owwrite(ow *w) { return w->f ? w->n && fwrite(w->b, 1, w->n, w->f) != w->n : fdput(w->fd, w->b, w->n); }
 
 static void owput(ow *w, const char *nm, size_t nl, uint64_t a, uint64_t b,
                   const char *lab, size_t ll) {
     if (w->n + nl + ll + 48 > w->cap) {
-        if (fwrite(w->b, 1, w->n, w->f) != w->n) die("write failed");
+        if (owwrite(w)) die("write failed");
         w->n = 0;
         if (nl + ll + 48 > w->cap) { w->cap = nl + ll + 64; w->b = xrealloc(w->b, w->cap); }   /* one row that is bigger */
     }
@@ -5190,12 +5397,99 @@ static void owput(ow *w, const char *nm, size_t nl, uint64_t a, uint64_t b,
     w->n = (size_t)(o - w->b);
 }
 
-static char **DBTMP; static size_t ndbtmp;
+static char **DBTMP; static size_t ndbtmp;   /* the handler's too: an entry is freed only in stage_swap, COMMITTING, when no
+                                                handler can have claimed EXITING (SIGSTATE) */
 static void dbtmpclean(void) { for (size_t i = 0; i < ndbtmp; i++) if (DBTMP[i]) remove(DBTMP[i]); }
-static void dbtmpsig(int s) { dbtmpclean(); outclean(); (void)s; _exit(1); }   /* atexit does not run on a signal */
+/* The one state the handler and the commit agree through, so that a signal either ends the process before a commit
+   starts or waits for it to finish, never cuts it in two. IDLE: a handler may claim EXITING, then removes the
+   temporaries and exits. COMMITTING: stage_swap's renames are under way; a handler on another thread (an OpenMP
+   worker, which has the signals unblocked) only records the signal in PENDSIG, raised once the renames are done.
+   EXITING: a handler has claimed the exit; the commit never starts, and any other handler waits for the process to
+   end. Both sides move it by compare-and-swap from IDLE, so a handler that has decided to exit and is then
+   descheduled cannot have a commit start under it. Lock-free, so the handler may use it. As the Rust's SIGSTATE */
+enum { SIG_IDLE, SIG_COMMITTING, SIG_EXITING };
+static _Atomic int SIGSTATE = SIG_IDLE;
+_Static_assert(ATOMIC_INT_LOCK_FREE == 2, "the signal state must be lock-free");
+static _Atomic int PENDSIG;   /* stored before the handler's compare-and-swap, so a commit that ended after it saw
+                                  COMMITTING still reads the signal */
+/* KZ_TEST_SIG_PAUSE_MS=N, for tests only: the handler sleeps N ms right after it decides, to exit or to defer, so a
+   test can move the main thread on meanwhile (KZ_TEST_SWAP_PAUSE_MS, swap_pause, holds it before and inside the commit
+   window). Read once by kzmain at startup, before any handler is installed (getenv is not async-signal-safe); unset
+   or 0, nothing sleeps. As the Rust's SIGPAUSE_MS */
+static long SIGPAUSE_MS;
+static void sig_pause(void) {   /* nanosleep, async-signal-safe, through EINTR */
+    struct timespec t = { SIGPAUSE_MS / 1000, (SIGPAUSE_MS % 1000) * 1000000L };
+    while (SIGPAUSE_MS && nanosleep(&t, &t)) {}
+}
+static _Noreturn void await_exit(void) {   /* a handler claimed EXITING and is on its way to _exit: nanosleep until then */
+    struct timespec t = { 1, 0 };
+    for (;;) nanosleep(&t, NULL);
+}
+/* 1 while stage_open creates and records the staged BEDs, with the handled signals blocked in its thread: a handler on
+   another thread that claimed EXITING waits for it to drop, so it never removes the list while a file being made is
+   not yet on it. stage_open sets it, then looks for EXITING; the handler claims EXITING, then looks at it; both
+   sequentially consistent, so one of the two sees the other. Never a mutual wait: the handler waits only for STAGING
+   to drop, and stage_open never waits for a handler, nor exits, with STAGING up. Seeing EXITING it drops STAGING
+   first, nothing yet staged, then waits for that handler to end the process (await_exit); a refusal drops it before
+   die. As the Rust's STAGING */
+static _Atomic int STAGING;
+static void staging_wait(void) {
+    struct timespec t = { 0, 1000000L };
+    while (atomic_load(&STAGING)) nanosleep(&t, NULL);
+}
+/* IDLE to EXITING, then the temporaries removed and _exit; COMMITTING, the signal recorded for stage_swap; EXITING,
+   another handler is ending the process, so this one waits for it */
+static void dbtmpsig(int s) {   /* atexit does not run on a signal */
+    int st = SIG_IDLE;
+    atomic_store(&PENDSIG, s);
+    if (!atomic_compare_exchange_strong(&SIGSTATE, &st, SIG_EXITING)) {
+        if (st == SIG_COMMITTING) { sig_pause(); return; }
+        sig_pause(); await_exit();
+    }
+    sig_pause(); staging_wait();
+    dbtmpclean(); outclean(); _exit(1);
+}
+/* SIGINT, SIGTERM and SIGHUP to h, with all three in sa_mask, so while any one's handler runs on a thread, none of
+   them can interrupt it there: one that claimed EXITING is never suspended under a nested handler, which would see
+   EXITING and wait for it forever (await_exit). A second signal to that thread stays pending until _exit; one to
+   another thread runs its handler there. SA_RESTART, as glibc's signal() gave. As the Rust's catch_signals */
+static void catchsig(void (*h)(int)) {
+    struct sigaction a = { .sa_handler = h, .sa_flags = SA_RESTART };
+    sigemptyset(&a.sa_mask); sigaddset(&a.sa_mask, SIGINT); sigaddset(&a.sa_mask, SIGTERM); sigaddset(&a.sa_mask, SIGHUP);
+    sigaction(SIGINT, &a, NULL); sigaction(SIGTERM, &a, NULL); sigaction(SIGHUP, &a, NULL);
+}
 
-/* --out-dir DIR: one staged BED a selected set, DBTMP[i] for SETK[i] */
-static void stage_open(const char *dir) {
+/* SET.bed.old.* in DIR for a set about to be written: what an uncatchable end inside an earlier commit left (stage_swap).
+   Counted, said once, never touched; a name counts once however many sets it could belong to. As the Rust's
+   stale_warn */
+static void stale_warn(const char *dir) {
+    DIR *dp = opendir(dir); if (!dp) return;
+    size_t n = 0; struct dirent *e;
+    while ((e = readdir(dp))) for (size_t i = 0; i < NSETK; i++) {
+        size_t l = strlen(fset[SETK[i]]);
+        if (!strncmp(e->d_name, fset[SETK[i]], l) && !strncmp(e->d_name + l, ".bed.old.", 9)) { n++; break; }
+    }
+    closedir(dp);
+    if (n) fprintf(stderr, "karyozip: warning: %s holds %zu old BED(s) from an interrupted run (*.bed.old.*); they are left in place\n", dir, n);
+}
+/* For tests only, both read by stage_open, unset or 0 nothing sleeps. KZ_TEST_STAGE_PAUSE_MS=N: it sleeps N ms after
+   it makes each staged BED and before it records it, so a test can signal in what was once a window where the file
+   existed and no handler knew it. KZ_TEST_STAGE_ENTRY_PAUSE_MS=N: it sleeps N ms once STAGING is up and before it
+   looks for EXITING, so a handler on another thread can claim EXITING and find STAGING up (once a mutual wait); as it
+   starts that sleep it writes STAGE_ENTRY_ACK to stderr with one write(2), so the test signals once it is inside. As
+   the Rust's stage_pause */
+#define STAGE_ENTRY_ACK "karyozip: test: staging entry paused\n"
+static long stage_pause_ms(const char *var) {
+    const char *e = getenv(var); long ms = e ? atol(e) : 0;
+    return ms < 0 ? 0 : ms;
+}
+static void stage_sleep(long ms) {
+    struct timespec p = { ms / 1000, (ms % 1000) * 1000000L };
+    while (ms && nanosleep(&p, &p) && errno == EINTR) {}
+}
+/* --out-dir DIR: one staged BED a selected set, DBTMP[i] for SETK[i], each a new random name made exclusively, so
+   never through a symlink; the open descriptors are returned, as the Rust's stage_open */
+static int *stage_open(const char *dir) {
     char pb[4096];
     char *d = xstrdup(dir);                     /* mkdir -p, as the Rust does */
     for (char *q = d + 1; ; q++) if (*q == '/' || !*q) {
@@ -5209,55 +5503,141 @@ static void stage_open(const char *dir) {
         if (pn < 0 || (size_t)pn >= sizeof pb - 16) die("--out-dir: the output path is too long");
         if (!lstat(pb, &ts) && !S_ISREG(ts.st_mode)) die("--out-dir: a set's BED exists and is not a regular file");
     }
+    stale_warn(dir);
     DBTMP = xcalloc(NSETK, sizeof *DBTMP); ndbtmp = NSETK; atexit(dbtmpclean);
-    signal(SIGINT, dbtmpsig); signal(SIGTERM, dbtmpsig); signal(SIGHUP, dbtmpsig);
+    catchsig(dbtmpsig);
+    int *fd = xmalloc(NSETK * sizeof *fd);
+    mode_t um = umask(0); umask(um);
+    long ms = stage_pause_ms("KZ_TEST_STAGE_PAUSE_MS"), ems = stage_pause_ms("KZ_TEST_STAGE_ENTRY_PAUSE_MS");
+    /* each file made and recorded in DBTMP with the handled signals blocked here and STAGING up, so no handler runs
+       between the two: one on this thread waits, pending, until every name is recorded; one on another thread that
+       claimed EXITING waits for STAGING to drop (staging_wait). Every way out drops STAGING first (STAGING) */
+    char **tn = xmalloc(NSETK * sizeof *tn);   /* the templates allocated first: no oom refusal with STAGING up */
     for (size_t i = 0; i < NSETK; i++) {
-        int pn = snprintf(pb, sizeof pb, "%s/%s.bed.tmp.%d", dir, fset[SETK[i]], (int)getpid());
-        if (pn < 0 || (size_t)pn >= sizeof pb - 16) die("--out-dir: the output path is too long");
-        DBTMP[i] = xstrdup(pb);
+        snprintf(pb, sizeof pb, "%s/%s.bed.tmp.XXXXXX", dir, fset[SETK[i]]);   /* fits: checked above */
+        tn[i] = xstrdup(pb);
     }
+    sigset_t hs, was;
+    sigemptyset(&hs); sigaddset(&hs, SIGINT); sigaddset(&hs, SIGTERM); sigaddset(&hs, SIGHUP);
+    pthread_sigmask(SIG_BLOCK, &hs, &was);
+    atomic_store(&STAGING, 1);
+    if (ems) { (void)!write(2, STAGE_ENTRY_ACK, sizeof STAGE_ENTRY_ACK - 1); stage_sleep(ems); }   /* told, then slept */
+    if (atomic_load(&SIGSTATE) == SIG_EXITING) {   /* a handler elsewhere is ending the process, and waits for STAGING */
+        atomic_store(&STAGING, 0); await_exit();
+    }
+    for (size_t i = 0; i < NSETK; i++) {
+        char *t = tn[i];
+        if ((fd[i] = mkstemp(t)) < 0) {
+            atomic_store(&STAGING, 0);
+            for (size_t j = i; j < NSETK; j++) free(tn[j]);
+            free(tn); die("cannot write a derived BED");
+        }
+        stage_sleep(ms);
+        DBTMP[i] = t;
+        (void)!fchmod(fd[i], 0666 & ~um);   /* as a plain create */
+    }
+    atomic_store(&STAGING, 0);
+    pthread_sigmask(SIG_SETMASK, &was, NULL);
+    free(tn);
+    return fd;
 }
-/* the staged BEDs swapped in together, the old ones restored on a failure */
+/* KZ_TEST_SWAP_PAUSE_MS=N, for tests only: a commit, --out-dir's (stage_swap) or -o's (outcommit), sleeps N ms
+   before its window opens and after each of its renames, so a test can act just before and inside the window (with
+   KZ_TEST_SIG_PAUSE_MS, sig_pause). Read nowhere else; unset, nothing sleeps. As the Rust's swap_pause */
+static void swap_pause(void) {
+    static long ms = -1;
+    if (ms < 0) { const char *e = getenv("KZ_TEST_SWAP_PAUSE_MS"); ms = e ? atol(e) : 0; if (ms < 0) ms = 0; }
+    struct timespec t = { ms / 1000, (ms % 1000) * 1000000L };
+    while (ms && nanosleep(&t, &t) && errno == EINTR) {}
+}
+/* The commit window opens: SIGINT, SIGTERM and SIGHUP blocked in this thread, then IDLE to COMMITTING, after which a
+   handler on any other thread only records the signal. When a handler has already claimed EXITING, no rename starts:
+   this waits for that handler to end the process. That handler is on another thread: this one has the three blocked
+   and is in no handler (one that claims EXITING never returns), and catchsig's mask keeps any of them from nesting
+   under it there, so it reaches _exit. As the Rust's commit_begin */
+static void win_open(sigset_t *was) {
+    sigset_t hs; sigemptyset(&hs); sigaddset(&hs, SIGINT); sigaddset(&hs, SIGTERM); sigaddset(&hs, SIGHUP);
+    pthread_sigmask(SIG_BLOCK, &hs, was);
+    int st = SIG_IDLE;
+    if (!atomic_compare_exchange_strong(&SIGSTATE, &st, SIG_COMMITTING)) await_exit();
+}
+/* The window closes, back to IDLE. A deferred signal is raised, pending until the mask is restored, then the handler
+   runs with nothing staged left; unless quiet, when the caller refuses and exits anyway. As the Rust's commit_end */
+static void win_close(const sigset_t *was, int quiet) {
+    atomic_store(&SIGSTATE, SIG_IDLE);
+    if (quiet) return;
+    int ps = atomic_load(&PENDSIG);
+    if (ps) raise(ps);
+    pthread_sigmask(SIG_SETMASK, was, NULL);
+}
+/* The staged BEDs swapped in together. The contract: --out-dir replaces the set of BEDs all or nothing with respect
+   to SIGINT, SIGTERM and SIGHUP and to a failed rename. Either every BED is the new one, or every BED is the old one
+   (or absent, if it was absent before). Each live BED is first renamed onto SET.bed.old.XXXXXX, an empty placeholder
+   made exclusively (mkstemp), so a backup never takes a name in use, a stale backup of an earlier run included; then
+   every staged BED is renamed in; then the backups are removed. On a failed rename every backup is renamed back and
+   every new BED that had no old one removed; when even that fails, the refusal says old BEDs remain. The handled
+   signals are blocked in this thread for all of it, and the window opens only by one compare-and-swap of SIGSTATE,
+   IDLE to COMMITTING, the same one a handler on another thread races, IDLE to EXITING (dbtmpsig). A handler that won
+   exits before any rename, the commit waiting for it; one that lost only records the signal, raised once the renames
+   are done, when nothing staged is left. So a signal leaves every old BED or every new one. An uncatchable end
+   (SIGKILL, OOM, power loss) inside the window can leave old BEDs as SET.bed.old.XXXXXX beside the outputs, and nothing
+   reports them. No directory fsync follows. As the Rust's swap_in */
 static void stage_swap(const char *dir) {
     char pb[4096];
-    char **old = xcalloc(NSETK, sizeof *old); size_t nmv = 0; int bad = 0;
-    for (size_t j = 0; j < NSETK && !bad; j++) {
+    char **ph = xcalloc(NSETK, sizeof *ph); char *had = xcalloc(NSETK, 1), *inst = xcalloc(NSETK, 1);
+    for (size_t j = 0; j < NSETK; j++)   /* allocated first: no die inside the window */
+        if (asprintf(&ph[j], "%s/%s.bed.old.XXXXXX", dir, fset[SETK[j]]) < 0) die("oom");
+    swap_pause();
+    sigset_t was; win_open(&was);
+    int bad = 0, lost = 0;
+    for (size_t j = 0; j < NSETK && !bad; j++) {   /* every live BED onto its own backup name */
         snprintf(pb, sizeof pb, "%s/%s.bed", dir, fset[SETK[j]]);
-        char *o2; if (asprintf(&o2, "%s/%s.bed.old.%d", dir, fset[SETK[j]], (int)getpid()) < 0) die("oom");
-        if (!rename(pb, o2)) { old[j] = o2; } else { free(o2); if (errno != ENOENT) bad = 1; }
+        int pf = mkstemp(ph[j]);
+        if (pf < 0) { bad = 1; break; }
+        close(pf);
+        if (!rename(pb, ph[j])) had[j] = 1;
+        else { int e = errno; unlink(ph[j]); if (e != ENOENT) bad = 1; }
+        swap_pause();
     }
-    for (size_t j = 0; j < NSETK && !bad; j++) {
+    for (size_t j = 0; j < NSETK && !bad; j++) {   /* every staged BED in */
         snprintf(pb, sizeof pb, "%s/%s.bed", dir, fset[SETK[j]]);
-        if (rename(DBTMP[j], pb)) bad = 1; else { free(DBTMP[j]); DBTMP[j] = NULL; nmv++; }
+        if (rename(DBTMP[j], pb)) bad = 1; else inst[j] = 1;
+        swap_pause();
     }
-    if (bad) {
-        for (size_t j = 0; j < nmv; j++) {   /* take the new ones back out */
+    if (bad) {   /* every old one back, over the new one; a new one with no old one removed */
+        for (size_t j = 0; j < NSETK; j++) {
             snprintf(pb, sizeof pb, "%s/%s.bed", dir, fset[SETK[j]]);
-            if (asprintf(&DBTMP[j], "%s/%s.bed.tmp.%d", dir, fset[SETK[j]], (int)getpid()) >= 0)
-                (void)!rename(pb, DBTMP[j]);
+            if (had[j]) { if (rename(ph[j], pb)) lost = 1; }
+            else if (inst[j] && unlink(pb)) lost = 1;
+            if (inst[j]) { free(DBTMP[j]); DBTMP[j] = NULL; }   /* gone from its staged name either way */
         }
-        for (size_t j = 0; j < NSETK; j++) if (old[j]) {
-            snprintf(pb, sizeof pb, "%s/%s.bed", dir, fset[SETK[j]]);
-            (void)!rename(old[j], pb); free(old[j]);
-        }
-        free(old); die("cannot rename a derived BED into place");
+    } else {
+        for (size_t j = 0; j < NSETK; j++) { if (had[j]) unlink(ph[j]); free(DBTMP[j]); DBTMP[j] = NULL; }
     }
-    for (size_t j = 0; j < NSETK; j++) if (old[j]) { remove(old[j]); free(old[j]); }
-    free(old);
+    win_close(&was, bad);
+    for (size_t j = 0; j < NSETK; j++) free(ph[j]);
+    free(ph); free(had); free(inst);
+    if (lost) die2("cannot rename a derived BED into place, nor put every old one back: old BEDs remain as *.bed.old.* under ", dir);
+    if (bad) die("cannot rename a derived BED into place");
 }
 
 /* --smooth --out-dir DIR on a -d track: every --set smoothed into DIR/SET.bed */
 static void smoothsets(const char *path, const char *hier, int v1, const char *dir) {
-    stage_open(dir);
+    int *fd = stage_open(dir);
+    fflush(stdout);
+    /* each set written through stdout, a second descriptor of its file. After the set, stdout is put back from sv
+       first, so dup2 drops only that second descriptor; the set's own one is then synced and closed, last, checked */
+    int sv = dup(1);
+    if (sv < 0) die("cannot write a derived BED");
     for (size_t i = 0; i < NSETK; i++) {
-        fflush(stdout);
-        int fd = open(DBTMP[i], O_WRONLY | O_CREAT | O_TRUNC, 0666);
-        if (fd < 0 || dup2(fd, 1) < 0) die("cannot write a derived BED");
-        close(fd);
+        if (dup2(fd[i], 1) < 0) die("cannot write a derived BED");
         if (i) hierreset();
         smoothcmd(path, hier, fset[SETK[i]], NULL, 0, 0, v1);
         emitflush();   /* the rows emit holds go to this set's file */
+        if (dup2(sv, 1) < 0 || fdfinish(fd[i])) die("write failed");
     }
+    close(sv);
+    free(fd);
     stage_swap(dir);
     fprintf(stderr, "db: %zu smoothed tracks under %s\n", NSETK, dir);
 }
@@ -5275,13 +5655,13 @@ static void decode_db(const char *path, const char *dir) {
     ensurenames(r);
     if (tostd) { o[0].f = stdout; o[0].cap = 1 << 20; o[0].b = xmalloc(o[0].cap); }
     else {
-        stage_open(dir);
+        int *fd = stage_open(dir);
         for (size_t i = 0; i < NSETK; i++) {
-            o[i].f = fopen(DBTMP[i], "w");
-            if (!o[i].f) die("cannot write a derived BED");
+            o[i].fd = fd[i];
             o[i].cap = 1 << 20;
             o[i].b = xmalloc(o[i].cap);
         }
+        free(fd);
     }
     char *jb[2] = { NULL, NULL }; size_t jcap[2] = { 0, 0 }; int jw = 0;   /* joined labels, pending and current */
     /* a label's featureID, parsed the first time its table entry is seen */
@@ -5343,7 +5723,7 @@ static void decode_db(const char *path, const char *dir) {
         for (size_t j = 0; j < nout; j++)
             owput(&o[j], cseq, cseqn, c0[j], c1[j], cl[j], cll[j]);
     for (size_t j = 0; j < nout; j++) {
-        if ((o[j].n && fwrite(o[j].b, 1, o[j].n, o[j].f) != o[j].n) || (tostd ? fflush(o[j].f) : fclose(o[j].f))) die("write failed");
+        if (owwrite(&o[j]) || (tostd ? fflush(o[j].f) : fdfinish(o[j].fd))) die("write failed");
         free(o[j].b);
     }
     free(jb[0]); free(jb[1]); free(fidof);
@@ -5370,29 +5750,45 @@ static const char *regparse(char *r, uint64_t *lo, uint64_t *hi) {
 }
 
 /* -o to a regular file: written under a temporary name, renamed in on success; a device or a FIFO in place */
-static void outsig(int s) { outclean(); dbtmpclean(); (void)s; _exit(1); }
+static void outsig(int s) { dbtmpsig(s); }
+/* the rename inside the same window as --out-dir's (win_open): a handler that claimed EXITING first removes the
+   temporary and exits, the old file kept, and no rename starts; a signal during the rename is raised once it is done,
+   exit 1 with the new file in place. Until the window the handler still sees OUTTMP, so a signal while it is synced
+   removes it. As the Rust's commit_out */
 static void outcommit(void) {
     if (!OUTTMP) return;
     emitflush();
-    if (close(1)) { fprintf(stderr, "karyozip: write failed\n"); exit(1); }   /* NFS reports some errors only here */
-    if (rename(OUTTMP, OUTFIN)) { fprintf(stderr, "karyozip: cannot rename into %s\n", OUTFIN); exit(1); }
-    free(OUTTMP); OUTTMP = NULL;
+    if (fdfinish(1)) { fprintf(stderr, "karyozip: write failed\n"); exit(1); }   /* NFS reports some errors only here */
+    swap_pause();
+    sigset_t was; win_open(&was);
+    int bad = rename(OUTTMP, OUTDST) != 0;
+    if (!bad) { OUTKEPT = OUTTMP; OUTTMP = NULL; }   /* not freed (OUTKEPT) */
+    swap_pause();
+    win_close(&was, bad);
+    if (bad) { fprintf(stderr, "karyozip: cannot rename into %s\n", OUTFIN); exit(1); }   /* atexit's outclean removes it */
 }
 
-/* -i and -o: the file takes the place of stdin or stdout */
+/* -i and -o: the file takes the place of stdin or stdout. -o to a regular file, or to none yet, is staged in a
+   new random name beside it, so a failure to stage is fatal and never truncates the old file. A symlink is
+   resolved and its target staged and replaced, the link kept; a dangling one is refused. As the Rust's redirect */
 static void redirect(const char *path, int fd) {
     struct stat st; int f, ex = !lstat(path, &st);
-    if (fd && (!ex || S_ISREG(st.st_mode)) && asprintf(&OUTTMP, "%s.tmp.XXXXXX", path) >= 0) {
+    const char *dst = path;
+    if (fd && ex && S_ISLNK(st.st_mode)) {
+        char *rp = realpath(path, NULL);
+        if (!rp || stat(rp, &st)) { fprintf(stderr, "karyozip: cannot open %s\n", path); exit(1); }
+        dst = rp;   /* kept to the rename */
+    }
+    if (fd && (!ex || S_ISREG(st.st_mode))) {
+        if (asprintf(&OUTTMP, "%s.tmp.XXXXXX", dst) < 0) die("oom");
         mode_t um = umask(0); umask(um);
         f = mkstemp(OUTTMP);
-        if (f < 0) { free(OUTTMP); OUTTMP = NULL; }
-        else {
-            (void)!fchmod(f, ex ? st.st_mode & 07777 : 0644 & ~um);   /* as a plain create, or the old file's */
-            OUTFIN = path; atexit(outclean);
-            signal(SIGINT, outsig); signal(SIGTERM, outsig); signal(SIGHUP, outsig);
-        }
-    } else f = -1;
-    if (f < 0) f = fd ? open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644) : open(path, O_RDONLY);
+        if (f < 0) { free(OUTTMP); OUTTMP = NULL;
+            fprintf(stderr, "karyozip: cannot create a temporary file beside %s\n", path); exit(1); }
+        (void)!fchmod(f, ex ? st.st_mode & 07777 : 0644 & ~um);   /* as a plain create, or the old file's */
+        OUTFIN = path; OUTDST = dst; atexit(outclean);
+        catchsig(outsig);
+    } else f = open(dst, fd ? O_WRONLY : O_RDONLY);
     if (f < 0 || dup2(f, fd) < 0) { fprintf(stderr, "karyozip: cannot open %s\n", path); exit(1); }
     close(f);
 }
@@ -5404,32 +5800,13 @@ static int kzmain(int argc, char **argv) {
     /* glibc raises its mmap threshold to the first large chunk it frees, after which big buffers stay resident: pin it */
     mallopt(M_MMAP_THRESHOLD, 128 << 10);
     signal(SIGXFSZ, SIG_IGN);
+    { const char *e = getenv("KZ_TEST_SIG_PAUSE_MS"); SIGPAUSE_MS = e ? atol(e) : 0; if (SIGPAUSE_MS < 0) SIGPAUSE_MS = 0; }
     for (int fd = 0; fd < 3; fd++) if (fcntl(fd, F_GETFD) < 0) die("stdin, stdout or stderr is closed");
     atexit(profdump);
     atexit(emitflush);
-    static const char *const USAGE = "usage:\n"
-            "  karyozip compress   [-i IN.bed[.gz]] [-o OUT.kst] [-e low|medium|high] [-n drop]\n"
-            "                      [-d features.tsv [--hier H] -i SET.bed ...] [-a P.paf --ref R.bed|R.kst]\n"
-            "  karyozip decompress -i F [-o OUT.bed] [-n FILE] [-d features.tsv [--set A,B] [--out-dir DIR]]\n"
-            "  karyozip query      -i F -r NAME[:START-END] [-o OUT.bed] [-n FILE]\n"
-            "  karyozip index      -i F        writes F.kzi, which makes query fast on tracks with many reads\n"
-            "  compress reads stdin without -i; decompress and query write stdout without -o\n"
-            "  -e, --effort: low is quickest to compress and query; medium, the default, is smaller and a query\n"
-            "               decodes one block of whole reads; high is smallest and a query decodes the whole file\n"
-            "  -r NAME:START-END is BED, 0-based, END excluded; -r NAME alone is the whole sequence\n"
-            "  --smooth --hier H [--set SET]: decompress and query give KaryoScope's smoothed track; the\n"
-            "               set is the one whose tree holds the track's labels, or --set when two do\n"
-            "               --v1 for tracks of KaryoScope 1.x, --chunk 20000 for those before 2026-01-08\n"
-            "  readers take -n, -d, --hier, -a, --ref as compress was given; -n FILE takes the names\n"
-            "               from a FASTA, FASTQ or list\n"
-            "  -d: --set A,B picks feature sets, default all; without --out-dir they print as columns;\n"
-            "               with --smooth, one set on stdout, or every picked set under --out-dir\n"
-            "  any command: -t N, --threads N  --tmp-dir DIR  -h, --help  --version\n"
-            "  long forms:  -i --input  -o --output  -r --region  -e --effort  -n --names  -d --db  -a --aln\n"
-            "advanced:\n"
-            "  karyozip aln-pack -a P.paf --ref REF.bed|REF.kst -o OUT   cuts a PAF to what -a reads\n"
-            "  -a with --aln-names F: the track names rows by ordinal, F names them\n"
-            "  --smooth --max-gap N: KaryoScope's gap bound, 1000 by default"
+    /* usage.txt, the Rust's too; the Makefile writes it as a literal, last newline dropped */
+    static const char *const USAGE =
+#include "build/usage.inc"
 /* Debug flags, out of the help: -b, --block N|all; --read-blocks N; --raw; --profile */;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) { puts(USAGE); return 0; }
@@ -5445,7 +5822,8 @@ static int kzmain(int argc, char **argv) {
         }
     }
     if (argc < 2) die(USAGE);
-    const char *INS[64]; int NIN = 0;
+    static const char **INS; int NIN = 0;   /* no cap: --db takes one BED per feature set; static, so reachable at exit */
+    INS = xmalloc(mul((size_t)argc, sizeof *INS));
     const char *OUTPUT = NULL, *FSA = NULL, *HIERA = NULL;
     char *REGA = NULL;
     static const struct { const char *f; int nv; } FLAGS[] = {
@@ -5520,7 +5898,6 @@ static int kzmain(int argc, char **argv) {
         else if (!strcmp(a, "--ref")) { ok = inf || pack; ALNREF = v; take = 2; }
         else if (!strcmp(a, "--out-dir")) { ok = dec || (sm && !qry); OUTDIR = v; take = 2; }
         else if (!strcmp(a, "--input")) { ok = !pack;
-            if (NIN == 64) die("too many input files");
             INS[NIN++] = v; take = 2; }
         else if (!strcmp(a, "--output")) { ok = strcmp(cmd, "index") != 0; OUTPUT = v; take = 2; }
         else if (!strcmp(a, "--region")) { ok = qry; REGA = (char *)v; take = 2; }
@@ -5540,6 +5917,8 @@ static int kzmain(int argc, char **argv) {
         if (argv[i][0] == '-' && argv[i][1]) fprintf(stderr, "karyozip: unknown flag %s\n", argv[i]);
         else fprintf(stderr, "karyozip: unexpected argument %s\n", argv[i]);
         exit(1); }
+    if (OUTDIR && !*OUTDIR) die("--out-dir needs a directory");
+    if (OUTDIR && OUTPUT) die("-o and --out-dir: give one");   /* the sets go to DIR, nothing to -o */
     if (NTHREADS > 1024) NTHREADS = 1024;   /* libgomp keeps team state on the stack */
 #ifdef _OPENMP
     omp_set_num_threads(nthreads());   /* teams with no num_threads, bzip3's, follow -t too */
@@ -5550,11 +5929,11 @@ static int kzmain(int argc, char **argv) {
 
     if (sm) { HIERTAB = DBFEATS ? HIERA : NULL; } else HIERTAB = HIERA;   /* smooth's own, and --db's */
     if (NIN > 1 && !(enc && DBFEATS)) die("give one -i");
-    if (OUTPUT && !pack) redirect(OUTPUT, 1);
+    if (pack && (!ALNPAF || !ALNREF || !OUTPUT)) die("usage: karyozip aln-pack -a P.paf --ref REF.bed|REF.kst -o OUT");
+    if (OUTPUT) redirect(OUTPUT, 1);
     if (pack) {
-        if (!ALNPAF || !ALNREF || !OUTPUT) die("usage: karyozip aln-pack -a P.paf --ref REF.bed|REF.kst -o OUT");
         loadref(ALNREF);
-        alnpack(ALNPAF, OUTPUT);
+        alnpack(ALNPAF);
         return 0;
     }
     if (enc) {

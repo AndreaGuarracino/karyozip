@@ -2,6 +2,8 @@
 
 Compresses KaryoScope annotation tracks losslessly, and reads them back without decompressing the whole file.
 
+[KaryoScope](https://github.com/barthel-lab/KaryoScope) annotates assemblies and sequencing reads without alignment. It gives every base of every read or contig a label drawn from one or more hierarchical feature sets (chromosome of origin, satellite, repeat class, and so on), and writes one BED track per feature set. Those tracks are what karyozip stores.
+
 ## Install
 
 ```
@@ -10,6 +12,24 @@ cargo install --path rust       # puts karyozip in ~/.cargo/bin
 ```
 
 It needs cargo, a C and a C++ compiler and libgomp: the codecs under `c/` are compiled into the binary.
+It builds on Linux with glibc and GCC (or a compiler with `-fopenmp` and libgomp), and from a clone only: `rust/build.rs` reads `c/`, so the crate is not published.
+
+## Input
+
+A track is a 4-column BED: sequence name, start, end, label.
+
+```
+m84039_230928_213653_s3/1000/ccs	0	18701	chr1
+m84039_230928_213653_s3/1000/ccs	18701	27109	chr13
+m84039_230928_213653_s3/1007/ccs	0	14778	chrX
+```
+
+Every row must meet these rules, and compress refuses the input with a message otherwise:
+- Each sequence's rows come together, and a sequence never comes back once left.
+- Each sequence starts at 0 and is gapless: every row starts where the one before ended.
+- Every run has a positive length.
+- Names are unique, under 512 bytes, and contain no tab, newline or NUL. Labels contain no newline or NUL.
+- Under `-d`, two touching runs of one sequence must not carry the same label (featureID): merge them first.
 
 ## Quick start
 
@@ -41,11 +61,13 @@ The index costs 7.5 B a read: on short reads it can be larger than the track, on
 | mode | input | flags, on compress and on every read |
 |---|---|---|
 | standard, the default | one BED, or stdin | none |
-| db-informed | one BED per feature set of a sample, in `features.tsv` column order | `-d features.tsv` |
+| db-informed | one BED or plain `.kst` per feature set of a sample, in `features.tsv` column order | `-d features.tsv` |
 | alignment-informed | one BED, with its reads aligned to a reference | `-a P.paf --ref ref.bed` |
 | db + alignment | as db-informed | `-d features.tsv -a P.paf --ref ref.ids.bed` |
 
 Use db-informed when you have every feature set of a sample: one file replaces the per-set files and is smaller than their sum.
+Each set may come as its BED or as its plain `.kst` (what `compress` wrote from that BED, in any mode), known by its magic `KST00001` starting a first line that is not a BED row's start (a name, then a tab, digits, a tab, digits and a tab, no NUL), so a BED whose first name begins with `KST00001` is still a BED, and the two may be mixed: the `.kst` inputs are decoded in step, one row at a time, and the merged file is byte-identical to the one their BEDs give.
+A `.kst` input must be plain: not written with `-d`, `-a` or `-n drop`. A missing set, a wrong order or a refused input is refused in the same words as for BEDs.
 Standard stays the default because db-informed cannot take one BED or stdin, and its file reads back only with the same `features.tsv`.
 
 An alignment-informed file stores only what differs from the reference. The PAF and the reference stay outside the file, and on short reads they cost more than one file saves.
@@ -54,6 +76,7 @@ For queries, give `--ref` as a plain `.kst` track (`compress -e low`): it is rea
 
 ```
 karyozip compress   -d features.tsv -i s.acrocentric.bed.gz -i s.chromosome.bed.gz ... -o s.all.kst
+karyozip compress   -d features.tsv -i s.acrocentric.kst -i s.chromosome.kst ... -o s.all.kst   # the same file, from per-set tracks
 karyozip decompress -d features.tsv -i s.all.kst --out-dir DIR      # every set's BED back
 karyozip decompress -d features.tsv -i s.all.kst --set gene         # one set
 karyozip decompress -d features.tsv -i s.all.kst --smooth --hier hierarchy.tsv --out-dir DIR   # every set smoothed, one BED each
@@ -86,7 +109,7 @@ Read names are stored in the file by default.
 
 | flag | on | effect |
 |---|---|---|
-| `-i`, `--input FILE` | all but aln-pack | compress: the BED, one `-i` per set under `-d`, else stdin; the others: the track |
+| `-i`, `--input FILE` | all but aln-pack | compress: the BED, else stdin; under `-d` one `-i` per set, a BED or a plain `.kst`; the others: the track |
 | `-o`, `--output FILE` | all but index | where the output goes, else stdout; aln-pack: the packed file, required |
 | `-r`, `--region NAME[:START-END]` | query | a sequence, or a range of it |
 | `--smooth` | decompress, query | KaryoScope's smoothed track instead of the stored one; with query the whole sequence is smoothed and the range printed |
@@ -96,13 +119,14 @@ Read names are stored in the file by default.
 | `-n`, `--names ...` | compress, readers | see Read names |
 | `-d`, `--db features.tsv` | compress, readers | see Compression modes |
 | `--set A,B` | decompress, query | the sets of a `-d` track to print, default all; with `--smooth`, the one set smoothed |
-| `--out-dir DIR` | decompress | one BED per set under `-d` |
+| `--out-dir DIR` | decompress | one BED per set under `-d`; the BEDs are replaced all or nothing on a SIGINT, SIGTERM, SIGHUP or failed rename (every new, or every old or absent as before), though an uncatchable kill (SIGKILL, OOM, power loss) mid-commit may leave the old ones as SET.bed.old.XXXXXX beside them |
 | `-a`, `--aln P.paf`, `--ref R` | compress, readers, aln-pack | see Compression modes |
-| `-t`, `--threads N` | all | default the cores, up to 8 |
+| `-t`, `--threads N` | all | default the CPUs this process may run on (its affinity mask: a Slurm or `taskset` allocation), up to 8 |
 | `--tmp-dir DIR` | all | where temporary files go, default /tmp |
 | `-h`, `--help`, `--version` | all | usage; library versions |
 
 Flags work on either side of the command name. The readers are decompress and query.
+No environment variable changes the bytes karyozip writes. Four are read, for the test suite only: `KZ_TEST_SIG_PAUSE_MS`, `KZ_TEST_SWAP_PAUSE_MS`, `KZ_TEST_STAGE_PAUSE_MS` and `KZ_TEST_STAGE_ENTRY_PAUSE_MS` add sleeps at fixed points of a signal, an output commit or `--out-dir`'s staging, and do nothing when unset ([C-and-Rust.md](C-and-Rust.md#tests)).
 
 ## Advanced
 
@@ -111,6 +135,10 @@ Flags work on either side of the command name. The readers are decompress and qu
 | `aln-pack -a P.paf --ref R -o OUT` | | cuts a PAF to what `-a` reads, for many tracks against one alignment |
 | `--aln-names F` | compress, readers | with `-a`: read N is line N+1 of `F` |
 | `--max-gap N` | `--smooth` | KaryoScope's gap bound, 1000 by default |
+| `--raw` | decompress | prints what is stored, without the companion files: featureIDs of a `-d` track, `=` labels and 0 lengths of an `-a` track, ordinals for dropped names |
+| `-b`, `--block N\|all` | compress | blocks of exactly N rows (a block may split a sequence); `all` is one block. Overrides the block size `-e` picks |
+| `--read-blocks N` | compress | blocks of whole sequences, each closing at the first sequence start at or past N rows. The later of `-b` and `--read-blocks` wins |
+| `--profile` | all | a debug flag: per-phase times and peak memory on stderr |
 
 ## How it works
 
@@ -121,3 +149,8 @@ Compress tries its codecs on a sample, and under `medium` and `high` four layout
 ## C and Rust
 
 A C implementation in `c/` writes the same bytes. How to build it, its library, and how the two are kept equal: [C-and-Rust.md](C-and-Rust.md).
+The Rust library's writer (`karyozip::writer::Writer`) returns every error as a `Result` with the CLI's words and never exits the process, and writers may run at once on several threads; the Rust reader, and the C library `libkaryozip.a`, still print a message and exit on an error, and the C library is not thread-safe.
+
+## File format
+
+[FORMAT.md](FORMAT.md) specifies the `.kst` track, the `.kzi` index and the `aln-pack` file. The magic `KST00001` has not changed while flags and codecs were added. 0.3.0 is the first tagged release: what it writes, it reads, and its readers refuse a header flag they do not know by name. A file from an untagged commit before 0.3.0 is not guaranteed to read.

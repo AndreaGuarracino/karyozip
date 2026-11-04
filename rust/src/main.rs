@@ -1,4 +1,6 @@
 use karyozip::{aln, bail as die, bedcoord_r, db, ffi, prof, reader, smooth, writer};
+/// A refusal the library returned: the same `karyozip: ` line and exit as `die`
+use karyozip::die as fatal;
 
 use std::io::{BufWriter, Read, Write};
 
@@ -16,14 +18,17 @@ fn cnt(v: &Option<String>, lo: u64, hi: u64, what: &'static str) -> Option<u64> 
 
 fn main() {
     ffi::ignore_sigxfsz();
+    ffi::sig_test_init();
+    ffi::default_sigpipe();   // a closed stdout ends the process quietly, as it ends the C
     ffi::panic_clean();
     if !ffi::STDFDS_OPEN.load(std::sync::atomic::Ordering::Relaxed) { die("stdin, stdout or stderr is closed"); }
     let c = Cli::get();
-    // --threads, else one per core capped at 8, as the C; the pool is explicit, so no environment variable reaches it
+    // --threads, else one per CPU of the affinity mask capped at 8, as the C; the pool is explicit, so no environment
+    // variable reaches it
     const THRCAP: usize = 8;
     let n = match cnt(&c.threads, 1, 1024, "--threads is a number of 1 to 1024") {
         Some(t) => t as usize,
-        None => std::thread::available_parallelism().map_or(1, |p| p.get()).min(THRCAP),
+        None => ffi::affinity_cpus().min(THRCAP),
     };
     ffi::pin_mmap_threshold();
     ffi::omp_threads(n);
@@ -55,7 +60,10 @@ fn main() {
     let name = c.name();
     let pack = name == "aln-pack";
     if c.input.len() > 1 && !(name == "compress" && c.db.is_some()) { die("give one -i"); }
-    if let (Some(o), false) = (&c.output, pack) { ffi::redirect(o, 1); }
+    if pack && (c.aln.is_none() || c.refbed.is_none() || c.output.is_none()) {
+        die("usage: karyozip aln-pack -a P.paf --ref REF.bed|REF.kst -o OUT");
+    }
+    if let Some(o) = &c.output { ffi::redirect(o, 1); }
     let track = || c.input.first().map(|s| s.as_str())
         .unwrap_or_else(|| die(&format!("{name} needs -i TRACK")));
     match cmd {
@@ -73,7 +81,7 @@ fn main() {
                     let mut w = new_writer(opt, std::path::Path::new(&tmpdir));
                     let aln_on = a.is_some();
                     if let Some(x) = a { w.set_aln(x); }
-                    let used = db::encode(&c.input, &feats, &mut w);
+                    let used = db::encode(&c.input, &feats, &mut w).unwrap_or_else(|e| fatal(&e));
                     w.set_feathash(if used { feats.hierhash } else { feats.hash }, used);
                     finish(w, aln_on);
                 }
@@ -116,6 +124,7 @@ fn main() {
         }
         Cmd::Smooth => {
             let track = track();
+            if c.query && c.region.is_none() { die("query needs -r NAME[:START-END]"); }   // as the C, before anything opens
             let fs = c.feature_set.as_deref();
             if c.out.is_some() && c.db.is_none() { die("--out-dir needs --db"); }
             if let Some(dir) = c.out.as_deref() {   // every set, or those --set names, one BED each
@@ -125,11 +134,13 @@ fn main() {
                 let feats = informed(&c, &mut ro, "decompress ", Some(hier), aln::Lazy::Contig).unwrap();
                 let sets: Vec<Vec<u8>> = feats.setcols(fs).iter().map(|&k| feats.sets[k].clone()).collect();
                 let sr: Vec<&[u8]> = sets.iter().map(|s| s.as_slice()).collect();
-                let tmps = db::stage_open(dir, &sr);
-                for (s, t) in sr.iter().zip(&tmps) {
-                    let mut o = BufWriter::new(std::fs::File::create(t).unwrap_or_else(|_| die("cannot write a derived BED")));
+                let (tmps, fs) = db::stage_open(dir, &sr);
+                for (s, f) in sr.iter().zip(fs) {
+                    let mut o = BufWriter::new(f);
                     smooth::run(track, hier, Some(s), None, 0, 0, c.v1, maxgap, smchunk, &ro, Some(&feats), &mut o);
-                    o.flush().unwrap_or_else(|_| die("write failed"));
+                    // synced and closed, checked, before any BED is renamed in
+                    let f = o.into_inner().unwrap_or_else(|_| die("write failed"));
+                    if !ffi::finish(f) { die("write failed"); }
                 }
                 db::stage_done(dir, &sr, &tmps);
                 eprintln!("db: {} smoothed tracks under {dir}", sr.len());
@@ -154,13 +165,12 @@ fn main() {
             reader::Reader::open_with(track, &ro).build_index(track)
         }
         Cmd::AlnPack => {
-            let (Some(paf), Some(rbed), Some(dest)) = (&c.aln, &c.refbed, &c.output)
-                else { die("usage: karyozip aln-pack -a P.paf --ref REF.bed|REF.kst -o OUT") };
+            let (Some(paf), Some(rbed)) = (&c.aln, &c.refbed) else { unreachable!() };
             let mut a = aln::Aln::default();
-            a.load_ref(rbed, aln::Lazy::No);
+            a.load_ref(rbed, aln::Lazy::No).unwrap_or_else(|e| fatal(&e));
             let rh = aln::refhash(&a);
-            a.load_paf(paf);
-            aln::pack(&a, dest, rh);
+            a.load_paf(paf).unwrap_or_else(|e| fatal(&e));
+            aln::pack(&a, rh);
         }
     }
     ffi::commit_out();
@@ -171,8 +181,8 @@ fn main() {
 fn finish(w: writer::Writer, aln_on: bool) {
     let so = std::io::stdout();
     let mut o = BufWriter::new(so.lock());
-    let st = w.close(&mut o).unwrap_or_else(|m| die(&m));
-    o.flush().unwrap_or_else(|e| die(&e.to_string()));
+    let st = w.close(&mut o).unwrap_or_else(|e| fatal(&e));
+    o.flush().unwrap_or_else(|_| die("write failed"));
     if aln_on {
         eprintln!("aln: {} of {} rows matched the reference ({:.1}%)", st.alnhit,
                   st.rows, if st.rows > 0 { 100.0 * st.alnhit as f64 / st.rows as f64 } else { 0.0 });
@@ -205,10 +215,10 @@ fn informed(c: &Cli, ro: &mut reader::ReadOpts, who: &str, hier: Option<&str>,
 }
 
 fn load_feats(fp: &str, hier: Option<&str>) -> db::Feats {
-    let mut f = db::Feats::load(fp);
+    let mut f = db::Feats::load(fp).unwrap_or_else(|e| fatal(&e));
     eprintln!("features: {} ids, {} sets", f.nids, f.sets.len());
     if f.sets.len() <= 32 { eprintln!("features: integer-tuple index on"); }
-    if let Some(h) = hier { f.load_hier(h); }
+    if let Some(h) = hier { f.load_hier(h).unwrap_or_else(|e| fatal(&e)); }
     f
 }
 
@@ -222,9 +232,9 @@ fn load_aln(paf: &Option<String>, refbed: &Option<String>,
         (Some(p), Some(r)) => {
             // The C loads the ordinal map first, and the diagnostics are compared line for line
             let mut a = aln::Aln::default();
-            if let Some(o) = ordfile { a.load_ordinals(o); }
-            a.load_ref(r, lazy);
-            a.load_aln(p);
+            if let Some(o) = ordfile { a.load_ordinals(o).unwrap_or_else(|e| fatal(&e)); }
+            a.load_ref(r, lazy).unwrap_or_else(|e| fatal(&e));
+            a.load_aln(p).unwrap_or_else(|e| fatal(&e));
             Some(a)
         }
     }
@@ -232,8 +242,7 @@ fn load_aln(paf: &Option<String>, refbed: &Option<String>,
 
 /// The staging file goes under tmpdir; the C's words if it cannot
 fn new_writer(opt: writer::Options, tmpdir: &std::path::Path) -> writer::Writer {
-    writer::Writer::new(opt, tmpdir).unwrap_or_else(|_| die(&format!(
-        "cannot create a temp file under {} (see --tmp-dir)", tmpdir.display())))
+    writer::Writer::new(opt, tmpdir).unwrap_or_else(|e| fatal(&e))
 }
 
 fn encode(opt: writer::Options, tmpdir: &std::path::Path, a: Option<aln::Aln>) {
@@ -258,7 +267,7 @@ fn encode(opt: writer::Options, tmpdir: &std::path::Path, a: Option<aln::Aln>) {
             for r in a.rows.iter().flatten() {
                 w.push(&a.b[r.nm.0 as usize..r.nm.1 as usize], r.en - r.st,
                       &a.b[r.lab.0 as usize..r.lab.1 as usize], r.st, r.same)
-                    .unwrap_or_else(|m| die(&m));
+                    .unwrap_or_else(|e| fatal(&e));
             }
             drop(_s);
             if let Some(h) = h { h.join().unwrap_or_else(|_| die("the reader thread failed")); }
@@ -398,8 +407,15 @@ fn fill_rows(s: &[u8], from: usize, to: usize, out: &mut Vec<Row>) -> Result<(),
 
 // The command line, parsed as the C parses it: the same flags, either side of the command, the same refusals in order
 
-/// The C's own usage text, lifted from karyozip.c by build.rs
-pub const USAGE: &str = include_str!(concat!(env!("OUT_DIR"), "/usage.txt"));
+/// The usage text, c/usage.txt, which the C embeds too; its last newline dropped, as the C's Makefile drops it
+pub const USAGE: &str = chomp(include_str!("../../c/usage.txt"));
+
+const fn chomp(s: &str) -> &str {
+    match s.as_bytes() {
+        [rest @ .., b'\n'] => match std::str::from_utf8(rest) { Ok(r) => r, Err(_) => s },
+        _ => s,
+    }
+}
 
 pub enum Cmd { Encode, Decode, Smooth, Index, AlnPack }
 
@@ -452,12 +468,17 @@ impl Cli {
     pub fn get() -> Cli {
         let mut av: Vec<String> = std::env::args().skip(1).collect();
         for a in &av {
-            if a == "--help" || a == "-h" { println!("{USAGE}"); std::process::exit(0); }
+            if a == "--help" || a == "-h" {
+                let _ = std::io::stdout().write_all(format!("{USAGE}\n").as_bytes()).and_then(|_| std::io::stdout().flush());
+                std::process::exit(0);
+            }
             if a == "--version" {
-                println!("karyozip {}, format KST00001\n  zstd       {}\n  libbz3     {}\n  htscodecs  {}\n  libdeflate {}\n  liblzma    {}",
-                         env!("CARGO_PKG_VERSION"), karyozip::ffi::zstd_version(),
-                         karyozip::ffi::bzip3_version(), karyozip::ffi::HTSCODECS_VERSION, karyozip::ffi::LIBDEFLATE_VERSION,
-                         karyozip::ffi::lzma_version());
+                // one write, as the C's one buffered printf: println! panics on a closed pipe
+                let v = format!("karyozip {}, format KST00001\n  zstd       {}\n  libbz3     {}\n  htscodecs  {}\n  libdeflate {}\n  liblzma    {}\n",
+                                env!("CARGO_PKG_VERSION"), karyozip::ffi::zstd_version(),
+                                karyozip::ffi::bzip3_version(), karyozip::ffi::HTSCODECS_VERSION, karyozip::ffi::LIBDEFLATE_VERSION,
+                                karyozip::ffi::lzma_version());
+                let _ = std::io::stdout().write_all(v.as_bytes()).and_then(|_| std::io::stdout().flush());
                 std::process::exit(0);
             }
         }
@@ -546,6 +567,8 @@ impl Cli {
             die(&if a.starts_with('-') && a.len() > 1 { format!("unknown flag {a}") }
                  else { format!("unexpected argument {a}") });
         }
+        if o.out.as_ref().is_some_and(|d| d.is_empty()) { die("--out-dir needs a directory"); }
+        if o.out.is_some() && o.output.is_some() { die("-o and --out-dir: give one"); }   // the sets go to DIR, nothing to -o
         o
     }
 
@@ -554,5 +577,27 @@ impl Cli {
             Cmd::Encode => "compress", Cmd::Decode | Cmd::Smooth => if self.query { "query" } else { "decompress" },
             Cmd::Index => "index", Cmd::AlnPack => "aln-pack",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::regparse;
+
+    #[test]
+    fn regparse_names_and_ranges() {
+        assert_eq!(regparse("chr1"), ("chr1", 0, 0));
+        assert_eq!(regparse("chr1:100-200"), ("chr1", 100, 200));
+        assert_eq!(regparse("chr1:0-1"), ("chr1", 0, 1));
+        // a name may hold ':'; only a final :START-END of digits is a range
+        assert_eq!(regparse("HLA:A*01"), ("HLA:A*01", 0, 0));
+        assert_eq!(regparse("a:b:5-10"), ("a:b", 5, 10));
+        assert_eq!(regparse("chr1:5-10:x"), ("chr1:5-10:x", 0, 0));
+        assert_eq!(regparse("chr1:1e2-3e2"), ("chr1:1e2-3e2", 0, 0));
+        assert_eq!(regparse("chr1:+1-5"), ("chr1:+1-5", 0, 0));
+        assert_eq!(regparse("chr1:-5"), ("chr1:-5", 0, 0));
+        assert_eq!(regparse("chr1:5-"), ("chr1:5-", 0, 0));
+        assert_eq!(regparse("chr1:"), ("chr1:", 0, 0));
+        assert_eq!(regparse("c:0-18446744073709551615"), ("c", 0, u64::MAX));
     }
 }

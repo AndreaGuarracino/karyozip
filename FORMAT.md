@@ -1,6 +1,6 @@
 # The KST00001 file format
 
-This document specifies the `.kst` track that karyozip 0.3.0 writes, plus its two companion files: the `.kzi` name index and the `KSTAL1` packed alignment.
+This document specifies the `.kst` track that karyozip 0.3.x writes (0.3.1 changed no format), plus its two companion files: the `.kzi` name index and the `KSTAL1` packed alignment.
 It was derived from the code, mainly `rust/src/writer.rs` (`Writer::close`), `rust/src/reader.rs` (`Reader::open_with`, `block_dec`, `rmheads`, `ilv_split`, `grp_unpack`, the name decoders, `build_index`, `idxlookup`), `rust/src/kst.rs`, `rust/src/aln.rs` and `c/karyozip.c`.
 Where the code and this document disagree, the code is what existing files contain. Please report the disagreement.
 

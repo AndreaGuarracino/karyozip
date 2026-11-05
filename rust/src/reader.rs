@@ -120,7 +120,7 @@ pub struct Reader {
 
 /// What decoding one block needs, copied for each decode-ahead thread
 #[derive(Clone)]
-struct Dec { b: Vec<Blk>, data0: u64, rows: u64, lencodec: i32, idcodec: i32, ilv: bool, runhead: bool, grp: bool }
+struct Dec { b: Vec<Blk>, data0: u64, lencodec: i32, idcodec: i32, ilv: bool, runhead: bool, grp: bool }
 
 /// A decoded block: its two regions back to back, the split, its rows, the run-count prefix sums
 type Decoded = (Vec<u8>, usize, u64, Option<Vec<u32>>);
@@ -147,7 +147,7 @@ fn block_dec(f: &mut std::fs::File, d: &Dec, b: usize) -> Decoded {
     let mut data = if d.ilv { ilv_split(data, lraw, raw, m.rows) } else { data };
     let (mut split, mut tab) = (lraw, None);
     if d.runhead {   // close the gap the run counts leave, as the C's memmove
-        let (sp, t) = rmheads(&mut data[..lraw], d.rows, m.rows, m.nrd);
+        let (sp, t) = rmheads(&mut data[..lraw], m.rows, m.nrd);
         split = sp;
         data.copy_within(lraw.., split);
         data.truncate(split + raw); data.shrink_to_fit();   // the heads' touched tail goes back
@@ -551,7 +551,7 @@ impl Reader {
     }
 
     fn dec(&self) -> Dec {
-        Dec { b: self.b.clone(), data0: self.data0, rows: self.rows, lencodec: self.lencodec, idcodec: self.idcodec,
+        Dec { b: self.b.clone(), data0: self.data0, lencodec: self.lencodec, idcodec: self.idcodec,
               ilv: self.ilv, runhead: self.runhead, grp: self.grp }
     }
 
@@ -631,10 +631,11 @@ pub(crate) fn ilv_split(v: Vec<u8>, nl: usize, ni: usize, rows: u64) -> Vec<u8> 
 }
 
 /// The run counts head every read on disk: lifted into rtab in place, as the C's memmove, so every walk sees its old layout
-fn rmheads(lens: &mut [u8], total: u64, rows: u64, nrd: u64) -> (usize, Vec<u32>) {
+fn rmheads(lens: &mut [u8], rows: u64, nrd: u64) -> (usize, Vec<u32>) {
     let (mut w, mut i, mut seen) = (0usize, 0usize, 0u64);
-    // 4 B a read, as the C's counts
-    if total > u32::MAX as u64 { crate::bail("corrupt index: a sequence offset past 32 bits"); }
+    // 4 B a read, as the C's counts: the running row count within this block, so the block's rows must fit 32
+    // bits, not the file's (a track past 2^32 rows reads fine; the C refuses the same offsets in runidx)
+    if rows > u32::MAX as u64 { crate::bail("corrupt index: a sequence offset past 32 bits"); }
     let mut tab: Vec<u32> = Vec::with_capacity(nrd as usize + 1);
     tab.push(0);
     while i < lens.len() {

@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+- Rust reader: a track with more than 2^32 rows in all, written with the run counts heading each read (the `interleaved` layout `-e medium` can pick), no longer fails `decompress` and `query` with `corrupt index: a sequence offset past 32 bits`. The check compared the file's row count against 32 bits, but the table it guards holds the running row count within one block; it now checks the block's rows, as the C reader does. The writer and the format are unchanged: such files written by 0.3.0 read with this fix. Found on a 5,223,834,528-row whole-library ONT track (64,281,433 reads, 1,246 blocks), which now reads back byte for byte, as it already did with the C reader.
+
 ## 0.3.0 (2026-11-03)
 
 The first tagged release. File format `KST00001` ([FORMAT.md](FORMAT.md)); files written by 0.3.0 read with this release, and readers now refuse header flags they do not know instead of misreading them.

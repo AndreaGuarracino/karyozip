@@ -12,10 +12,40 @@ const IDXMAGIC: u64 = 0x3130_5844_4954_534b;   // "KSTIDX01"
 type Cached = (usize, std::sync::Arc<Vec<u8>>, usize, u64);
 pub type Shared = (Cached, std::sync::Arc<Vec<u32>>);
 
-fn ordinals(n: u64) -> Vec<u8> {
-    let mut v = Vec::with_capacity(crate::ckalloc(n as usize * 8));
-    for i in 0..n { crate::kst::putu64(&mut v, i); v.push(b'\n'); }
-    v
+/// A track's names once decoded. Ordinal and integer names are not spelled out as text: a read-level track
+/// has a billion of them, and the text and its offsets would take about 17 bytes a sequence
+pub enum Names {
+    /// the ordinals 0, 1, ..., h[0] - 1: no table at all
+    Ord,
+    /// integer names (INTFLAG) that are not the ordinals, 8 bytes a sequence
+    Int(Vec<u64>),
+    /// every name back to back, noff[i]..noff[i+1] is name i
+    Text(Vec<u8>, Vec<u64>),
+}
+
+/// One name: borrowed from the decoded text, or an integer name spelled in decimal on the stack
+pub enum Nm<'a> { B(&'a [u8]), D([u8; 20], u8) }
+
+impl Nm<'_> {
+    fn dec(v: u64) -> Nm<'static> { let mut b = [0u8; 20]; let n = kst::putu64_at(&mut b, v); Nm::D(b, n as u8) }
+}
+
+impl std::ops::Deref for Nm<'_> {
+    type Target = [u8];
+    #[inline]
+    fn deref(&self) -> &[u8] { match self { Nm::B(s) => s, Nm::D(b, n) => &b[..*n as usize] } }
+}
+
+/// The rank an ordinal-named track gives `seq`: its decimal value when it spells one below n without a leading zero
+fn ord_rank(seq: &[u8], n: u64) -> i64 {
+    if seq.is_empty() || seq.len() > 20 || (seq.len() > 1 && seq[0] == b'0') || !seq.iter().all(u8::is_ascii_digit) {
+        return -1;
+    }
+    let mut v = 0u64;
+    for &c in seq {
+        match v.checked_mul(10).and_then(|v| v.checked_add((c - b'0') as u64)) { Some(x) => v = x, None => return -1 }
+    }
+    if v < n { v as i64 } else { -1 }
 }
 
 /// --names FILE: a FASTA, a FASTQ, or one name per line; rank N is record N
@@ -79,8 +109,8 @@ pub struct Reader {
     taildec: bool,
     tailpred: u64,
     tailskip: u64,
-    /// every name back to back, noff[i]..noff[i+1] is name i, decoded from the names stream on first use
-    names: std::cell::OnceCell<std::sync::Arc<(Vec<u8>, Vec<u64>)>>,
+    /// the names, decoded from the names stream on first use
+    names: std::cell::OnceCell<std::sync::Arc<Names>>,
     /// the names stream's offset and size: read when the names are, as the C's nz_off, not held by every reader
     nz_off: u64,
     nzl: usize,
@@ -431,7 +461,7 @@ impl Reader {
         let (mut name, mut lab) = (Vec::new(), Vec::new());
         for i in 0..self.nreads {
             let nruns = self.locate(i).2;
-            name.clear(); name.extend_from_slice(self.name_at(i));
+            name.clear(); name.extend_from_slice(&self.name_at(i));
             self.alnq = self.aln.as_ref().and_then(|a| a.find(&name));
             let mut st = 0u64;
             for k in 0..nruns {
@@ -489,7 +519,7 @@ impl Reader {
         self.prefetch();
         for i in 0..self.nreads {
             let nruns = self.locate(i).2;
-            name.clear(); name.extend_from_slice(self.name_at(i));
+            name.clear(); name.extend_from_slice(&self.name_at(i));
             self.alnq = self.aln.as_ref().and_then(|a| a.find(&name));
             let mut st = 0u64;
             for k in 0..nruns {
@@ -763,20 +793,34 @@ fn fld_names_d(b: &[u8], cnt: u64) -> Vec<u8> {
     o
 }
 
-fn int_names_d(b: &[u8], cnt: u64) -> Vec<u8> {
+/// The integer names as numbers, not text; the ordinals 0..cnt are no table at all
+fn int_names_d(b: &[u8], cnt: u64) -> Names {
     let v = zdec(b, "int names");
-    let mut o = Vec::with_capacity(crate::ckalloc(cnt as usize * 8));
+    // The cap is checked in BYTES and the Vec reserved in ELEMENTS (with_capacity(bytes) once reserved 8x).
+    // Nothing is allocated while the names are still exactly their ordinals: an integer stream that encodes
+    // 0..cnt (the dense case) costs no table, and the first mismatch at i reconstructs the prefix 0..i.
+    let n_el = usize::try_from(cnt).unwrap_or_else(|_| crate::bail("corrupt file: an impossible allocation size"));
+    crate::ckalloc(n_el.checked_mul(8).unwrap_or_else(|| crate::bail("corrupt file: an impossible allocation size")));
+    let mut o: Option<Vec<u64>> = None;
     let (mut q, mut cur) = (0usize, 0u64);
-    for _ in 0..cnt {
+    for i in 0..cnt {
         let (u, n) = vget(&v, q);
         q = n;
         cur = cur.wrapping_add(unzz(u));
         if cur > 1 << 50 { crate::bail("corrupt names: an integer name past 2^50"); }
-        kst::putu64(&mut o, cur);
-        o.push(b'\n');
+        match &mut o {
+            Some(t) => t.push(cur),
+            None if cur != i => {
+                let mut t = Vec::with_capacity(n_el);
+                t.extend(0..i);
+                t.push(cur);
+                o = Some(t);
+            }
+            None => {}
+        }
     }
     if q != v.len() { crate::bail("corrupt names: the integer stream has more than the count"); }
-    o
+    match o { Some(t) => Names::Int(t), None => Names::Ord }
 }
 
 /// Tokenised names, the reader path's form: a refusal exits, as the C's tokd
@@ -981,7 +1025,7 @@ impl Reader {
     }
 
     /// What the C's ensurenames does: the names by their codec, from --names FILE, or the ordinals
-    fn decode_names(&self) -> (Vec<u8>, Vec<u64>) {
+    fn decode_names(&self) -> Names {
         let (dropped, names_int) = (self.nf & 1 != 0, self.nf & 2 != 0);
         let (names_tok, names_fld) = (self.nf & 4 != 0, self.nf & 8 != 0);
         let (n, has) = (self.nreads, self.nzl > 0);
@@ -1000,13 +1044,13 @@ impl Reader {
             if !self.raw {
                 crate::bail("the names of this track were dropped at compress time: give them back with --names FILE");
             }
-            ordinals(n)
+            return Names::Ord;
         } else if !has {
-            ordinals(n)
+            return Names::Ord;
         } else if names_fld {
             fld_names_d(&nz(), n)
         } else if names_int {
-            int_names_d(&nz(), n)
+            return int_names_d(&nz(), n);
         } else if names_tok {
             tok_d(&nz())
         } else {
@@ -1022,7 +1066,7 @@ impl Reader {
         if noff.len() as u64 - 1 != n {
             crate::bail("names stream does not match the track's sequence count");
         }
-        (names, noff)
+        Names::Text(names, noff)
     }
 
     /// The C's namesrc: an index is bound to the --names FILE it was built under, by path and stat
@@ -1065,7 +1109,7 @@ impl Reader {
             (o < n && ixget(&ent, bit, 32) == ixfp(h, o)).then_some(o)
         }).collect();
         if hits.len() == 1 && self.names.get().is_none() { return hits[0] as i64; }   // one fingerprint: no name to decode
-        hits.into_iter().find(|&o| self.name_at(o) == nm).map_or(-1, |o| o as i64)
+        hits.into_iter().find(|&o| *self.name_at(o) == *nm).map_or(-1, |o| o as i64)
     }
 
     /// As find, but a one-block track decodes its block before the names, as the C, so the codec's memory is gone first
@@ -1079,15 +1123,17 @@ impl Reader {
     pub fn find(&self, seq: &[u8]) -> i64 {
         let hit = self.idxlookup(seq);
         if hit >= 0 { return hit; }
+        if self.nreads > u32::MAX as u64 { crate::bail("more than 2^32 sequences: the name table stores the ordinal in 32 bits"); }
+        // ordinal names: the name is the rank, so no table (it would take 8 bytes or more a sequence) and no repeat
+        if matches!(*self.names_shared(), Names::Ord) { return ord_rank(seq, self.nreads); }
         let (tab, mask) = self.nameix.get_or_init(|| {
-            if self.nreads > u32::MAX as u64 { crate::bail("more than 2^32 sequences: the name table stores the ordinal in 32 bits"); }
             let mut cap = 1u64; while cap < self.nreads * 2 { cap <<= 1; }
             let (mut tab, mask) = (vec![u32::MAX; cap as usize], cap - 1);
             for i in 0..self.nreads {
                 let nm = self.name_at(i);
-                let mut s = (kst::fnv(FNV0, nm) & mask) as usize;
+                let mut s = (kst::fnv(FNV0, &nm) & mask) as usize;
                 while tab[s] != u32::MAX {
-                    if self.name_at(tab[s] as u64) == nm { crate::bail("a sequence name repeats: the names are not usable"); }
+                    if *self.name_at(tab[s] as u64) == *nm { crate::bail("a sequence name repeats: the names are not usable"); }
                     s = (s + 1) & mask as usize;
                 }
                 tab[s] = i as u32;
@@ -1096,7 +1142,7 @@ impl Reader {
         });
         let mut s = (kst::fnv(FNV0, seq) & mask) as usize;
         while tab[s] != u32::MAX {
-            if self.name_at(tab[s] as u64) == seq { return tab[s] as i64; }
+            if *self.name_at(tab[s] as u64) == *seq { return tab[s] as i64; }
             s = (s + 1) & *mask as usize;
         }
         -1
@@ -1218,10 +1264,10 @@ impl Reader {
         let w = ixw(n.max(1));
         let mut k = 0u32;
         while k < 30 && (1u64 << (k + 2)) < n { k += 1; }   // about 4 reads a bucket
-        let hs: Vec<u64> = (0..n).map(|i| h64b(self.name_at(i))).collect();
+        // the hashes are taken again on the rare retry, not kept: 8 bytes a sequence beside the keys and the table
         let key = loop {                                   // a count must fit its byte
-            let mut key: Vec<(u64, u64)> = hs.iter().enumerate()
-                .map(|(i, &h)| ((if k > 0 { (h >> (64 - k)) << 32 } else { 0 }) | ixfp(h, i as u64), i as u64)).collect();
+            let mut key: Vec<(u64, u64)> = (0..n)
+                .map(|i| { let h = h64b(&self.name_at(i)); ((if k > 0 { (h >> (64 - k)) << 32 } else { 0 }) | ixfp(h, i), i) }).collect();
             key.sort_unstable();
             let top = key.chunk_by(|a, b| a.0 >> 32 == b.0 >> 32).map(|c| c.len()).max().unwrap_or(0);
             if top <= 255 { break key; }
@@ -1276,15 +1322,20 @@ impl Reader {
     pub fn nlabels(&self) -> usize { self.lab.len() }
     pub fn has_aln(&self) -> bool { self.aln.is_some() }
     pub fn label_at(&self, i: usize) -> &[u8] { &self.lab[i] }
-    pub fn name_at(&self, i: u64) -> &[u8] {
-        let (names, noff) = &**self.names.get_or_init(|| std::sync::Arc::new(self.decode_names()));
-        let i = i as usize; &names[noff[i] as usize..noff[i + 1] as usize - 1]
+    /// Name `i`, decoding the names on first use; an ordinal or integer name is spelled on the spot
+    #[inline]
+    pub fn name_at(&self, i: u64) -> Nm<'_> {
+        match &**self.names.get_or_init(|| std::sync::Arc::new(self.decode_names())) {
+            Names::Ord => Nm::dec(i),
+            Names::Int(v) => Nm::dec(v[i as usize]),
+            Names::Text(names, noff) => { let i = i as usize; Nm::B(&names[noff[i] as usize..noff[i + 1] as usize - 1]) }
+        }
     }
     /// The decoded names for a worker's reader of the same track, decoded once, as the C's smooth_mt borrows them
-    pub fn names_shared(&self) -> std::sync::Arc<(Vec<u8>, Vec<u64>)> {
+    pub fn names_shared(&self) -> std::sync::Arc<Names> {
         self.names.get_or_init(|| std::sync::Arc::new(self.decode_names())).clone()
     }
-    pub fn adopt_names(&mut self, n: std::sync::Arc<(Vec<u8>, Vec<u64>)>) { let _ = self.names.set(n); }
+    pub fn adopt_names(&mut self, n: std::sync::Arc<Names>) { let _ = self.names.set(n); }
     pub fn labels(&self) -> &[Vec<u8>] { &self.lab }
     /// run count of sequence `ri`, from the index alone
     pub fn nruns_of(&mut self, ri: u64) -> u64 { self.locate(ri).2 }
@@ -1343,7 +1394,7 @@ impl Reader {
     pub fn seq_rows(&mut self, ri: u64, labmap: &[i32], isnovel: &[u8], root: i32,
                     out: &mut SeqRows) {
         let (blk, off, nruns) = self.locate(ri);
-        self.alnq = self.aln.as_ref().and_then(|a| a.find(self.name_at(ri)));
+        self.alnq = self.aln.as_ref().and_then(|a| a.find(&self.name_at(ri)));
         let mut c = match self.sc.take() {
             Some((b, o, mut c)) if b == blk && o <= off => {
                 for _ in o..off { c.lp = skip(&c.data, c.lp); c.ip = skip(&c.data, c.ip); }
@@ -1390,3 +1441,58 @@ pub struct RowStream { c: Cursor, ri: u64, k: u64, nruns: u64, st: u64, emitted:
 /// One sequence as arrays, reused across sequences
 #[derive(Default)]
 pub struct SeqRows { pub st: Vec<u64>, pub en: Vec<u64>, pub feat: Vec<i32>, pub nov: Vec<u8> }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn int_stream(names: &[&str]) -> Vec<u8> {
+        let text: Vec<u8> = names.iter().flat_map(|n| format!("{n}\n").into_bytes()).collect();
+        let raw = crate::writer::int_names(&text, names.len() as u64).expect("integer names");
+        crate::ffi::zstd(&raw, 3)
+    }
+
+    #[test]
+    fn int_names_keep_exactly_one_u64_a_name_and_none_for_ordinals() {
+        // non-consecutive integers: the table holds them, reserved in elements (not 8x)
+        let names = ["5", "3", "1000000", "0", "42"];
+        match int_names_d(&int_stream(&names), names.len() as u64) {
+            Names::Int(t) => {
+                assert_eq!(t, vec![5, 3, 1_000_000, 0, 42]);
+                assert!(t.capacity() >= names.len() && t.capacity() < 2 * names.len(), "capacity is in elements, not bytes");
+            }
+            _ => panic!("expected an integer table"),
+        }
+        // the dense case encoded as integers: no table at all
+        assert!(matches!(int_names_d(&int_stream(&["0", "1", "2", "3"]), 4), Names::Ord));
+        // a mismatch after an ordinal prefix rebuilds the prefix
+        match int_names_d(&int_stream(&["0", "1", "2", "7", "8"]), 5) {
+            Names::Int(t) => {
+                assert_eq!(t, vec![0, 1, 2, 7, 8]);
+                assert!(t.capacity() >= 5 && t.capacity() < 10);
+            }
+            _ => panic!("expected an integer table"),
+        }
+    }
+
+    #[test]
+    fn ord_rank_is_the_canonical_decimal_below_n() {
+        assert_eq!(ord_rank(b"0", 1), 0);
+        assert_eq!(ord_rank(b"11", 12), 11);
+        assert_eq!(ord_rank(b"12", 12), -1);
+        for bad in [&b""[..], b"00", b"011", b"-1", b"+1", b"1x", b" 1", b"99999999999999999999", b"184467440737095516160"] {
+            assert_eq!(ord_rank(bad, u32::MAX as u64), -1, "{}", String::from_utf8_lossy(bad));
+        }
+        assert_eq!(ord_rank(b"4294967294", u32::MAX as u64), 4294967294);
+    }
+
+    #[test]
+    fn nm_spells_integers_as_the_text_did() {
+        for v in [0u64, 7, 10, 999, 1 << 50, u64::MAX] {
+            let mut want = Vec::new();
+            kst::putu64(&mut want, v);
+            assert_eq!(&*Nm::dec(v), &want[..]);
+        }
+        assert_eq!(&*Nm::B(b"chr1"), b"chr1");
+    }
+}

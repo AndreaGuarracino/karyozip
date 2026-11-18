@@ -489,6 +489,22 @@ for f in gap ovl; do must_fail "$f" $KT compress --block 4 < "$W/$f.bed"; done
 printf '0\t0\t10\tA\n1\t0\t10\tB\n2\t0\t10\tC\n' > "$W/ord2.bed"
 $KT compress --block 4 < "$W/ord2.bed" > "$W/ord2.kt" 2>/dev/null
 $KT decompress -i "$W/ord2.kt" 2>/dev/null | cmp -s - "$W/ord2.bed" && ok "ordinal names: round-trip" || no "ordinal names: DIFFERS"
+# a lookup by name on ordinal and integer names, which the readers answer without spelling every name
+for i in $(seq 0 11); do printf '%s\t0\t5\tA\n%s\t5\t9\tB\n' $i $i; done > "$W/ord12.bed"
+awk -F'\t' -v OFS='\t' '{$1 = $1 * 7 + 3; print}' "$W/ord12.bed" > "$W/int12.bed"
+for t in ord12 int12; do $KT compress --block 4 < "$W/$t.bed" > "$W/$t.kt" 2>/dev/null; done
+n=0
+for q in 0 7 11; do $KT query -i "$W/ord12.kt" -r $q 2>/dev/null | cmp -s - <(grep -P "^$q\t" "$W/ord12.bed") && n=$((n+1)); done
+for q in 3 52 80; do $KT query -i "$W/int12.kt" -r $q 2>/dev/null | cmp -s - <(grep -P "^$q\t" "$W/int12.bed") && n=$((n+1)); done
+$KT query -i "$W/ord12.kt" -r 11:0-100 2>/dev/null | cmp -s - <(grep -P '^11\t' "$W/ord12.bed") && n=$((n+1))
+[ "$n" = 7 ] && ok "ordinal and integer names: query by name" || no "ordinal and integer names: query by name, only $n/7"
+for q in 12 011 00 -1 1x "" 99999999999999999999999; do
+  amf "ordinal names: query -r '$q' not found" "sequence not found" $KT query -i "$W/ord12.kt" -r "$q:0-1"
+done
+for q in 0 4 03; do amf "integer names: query -r '$q' not found" "sequence not found" $KT query -i "$W/int12.kt" -r "$q:0-1"; done
+cp "$W/ord12.kt" "$W/ord12i.kt"; $KT index -i "$W/ord12i.kt" >/dev/null 2>&1
+$KT query -i "$W/ord12i.kt" -r 9 2>/dev/null | cmp -s - <(grep -P '^9\t' "$W/ord12.bed") && ok "ordinal names: query through the index" || no "ordinal names: query through the index WRONG"
+$KT decompress -i "$W/int12.kt" 2>/dev/null | cmp -s - "$W/int12.bed" && ok "integer names: round-trip" || no "integer names: DIFFERS"
 
 # a last line with no newline: refused
 printf 'a\t0\t10\tA' > "$W/nonl.bed"

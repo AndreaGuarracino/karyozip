@@ -115,6 +115,19 @@ cp "$W/ci.kst" "$W/ri.kst"
 if [ $irc = 0 ] && [ $irr = 0 ] && cmp -s "$W/ci.kst" "$W/ri.kst"; then tpass "index: byte-identical trailer"
 else tfail "index: TRAILERS DIFFER (rc $irc/$irr)"; fi
 both "index cross-read" query -i "$W/ci.kst" -r seq0005; tally "index cross-read"
+cmp -s "$W/ci.kst.kzi" "$W/ri.kst.kzi" && tpass "index: byte-identical .kzi" || tfail "index: .kzi FILES DIFFER"
+# ordinal names (an empty names stream): the Rust spells them on the spot, the C from its table
+for i in $(seq 0 2999); do printf '%s\t0\t%s\tA\n' $i $((i % 7 + 1)); done > "$W/oi.bed"
+"$C" compress < "$W/oi.bed" > "$W/coi.kst" 2>/dev/null; cp "$W/coi.kst" "$W/roi.kst"
+"$C" index -i "$W/coi.kst" >/dev/null 2>&1; irc=$?
+"$R" index -i "$W/roi.kst" >/dev/null 2>&1; irr=$?
+[ $irc = 0 ] && [ $irr = 0 ] && cmp -s "$W/coi.kst.kzi" "$W/roi.kst.kzi" && tpass "index, ordinal names: byte-identical .kzi" || tfail "index, ordinal names: .kzi FILES DIFFER (rc $irc/$irr)"
+for q in 0 1234 2999; do both "query, ordinal names, indexed" query -i "$W/coi.kst" -r $q; done
+cp "$W/coi.kst" "$W/oi.kst"
+for q in 0 1234 2999; do both "query, ordinal names" query -i "$W/oi.kst" -r $q; done
+EXPECT=fail both "query, ordinal names, a leading zero" query -i "$W/oi.kst" -r 0123
+EXPECT=fail both "query, ordinal names, past the count" query -i "$W/oi.kst" -r 3000; EXPECT=ok
+tally "ordinal names"
 fi
 
 # 7. reader flags: dropped names, --raw

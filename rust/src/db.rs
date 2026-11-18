@@ -321,7 +321,7 @@ impl Brd {
                     std::mem::swap(&mut self.pseq, &mut self.seq);
                     self.pen = self.en;
                 }
-                self.seq.clear(); self.seq.extend_from_slice(nm);
+                self.seq.clear(); self.seq.extend_from_slice(&nm);
                 (self.st, self.en) = (st, en);
                 let samelab = l == self.lab.as_slice();
                 if !samelab { self.lab.clear(); self.lab.extend_from_slice(l); self.labid = u32::MAX - 1; }

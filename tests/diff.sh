@@ -151,6 +151,8 @@ done
 for q in $(head -1 "$W/ov.bed" | cut -f1) $(sed -n 300p "$W/ov.bed" | cut -f1) $(tail -1 "$W/ov.bed" | cut -f1); do
   both "query, overflowed bucket, indexed" query -i "$W/cov.kst" -r $q; done
 for q in 0 131072 200000; do both "query, 200,001 names, indexed" query -i "$W/cbi.kst" -r $q; done
+printf 'r0\t0\t10\tA\nr1\t0\t10\tB\n' | "$C" compress --names drop > "$W/pd.kst" 2>/dev/null; printf 'r0\nr1\n' > "$W/pd.txt"
+EXPECT=fail both "index from piped names: refused alike" --names <(cat "$W/pd.txt") index -i "$W/pd.kst"
 cp "$W/coi.kst" "$W/oi.kst"
 for q in 0 1234 2999; do both "query, ordinal names" query -i "$W/oi.kst" -r $q; done
 EXPECT=fail both "query, ordinal names, a leading zero" query -i "$W/oi.kst" -r 0123

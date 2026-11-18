@@ -3661,6 +3661,7 @@ static void buildhash(R *r) {
 }
 
 static uint64_t NAMESRC_H;
+static int NAMESRC_READ, NAMESRC_REG;   /* the names were read; from a regular file */
 static uint64_t stathash(const struct stat *st) {
     uint64_t h = fnvbuf(FNV0, NAMEFILE, strlen(NAMEFILE));
     /* the fields as the Rust's namesrc: seven little-endian words */
@@ -3706,7 +3707,8 @@ static char *readnamefile(uint64_t nreads) {
             NAMESRC_H = stathash(&st0);
             if (S_ISREG(st0.st_mode) && stathash(&st1) != NAMESRC_H)
                 die("the file given to --names changed while it was read");
-            if (!S_ISREG(st0.st_mode)) NAMESRC_H = 0; }   /* a pipe cannot bind an index */
+            if (!S_ISREG(st0.st_mode)) NAMESRC_H = 0;    /* a pipe cannot bind an index */
+            NAMESRC_READ = 1; NAMESRC_REG = S_ISREG(st0.st_mode) != 0; }
         if (ferror(nf)) die("read error on a companion file");
         free(ln); fclose(nf);
 
@@ -3779,6 +3781,14 @@ static uint64_t h64b(const char *s) {
     for (; *s; s++) { h ^= (unsigned char)*s; h *= 0xff51afd7ed558ccdULL; h ^= h >> 32; }
     return h;
 }
+/* 0 when --names is not a regular file: a pipe gives no identity to bind an index to, so no index is built from one
+   and none is trusted under one (the same pipe can carry other names in another order) */
+static int namesrc_reg(void) {
+    if (!NAMEFILE) return 1;
+    if (NAMESRC_READ) return NAMESRC_REG;
+    struct stat st; if (stat(NAMEFILE, &st)) die("cannot stat the file given to --names");
+    return S_ISREG(st.st_mode) != 0;
+}
 static uint64_t namesrc(void) {
     if (!NAMEFILE) return 0;
     if (NAMESRC_H) return NAMESRC_H;
@@ -3818,6 +3828,7 @@ static uint64_t ixget(const uint8_t *p, uint64_t bit, int nb) {
 static void swap_pause(void);
 static void buildindex(const char *path) {
     R *r = ropen(path);
+    if (!namesrc_reg()) die("an index needs a regular file for --names, not a pipe: the names it was built from could not be told from others later");
     ensurenames(r);
     if (r->nreads > 0xffffffffu)
         die("more than 2^32 sequences: the index stores the ordinal in 32 bits");
@@ -3878,6 +3889,7 @@ static int64_t idxlookup(R *r, const char *path, const char *nm) {
     int fd = open(ip, O_RDONLY);
     free(ip);
     if (fd < 0) return -1;
+    if (!namesrc_reg()) { close(fd); return -1; }
     struct stat st;
     if (fstat(fd, &st) || (size_t)st.st_size < 40) { close(fd); return -1; }
     void *m = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);

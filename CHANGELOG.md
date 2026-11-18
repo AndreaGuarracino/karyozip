@@ -39,6 +39,11 @@ The file format and every byte written are unchanged.
   bind an index whose keys came from the old file, and a query under the new file could then return the wrong
   sequence. It now takes the binding from the file it opened and refuses a file changed while it was read, as the
   C already did. The C now also stats the path before opening it, so a file swapped in before the open is caught.
+- `index --names` from a pipe or other non-regular file is refused (C and Rust), and a query whose `--names`
+  is not a regular file never uses an index beside the track. A pipe has no identity to bind an index to: the
+  Rust bound every pipe alike, so an index built from a pipe was trusted under a pipe carrying other names in
+  another order, and a unique fingerprint hit returned the wrong sequence. Lookups through a pipe now read its
+  names, as `decompress` does. Regular files keep the fast indexed path.
 
 ## 0.3.1 (2026-11-05)
 

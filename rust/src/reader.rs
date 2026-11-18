@@ -50,7 +50,7 @@ fn ord_rank(seq: &[u8], n: u64) -> i64 {
 
 /// --names FILE: a FASTA, a FASTQ, or one name per line; rank N is record N. With the names, the binding an index
 /// built from them carries: the stat of the file opened, checked again on its path once read, as the C's NAMESRC_H
-fn read_name_file(path: &str, nreads: u64) -> (Vec<u8>, u64) {
+fn read_name_file(path: &str, nreads: u64) -> (Vec<u8>, Option<u64>) {
     let f = std::fs::File::open(path).unwrap_or_else(|_| crate::bail("cannot open the file given to --names"));
     let m0 = rd(f.metadata(), "cannot stat the file given to --names");
     let mut data = Vec::new();
@@ -59,8 +59,8 @@ fn read_name_file(path: &str, nreads: u64) -> (Vec<u8>, u64) {
         let m1 = rd(std::fs::metadata(path), "cannot stat the file given to --names");
         let b = names_bind_of(path, &m0);
         if names_bind_of(path, &m1) != b { crate::bail("the file given to --names changed while it was read"); }
-        b
-    } else { 0 };                                       // a pipe cannot bind an index
+        Some(b)
+    } else { None };                                    // a pipe cannot bind an index
     // getline gives no line after a final newline, and the split does
     let mut lines: Vec<&[u8]> = data.split(|&c| c == b'\n').collect();
     if data.last() == Some(&b'\n') { lines.pop(); }
@@ -137,7 +137,7 @@ pub struct Reader {
     nzl: usize,
     names_file: Option<String>,
     /// the --names FILE's binding, taken from the file the names were read from (the C's NAMESRC_H)
-    names_bind: std::cell::OnceCell<u64>,
+    names_bind: std::cell::OnceCell<Option<u64>>,
     /// dropped, int, tok, fld
     nf: u8,
     /// the appended index: offset of its key table, and its trailer's binding word
@@ -1096,12 +1096,14 @@ impl Reader {
 
     /// The C's namesrc: an index is bound to the --names FILE it was built under, by path and stat
     /// once the names are read, the binding of the file they came from; before, the file now at the path
-    fn namesrc(&self) -> u64 {
-        let Some(f) = self.names_file.as_ref() else { return 0 };
+    /// None when the --names FILE is not a regular file: a pipe gives no identity to bind an index to, so no index
+    /// is built from one and none is trusted under one (the same pipe can carry other names in another order)
+    fn namesrc(&self) -> Option<u64> {
+        let Some(f) = self.names_file.as_ref() else { return Some(0) };
         if let Some(&b) = self.names_bind.get() { return b; }
         let m = rd(std::fs::metadata(f), "cannot stat the file given to --names");
-        if !m.is_file() { return 0; }
-        names_bind_of(f, &m)
+        if !m.is_file() { return None; }
+        Some(names_bind_of(f, &m))
     }
 
     /// The appended index, as the C reads it: the bucket, its fingerprints, a name decoded only when needed
@@ -1112,7 +1114,8 @@ impl Reader {
         let n = self.nreads;
         let (nb, w) = (1u64 << k, ixw(n.max(1)));
         let ns = nb.div_ceil(1024);
-        if bind != self.mhash ^ self.namesrc() || pay != nb + ns * 8 + (n * (32 + w)).div_ceil(8) + 8 { return -1; }
+        let Some(src) = self.namesrc() else { return -1 };
+        if bind != self.mhash ^ src || pay != nb + ns * 8 + (n * (32 + w)).div_ceil(8) + 8 { return -1; }
         // only the name's bucket is read, as the C's mmap touches only it
         let h = h64b(nm);
         let b = if k > 0 { h >> (64 - k) } else { 0 };
@@ -1278,6 +1281,7 @@ fn h64b(s: &[u8]) -> u64 {
 impl Reader {
     /// Appends a name index to the track, magic last so a torn write is simply not seen
     pub fn build_index(&mut self, path: &str) {
+        if self.namesrc().is_none() { crate::bail("an index needs a regular file for --names, not a pipe: the names it was built from could not be told from others later"); }
         if self.nreads > u32::MAX as u64 {
             crate::bail("more than 2^32 sequences: the index stores the ordinal in 32 bits");
         }
@@ -1345,7 +1349,7 @@ impl Reader {
         // the names were read above, so this is the binding of the file they came from, and nothing between the
         // temporary file and its commit can fail but the write itself
         crate::ffi::swap_pause();                          // tests only: a --names swap lands here
-        let bind = self.mhash ^ self.namesrc();
+        let bind = self.mhash ^ self.namesrc().unwrap_or_else(|| crate::bail("an index needs a regular file for --names, not a pipe: the names it was built from could not be told from others later"));
         // beside the track in TRACK.kzi, under a new random name made exclusively (as the C's mkstemp), synced and
         // closed, its length checked, then renamed into place
         let ip = format!("{path}.kzi");

@@ -796,18 +796,31 @@ fn fld_names_d(b: &[u8], cnt: u64) -> Vec<u8> {
 /// The integer names as numbers, not text; the ordinals 0..cnt are no table at all
 fn int_names_d(b: &[u8], cnt: u64) -> Names {
     let v = zdec(b, "int names");
-    let mut o: Vec<u64> = Vec::with_capacity(crate::ckalloc(cnt as usize * 8));
-    let (mut q, mut cur, mut ord) = (0usize, 0u64, true);
+    // The cap is checked in BYTES and the Vec reserved in ELEMENTS (with_capacity(bytes) once reserved 8x).
+    // Nothing is allocated while the names are still exactly their ordinals: an integer stream that encodes
+    // 0..cnt (the dense case) costs no table, and the first mismatch at i reconstructs the prefix 0..i.
+    let n_el = usize::try_from(cnt).unwrap_or_else(|_| crate::bail("corrupt file: an impossible allocation size"));
+    crate::ckalloc(n_el.checked_mul(8).unwrap_or_else(|| crate::bail("corrupt file: an impossible allocation size")));
+    let mut o: Option<Vec<u64>> = None;
+    let (mut q, mut cur) = (0usize, 0u64);
     for i in 0..cnt {
         let (u, n) = vget(&v, q);
         q = n;
         cur = cur.wrapping_add(unzz(u));
         if cur > 1 << 50 { crate::bail("corrupt names: an integer name past 2^50"); }
-        ord &= cur == i;
-        o.push(cur);
+        match &mut o {
+            Some(t) => t.push(cur),
+            None if cur != i => {
+                let mut t = Vec::with_capacity(n_el);
+                t.extend(0..i);
+                t.push(cur);
+                o = Some(t);
+            }
+            None => {}
+        }
     }
     if q != v.len() { crate::bail("corrupt names: the integer stream has more than the count"); }
-    if ord { Names::Ord } else { Names::Int(o) }
+    match o { Some(t) => Names::Int(t), None => Names::Ord }
 }
 
 /// Tokenised names, the reader path's form: a refusal exits, as the C's tokd
@@ -1432,6 +1445,35 @@ pub struct SeqRows { pub st: Vec<u64>, pub en: Vec<u64>, pub feat: Vec<i32>, pub
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn int_stream(names: &[&str]) -> Vec<u8> {
+        let text: Vec<u8> = names.iter().flat_map(|n| format!("{n}\n").into_bytes()).collect();
+        let raw = crate::writer::int_names(&text, names.len() as u64).expect("integer names");
+        crate::ffi::zstd(&raw, 3)
+    }
+
+    #[test]
+    fn int_names_keep_exactly_one_u64_a_name_and_none_for_ordinals() {
+        // non-consecutive integers: the table holds them, reserved in elements (not 8x)
+        let names = ["5", "3", "1000000", "0", "42"];
+        match int_names_d(&int_stream(&names), names.len() as u64) {
+            Names::Int(t) => {
+                assert_eq!(t, vec![5, 3, 1_000_000, 0, 42]);
+                assert!(t.capacity() >= names.len() && t.capacity() < 2 * names.len(), "capacity is in elements, not bytes");
+            }
+            _ => panic!("expected an integer table"),
+        }
+        // the dense case encoded as integers: no table at all
+        assert!(matches!(int_names_d(&int_stream(&["0", "1", "2", "3"]), 4), Names::Ord));
+        // a mismatch after an ordinal prefix rebuilds the prefix
+        match int_names_d(&int_stream(&["0", "1", "2", "7", "8"]), 5) {
+            Names::Int(t) => {
+                assert_eq!(t, vec![0, 1, 2, 7, 8]);
+                assert!(t.capacity() >= 5 && t.capacity() < 10);
+            }
+            _ => panic!("expected an integer table"),
+        }
+    }
 
     #[test]
     fn ord_rank_is_the_canonical_decimal_below_n() {

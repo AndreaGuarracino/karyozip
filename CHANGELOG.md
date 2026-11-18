@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased
+
+The file format and every byte written are unchanged.
+
+### Changed
+- Rust reader: names that are ordinals (no names stored) or integers are no longer spelled out as text for
+  every sequence before the first block. Ordinal names keep no table, and integer names keep one `u64` each,
+  or nothing when they are exactly 0..n-1. On an 808 M-read short-read track, `decompress` fell from 14.3 GB
+  to under 0.2 GB of peak memory, with identical output and slightly less time. `query` on an ordinal track
+  reads the rank from the name directly. The C reader is unchanged.
+- **Rust API (for crates that use `karyozip::reader`):** `Reader::name_at(i)` now returns `Nm<'_>`, which
+  derefs to `[u8]`, instead of `&[u8]`. `names_shared` / `adopt_names` now carry `Arc<Names>`. Most callers
+  only need to borrow:
+
+  ```rust
+  // before: let name: &[u8] = reader.name_at(i);
+  let nm = reader.name_at(i);   // keep the Nm alive while the slice is used
+  let name: &[u8] = &nm;
+  ```
+
+  A numeric name is spelled into the `Nm` when it is asked for, so a slice must not outlive its `Nm`.
+
 ## 0.3.1 (2026-11-05)
 
 A bug-fix release. The file format is unchanged, and 0.3.1 reads every file 0.3.0 wrote.

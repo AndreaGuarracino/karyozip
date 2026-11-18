@@ -1,8 +1,9 @@
 # Changelog
 
-## Unreleased
+## 0.3.2 (2026-11-18)
 
-The file format and every byte written are unchanged.
+A performance release. The file format and every byte written are unchanged, and 0.3.2 reads every file 0.3.0
+and 0.3.1 wrote. One Rust API change, noted below, affects crates that call `karyozip::reader`.
 
 ### Changed
 - Rust reader: names that are ordinals (no names stored) or integers are no longer spelled out as text for

@@ -3661,6 +3661,7 @@ static void buildhash(R *r) {
 }
 
 static uint64_t NAMESRC_H;
+static int NAMESRC_READ, NAMESRC_REG;   /* the names were read; from a regular file */
 static uint64_t stathash(const struct stat *st) {
     uint64_t h = fnvbuf(FNV0, NAMEFILE, strlen(NAMEFILE));
     /* the fields as the Rust's namesrc: seven little-endian words */
@@ -3672,10 +3673,11 @@ static uint64_t stathash(const struct stat *st) {
 }
 static char *readnamefile(uint64_t nreads) {
     char *names;
+        /* stat the path (a cookie stream has no descriptor of its own) before it is opened, so a file put in its
+           place before the open fails the check after the read instead of binding the index to the new file */
+        struct stat st0; if (stat(NAMEFILE, &st0)) die("cannot open the file given to --names");
         FILE *nf = zfopen(NAMEFILE);
         if (!nf) die("cannot open the file given to --names");
-        /* stat the path: a cookie stream has no descriptor of its own */
-        struct stat st0; if (stat(NAMEFILE, &st0)) die("cannot stat the file given to --names");
         size_t cap = 1 << 20, w = 0;
         names = xmalloc(cap);
         char *ln = NULL; size_t lcap = 0; uint64_t got = 0, lineno = 0; int fq = 2;
@@ -3705,7 +3707,8 @@ static char *readnamefile(uint64_t nreads) {
             NAMESRC_H = stathash(&st0);
             if (S_ISREG(st0.st_mode) && stathash(&st1) != NAMESRC_H)
                 die("the file given to --names changed while it was read");
-            if (!S_ISREG(st0.st_mode)) NAMESRC_H = 0; }   /* a pipe cannot bind an index */
+            if (!S_ISREG(st0.st_mode)) NAMESRC_H = 0;    /* a pipe cannot bind an index */
+            NAMESRC_READ = 1; NAMESRC_REG = S_ISREG(st0.st_mode) != 0; }
         if (ferror(nf)) die("read error on a companion file");
         free(ln); fclose(nf);
 
@@ -3778,6 +3781,14 @@ static uint64_t h64b(const char *s) {
     for (; *s; s++) { h ^= (unsigned char)*s; h *= 0xff51afd7ed558ccdULL; h ^= h >> 32; }
     return h;
 }
+/* 0 when --names is not a regular file: a pipe gives no identity to bind an index to, so no index is built from one
+   and none is trusted under one (the same pipe can carry other names in another order) */
+static int namesrc_reg(void) {
+    if (!NAMEFILE) return 1;
+    if (NAMESRC_READ) return NAMESRC_REG;
+    struct stat st; if (stat(NAMEFILE, &st)) die("cannot stat the file given to --names");
+    return S_ISREG(st.st_mode) != 0;
+}
 static uint64_t namesrc(void) {
     if (!NAMEFILE) return 0;
     if (NAMESRC_H) return NAMESRC_H;
@@ -3814,8 +3825,10 @@ static uint64_t ixget(const uint8_t *p, uint64_t bit, int nb) {
     return (ld64(p + (bit >> 3)) >> (bit & 7)) & ((1ULL << nb) - 1);
 }
 
+static void swap_pause(void);
 static void buildindex(const char *path) {
     R *r = ropen(path);
+    if (!namesrc_reg()) die("an index needs a regular file for --names, not a pipe: the names it was built from could not be told from others later");
     ensurenames(r);
     if (r->nreads > 0xffffffffu)
         die("more than 2^32 sequences: the index stores the ordinal in 32 bits");
@@ -3823,6 +3836,7 @@ static void buildindex(const char *path) {
     int w = ixw(n ? n : 1), k = 0;
     while (k < 30 && (1ULL << (k + 2)) < n) k++;          /* about 4 reads a bucket */
     for (;; k++) {                                        /* a count must fit its byte */
+        if (k > 32) die("more than 255 sequences in one bucket at the widest index (32 bucket bits): cannot index");
         for (uint64_t i = 0; i < n; i++) {
             uint64_t h = h64b(r->name[i]);
             key[2 * i] = (k ? (h >> (64 - k)) << 32 : 0) | IXFP(h, i); key[2 * i + 1] = i;
@@ -3832,6 +3846,7 @@ static void buildindex(const char *path) {
         for (uint64_t i = 0; i < n; i++) { run = i && key[2 * i] >> 32 == key[2 * i - 2] >> 32 ? run + 1 : 1; if (run > top) top = run; }
         if (top <= 255) break;
     }
+    swap_pause();                                         /* tests only: a --names swap lands here */
     uint64_t nb = 1ULL << k, ns = (nb + 1023) / 1024, eb = (n * (32 + (uint64_t)w) + 7) / 8 + 8;
     uint64_t pay = nb + ns * 8 + eb, dup = 0;
     uint8_t *t = xcalloc(pay, 1), *cnt = t, *ent = t + nb + ns * 8;
@@ -3874,6 +3889,7 @@ static int64_t idxlookup(R *r, const char *path, const char *nm) {
     int fd = open(ip, O_RDONLY);
     free(ip);
     if (fd < 0) return -1;
+    if (!namesrc_reg()) { close(fd); return -1; }
     struct stat st;
     if (fstat(fd, &st) || (size_t)st.st_size < 40) { close(fd); return -1; }
     void *m = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);

@@ -606,7 +606,8 @@ pub fn drop_out() {
 
 /// KZ_TEST_SWAP_PAUSE_MS=N, for tests only: a commit, --out-dir's (db.rs swap_in) or -o's (commit_out), sleeps N ms
 /// before its window opens and after each of its renames, so a test can act just before and inside the window (with
-/// KZ_TEST_SIG_PAUSE_MS). Read nowhere else; unset, nothing sleeps. As the C's swap_pause
+/// KZ_TEST_SIG_PAUSE_MS). `index` also sleeps once, after the names are hashed and before its output is opened, so a
+/// test can replace the --names FILE mid-build. Read nowhere else; unset, nothing sleeps. As the C's swap_pause
 pub fn swap_pause() {
     static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     let ms = *MS.get_or_init(|| std::env::var("KZ_TEST_SWAP_PAUSE_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(0));

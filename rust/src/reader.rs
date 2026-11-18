@@ -48,9 +48,19 @@ fn ord_rank(seq: &[u8], n: u64) -> i64 {
     if v < n { v as i64 } else { -1 }
 }
 
-/// --names FILE: a FASTA, a FASTQ, or one name per line; rank N is record N
-fn read_name_file(path: &str, nreads: u64) -> Vec<u8> {
-    let data = crate::slurp(path, "cannot open the file given to --names");
+/// --names FILE: a FASTA, a FASTQ, or one name per line; rank N is record N. With the names, the binding an index
+/// built from them carries: the stat of the file opened, checked again on its path once read, as the C's NAMESRC_H
+fn read_name_file(path: &str, nreads: u64) -> (Vec<u8>, Option<u64>) {
+    let f = std::fs::File::open(path).unwrap_or_else(|_| crate::bail("cannot open the file given to --names"));
+    let m0 = rd(f.metadata(), "cannot stat the file given to --names");
+    let mut data = Vec::new();
+    if std::io::Read::read_to_end(&mut crate::unzip(f), &mut data).is_err() { crate::bail("read error on a companion file"); }
+    let bind = if m0.is_file() {
+        let m1 = rd(std::fs::metadata(path), "cannot stat the file given to --names");
+        let b = names_bind_of(path, &m0);
+        if names_bind_of(path, &m1) != b { crate::bail("the file given to --names changed while it was read"); }
+        Some(b)
+    } else { None };                                    // a pipe cannot bind an index
     // getline gives no line after a final newline, and the split does
     let mut lines: Vec<&[u8]> = data.split(|&c| c == b'\n').collect();
     if data.last() == Some(&b'\n') { lines.pop(); }
@@ -76,7 +86,18 @@ fn read_name_file(path: &str, nreads: u64) -> Vec<u8> {
         eprintln!("--names: the file has {got} records, the track has {nreads} sequences. Rank N is the Nth record only when every record produced rows, so this file cannot name it.");
         crate::bail("name file does not match the track");
     }
-    out
+    (out, bind)
+}
+
+/// The binding word of a --names FILE: its path and seven stat fields, as the C's stathash
+fn names_bind_of(path: &str, m: &std::fs::Metadata) -> u64 {
+    use std::os::linux::fs::MetadataExt;
+    let mut h = kst::fnv(FNV0, path.as_bytes());
+    for v in [m.st_size(), m.st_ino(), m.st_dev(), m.st_mtime() as u64, m.st_mtime_nsec() as u64,
+              m.st_ctime() as u64, m.st_ctime_nsec() as u64] {
+        h = kst::fnv(h, &v.to_le_bytes());
+    }
+    h
 }
 
 /// One block: where it is, both frame and decoded sizes, its rows, the bases before it, its own hash
@@ -115,6 +136,8 @@ pub struct Reader {
     nz_off: u64,
     nzl: usize,
     names_file: Option<String>,
+    /// the --names FILE's binding, taken from the file the names were read from (the C's NAMESRC_H)
+    names_bind: std::cell::OnceCell<Option<u64>>,
     /// dropped, int, tok, fld
     nf: u8,
     /// the appended index: offset of its key table, and its trailer's binding word
@@ -441,7 +464,7 @@ impl Reader {
             taildec, tailpred: h[12], tailskip: h[13] & 0xff, iz, coff, cpend, ibx: Vec::new(), cur_chunk: u64::MAX,
             runhead, ilv, grp, rtab: Default::default(), varblk, rtab_blk: usize::MAX,
             names: std::cell::OnceCell::new(), nz_off, nzl, names_file: o.names_file.clone(),
-            nf, idx,
+            names_bind: std::cell::OnceCell::new(), nf, idx,
             mhash: h[15], cur_ri: 0, cur_q: 0, cur_pend: 0, cached: None, sc: None,
             rowhash: if h1_raw & ALNFLAG != 0 { 0 } else { h[13] >> 8 },
             plainref: h1_raw & (ALNFLAG | DBFLAG | DROPPED) == 0,
@@ -1039,7 +1062,9 @@ impl Reader {
             if !dropped && has {
                 crate::bail("this track stores its own names: --names FILE would replace them, so it is refused. Unset it to read the names in the file");
             }
-            read_name_file(f, n)
+            let (v, b) = read_name_file(f, n);
+            let _ = self.names_bind.set(b);
+            v
         } else if dropped && !has {
             if !self.raw {
                 crate::bail("the names of this track were dropped at compress time: give them back with --names FILE");
@@ -1070,17 +1095,15 @@ impl Reader {
     }
 
     /// The C's namesrc: an index is bound to the --names FILE it was built under, by path and stat
-    fn namesrc(&self) -> u64 {
-        use std::os::linux::fs::MetadataExt;
-        let Some(f) = self.names_file.as_ref() else { return 0 };
+    /// once the names are read, the binding of the file they came from; before, the file now at the path
+    /// None when the --names FILE is not a regular file: a pipe gives no identity to bind an index to, so no index
+    /// is built from one and none is trusted under one (the same pipe can carry other names in another order)
+    fn namesrc(&self) -> Option<u64> {
+        let Some(f) = self.names_file.as_ref() else { return Some(0) };
+        if let Some(&b) = self.names_bind.get() { return b; }
         let m = rd(std::fs::metadata(f), "cannot stat the file given to --names");
-        if !m.is_file() { return 0; }
-        let mut h = kst::fnv(FNV0, f.as_bytes());
-        for v in [m.st_size() as u64, m.st_ino(), m.st_dev(), m.st_mtime() as u64, m.st_mtime_nsec() as u64,
-                  m.st_ctime() as u64, m.st_ctime_nsec() as u64] {
-            h = kst::fnv(h, &v.to_le_bytes());
-        }
-        h
+        if !m.is_file() { return None; }
+        Some(names_bind_of(f, &m))
     }
 
     /// The appended index, as the C reads it: the bucket, its fingerprints, a name decoded only when needed
@@ -1091,7 +1114,8 @@ impl Reader {
         let n = self.nreads;
         let (nb, w) = (1u64 << k, ixw(n.max(1)));
         let ns = nb.div_ceil(1024);
-        if bind != self.mhash ^ self.namesrc() || pay != nb + ns * 8 + (n * (32 + w)).div_ceil(8) + 8 { return -1; }
+        let Some(src) = self.namesrc() else { return -1 };
+        if bind != self.mhash ^ src || pay != nb + ns * 8 + (n * (32 + w)).div_ceil(8) + 8 { return -1; }
         // only the name's bucket is read, as the C's mmap touches only it
         let h = h64b(nm);
         let b = if k > 0 { h >> (64 - k) } else { 0 };
@@ -1257,55 +1281,148 @@ fn h64b(s: &[u8]) -> u64 {
 impl Reader {
     /// Appends a name index to the track, magic last so a torn write is simply not seen
     pub fn build_index(&mut self, path: &str) {
+        if self.namesrc().is_none() { crate::bail("an index needs a regular file for --names, not a pipe: the names it was built from could not be told from others later"); }
         if self.nreads > u32::MAX as u64 {
             crate::bail("more than 2^32 sequences: the index stores the ordinal in 32 bits");
         }
+        // Count and place: pass 1 hashes every name and counts per bucket, pass 2 hashes again and scatters one
+        // 8-byte key (fingerprint << 32 | ordinal) into its bucket, each bucket is sorted, and the entries are
+        // bit-packed out through a small buffer. 8 bytes a sequence of keys, 4 a bucket of cursors and 1 of counts:
+        // no global sort and no whole table in memory. Hashes go a batch at a time, then the random count, cursor
+        // and key accesses run from a tight prefetched loop over the batch, so the cache misses overlap.
+        const BT: usize = 4096;                            // names hashed a batch
+        const PD: usize = 24;                              // prefetch distance, in names
         let n = self.nreads;
         let w = ixw(n.max(1));
         let mut k = 0u32;
         while k < 30 && (1u64 << (k + 2)) < n { k += 1; }   // about 4 reads a bucket
-        // the hashes are taken again on the rare retry, not kept: 8 bytes a sequence beside the keys and the table
-        let key = loop {                                   // a count must fit its byte
-            let mut key: Vec<(u64, u64)> = (0..n)
-                .map(|i| { let h = h64b(&self.name_at(i)); ((if k > 0 { (h >> (64 - k)) << 32 } else { 0 }) | ixfp(h, i), i) }).collect();
-            key.sort_unstable();
-            let top = key.chunk_by(|a, b| a.0 >> 32 == b.0 >> 32).map(|c| c.len()).max().unwrap_or(0);
-            if top <= 255 { break key; }
-            k += 1;
+        let bk = |h: u64, k: u32| if k > 0 { (h >> (64 - k)) as usize } else { 0 };
+        let mut hb = vec![0u64; BT];
+        let cnt = 'retry: loop {                           // a count must fit its byte: grow k before one wraps
+            if k > 32 { crate::bail("more than 255 sequences in one bucket at the widest index (32 bucket bits): cannot index"); }
+            let mut c = vec![0u8; 1usize << k];
+            let mut i0 = 0u64;
+            while i0 < n {
+                let m = (n - i0).min(BT as u64) as usize;
+                for (j, h) in hb[..m].iter_mut().enumerate() { *h = bk(h64b(&self.name_at(i0 + j as u64)), k) as u64; }
+                for j in 0..m {
+                    if j + PD < m { ixpf(c.as_ptr().wrapping_add(hb[j + PD] as usize)); }
+                    let b = hb[j] as usize;
+                    if c[b] == 255 { k += 1; continue 'retry; }
+                    c[b] += 1;
+                }
+                i0 += m as u64;
+            }
+            break c;
         };
-        let (nb, dup) = (1u64 << k, key.windows(2).filter(|p| p[0].0 == p[1].0).count() as u64);
+        let nb = 1u64 << k;
+        let mut cur = vec![0u32; nb as usize];             // n < 2^32, so a 32-bit cursor holds any start
+        let mut s = 0u32;
+        for (c, &m) in cur.iter_mut().zip(&cnt) { *c = s; s += m as u32; }
+        let mut key = vec![0u64; n as usize];
+        let mut hh = vec![0u64; BT];
+        let mut i0 = 0u64;
+        while i0 < n {
+            let m = (n - i0).min(BT as u64) as usize;
+            for j in 0..m { let h = h64b(&self.name_at(i0 + j as u64)); hh[j] = h; hb[j] = bk(h, k) as u64; }
+            for j in 0..m {
+                if j + 2 * PD < m { ixpf(cur.as_ptr().wrapping_add(hb[j + 2 * PD] as usize) as *const u8); }
+                if j + PD < m { ixpf(key.as_ptr().wrapping_add(cur[hb[j + PD] as usize] as usize) as *const u8); }
+                let i = i0 + j as u64;
+                let c = &mut cur[hb[j] as usize];
+                key[*c as usize] = (ixfp(hh[j], i) << 32) | i;
+                *c += 1;
+            }
+            i0 += m as u64;
+        }
+        drop((cur, hb, hh));
+        // within a bucket, (fingerprint, ordinal) order: the order of the global sort of (bucket, fingerprint, ordinal)
+        let (mut dup, mut s) = (0u64, 0usize);
+        for &m in &cnt {
+            let sl = &mut key[s..s + m as usize];
+            sl.sort_unstable();
+            dup += sl.windows(2).filter(|p| p[0] >> 32 == p[1] >> 32).count() as u64;
+            s += m as usize;
+        }
         let ns = nb.div_ceil(1024);
         let pay = nb + ns * 8 + (n * (32 + w)).div_ceil(8) + 8;
-        let mut t = vec![0u8; crate::ckalloc(pay as usize)];
-        let eo = (nb + ns * 8) as usize;
-        for (i, &(kk, o)) in key.iter().enumerate() {
-            t[(kk >> 32) as usize] += 1;
-            let (mut bit, mut v) = (i as u64 * (32 + w), (kk & 0xffff_ffff) | (o << 32));
-            let mut left = 32 + w;
-            while left != 0 {
-                let sh = bit & 7;
-                let take = left.min(8 - sh);
-                t[eo + (bit >> 3) as usize] |= ((v & ((1u64 << take) - 1)) << sh) as u8;
-                v >>= take; bit += take; left -= take;
-            }
-        }
-        let mut sum = 0u64;
-        for g in 0..ns {
-            t[(nb + g * 8) as usize..][..8].copy_from_slice(&sum.to_le_bytes());
-            for b in g * 1024..nb.min((g + 1) * 1024) { sum += t[b as usize] as u64; }
-        }
-        for v in [n, k as u64, self.mhash ^ self.namesrc(), pay, IDXMAGIC] { t.extend_from_slice(&v.to_le_bytes()); }
-        // beside the track in TRACK.kzi, written whole, then renamed into place
-        use std::io::Write;
-        // a new random name, made exclusively, as the C's mkstemp
+        // the names were read above, so this is the binding of the file they came from, and nothing between the
+        // temporary file and its commit can fail but the write itself
+        crate::ffi::swap_pause();                          // tests only: a --names swap lands here
+        let bind = self.mhash ^ self.namesrc().unwrap_or_else(|| crate::bail("an index needs a regular file for --names, not a pipe: the names it was built from could not be told from others later"));
+        // beside the track in TRACK.kzi, under a new random name made exclusively (as the C's mkstemp), synced and
+        // closed, its length checked, then renamed into place
         let ip = format!("{path}.kzi");
-        let (mut f, tp) = crate::ffi::mkstemp(ip.as_ref(), 0o666)
-            .unwrap_or_else(|_| crate::bail("cannot create the index file beside the track"));
-        // synced and closed, checked, before the rename
-        let wrote = f.write_all(&t).is_ok();
-        let ok = crate::ffi::finish(f) && wrote && std::fs::rename(&tp, &ip).is_ok();
-        if !ok { let _ = std::fs::remove_file(&tp); crate::bail("index write failed"); }
+        let mut out = IxOut::open(&ip);
+        out.bytes(&cnt);
+        let mut sum = 0u64;                                // superblocks: the entries before each 1024 buckets
+        for g in cnt.chunks(1024) {
+            out.bytes(&sum.to_le_bytes());
+            sum += g.iter().map(|&c| c as u64).sum::<u64>();
+        }
+        drop(cnt);
+        // an entry is the fingerprint then the ordinal in 32 + w bits, LSB first
+        for &kk in &key { out.bits((kk >> 32) | ((kk & 0xffff_ffff) << 32), 32 + w); }
+        drop(key);
+        out.endbits();
+        out.bytes(&[0u8; 8]);
+        for v in [n, k as u64, bind, pay, IDXMAGIC] { out.bytes(&v.to_le_bytes()); }
+        out.commit(pay + 40);
         eprintln!("index: {n} sequences, {} B in {ip}, {dup} fingerprint collisions", pay + 40);
+    }
+}
+
+#[inline(always)]
+fn ixpf(p: *const u8) {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: a prefetch is a hint: it never faults and the address need not be valid
+    unsafe { core::arch::x86_64::_mm_prefetch(p as *const i8, core::arch::x86_64::_MM_HINT_T0) }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = p;
+}
+
+/// the index written through a 1 MiB buffer, the entries bit-packed LSB first
+struct IxOut { f: Option<std::fs::File>, tp: std::path::PathBuf, ip: String, buf: Vec<u8>, acc: u128, nb: u32, ok: bool, len: u64 }
+impl IxOut {
+    const CAP: usize = 1 << 20;
+    fn open(ip: &str) -> Self {
+        let (f, tp) = crate::ffi::mkstemp(ip.as_ref(), 0o666)
+            .unwrap_or_else(|_| crate::bail("cannot create the index file beside the track"));
+        IxOut { f: Some(f), tp, ip: ip.to_string(), buf: Vec::with_capacity(Self::CAP + 64), acc: 0, nb: 0, ok: true, len: 0 }
+    }
+    fn write(&mut self, b: &[u8]) {
+        use std::io::Write;
+        if self.ok { self.ok = self.f.as_mut().unwrap().write_all(b).is_ok(); }
+        self.len += b.len() as u64;
+    }
+    fn flush(&mut self) { let b = std::mem::take(&mut self.buf); self.write(&b); self.buf = b; self.buf.clear(); }
+    fn bytes(&mut self, b: &[u8]) {
+        debug_assert!(self.nb == 0);
+        if self.buf.len() + b.len() > Self::CAP { self.flush(); }
+        if b.len() > Self::CAP { self.write(b) } else { self.buf.extend_from_slice(b) }
+    }
+    #[inline]
+    fn bits(&mut self, v: u64, width: u64) {           // width <= 64 and nb < 64, so the accumulator never overflows
+        self.acc |= (v as u128) << self.nb;
+        self.nb += width as u32;
+        if self.nb >= 64 {
+            self.buf.extend_from_slice(&(self.acc as u64).to_le_bytes());
+            self.acc >>= 64;
+            self.nb -= 64;
+            if self.buf.len() >= Self::CAP { self.flush(); }
+        }
+    }
+    fn endbits(&mut self) {
+        let m = self.nb.div_ceil(8) as usize;
+        self.buf.extend_from_slice(&self.acc.to_le_bytes()[..m]);
+        self.acc = 0;
+        self.nb = 0;
+    }
+    fn commit(mut self, want: u64) {
+        self.flush();
+        let f = self.f.take().unwrap();
+        let ok = crate::ffi::finish(f) && self.ok && self.len == want && std::fs::rename(&self.tp, &self.ip).is_ok();
+        if !ok { let _ = std::fs::remove_file(&self.tp); crate::bail("index write failed"); }
     }
 }
 

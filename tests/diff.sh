@@ -123,6 +123,36 @@ for i in $(seq 0 2999); do printf '%s\t0\t%s\tA\n' $i $((i % 7 + 1)); done > "$W
 "$R" index -i "$W/roi.kst" >/dev/null 2>&1; irr=$?
 [ $irc = 0 ] && [ $irr = 0 ] && cmp -s "$W/coi.kst.kzi" "$W/roi.kst.kzi" && tpass "index, ordinal names: byte-identical .kzi" || tfail "index, ordinal names: .kzi FILES DIFFER (rc $irc/$irr)"
 for q in 0 1234 2999; do both "query, ordinal names, indexed" query -i "$W/coi.kst" -r $q; done
+# a bucket that overflows twice: 300 of 1000 names share their top 9 hash bits, so the bucket count grows from 2^8 to
+# 2^10 before every count fits its byte; and 200,001 ordinal names, whose entries pass the Rust's 1 MiB output buffer
+# and end in a partial byte
+python3 - "$W/ov.bed" <<'PY'
+import sys
+M = (1 << 64) - 1
+def h64b(s):
+    h = 0x9e3779b97f4a7c15
+    for c in s.encode():
+        h ^= c; h = (h * 0xff51afd7ed558ccd) & M; h ^= h >> 32
+    return h
+hot, cold, i = [], [], 0
+while len(hot) < 300 or len(cold) < 700:
+    n = "n%d" % i; i += 1
+    (hot if h64b(n) >> 55 == 0 else cold).append(n)
+with open(sys.argv[1], "w") as f:
+    for n in hot[:300] + cold[:700]: f.write("%s\t0\t10\tx\n" % n)
+PY
+awk 'BEGIN { for (i = 0; i < 200001; i++) printf "%d\t0\t%d\tA\n", i, i % 7 + 1 }' > "$W/bi.bed"
+for t in ov bi; do
+  "$C" compress < "$W/$t.bed" > "$W/c$t.kst" 2>/dev/null; cp "$W/c$t.kst" "$W/r$t.kst"
+  "$C" index -i "$W/c$t.kst" >/dev/null 2>&1; irc=$?
+  "$R" index -i "$W/r$t.kst" >/dev/null 2>&1; irr=$?
+  [ $irc = 0 ] && [ $irr = 0 ] && cmp -s "$W/c$t.kst.kzi" "$W/r$t.kst.kzi" && tpass "index, $t: byte-identical .kzi" || tfail "index, $t: .kzi FILES DIFFER (rc $irc/$irr)"
+done
+for q in $(head -1 "$W/ov.bed" | cut -f1) $(sed -n 300p "$W/ov.bed" | cut -f1) $(tail -1 "$W/ov.bed" | cut -f1); do
+  both "query, overflowed bucket, indexed" query -i "$W/cov.kst" -r $q; done
+for q in 0 131072 200000; do both "query, 200,001 names, indexed" query -i "$W/cbi.kst" -r $q; done
+printf 'r0\t0\t10\tA\nr1\t0\t10\tB\n' | "$C" compress --names drop > "$W/pd.kst" 2>/dev/null; printf 'r0\nr1\n' > "$W/pd.txt"
+EXPECT=fail both "index from piped names: refused alike" --names <(cat "$W/pd.txt") index -i "$W/pd.kst"
 cp "$W/coi.kst" "$W/oi.kst"
 for q in 0 1234 2999; do both "query, ordinal names" query -i "$W/oi.kst" -r $q; done
 EXPECT=fail both "query, ordinal names, a leading zero" query -i "$W/oi.kst" -r 0123

@@ -3672,10 +3672,11 @@ static uint64_t stathash(const struct stat *st) {
 }
 static char *readnamefile(uint64_t nreads) {
     char *names;
+        /* stat the path (a cookie stream has no descriptor of its own) before it is opened, so a file put in its
+           place before the open fails the check after the read instead of binding the index to the new file */
+        struct stat st0; if (stat(NAMEFILE, &st0)) die("cannot open the file given to --names");
         FILE *nf = zfopen(NAMEFILE);
         if (!nf) die("cannot open the file given to --names");
-        /* stat the path: a cookie stream has no descriptor of its own */
-        struct stat st0; if (stat(NAMEFILE, &st0)) die("cannot stat the file given to --names");
         size_t cap = 1 << 20, w = 0;
         names = xmalloc(cap);
         char *ln = NULL; size_t lcap = 0; uint64_t got = 0, lineno = 0; int fq = 2;
@@ -3814,6 +3815,7 @@ static uint64_t ixget(const uint8_t *p, uint64_t bit, int nb) {
     return (ld64(p + (bit >> 3)) >> (bit & 7)) & ((1ULL << nb) - 1);
 }
 
+static void swap_pause(void);
 static void buildindex(const char *path) {
     R *r = ropen(path);
     ensurenames(r);
@@ -3823,7 +3825,7 @@ static void buildindex(const char *path) {
     int w = ixw(n ? n : 1), k = 0;
     while (k < 30 && (1ULL << (k + 2)) < n) k++;          /* about 4 reads a bucket */
     for (;; k++) {                                        /* a count must fit its byte */
-        if (k > 32) die("more than 255 sequences share one name hash: cannot index");
+        if (k > 32) die("more than 255 sequences in one bucket at the widest index (32 bucket bits): cannot index");
         for (uint64_t i = 0; i < n; i++) {
             uint64_t h = h64b(r->name[i]);
             key[2 * i] = (k ? (h >> (64 - k)) << 32 : 0) | IXFP(h, i); key[2 * i + 1] = i;
@@ -3833,6 +3835,7 @@ static void buildindex(const char *path) {
         for (uint64_t i = 0; i < n; i++) { run = i && key[2 * i] >> 32 == key[2 * i - 2] >> 32 ? run + 1 : 1; if (run > top) top = run; }
         if (top <= 255) break;
     }
+    swap_pause();                                         /* tests only: a --names swap lands here */
     uint64_t nb = 1ULL << k, ns = (nb + 1023) / 1024, eb = (n * (32 + (uint64_t)w) + 7) / 8 + 8;
     uint64_t pay = nb + ns * 8 + eb, dup = 0;
     uint8_t *t = xcalloc(pay, 1), *cnt = t, *ent = t + nb + ns * 8;

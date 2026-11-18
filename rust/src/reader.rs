@@ -48,9 +48,19 @@ fn ord_rank(seq: &[u8], n: u64) -> i64 {
     if v < n { v as i64 } else { -1 }
 }
 
-/// --names FILE: a FASTA, a FASTQ, or one name per line; rank N is record N
-fn read_name_file(path: &str, nreads: u64) -> Vec<u8> {
-    let data = crate::slurp(path, "cannot open the file given to --names");
+/// --names FILE: a FASTA, a FASTQ, or one name per line; rank N is record N. With the names, the binding an index
+/// built from them carries: the stat of the file opened, checked again on its path once read, as the C's NAMESRC_H
+fn read_name_file(path: &str, nreads: u64) -> (Vec<u8>, u64) {
+    let f = std::fs::File::open(path).unwrap_or_else(|_| crate::bail("cannot open the file given to --names"));
+    let m0 = rd(f.metadata(), "cannot stat the file given to --names");
+    let mut data = Vec::new();
+    if std::io::Read::read_to_end(&mut crate::unzip(f), &mut data).is_err() { crate::bail("read error on a companion file"); }
+    let bind = if m0.is_file() {
+        let m1 = rd(std::fs::metadata(path), "cannot stat the file given to --names");
+        let b = names_bind_of(path, &m0);
+        if names_bind_of(path, &m1) != b { crate::bail("the file given to --names changed while it was read"); }
+        b
+    } else { 0 };                                       // a pipe cannot bind an index
     // getline gives no line after a final newline, and the split does
     let mut lines: Vec<&[u8]> = data.split(|&c| c == b'\n').collect();
     if data.last() == Some(&b'\n') { lines.pop(); }
@@ -76,7 +86,18 @@ fn read_name_file(path: &str, nreads: u64) -> Vec<u8> {
         eprintln!("--names: the file has {got} records, the track has {nreads} sequences. Rank N is the Nth record only when every record produced rows, so this file cannot name it.");
         crate::bail("name file does not match the track");
     }
-    out
+    (out, bind)
+}
+
+/// The binding word of a --names FILE: its path and seven stat fields, as the C's stathash
+fn names_bind_of(path: &str, m: &std::fs::Metadata) -> u64 {
+    use std::os::linux::fs::MetadataExt;
+    let mut h = kst::fnv(FNV0, path.as_bytes());
+    for v in [m.st_size(), m.st_ino(), m.st_dev(), m.st_mtime() as u64, m.st_mtime_nsec() as u64,
+              m.st_ctime() as u64, m.st_ctime_nsec() as u64] {
+        h = kst::fnv(h, &v.to_le_bytes());
+    }
+    h
 }
 
 /// One block: where it is, both frame and decoded sizes, its rows, the bases before it, its own hash
@@ -115,6 +136,8 @@ pub struct Reader {
     nz_off: u64,
     nzl: usize,
     names_file: Option<String>,
+    /// the --names FILE's binding, taken from the file the names were read from (the C's NAMESRC_H)
+    names_bind: std::cell::OnceCell<u64>,
     /// dropped, int, tok, fld
     nf: u8,
     /// the appended index: offset of its key table, and its trailer's binding word
@@ -441,7 +464,7 @@ impl Reader {
             taildec, tailpred: h[12], tailskip: h[13] & 0xff, iz, coff, cpend, ibx: Vec::new(), cur_chunk: u64::MAX,
             runhead, ilv, grp, rtab: Default::default(), varblk, rtab_blk: usize::MAX,
             names: std::cell::OnceCell::new(), nz_off, nzl, names_file: o.names_file.clone(),
-            nf, idx,
+            names_bind: std::cell::OnceCell::new(), nf, idx,
             mhash: h[15], cur_ri: 0, cur_q: 0, cur_pend: 0, cached: None, sc: None,
             rowhash: if h1_raw & ALNFLAG != 0 { 0 } else { h[13] >> 8 },
             plainref: h1_raw & (ALNFLAG | DBFLAG | DROPPED) == 0,
@@ -1039,7 +1062,9 @@ impl Reader {
             if !dropped && has {
                 crate::bail("this track stores its own names: --names FILE would replace them, so it is refused. Unset it to read the names in the file");
             }
-            read_name_file(f, n)
+            let (v, b) = read_name_file(f, n);
+            let _ = self.names_bind.set(b);
+            v
         } else if dropped && !has {
             if !self.raw {
                 crate::bail("the names of this track were dropped at compress time: give them back with --names FILE");
@@ -1070,17 +1095,13 @@ impl Reader {
     }
 
     /// The C's namesrc: an index is bound to the --names FILE it was built under, by path and stat
+    /// once the names are read, the binding of the file they came from; before, the file now at the path
     fn namesrc(&self) -> u64 {
-        use std::os::linux::fs::MetadataExt;
         let Some(f) = self.names_file.as_ref() else { return 0 };
+        if let Some(&b) = self.names_bind.get() { return b; }
         let m = rd(std::fs::metadata(f), "cannot stat the file given to --names");
         if !m.is_file() { return 0; }
-        let mut h = kst::fnv(FNV0, f.as_bytes());
-        for v in [m.st_size() as u64, m.st_ino(), m.st_dev(), m.st_mtime() as u64, m.st_mtime_nsec() as u64,
-                  m.st_ctime() as u64, m.st_ctime_nsec() as u64] {
-            h = kst::fnv(h, &v.to_le_bytes());
-        }
-        h
+        names_bind_of(f, &m)
     }
 
     /// The appended index, as the C reads it: the bucket, its fingerprints, a name decoded only when needed
@@ -1274,7 +1295,7 @@ impl Reader {
         let bk = |h: u64, k: u32| if k > 0 { (h >> (64 - k)) as usize } else { 0 };
         let mut hb = vec![0u64; BT];
         let cnt = 'retry: loop {                           // a count must fit its byte: grow k before one wraps
-            if k > 32 { crate::bail("more than 255 sequences share one name hash: cannot index"); }
+            if k > 32 { crate::bail("more than 255 sequences in one bucket at the widest index (32 bucket bits): cannot index"); }
             let mut c = vec![0u8; 1usize << k];
             let mut i0 = 0u64;
             while i0 < n {
@@ -1321,6 +1342,10 @@ impl Reader {
         }
         let ns = nb.div_ceil(1024);
         let pay = nb + ns * 8 + (n * (32 + w)).div_ceil(8) + 8;
+        // the names were read above, so this is the binding of the file they came from, and nothing between the
+        // temporary file and its commit can fail but the write itself
+        crate::ffi::swap_pause();                          // tests only: a --names swap lands here
+        let bind = self.mhash ^ self.namesrc();
         // beside the track in TRACK.kzi, under a new random name made exclusively (as the C's mkstemp), synced and
         // closed, its length checked, then renamed into place
         let ip = format!("{path}.kzi");
@@ -1337,7 +1362,7 @@ impl Reader {
         drop(key);
         out.endbits();
         out.bytes(&[0u8; 8]);
-        for v in [n, k as u64, self.mhash ^ self.namesrc(), pay, IDXMAGIC] { out.bytes(&v.to_le_bytes()); }
+        for v in [n, k as u64, bind, pay, IDXMAGIC] { out.bytes(&v.to_le_bytes()); }
         out.commit(pay + 40);
         eprintln!("index: {n} sequences, {} B in {ip}, {dup} fingerprint collisions", pay + 40);
     }

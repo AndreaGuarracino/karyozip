@@ -990,6 +990,13 @@ must_fail "-t 4x" $KT -t 4x compress < "$D/s.bed"
 # round 26 findings, one case each
 cp "$W/A.txt" "$W/A2.txt"; $KT --names "$W/A2.txt" index -i "$W/nx.kt" >/dev/null 2>&1; cp "$W/B.txt" "$W/A2.tmp"; mv -f "$W/A2.tmp" "$W/A2.txt"
 [ "$($KT --names "$W/A2.txt" query -i "$W/nx.kt" -r r0 2>/dev/null | cut -f4)" = D ] && ok "index built before a name file swap: ignored" || no "index built before a name file swap: WRONG"
+# the --names FILE replaced while index runs, after the names were hashed: the index binds the file it read, so the
+# replacement's lookups are right, and no temporary is left beside the track
+cp "$W/A.txt" "$W/A3.txt"; rm -f "$W/nx.kt.kzi"
+KZ_TEST_SWAP_PAUSE_MS=1500 $KT --names "$W/A3.txt" index -i "$W/nx.kt" >/dev/null 2>&1 & ixp=$!
+sleep 0.5; cp "$W/B.txt" "$W/A3.tmp"; mv -f "$W/A3.tmp" "$W/A3.txt"; wait $ixp
+[ "$($KT --names "$W/A3.txt" query -i "$W/nx.kt" -r r0 2>/dev/null | cut -f4)" = D ] && ok "name file swapped during index: lookups right" || no "name file swapped during index: WRONG"
+ls "$W"/nx.kt.kzi.* >/dev/null 2>&1 && no "name file swapped during index: a temporary left" || ok "name file swapped during index: no temporary left"
 mkdir -p "$W/good"; $KT decompress --db "$D/db.features.tsv" --out-dir "$W/good" -i "$W/f.kt" >/dev/null 2>&1; m1=$(cat "$W/good"/*.bed | md5sum)
 cp "$W/f.kt" "$W/fbad.kt"; sz=$(stat -c%s "$W/fbad.kt"); printf '\xff' | dd of="$W/fbad.kt" bs=1 seek=$((sz-100)) conv=notrunc status=none
 $KT decompress --db "$D/db.features.tsv" --out-dir "$W/good" -i "$W/fbad.kt" >/dev/null 2>&1 && no "decompress of a damaged db track: EXIT 0"

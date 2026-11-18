@@ -34,6 +34,11 @@ The file format and every byte written are unchanged.
 ### Fixed
 - `index` (C and Rust): a name distribution that keeps overfilling one bucket now stops with an error once the
   bucket count would pass 2^32, instead of growing it until the shift overflows.
+- Rust `index --names FILE`: the `.kzi` is bound to the names file it was built from. The Rust reader took that
+  binding from a fresh stat of the path when it wrote the trailer, so a file swapped in during the build could
+  bind an index whose keys came from the old file, and a query under the new file could then return the wrong
+  sequence. It now takes the binding from the file it opened and refuses a file changed while it was read, as the
+  C already did. The C now also stats the path before opening it, so a file swapped in before the open is caught.
 
 ## 0.3.1 (2026-11-05)
 

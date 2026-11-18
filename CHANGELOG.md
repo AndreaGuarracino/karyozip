@@ -21,6 +21,19 @@ The file format and every byte written are unchanged.
   ```
 
   A numeric name is spelled into the `Nm` when it is asked for, so a slice must not outlive its `Nm`.
+- Rust `index` (and the `.kzi` written by a `compress`/`annotate` that indexes) builds by count and place: it
+  hashes every name to count its bucket, hashes again to place one 8-byte key per name in its bucket, sorts each
+  bucket, and writes the entries through a 1 MiB buffer. The global sort of 16-byte keys and the whole table held
+  in memory are gone. On the 808 M-read track the build fell from 19.2 GB to 7.8 GB of peak memory and from
+  about 1:45 to 1:28; on 200 M ordinal names, from 4.7 GB to 1.9 GB. Hashing goes in batches and the scattered
+  writes are prefetched: without that, count and place ran 3-4x slower. With long text names the build is about
+  10% slower (the names are hashed twice) and the saving is smaller, since the decoded names dominate. The
+  `.kzi` bytes are identical to 0.3.1's (checked with `cmp` on ordinal, integer and text names, and on a
+  bucket-overflow retry). The C builder is unchanged.
+
+### Fixed
+- `index` (C and Rust): a name distribution that keeps overfilling one bucket now stops with an error once the
+  bucket count would pass 2^32, instead of growing it until the shift overflows.
 
 ## 0.3.1 (2026-11-05)
 

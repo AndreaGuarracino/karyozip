@@ -3823,6 +3823,7 @@ static void buildindex(const char *path) {
     int w = ixw(n ? n : 1), k = 0;
     while (k < 30 && (1ULL << (k + 2)) < n) k++;          /* about 4 reads a bucket */
     for (;; k++) {                                        /* a count must fit its byte */
+        if (k > 32) die("more than 255 sequences share one name hash: cannot index");
         for (uint64_t i = 0; i < n; i++) {
             uint64_t h = h64b(r->name[i]);
             key[2 * i] = (k ? (h >> (64 - k)) << 32 : 0) | IXFP(h, i); key[2 * i + 1] = i;
